@@ -32,6 +32,7 @@ struct ChatView: View {
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 8) {
                 if let call = callHere { CallPanel(call: call) }
+                if let prompts = model.prompts { PromptStack(center: prompts, sessionIDs: chat.sessionIDs) }
                 composer
             }
             .padding(.horizontal)

@@ -9,7 +9,9 @@ final class AppModel: ObservableObject {
 
     let calls = CallController()
     private(set) var client: DashboardClient?
-    private(set) var socket: GatewaySocket?
+    private(set) var connection: GatewayConnection?
+    /// Approvals, questions and passwords Hermes is waiting on, for every chat.
+    private(set) var prompts: PromptCenter?
     /// One model per stored session, so the list, the chat screen and a call share its state.
     private var chats: [String: ChatModel] = [:]
     /// Bumped on sign-in and sign-out, so a chat from an earlier sign-in can't enter the cache.
@@ -26,9 +28,11 @@ final class AppModel: ObservableObject {
             try await client.signIn()
             next.save()
             settings = next
-            socket?.disconnect()
+            connection?.disconnect()
             self.client = client
-            socket = GatewaySocket(client: client)
+            let connection = GatewayConnection(client: client)
+            self.connection = connection
+            prompts = PromptCenter(connection: connection)
             chats.removeAll()
             generation += 1
             signedIn = true
@@ -46,12 +50,13 @@ final class AppModel: ObservableObject {
         settings.save()
     }
 
-    /// Hangs up without telling Hermes, closes the gateway socket for good, and logs out of the dashboard.
+    /// Hangs up without telling Hermes, closes the gateway connection for good, and logs out of the dashboard.
     func signOut() {
         calls.end(notifyHermes: false)
-        socket?.disconnect()
+        connection?.disconnect()
         client?.signOut()
-        socket = nil
+        connection = nil
+        prompts = nil
         client = nil
         chats.removeAll()
         generation += 1
@@ -75,10 +80,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The app is back in the foreground: check the gateway socket, catch up the chats in use, refresh the list.
+    /// The app is back in the foreground: check the gateway connection, catch up the chats in use, refresh the list.
     func didBecomeActive() {
         guard signedIn else { return }
-        socket?.probe()
+        connection?.probe()
         for chat in chats.values { chat.wake() }
         calls.active?.chat.wake()
         Task { await refresh() }
@@ -86,7 +91,7 @@ final class AppModel: ObservableObject {
 
     /// The chat for a stored session (always the same model for one session), or a new chat when `summary` is nil.
     func chat(for summary: SessionSummary?) -> ChatModel? {
-        guard let client, let socket else { return nil }
+        guard let client, let connection else { return nil }
         if let summary {
             if let existing = chats[summary.id] { return existing }
             if let call = calls.active?.chat, call.storedID == summary.id {
@@ -94,7 +99,7 @@ final class AppModel: ObservableObject {
                 return call
             }
         }
-        let chat = ChatModel(client: client, socket: socket, summary: summary)
+        let chat = ChatModel(client: client, connection: connection, summary: summary)
         if let summary {
             chats[summary.id] = chat
         } else {

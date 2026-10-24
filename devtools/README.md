@@ -6,13 +6,20 @@ A small stand-in for the Hermes web dashboard (port 9119) that speaks exactly th
 uses. The shapes come from the Hermes source: cookie sign-in, the session list, stored messages, WebSocket
 tickets, and the `/api/ws` JSON-RPC gateway with its events. Its "agent" is scripted and really calls the
 voice server's `speak` tool over MCP. That lets you test a whole call in the iOS Simulator without a real
-Hermes, a model or ElevenLabs. Everything is kept in memory, and nothing touches `~/.hermes`.
+Hermes, a model or ElevenLabs. It also does what the app has to handle when the connection drops:
+event replay, detached sessions that get reaped, and server→client requests such as approvals.
+Everything is kept in memory, and nothing touches `~/.hermes`.
 
 | Prompt | Fake agent |
 |---|---|
 | `[Voice call started] call_id: <32 hex> …` | `tool.start` for `mcp__hermes_voice__speak` with `{text, call_id}`. Calls `speak("Hi, I am fake Hermes. I can hear you.")` on the voice server and waits for the result, then `tool.complete`. Then it streams the text reply `Call connected (text only).` |
 | `[Voice] <words>` | `speak("You said: <words>")`, then the same line as text |
 | `[Voice call ended] …` | text `Call ended.`, with no speak |
+| text containing `approve` | `tool.start` for `terminal`, then an `approval` request `{command, description, choices, request_id, …}`. The reply says which choice came back, or that nobody could answer |
+| text containing `clarify` | a `clarify` request with three questions (single choice, multi-select, open-ended), then the answers |
+| text containing `secret` | a `secret` request `{env_var, prompt}` (300 s deadline). The value is never echoed or logged, only its length |
+| text containing `sudo` | a `sudo` request `{command}` (120 s deadline) inside a `terminal` tool call |
+| text containing `window` | a window-owned `window.read` request (30 s deadline), the one to test 4404 declines with |
 | anything else | text `Echo: <prompt>` |
 
 Each turn streams in about 0.3 s: `message.start` → `message.delta`… → `message.complete` →
@@ -49,8 +56,14 @@ The fake prints every RPC, every event and every `speak` result with the prefix 
 `FAKE 20:02:30 speak result (0.4s, ok): Spoken to the user (2.1s of audio).` Stop both with Ctrl-C.
 
 Options: `--host` (default `127.0.0.1`; use `0.0.0.0` or the Tailscale IP to test from a real iPhone),
-`--username` and `--password` (default `test`/`test`), and `--speak-timeout` (default 300 s). The token can
-also come from `HERMES_VOICE_TOKEN`.
+`--username` and `--password` (default `test`/`test`), `--speak-timeout` (default 300 s), `--reap-grace`
+(default 20 s, `0` keeps detached sessions forever), `--replay-max` (default 512 events per session) and
+`--contract` (default `HermesVoice/Contract/gateway-contract.openrpc.json`, `''` turns the param check off).
+The token can also come from `HERMES_VOICE_TOKEN`.
+
+Use a short grace to test what happens when the app was backgrounded for too long, for example
+`--reap-grace 3`: background the app, wait, come back, and the app has to fall back from `session.activate`
+(4001) to `session.resume`.
 
 ### What it implements
 
@@ -64,14 +77,71 @@ also come from `HERMES_VOICE_TOKEN`.
   display_kind, tool_calls, …}], pagination}`. A draft with no prompt yet gets 404.
 - Any unauthenticated `/api/*` call gets Hermes' 401 envelope `{error: "unauthenticated", …}`. A `POST`
   whose `Origin` doesn't match its `Host` gets 403.
-- `WS /api/ws?ticket=…` sends `gateway.ready` first. A bad ticket closes the socket with 4401 before
-  accepting it. Supported methods:
-  - `gateway.ping`, `ping`, `client.capabilities`
-  - `session.create`, with `idempotency_key` (a repeated key returns the same session)
-  - `session.resume`, with `omit_messages`. It returns the runtime `session_id`, the stored key as `session_key`
-    and `stored_session_id`, plus `running`, `inflight` and `queued`.
+- `WS /api/ws?ticket=…` sends `gateway.ready {skin, change_events, heartbeat: true, replay_epoch}` first. A bad
+  ticket closes the socket with 4401 before accepting it. Supported methods:
+  - `gateway.ping`, `ping`
+  - `client.capabilities {server_requests: true}` returns `{server_requests: [13 methods], declines_not_shown:
+    true}`. Without it the connection counts as an app that can't answer server requests: they aren't sent,
+    and an approval is withdrawn at once instead of stalling the turn.
+  - `session.create`, with `idempotency_key` (a repeated key returns the same session but doesn't bind the
+    new socket, as in Hermes)
+  - `session.resume`, with `omit_messages`. Takes the stored id and returns the runtime `session_id`, the stored
+    key as `session_key`, plus `running`, `status`, `inflight`, `queued`, `pending_approval` and
+    `open_requests` when they are set. A live session is re-attached; otherwise a new runtime id is minted.
+  - `session.activate {session_id: <runtime id>}` re-attaches a live session to this socket and returns the
+    same payload. A runtime id that is gone (reaped, or never existed) gets `4001 session not found`, as from
+    Hermes; Hermes answers 4007 only when a reap races the call.
+  - `session.events.since {session_id, last_seen}` returns `{events, latest_seq, truncated, count, epoch,
+    open_requests}`. `truncated` is true when events after `last_seen` fell out of the ring.
   - `prompt.submit`, which returns `{status: "streaming" | "queued"}`
-  - `session.interrupt`
+  - `session.interrupt`, which also withdraws the session's open requests
+  - `approval.respond {session_id, choice, all?, request_id?}` returns `{resolved}`. It also finds the approval by
+    `request_id` or a stored session id when the runtime id is stale.
+  - `request.answer {id, result}` and `clarify.lock {request_id, question_id, answer}` return `{status: "ok" |
+    "expired"}`.
 
-  Unknown methods get `-32601`. Events are framed as
-  `{"method": "event", "params": {type, session_id: <runtime id>, payload}}`.
+  Unknown methods get `-32601`, and params with a key the contract doesn't know get `4000`. Events are framed as
+  `{"method": "event", "params": {type, session_id: <runtime id>, seq, payload}}`. `seq` counts per session
+  from 1, and the last 512 events per session are kept for `session.events.since`, including the events sent
+  while no client was attached. `epoch` is the `replay_epoch` of this process: a restarted fake starts over
+  with a new one. Session-less broadcasts (`session.reclaimed`) have `session_id: ""` and no `seq`.
+
+### Detached sessions
+
+When the last socket of a session closes, the session keeps running with nobody attached, and its turn
+continues. After `--reap-grace` seconds without a client, an idle session is reaped and every connected client
+gets `session.reclaimed {session_id, stored_session_id, reason: "ws_orphan_reap"}`. A running session (also one
+waiting on an approval) is checked again after each grace. `session.activate`, `session.resume` and
+`prompt.submit` re-attach the session and cancel the reap.
+
+### Server→client requests
+
+The fake sends requests like Hermes does: `{"jsonrpc": "2.0", "id": "srq-<12 hex>", "method", "params":
+{session_id, …}}` goes to every socket attached to the session. The app answers with a response frame carrying
+the same id:
+
+- `{result}` settles the request. Clarify answers merge with the ones already locked with `clarify.lock`.
+- `{error: {code: 4404}}` is a "not shown here" decline. It settles the request only once every attached
+  client that sent `client.capabilities` has declined. The result is then Hermes' "No Hermes Desktop window"
+  refusal.
+- Any other error (such as `-32601`) settles it as unanswered. For an approval that means it is withdrawn,
+  not denied.
+- A response for an id that is no longer open is dropped without a reply.
+
+A request that nobody answered stays open across reconnects. It comes back in `open_requests` from
+`session.resume`, `session.activate` and `session.events.since`. A request is withdrawn with a `request.cancel
+{id, method, reason}` event when the turn is interrupted (`interrupted`), when its deadline passes (`timeout`),
+or when `approval.respond` resolved the approval (`resolved`).
+
+### Tests
+
+```bash
+cd hermes-voice-mcp
+uv run pytest -q ../devtools/tests
+```
+
+The tests start the fake in-process and cover sign-in and streaming, reconnect plus replay (also truncated),
+reaping and `session.activate` after a reap, approvals across a reconnect, `approval.respond`, 4404 declines,
+clients that can't answer, clarify locks, secrets, interrupt and timeout cancels, and the speak demo against
+an in-process voice server. One test checks every result, event and request against the pinned gateway contract.
+It is skipped when there's no contract; `HERMES_GATEWAY_CONTRACT=<path>` checks against another copy.
