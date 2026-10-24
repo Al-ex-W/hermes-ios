@@ -92,6 +92,7 @@ FIXTURE = {
             "mode": nullable(ref("Mode")),
             "wait_barrier": nullable(WAIT_BARRIER),
             "_lineage_ids": {"items": {"type": "string"}, "type": "array"},
+            "as": nullable({"type": "string"}),
         }, required=["session_id"], description="Echo ``params`` back."),
         "EchoResult": obj({
             "ok": {"type": "boolean"},
@@ -100,7 +101,7 @@ FIXTURE = {
             "shared": nullable(ref("Shared")),
         }, required=["ok", "detail"], extra=True),
         "EmptyParams": obj({}),
-        "Mode": {"enum": ["fast", "deny-all", "unknown", "continue", "NOT_OWNER"], "type": "string"},
+        "Mode": {"enum": ["fast", "deny-all", "unknown", "continue", "NOT_OWNER", "as"], "type": "string"},
         "WaitBarrierTarget": obj({
             "type": {"enum": ["session", "pid"], "type": "string"},
             "target": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
@@ -143,6 +144,7 @@ class NamingTests(unittest.TestCase):
     def test_reserved_words_are_escaped(self):
         self.assertEqual(gen.ident("repeat"), "`repeat`")
         self.assertEqual(gen.ident("default"), "`default`")
+        self.assertEqual(gen.ident("as"), "`as`")
         self.assertEqual(gen.ident("sessionId"), "sessionId")
         self.assertEqual(gen.unique("self", set()), "self_")
         taken = {"value"}
@@ -175,6 +177,9 @@ class FixtureRenderTests(unittest.TestCase):
         self.assertIn('case lineageIds = "_lineage_ids"', self.text)
         self.assertIn('case sessionId = "session_id"', self.text)
         self.assertIn("case `continue`\n", self.text)
+        self.assertIn("var `as`: String?", self.text)
+        self.assertIn("case `as`\n", self.text)
+        self.assertIn('case "as": self = .`as`', self.text)
 
     def test_discriminator_cases_named_from_tags(self):
         models = self.files["Models.swift"]
@@ -218,7 +223,7 @@ class FixtureRenderTests(unittest.TestCase):
     def test_string_enum_unknown_fallback(self):
         self.assertIn("enum Mode: Codable, Hashable, Sendable, CaseIterable, RawRepresentable {", self.text)
         self.assertIn("    case unknown(String)\n", self.text)
-        self.assertIn('static let allCases: [Mode] = [.fast, .denyAll, .unknown("unknown"), .`continue`, .notOwner]',
+        self.assertIn('static let allCases: [Mode] = [.fast, .denyAll, .unknown("unknown"), .`continue`, .notOwner, .`as`]',
                       self.text)
         self.assertIn('case "deny-all": self = .denyAll', self.text)
         self.assertIn("default: self = .unknown(rawValue)", self.text)
@@ -248,6 +253,15 @@ class FixtureRenderTests(unittest.TestCase):
         self.assertNotIn("voiceStatus", self.files["Events.swift"])
         self.assertNotIn("wakeDetected", self.files["Events.swift"])
         self.assertIn("case wakeState(GoalPayload)", self.files["Events.swift"])
+
+    def test_orphan_keeps_what_it_references(self):
+        contract = copy.deepcopy(FIXTURE)
+        contract["components"]["schemas"]["Orphan"]["properties"]["d"] = nullable(ref("VoiceDetail"))
+        files, renderer = render(contract)
+        self.assertEqual(renderer.contract.stripped_schemas, ["VoiceParams", "VoiceStatusPayload", "WakeOnly",
+                                                              "WakePayload"])
+        self.assertIn("var d: VoiceDetail?", all_text(files))
+        self.assertIn("struct VoiceDetail:", all_text(files))
 
     def test_methods_events_and_requests(self):
         methods = self.files["Methods.swift"]
@@ -362,6 +376,8 @@ SWIFT_MAIN = textwrap.dedent(r"""
                             lineageIds: ["a"])
     check(try object(params) == ["session_id": "s", "repeat": 3, "default": "d", "stamp": 1.5, "mode": "deny-all",
                                  "_lineage_ids": ["a"]], "wire names")
+    check(try object(EchoParams(sessionId: "s", as: "x")) == ["session_id": "s", "as": "x"], "keyword member")
+    check(Mode(rawValue: "as") == .`as` && Mode.`as`.rawValue == "as", "keyword enum value")
 
     // Discriminator: two tags for one schema; the case decides the tag.
     let pid = try parse(WaitBarrier.self, #"{"type": "pid", "target": 42}"#)

@@ -83,6 +83,8 @@ REPLAY_BUFFER_MAX = 512
 REPLAY_SESSIONS_MAX = 64
 # tui_gateway/server.py _resolve_ws_orphan_reap_grace (dashboard.ws_orphan_reap_grace_s, 0 = park forever)
 REAP_GRACE = 20.0
+# tui_gateway/server.py _MINTED_SESSION_KEY_RE: the stored keys session.create mints.
+MINTED_KEY = re.compile(r"\d{8}_\d{6}_[0-9a-f]{6}")
 # contracts.SERVER_REQUESTS, as client.capabilities lists them.
 SERVER_REQUESTS = sorted(["approval", "clarify", "display.install.sudo", "preview.act", "preview.read", "secret",
                           "sudo", "terminal.read", "tour", "vault.code", "vault.save_login", "vault.unlock_prompt",
@@ -605,7 +607,14 @@ class FakeHermes:
             self.attach(rt, conn)
             return {**self.live_payload(rt, omit), "resumed": key}
         if stored is None or not stored.persisted:
-            raise RpcError(4007, "session not found")
+            # A minted key without a row (a draft whose runtime was reaped before its first prompt) gets an empty
+            # row and resumes cold (methods_session.py _resume_materialize_minted), not 4007.
+            if not MINTED_KEY.fullmatch(key):
+                raise RpcError(4007, "session not found")
+            if stored is None:
+                stored = self.sessions[key] = StoredSession(key=key, source=str(params.get("source") or "desktop"))
+            stored.persisted = True
+            log(f"materialized an empty row for minted key {key}")
         rt = Runtime(sid=uuid.uuid4().hex[:8], key=key)
         self.attach(rt, conn)
         self.runtimes[rt.sid] = rt

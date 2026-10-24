@@ -11,6 +11,8 @@ final class FakeHermesTests: XCTestCase {
     private var connection: GatewayConnection!
     private var prompts: PromptCenter!
     private var transports: [WebSocketTransport] = []
+    /// Dialing fails: the dashboard can't be reached.
+    private var offline = false
 
     override func setUp() async throws {
         guard let url = ProcessInfo.processInfo.environment["HERMES_FAKE_URL"] else {
@@ -22,6 +24,7 @@ final class FakeHermesTests: XCTestCase {
         try await client.signIn()
         self.client = client
         connection = GatewayConnection { [weak self] in
+            if self?.offline == true { throw URLError(.notConnectedToInternet) }
             let transport = try await WebSocketTransport.dial(client)
             self?.transports.append(transport)
             return transport
@@ -117,10 +120,15 @@ final class FakeHermesTests: XCTestCase {
         XCTAssertEqual(chat.sessionIDs.count, 2, "the same runtime id came back (stored id + runtime id)")
     }
 
-    func testSessionReapedWhileAwayIsResumed() async throws {
+    private func reapGrace() throws -> Double {
         guard let grace = ProcessInfo.processInfo.environment["HERMES_FAKE_REAP_GRACE"].flatMap(Double.init) else {
             throw XCTSkip("Set HERMES_FAKE_REAP_GRACE to the fake's --reap-grace.")
         }
+        return grace
+    }
+
+    func testSessionReapedWhileAwayIsResumed() async throws {
+        let grace = try reapGrace()
         let chat = await newChat()
         await reply(chat, "one")
         transports.last?.close()
@@ -131,5 +139,47 @@ final class FakeHermesTests: XCTestCase {
         XCTAssertEqual(chat.sessionIDs.count, 3, "resume made a new runtime id")
         await settle(0.5)
         XCTAssertEqual(chat.messages.map(\.text), ["one", "Echo: one", "two", "Echo: two"])
+    }
+
+    func testChatNotInUseIsLeftReapedUntilOpened() async throws {
+        let grace = try reapGrace()
+        let idle = await newChat()
+        await reply(idle, "one")
+        idle.setInUse("view", false)
+        let active = await newChat()
+        await reply(active, "two")
+        let idleIDs = idle.sessionIDs
+        transports.last?.close()
+        try await Task.sleep(nanoseconds: UInt64((grace + 1.5) * 1_000_000_000))
+
+        await reply(active, "three")
+        XCTAssertEqual(active.sessionIDs.count, 3, "the chat in use was resumed")
+        XCTAssertEqual(idle.sessionIDs, idleIDs, "nothing rebuilt the idle chat's runtime")
+
+        idle.setInUse("view", true)
+        await idle.open()
+        await reply(idle, "four")
+        await settle(0.5)
+        XCTAssertEqual(idle.messages.map(\.text), ["one", "Echo: one", "four", "Echo: four"])
+    }
+
+    func testTurnCutOffWhileOfflineStopsSpinningWhenCatchingUpGivesUp() async throws {
+        let chat = await newChat()
+        await reply(chat, "one")
+        var dropped = false
+        let listener = connection.addListener { [weak self] event, _, _ in
+            guard case .messageDelta = event, !dropped, let self else { return }
+            dropped = true
+            self.offline = true
+            self.transports.last?.close()
+            self.connection.probe()
+        }
+        defer { connection.removeListener(listener) }
+        _ = await chat.send("four four")
+        await waitUntil(timeout: 5) { dropped }
+        XCTAssertTrue(chat.busy)
+
+        await waitUntil(timeout: 30) { chat.error != nil }
+        XCTAssertFalse(chat.busy, "nothing would end the spinner while offline")
     }
 }

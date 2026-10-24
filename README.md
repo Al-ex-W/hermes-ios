@@ -168,10 +168,10 @@ Swedish is recognized as Swedish.
 
 - **Dashboard**: `POST /auth/password-login` sets a cookie. `POST /api/auth/ws-ticket` returns a single-use ticket
   for `wss://…/api/ws?ticket=…`, which carries JSON-RPC: `session.resume`, `session.create`, `prompt.submit`, and
-  streamed `message.*`, `tool.*` and `session.*` events. After a reconnect the app re-attaches each open chat
-  (`session.activate`, or `session.resume` when Hermes reaped it meanwhile) and replays what it missed
-  (`session.events.since`). Approvals, questions and passwords arrive as server→client requests and are answered
-  from the chat.
+  streamed `message.*`, `tool.*` and `session.*` events. After a reconnect the app re-attaches each chat in use,
+  on screen or in a call (`session.activate`, or `session.resume` when Hermes reaped it meanwhile), and replays
+  what it missed (`session.events.since`). Other chats catch up when they are opened again. Approvals, questions
+  and passwords arrive as server→client requests and are answered from the chat.
 - **Voice server `/phone`**: the app sends `hello {call_id, session_id, title}` and gets `ready`. For each `speak`,
   the server sends `speech_start {id, text, sample_rate}`, then binary 16-bit PCM frames, then `speech_end {id}`.
   The app answers `played {id}` once it has been heard, and that is when the tool returns to Hermes. A stopped or

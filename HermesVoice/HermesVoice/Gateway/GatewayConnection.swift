@@ -94,6 +94,14 @@ struct GatewayRPCError: LocalizedError, Equatable {
     var errorDescription: String? { message }
 }
 
+/// Hermes won't re-attach a session while it settles the interrupt it sent the session's turn when its last client
+/// went away (4009 from resume and activate). Within seconds the session is reaped or freed, so asking again helps.
+struct SessionSettlingError: LocalizedError {
+    let message: String
+
+    var errorDescription: String? { message }
+}
+
 /// What the app reads from a `session.create` / `session.resume` / `session.activate` result. A result outside
 /// the contract (another Hermes version) is read from its raw form, so attaching never fails on shape alone.
 struct LiveSession: Equatable {
@@ -145,12 +153,15 @@ struct LiveSession: Equatable {
     }
 
     /// Runs a typed attach call; a result that doesn't match the contract is read from its raw form instead.
+    /// A 4009 refusal throws `SessionSettlingError`.
     static func attach<Result>(_ call: () async throws -> Result, _ typed: (Result) -> LiveSession) async throws -> LiveSession {
         do {
             return typed(try await call())
         } catch let error as GatewayDecodingError {
             connectionLog.error("\(error.method, privacy: .public) result outside the contract: \(String(describing: error.underlying), privacy: .public)")
             return try LiveSession(raw: error.raw)
+        } catch let error as GatewayRPCError where error.code == 4009 {
+            throw SessionSettlingError(message: error.message)
         }
     }
 }
@@ -175,8 +186,9 @@ protocol ServerRequestHandling: AnyObject {
     /// A resume/activate/events.since result listed every request still open for `sessionID`; one that arrived
     /// before `arrival` (when that call went out) and isn't listed has ended.
     func reconcile(_ sessionID: String, open: Set<String>, asOf arrival: Int)
-    /// A resume/activate result's `pending_approval` (nil: none).
-    func restore(pendingApproval: PendingApproval?, sessionID: String)
+    /// A resume/activate result's `pending_approval` (nil: none); `listed` holds the queue ids of the approval
+    /// requests the same result's `open_requests` re-delivered.
+    func restore(pendingApproval: PendingApproval?, sessionID: String, listed: Set<String>)
     /// The runtime `old` was reaped and resume made `new`: prompts of `old` went with it.
     func sessionReplaced(_ old: String, by new: String)
 }
@@ -185,7 +197,8 @@ protocol ServerRequestHandling: AnyObject {
 /// Each connect mints a fresh ticket, waits for `gateway.ready` (the replay epoch), advertises
 /// `client.capabilities {server_requests}` and pings every 15 s (no frame for 45 s drops the socket). After a
 /// reconnect every tracked session is re-attached (`session.activate`, else `session.resume` with the stored id) and
-/// what it missed is replayed from `session.events.since`, deduplicated by `seq`, before live frames resume.
+/// what it missed is replayed from `session.events.since`, deduplicated by `seq`, before live frames resume. A
+/// session Hermes is still settling (4009) is re-attached again shortly after.
 /// Calls have deadlines; a lost answer drops the socket and listeners hear `.disconnected`.
 @MainActor
 final class GatewayConnection: GatewayCalling {
@@ -203,6 +216,9 @@ final class GatewayConnection: GatewayCalling {
         var probeTimeout: TimeInterval = 5
         /// Waits before automatic reconnects while sessions are tracked (the last repeats); empty: none.
         var reconnectDelays: [TimeInterval] = [1, 2, 5, 10, 30]
+        /// Waits before re-attaching a session Hermes refused while settling it (about the reaper's minute of
+        /// interrupt polls in all); still refused after the last, the re-attach failed.
+        var settleRetryDelays: [TimeInterval] = [1, 2, 3, 5, 10, 10, 15, 30]
     }
 
     typealias Listener = (_ event: GatewayEvent, _ sessionID: String?, _ seq: Int?) -> Void
@@ -246,8 +262,8 @@ final class GatewayConnection: GatewayCalling {
     }
 
     private static let attachMethods: Set<String> = ["session.resume", "session.activate"]
-    /// Activate refusals that mean the runtime is gone (or its reap is settling): resume the stored id instead.
-    private static let sessionGone: Set<Int> = [4001, 4007, 4009]
+    /// Activate refusals that mean the runtime is gone: resume the stored id instead.
+    private static let sessionGone: Set<Int> = [4001, 4007]
 
     private let options: Options
     private let dial: () async throws -> GatewayTransport
@@ -261,6 +277,9 @@ final class GatewayConnection: GatewayCalling {
     private var listeners: [UUID: Listener] = [:]
     private var stateListeners: [UUID: (State) -> Void] = [:]
     private var tracked: [ObjectIdentifier: Tracked] = [:]
+    /// Tracked sessions Hermes refused to re-attach while settling them, and the task re-attaching them.
+    private var settling: Set<ObjectIdentifier> = []
+    private var settleRetry: Task<Void, Never>?
     /// Event frames parked during the handshake, and the replays fetched in it; delivered when it ends.
     private var held: [EventEnvelope]?
     private var replays: [String: [EventEnvelope]] = [:]
@@ -307,10 +326,13 @@ final class GatewayConnection: GatewayCalling {
         let key = ObjectIdentifier(owner)
         if let old = tracked[key]?.runtimeID, old != runtimeID { watermarks[old] = nil }
         tracked[key] = Tracked(owner: owner, runtimeID: runtimeID, storedID: storedID, profile: profile)
+        settling.remove(key)
     }
 
     func untrack(_ owner: GatewaySessionOwner) {
-        guard let entry = tracked.removeValue(forKey: ObjectIdentifier(owner)) else { return }
+        let key = ObjectIdentifier(owner)
+        settling.remove(key)
+        guard let entry = tracked.removeValue(forKey: key) else { return }
         watermarks[entry.runtimeID] = nil
     }
 
@@ -343,6 +365,9 @@ final class GatewayConnection: GatewayCalling {
         reconnect = nil
         heartbeat?.cancel()
         heartbeat = nil
+        settleRetry?.cancel()
+        settleRetry = nil
+        settling.removeAll()
         socket?.close()
         socket = nil
         settleReady(nil)
@@ -406,11 +431,12 @@ final class GatewayConnection: GatewayCalling {
             } catch is GatewayRPCError {
                 // A backend older than server→client requests.
             }
-            try await reattachAll(on: socket, epochChanged: epochChanged)
+            try await reattachAll(on: socket, replays: !epochChanged)
             try ensureCurrent(socket)
             flushHeld()
             reconnectAttempt = 0
             setState(.connected)
+            retrySettling(on: socket)
         } catch {
             drop(socket)
             throw error
@@ -453,22 +479,24 @@ final class GatewayConnection: GatewayCalling {
 
     // MARK: Re-attaching
 
-    private func reattachAll(on socket: GatewayTransport, epochChanged: Bool) async throws {
+    private func reattachAll(on socket: GatewayTransport, replays: Bool) async throws {
         pruneTracked()
+        settling.removeAll()
         let keys = Array(tracked.keys)
         guard !keys.isEmpty else { return }
         try await withThrowingTaskGroup(of: Void.self) { group in
             for key in keys {
-                group.addTask { @MainActor in try await self.reattach(key, on: socket, epochChanged: epochChanged) }
+                group.addTask { @MainActor in try await self.reattach(key, on: socket, replays: replays) }
             }
             try await group.waitForAll()
         }
     }
 
-    /// `session.activate` with the runtime id; when Hermes reaped it (4001/4007, or 4009 while that settles),
-    /// `session.resume` with the stored id, which may mint a new runtime id. Only a surviving runtime replays.
-    /// Socket failures propagate (the handshake fails); a refusal ends the tracking and tells the owner.
-    private func reattach(_ key: ObjectIdentifier, on socket: GatewayTransport, epochChanged: Bool) async throws {
+    /// `session.activate` with the runtime id; when Hermes reaped it (4001/4007), `session.resume` with the stored
+    /// id, which may mint a new runtime id. Only a surviving runtime replays, and only when `replays` (else what it
+    /// missed is refetched). Socket failures propagate (the handshake fails); a session Hermes is settling (4009)
+    /// stays tracked for `retrySettling`; any other refusal ends the tracking and tells the owner.
+    private func reattach(_ key: ObjectIdentifier, on socket: GatewayTransport, replays: Bool) async throws {
         guard let entry = tracked[key] else { return }
         let calls = GatewayClient(transport: SocketCaller(connection: self, socket: socket))
         let old = entry.runtimeID
@@ -487,6 +515,10 @@ final class GatewayConnection: GatewayCalling {
             }
         } catch where error.isConnectionLoss {
             throw error
+        } catch let error as SessionSettlingError {
+            connectionLog.notice("Session \(old, privacy: .public) is settling: \(error.message, privacy: .public)")
+            if tracked[key] != nil { settling.insert(key) }
+            return
         } catch {
             guard let owner = tracked.removeValue(forKey: key)?.owner else { return }
             watermarks[old] = nil
@@ -501,11 +533,39 @@ final class GatewayConnection: GatewayCalling {
             requests?.sessionReplaced(old, by: session.runtimeID)
         }
         tracked[key]?.owner?.gatewayReattached(session)
-        guard survived, !epochChanged else {
+        guard survived, replays else {
             tracked[key]?.owner?.gatewayNeedsRefetch()
             return
         }
         try await replay(key, runtimeID: old, profile: entry.profile, on: socket)
+    }
+
+    /// Re-attaches, with backoff, the sessions Hermes refused while settling. Live frames flow as soon as one is
+    /// attached, so what it missed is refetched, not replayed. Still settling after the last try: the re-attach failed.
+    private func retrySettling(on socket: GatewayTransport) {
+        guard settleRetry == nil, !settling.isEmpty else { return }
+        let delays = options.settleRetryDelays
+        settleRetry = Task { [weak self] in
+            for delay in delays {
+                await Self.sleep(delay)
+                guard let self, !Task.isCancelled, self.socket === socket, self.state == .connected else { return }
+                for key in Array(self.settling) {
+                    // Re-attached by its owner meanwhile.
+                    guard self.settling.remove(key) != nil else { continue }
+                    try? await self.reattach(key, on: socket, replays: false)
+                }
+                if self.settling.isEmpty { break }
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.settleRetry = nil
+            let stuck = self.settling
+            self.settling.removeAll()
+            for key in stuck {
+                guard let entry = self.tracked.removeValue(forKey: key) else { continue }
+                self.watermarks[entry.runtimeID] = nil
+                entry.owner?.gatewayReattachFailed(SessionSettlingError(message: "Hermes is still settling this session."))
+            }
+        }
     }
 
     /// Fetches what the runtime emitted after its watermark; delivered with the parked live frames when the
@@ -656,6 +716,8 @@ final class GatewayConnection: GatewayCalling {
         self.socket = nil
         heartbeat?.cancel()
         heartbeat = nil
+        settleRetry?.cancel()
+        settleRetry = nil
         held = nil
         replays = [:]
         socket.close()
@@ -773,15 +835,18 @@ final class GatewayConnection: GatewayCalling {
         let attach = Self.attachMethods.contains(entry.method)
         guard attach || entry.method == "session.events.since",
               let sessionID = result["session_id"]?.stringValue ?? entry.sessionID else { return }
-        var open: Set<String> = []
+        var open: Set<String> = [], approvals: Set<String> = []
         for item in result["open_requests"]?.arrayValue ?? [] {
             guard let id = item["id"]?.stringValue, let method = item["method"]?.stringValue else { continue }
             open.insert(id)
-            deliver(ServerRequest.decode(id: id, method: method, params: item["params"]), replayed: true)
+            let request = ServerRequest.decode(id: id, method: method, params: item["params"])
+            if case let .approval(_, params) = request { approvals.insert(params.requestId) }
+            deliver(request, replayed: true)
         }
         requests?.reconcile(sessionID, open: open, asOf: entry.arrival)
         if attach {
-            requests?.restore(pendingApproval: try? result["pending_approval"]?.decode(PendingApproval.self), sessionID: sessionID)
+            requests?.restore(pendingApproval: try? result["pending_approval"]?.decode(PendingApproval.self),
+                              sessionID: sessionID, listed: approvals)
         }
     }
 

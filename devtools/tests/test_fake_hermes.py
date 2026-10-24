@@ -160,6 +160,35 @@ def test_a_detached_session_is_reaped_and_only_resume_brings_it_back():
     assert [m["text"] for m in resumed["messages"]] == ["remember me", "Echo: remember me"]
 
 
+def test_a_reaped_draft_resumes_under_its_minted_key():
+    async def scenario():
+        async with serving(reap_grace=0.3) as (fake, base):
+            async with signed_in(base) as http:
+                watcher = await Gateway.connect(base, http)
+                owner = await Gateway.connect(base, http)
+                sid, key = await start_session(owner)
+                draft_rows = (await http.get(f"/api/sessions/{key}/messages")).status_code
+                await owner.close()
+                await watcher.event("session.reclaimed", timeout=3)
+                late = await Gateway.connect(base, http)
+                resumed = await late.call("session.resume", {"session_id": key, "omit_messages": True})
+                try:
+                    await late.call("session.resume", {"session_id": "not-a-minted-key"})
+                    unknown_error = None
+                except RpcFailure as failure:
+                    unknown_error = failure
+                await late.close()
+                await watcher.close()
+                messages = (await http.get(f"/api/sessions/{key}/messages")).json()["messages"]
+            return sid, key, draft_rows, resumed, unknown_error, messages
+
+    sid, key, draft_rows, resumed, unknown_error, messages = asyncio.run(scenario())
+    assert draft_rows == 404  # no row until the first prompt
+    assert resumed["session_id"] != sid and resumed["session_key"] == key and resumed["message_count"] == 0
+    assert messages == []  # the resume wrote an empty row
+    assert unknown_error.code == 4007
+
+
 def test_an_approval_waits_through_a_reconnect_and_is_answered_on_the_new_socket():
     async def scenario():
         async with serving(reap_grace=0.3) as (fake, base):

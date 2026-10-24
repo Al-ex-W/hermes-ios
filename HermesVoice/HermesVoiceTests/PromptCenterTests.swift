@@ -111,7 +111,7 @@ final class PromptCenterTests: XCTestCase {
         XCTAssertTrue(center.prompts.isEmpty)
     }
 
-    func testWindowOwnedRequestsGetMethodNotFoundFromAnOlderBackend() async throws {
+    func testWindowOwnedRequestsAreLeftToTheWindowByAnOlderBackend() async throws {
         connection.disconnect()
         gateway = ScriptedGateway()
         gateway.declinesNotShown = false
@@ -119,8 +119,11 @@ final class PromptCenterTests: XCTestCase {
         center = PromptCenter(connection: connection)
         try await connection.connect()
 
-        await receive("srq-1", "window.read", ["session_id": "r1"])
-        XCTAssertEqual(errorCode(of: "srq-1"), -32601)
+        for (index, method) in ["window.read", "preview.act", "tour"].enumerated() {
+            await receive("srq-\(index)", method, ["session_id": "r1"])
+        }
+        XCTAssertTrue(gateway.responses.isEmpty, "it settles on the first error, which would beat the desktop window")
+        XCTAssertTrue(center.prompts.isEmpty)
     }
 
     func testUnknownRequestsGetMethodNotFound() async throws {
@@ -180,14 +183,26 @@ final class PromptCenterTests: XCTestCase {
         await center.approve("srq-1", .deny)
         gateway.current.kill()
 
+        // Hermes lists the approval twice: as the open request and as the queue's pending entry.
         let open: JSONValue = ["id": "srq-1", "method": "approval", "params": approvalParams]
-        gateway.handlers["session.activate"] = { _ in .result(liveResult("r1", extra: ["open_requests": [open]])) }
+        gateway.handlers["session.activate"] = { _ in
+            .result(liveResult("r1", extra: ["open_requests": [open],
+                                             "pending_approval": ["request_id": "q1", "command": "rm -rf build"]]))
+        }
         try await connection.connect()
         await settle()
 
         XCTAssertEqual(gateway.responses(to: "srq-1").count, 2)
         XCTAssertEqual(result(of: "srq-1"), ["choice": "deny"])
         XCTAssertTrue(center.prompts.isEmpty, "no card comes back for an answered request")
+    }
+
+    func testRequestThatArrivedJustBeforeAResumeEndsWhenUnlisted() async throws {
+        await receive("srq-1", "approval", approvalParams)
+        // The desktop answered it (no request.cancel follows an answer); the next resume doesn't list it.
+        gateway.handlers["session.resume"] = { _ in .result(liveResult("r1")) }
+        _ = try await connection.client.sessionResume(.init(sessionId: "s1"))
+        XCTAssertTrue(center.prompts.isEmpty)
     }
 
     func testRestoredPendingApprovalIsAnsweredThroughApprovalRespond() async throws {

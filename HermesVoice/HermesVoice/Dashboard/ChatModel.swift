@@ -1,8 +1,9 @@
 import Foundation
 
 /// One conversation: its history from REST, and live turns over the gateway connection.
-/// After a reconnect the connection re-attaches the session and replays what it missed; when events were lost
-/// anyway, the stored transcript is fetched again (by itself while the chat is in use: on screen, or in a call).
+/// While the chat is in use (on screen, or in a call) the connection re-attaches its session after a reconnect and
+/// replays what it missed, and when events were lost anyway the stored transcript is fetched again by itself. A chat
+/// not in use catches up when it is next opened or sends.
 @MainActor
 final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     @Published private(set) var messages: [ChatMessage] = []
@@ -90,7 +91,18 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// another's hold). While in use, a dropped socket is caught up on by itself.
     func setInUse(_ key: String, _ inUse: Bool) {
         if inUse { users.insert(key) } else { users.remove(key) }
+        updateTracking()
         if inUse, needsResync || detached { scheduleResync() }
+    }
+
+    /// Only a chat in use has the connection re-attach its session after a drop. Any other stays detached until it
+    /// is next attached, so Hermes reaps its idle runtime and nothing rebuilds one for a chat nobody looks at.
+    private func updateTracking() {
+        if isInUse, let runtimeID {
+            connection.track(self, runtimeID: runtimeID, storedID: storedID, profile: profile)
+        } else {
+            connection.untrack(self)
+        }
     }
 
     /// Shows the stored transcript and attaches to the live session. The transcript is fetched again on every open
@@ -169,7 +181,7 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
             reportStoredID()
         }
         for id in [session.runtimeID, storedID].compactMap({ $0 }) where !sessionIDs.contains(id) { sessionIDs.insert(id) }
-        connection.track(self, runtimeID: session.runtimeID, storedID: storedID, profile: profile)
+        updateTracking()
         busy = session.running
         if !replays, !session.running, liveMessageID != nil {
             // The reply that was streaming ended while detached; the stored copy replaces it.
@@ -242,7 +254,8 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
             } catch {
                 if error.isCancellation { return }
                 if error.isRefusal || attempt == delays.count - 1 {
-                    if runtimeID == nil { busy = false }
+                    // Nothing will report how a turn that was running ends until the session is attached again.
+                    if runtimeID == nil || detached { busy = false }
                     if users.contains("view") { self.error = error.localizedDescription }
                     return
                 }
@@ -464,7 +477,7 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     }
 
     private func fail(_ error: Error, _ outcome: Delivery = .failed) -> Delivery {
-        if runtimeID == nil { busy = false }
+        if runtimeID == nil || detached { busy = false }
         if !error.isCancellation { self.error = error.localizedDescription }
         return outcome
     }

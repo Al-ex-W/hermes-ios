@@ -108,6 +108,19 @@ final class GatewayConnectionTests: XCTestCase {
                                             corrections: ["also this"], queuedPrompt: "next"))
     }
 
+    func testSettlingRefusalIsWorthRetrying() async throws {
+        gateway.handlers["session.resume"] = { _ in .error(4009, "session disconnect interrupt settling") }
+        let connection = gateway.connection()
+        do {
+            _ = try await LiveSession.attach({ try await connection.client.sessionResume(.init(sessionId: "s1")) }, LiveSession.init)
+            XCTFail("expected a refusal")
+        } catch let error as SessionSettlingError {
+            XCTAssertEqual(error.message, "session disconnect interrupt settling")
+            XCTAssertFalse(error.isRefusal)
+            XCTAssertFalse(error.isConnectionLoss)
+        }
+    }
+
     // MARK: Reconnect re-attach and replay
 
     /// Connects, attaches `r1` (stored `s1`) for an owner and delivers live events up to `seq`.
@@ -205,6 +218,48 @@ final class GatewayConnectionTests: XCTestCase {
         gateway.current.kill()
         try await connection.connect()
         XCTAssertEqual(gateway.calls("session.activate").count, 1, "an untracked session isn't re-attached")
+    }
+
+    func testSettlingSessionIsReattachedShortlyAfter() async throws {
+        let connection = gateway.connection { $0.settleRetryDelays = [0.05, 0.05] }
+        let owner = RecordingOwner()
+        try await attached(connection, owner: owner, through: 2)
+        gateway.current.kill()
+
+        var activations = 0
+        gateway.handlers["session.activate"] = { _ in
+            activations += 1
+            return activations == 1 ? .error(4009, "session disconnect interrupt settling") : .result(liveResult("r1"))
+        }
+        try await connection.connect()
+
+        XCTAssertEqual(connection.state, .connected)
+        XCTAssertTrue(owner.reattached.isEmpty)
+        XCTAssertTrue(gateway.calls("session.resume").isEmpty, "a settling session isn't resumed")
+        await waitUntil { owner.reattached.count == 1 }
+        XCTAssertEqual(owner.reattached.map(\.runtimeID), ["r1"])
+        XCTAssertEqual(owner.refetches, 1, "its live frames flow at once, so what it missed is refetched")
+        XCTAssertTrue(gateway.calls("session.events.since").isEmpty)
+        XCTAssertTrue(owner.failures.isEmpty)
+    }
+
+    func testSessionStillSettlingAfterTheRetriesFailsItsReattach() async throws {
+        let connection = gateway.connection { $0.settleRetryDelays = [0.05, 0.05] }
+        let owner = RecordingOwner()
+        try await attached(connection, owner: owner, through: 1)
+        gateway.current.kill()
+
+        gateway.handlers["session.activate"] = { _ in .error(4007, "session no longer live; retry resume") }
+        gateway.handlers["session.resume"] = { _ in .error(4009, "session disconnect interrupt settling") }
+        try await connection.connect()
+        await waitUntil { owner.failures.count == 1 }
+
+        XCTAssertTrue(owner.failures.first is SessionSettlingError)
+        XCTAssertEqual(gateway.calls("session.activate").count, 3)
+        XCTAssertEqual(gateway.calls("session.resume").count, 3)
+        gateway.current.kill()
+        try await connection.connect()
+        XCTAssertEqual(gateway.calls("session.activate").count, 3, "an untracked session isn't re-attached")
     }
 
     func testEpochChangeSignalsRefetch() async throws {

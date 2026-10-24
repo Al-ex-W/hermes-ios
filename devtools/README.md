@@ -87,7 +87,9 @@ Use a short grace to test what happens when the app was backgrounded for too lon
     new socket, as in Hermes)
   - `session.resume`, with `omit_messages`. Takes the stored id and returns the runtime `session_id`, the stored
     key as `session_key`, plus `running`, `status`, `inflight`, `queued`, `pending_approval` and
-    `open_requests` when they are set. A live session is re-attached; otherwise a new runtime id is minted.
+    `open_requests` when they are set. A live session is re-attached; otherwise a new runtime id is minted. A
+    minted key that has no row yet (a draft reaped before its first prompt) gets an empty row, as in Hermes, and
+    any other unknown id gets 4007.
   - `session.activate {session_id: <runtime id>}` re-attaches a live session to this socket and returns the
     same payload. A runtime id that is gone (reaped, or never existed) gets `4001 session not found`, as from
     Hermes; Hermes answers 4007 only when a reap races the call.
@@ -141,7 +143,13 @@ uv run pytest -q ../devtools/tests
 ```
 
 The tests start the fake in-process and cover sign-in and streaming, reconnect plus replay (also truncated),
-reaping and `session.activate` after a reap, approvals across a reconnect, `approval.respond`, 4404 declines,
-clients that can't answer, clarify locks, secrets, interrupt and timeout cancels, and the speak demo against
-an in-process voice server. One test checks every result, event and request against the pinned gateway contract.
-It is skipped when there's no contract; `HERMES_GATEWAY_CONTRACT=<path>` checks against another copy.
+reaping and `session.activate` after a reap, resuming a reaped draft, approvals across a reconnect,
+`approval.respond`, 4404 declines, clients that can't answer, clarify locks, secrets, interrupt and timeout
+cancels, and the speak demo against an in-process voice server. One test checks every result, event and request
+against the pinned gateway contract. It is skipped when there's no contract; `HERMES_GATEWAY_CONTRACT=<path>`
+checks against another copy.
+
+`record_fixtures.py` records the frames the app's `GatewayFixtureTests` decode
+(`HermesVoice/HermesVoiceTests/Fixtures/*.json`): `uv run python ../devtools/record_fixtures.py` from
+`hermes-voice-mcp` runs a scenario against an in-process fake. With `--url` it records a throwaway
+`hermes serve --isolated` instead; the script's docstring says how to start one.

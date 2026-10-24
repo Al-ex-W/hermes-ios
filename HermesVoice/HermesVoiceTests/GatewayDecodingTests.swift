@@ -48,6 +48,15 @@ final class GatewayDecodingTests: XCTestCase {
         XCTAssertEqual(decoded, EventEnvelope(type: "notice"))
     }
 
+    func testIntegersBeyondIntBecomeDoubles() throws {
+        XCTAssertEqual(try JSONValue(jsonData: Data("9223372036854775807".utf8)), .int(.max))
+        XCTAssertEqual(try JSONValue(jsonData: Data("-9223372036854775808".utf8)), .int(.min))
+        XCTAssertEqual(try JSONValue(jsonData: Data("12345678901234567890".utf8)), .double(Double(UInt64(12_345_678_901_234_567_890))))
+        XCTAssertEqual(try JSONValue(jsonData: Data(#"{"id": 18446744073709551615}"#.utf8)), ["id": .double(Double(UInt64.max))])
+        XCTAssertEqual(try JSONValue(jsonData: Data("2.5".utf8)), .double(2.5))
+        XCTAssertEqual(try JSONValue.encode(3.0), .int(3), "JSONEncoder writes an integral double as an integer")
+    }
+
     func testEncoderOmitsNilKeys() throws {
         XCTAssertEqual(try JSONValue.encode(SessionResumeParams(sessionId: "s1")), ["session_id": "s1"])
         XCTAssertEqual(try JSONValue.encode(SessionActivateParams(sessionId: "r1", cols: 96, omitMessages: true)),

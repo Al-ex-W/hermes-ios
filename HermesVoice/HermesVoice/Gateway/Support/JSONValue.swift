@@ -1,7 +1,8 @@
 import Foundation
 
-/// Any JSON value, kept exactly: the gateway's opaque fields, unknown keys and untyped frames.
-/// Integers and fractions stay distinct (`int` vs `double`) so values round-trip unchanged.
+/// Any JSON value: the gateway's opaque fields, unknown keys and untyped frames.
+/// Integers and fractions stay distinct (`int` vs `double`). An integer beyond `Int` becomes the nearest `double`,
+/// and `JSONEncoder` writes an integral double as an integer (3.0 as `3`), so `encode` gives that back as an `int`.
 enum JSONValue: Codable, Hashable, Sendable {
     case null
     case bool(Bool)
@@ -112,6 +113,9 @@ extension JSONValue {
                 self = .bool(number.boolValue)
             } else if CFNumberIsFloatType(number) {
                 self = .double(number.doubleValue)
+            } else if String(cString: number.objCType) == "Q" {
+                // Unsigned: JSONSerialization's form of an integer above Int64.max.
+                self = Int(exactly: number.uint64Value).map(JSONValue.int) ?? .double(number.doubleValue)
             } else {
                 self = .int(number.intValue)
             }

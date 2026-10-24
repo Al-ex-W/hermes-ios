@@ -53,7 +53,7 @@ MODEL_BUCKETS = (("ModelsA-C", "ABC"), ("ModelsD-O", "DEFGHIJKLMNO"), ("ModelsP-
 
 SWIFT_KEYWORDS = frozenset(
     """
-    associatedtype borrowing break case catch class consume consuming continue copy default defer deinit do
+    as associatedtype borrowing break case catch class consume consuming continue copy default defer deinit do
     else enum extension fallthrough false fileprivate for func guard if import in indirect inout internal is
     let nil open operator precedencegroup private protocol public repeat rethrows return static struct
     subscript super switch throw throws true try typealias var where while Any actor async await some any
@@ -320,10 +320,12 @@ class Contract:
         def roots(entries):
             return set().union(*[_refs(c.params) | _refs(c.result) for c in entries]) if entries else set()
 
-        kept = _closure(roots(self.methods) | roots(self.requests) | roots(self.events), self.schemas)
+        # Kept: whatever a kept root reaches, plus the schemas no stripped root reaches (orphans) and what they reach.
         stripped = _closure(roots(self.stripped_methods) | roots(self.stripped_events), self.schemas)
-        self.stripped_schemas = sorted(stripped - kept)
-        self.kept_schemas = sorted(set(self.schemas) - set(self.stripped_schemas))
+        kept_roots = roots(self.methods) | roots(self.requests) | roots(self.events) | (set(self.schemas) - stripped)
+        kept = _closure(kept_roots, self.schemas)
+        self.stripped_schemas = sorted(set(self.schemas) - kept)
+        self.kept_schemas = sorted(kept)
 
 
 # ── Rendering ─────────────────────────────────────────────────────────────────────────────────────

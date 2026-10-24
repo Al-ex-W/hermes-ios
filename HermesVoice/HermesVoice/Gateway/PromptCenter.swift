@@ -4,10 +4,11 @@ import os
 private let promptLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "HermesVoice", category: "PromptCenter")
 
 /// The server→client requests waiting on the user (approval, clarify, sudo, secret, vault, …), per session, and
-/// their answers. Window-owned bridges (preview, terminal and window reads, the tour) are declined at once: no screen
-/// here shows them. An answer goes back as the request's JSON-RPC response; while no socket is open it goes through
-/// `request.answer` once reconnected. An approval restored from a resume snapshot (no open request) is answered
-/// through `approval.respond`.
+/// their answers. Window-owned bridges (preview, terminal and window reads, the tour) aren't shown here: they are
+/// declined with 4404 where the backend counts declines, else left to the desktop window showing the session. An
+/// answer goes back as the request's JSON-RPC response; while no socket is open it goes through `request.answer`
+/// once reconnected. An approval restored from a resume snapshot (no open request) is answered through
+/// `approval.respond`.
 @MainActor
 final class PromptCenter: ObservableObject, ServerRequestHandling {
     struct Prompt: Identifiable, Equatable {
@@ -177,9 +178,11 @@ final class PromptCenter: ObservableObject, ServerRequestHandling {
             return
         }
         if Self.isWindowOwned(request.method) {
-            // Hermes counts a 4404 as one client declining; an older backend takes the first error as the answer.
-            let code = connection.declinesNotShown ? 4404 : -32601
-            connection.respond(to: id, errorCode: code, message: "HermesVoice doesn't show this session's desktop panes.")
+            // Hermes counts a 4404 as one client declining. An older backend takes the first error as the answer,
+            // so there the window that shows the session answers alone.
+            if connection.declinesNotShown {
+                connection.respond(to: id, errorCode: 4404, message: "HermesVoice doesn't show this session's desktop panes.")
+            }
             return
         }
         guard let kind = Self.kind(of: request) else {
@@ -204,17 +207,26 @@ final class PromptCenter: ObservableObject, ServerRequestHandling {
 
     func reconcile(_ sessionID: String, open: Set<String>, asOf arrival: Int) {
         prompts.removeAll { prompt in
-            prompt.sessionID == sessionID && prompt.arrival < arrival && !prompt.answering && !prompt.isRestoredApproval
+            prompt.sessionID == sessionID && prompt.arrival <= arrival && !prompt.answering && !prompt.isRestoredApproval
                 && !open.contains(prompt.id)
         }
     }
 
-    func restore(pendingApproval pending: PendingApproval?, sessionID: String) {
+    func restore(pendingApproval pending: PendingApproval?, sessionID: String, listed: Set<String>) {
         guard let pending else {
             prompts.removeAll { $0.sessionID == sessionID && $0.isRestoredApproval && !$0.answering }
             return
         }
-        // The live request (re-delivered from open_requests just before) already shows it.
+        // The live request listed in the same result covers it, whether it shows a card or was just answered again.
+        if !listed.isEmpty, pending.requestId.map(listed.contains) ?? true {
+            prompts.removeAll { prompt in
+                guard prompt.sessionID == sessionID, !prompt.answering, case let .approval(approval) = prompt.kind,
+                      approval.restored else { return false }
+                return approval.requestID.map(listed.contains) ?? true
+            }
+            return
+        }
+        // A live request delivered earlier shows it.
         let shown = prompts.contains { prompt in
             guard prompt.sessionID == sessionID, case let .approval(approval) = prompt.kind else { return false }
             return approval.requestID == nil || pending.requestId == nil || approval.requestID == pending.requestId
