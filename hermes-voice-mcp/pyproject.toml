@@ -1,0 +1,30 @@
+[project]
+name = "hermes-voice-mcp"
+version = "0.1.0"
+description = "MCP speak tool for Hermes that plays ElevenLabs speech in HermesVoice iPhone calls"
+readme = "README.md"
+authors = [
+    { name = "Al-ex-W" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "anyio>=4.5",
+    "httpx>=0.28.1",
+    "mcp>=2.3,<3",
+    "pyyaml>=6.0.3",
+    "starlette>=1.9.0",
+    "uvicorn>=0.54.0",
+    "websockets>=17.3",
+]
+
+[project.scripts]
+hermes-voice-mcp = "hermes_voice_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.11.15,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

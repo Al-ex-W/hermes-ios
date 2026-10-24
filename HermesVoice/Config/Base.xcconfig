@@ -1,0 +1,6 @@
+// Shared build settings. Signing and the bundle id prefix are personal, so they come from
+// Config/Local.xcconfig (gitignored). Copy Local.xcconfig.example to Local.xcconfig and fill it in.
+BUNDLE_ID_PREFIX = com.example
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

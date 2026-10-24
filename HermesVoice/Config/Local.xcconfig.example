@@ -1,0 +1,5 @@
+// Copy to Local.xcconfig (gitignored) and fill in your own values.
+// BUNDLE_ID_PREFIX: reverse-DNS prefix you own; the app becomes $(BUNDLE_ID_PREFIX).hermesvoice.
+// DEVELOPMENT_TEAM: your Apple Developer team id (Xcode > Settings > Accounts).
+BUNDLE_ID_PREFIX = com.example
+DEVELOPMENT_TEAM =

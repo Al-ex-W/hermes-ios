@@ -1,0 +1,23 @@
+# Local clones of upstream projects used as reference (credited in README.md)
+reference/
+# Internal review notes with local paths
+.review/
+
+# Xcode: the project is generated from project.yml by XcodeGen
+HermesVoice/build/
+HermesVoice/HermesVoice.xcodeproj/
+xcuserdata/
+DerivedData/
+
+# Personal signing settings and secrets
+HermesVoice/Config/Local.xcconfig
+.env
+.env.*
+*.p8
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+
+.DS_Store
