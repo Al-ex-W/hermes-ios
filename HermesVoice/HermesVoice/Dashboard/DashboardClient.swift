@@ -39,9 +39,19 @@ extension Error {
         return false
     }
 
+    /// The connection failed under the call (never sent, dropped, or no answer in time), not Hermes.
+    var isConnectionLoss: Bool {
+        switch self as? DashboardError {
+        case .disconnected?, .timeout?, .notSent?: return true
+        default: return false
+        }
+    }
+
     /// Hermes or the dashboard answered with a refusal, so sending the same request again won't help.
     /// A 5xx (Tailscale Serve answers 502 while the dashboard restarts), 408 or 429 is worth retrying.
+    /// A gateway error answer, or a result outside the contract, is one too.
     var isRefusal: Bool {
+        if self is GatewayRPCError || self is GatewayDecodingError { return true }
         switch self as? DashboardError {
         case .badURL?, .signedOut?, .rpc?: return true
         case let .http(code, _)?: return (400..<500).contains(code) && code != 408 && code != 429

@@ -1,13 +1,17 @@
 import Foundation
 
-/// One conversation: its history from REST, and live turns over the gateway socket.
-/// While the chat is in use (on screen, or in a call) it catches up by itself after the socket drops.
+/// One conversation: its history from REST, and live turns over the gateway connection.
+/// While the chat is in use (on screen, or in a call) the connection re-attaches its session after a reconnect and
+/// replays what it missed, and when events were lost anyway the stored transcript is fetched again by itself. A chat
+/// not in use catches up when it is next opened or sends.
 @MainActor
-final class ChatModel: ObservableObject, Identifiable {
+final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     @Published private(set) var messages: [ChatMessage] = []
     @Published private(set) var busy = false
     @Published private(set) var title: String
     @Published var error: String?
+    /// Every runtime id the session had, and its stored id: the sessions this chat's prompts can name.
+    @Published private(set) var sessionIDs: Set<String> = []
 
     let id = UUID()
     /// The profile whose store holds this chat; nil for the dashboard's own.
@@ -17,17 +21,19 @@ final class ChatModel: ObservableObject, Identifiable {
     var onStoredID: ((String) -> Void)?
 
     private var runtimeID: String?
+    /// The socket dropped since the session was attached: `runtimeID` waits for the connection's re-attach.
+    private var detached = false
     private let client: DashboardClient
-    private let socket: GatewaySocket
+    private let connection: GatewayConnection
     private let isNew: Bool
-    private var listener: UUID?
+    private var listeners: [UUID] = []
     private var liveMessageID: String?
-    private var attaching: Task<JSON, Error>?
+    private var attaching: Task<LiveSession?, Error>?
     private var resyncing: Task<Void, Never>?
     private var lastSend: Task<Bool, Never>?
     private var users: Set<String> = []
     private var loaded: Bool
-    /// Events were lost while detached: the stored transcript must be fetched again.
+    /// Events were lost: the stored transcript must be fetched again.
     private var needsResync = false
     /// Bumped when the socket drops, so an attach answered on the old socket isn't trusted.
     private var epoch = 0
@@ -53,30 +59,50 @@ final class ChatModel: ObservableObject, Identifiable {
     /// How a prompt's delivery ended.
     private enum Delivery { case delivered, failed, unknown }
 
-    init(client: DashboardClient, socket: GatewaySocket, summary: SessionSummary?) {
+    init(client: DashboardClient, connection: GatewayConnection, summary: SessionSummary?) {
         self.client = client
-        self.socket = socket
+        self.connection = connection
         storedID = summary?.id
         profile = summary?.profile
         title = summary?.title ?? "New chat"
         isNew = summary == nil
         loaded = summary == nil
         hasPrompt = summary != nil
-        listener = socket.addListener { [weak self] event in self?.handle(event) }
+        if let storedID { sessionIDs = [storedID] }
+        listeners = [
+            connection.addListener { [weak self] event, sessionID, _ in self?.handle(event, sessionID: sessionID) },
+            connection.addStateListener { [weak self] state in
+                if state == .disconnected { self?.socketClosed() }
+            },
+        ]
     }
 
     deinit {
-        let socket = socket, listener = listener
-        Task { @MainActor in if let listener { socket.removeListener(listener) } }
+        let connection = connection, listeners = listeners
+        Task { @MainActor in for listener in listeners { connection.removeListener(listener) } }
     }
 
     private var isInUse: Bool { !users.isEmpty }
+
+    /// Attached on the live socket, so prompts can go out with `runtimeID`.
+    private var isAttached: Bool { runtimeID != nil && !detached && connection.isConnected }
 
     /// Marks the chat in use by `key` ("view", or "call-<call id>" per call, so one call's late release can't end
     /// another's hold). While in use, a dropped socket is caught up on by itself.
     func setInUse(_ key: String, _ inUse: Bool) {
         if inUse { users.insert(key) } else { users.remove(key) }
-        if inUse, needsResync { scheduleResync() }
+        updateTracking()
+        if inUse, needsResync || detached { scheduleResync() }
+    }
+
+    /// Only a chat in use has the connection re-attach its session after a drop. Any other stays detached until it
+    /// is next attached, so Hermes reaps its idle runtime and nothing rebuilds one for a chat nobody looks at.
+    private func updateTracking() {
+        if isInUse, let runtimeID {
+            connection.track(self, runtimeID: runtimeID, storedID: storedID, profile: profile)
+        } else {
+            connection.untrack(self)
+        }
     }
 
     /// Shows the stored transcript and attaches to the live session. The transcript is fetched again on every open
@@ -88,7 +114,7 @@ final class ChatModel: ObservableObject, Identifiable {
 
     /// The app is back in the foreground: catch up if the chat is in use and lost its session meanwhile.
     func wake() {
-        guard isInUse, runtimeID == nil || needsResync else { return }
+        guard isInUse, runtimeID == nil || detached || needsResync else { return }
         scheduleResync()
     }
 
@@ -101,31 +127,43 @@ final class ChatModel: ObservableObject, Identifiable {
     // MARK: Attaching
 
     /// Resumes the stored session on the gateway (or creates one) and keeps the runtime id prompts need.
-    /// Single flight; returns the resume/create result, or nil when already attached.
+    /// Connecting first lets the connection re-attach the session the chat had before a drop. Single flight;
+    /// returns the resume/create result, or nil when already attached. `fresh` always asks Hermes again.
     @discardableResult
-    private func attach() async throws -> JSON? {
-        if runtimeID != nil, socket.isConnected { return nil }
-        if let attaching { return try await attaching.value }
-        let task = Task { () throws -> JSON in
+    private func attach(fresh: Bool = false) async throws -> LiveSession? {
+        if !fresh, isAttached { return nil }
+        if let attaching {
+            let result = try await attaching.value
+            if !fresh || result != nil { return result }
+            return try await attach(fresh: true)
+        }
+        let task = Task { () throws -> LiveSession? in
             defer { attaching = nil }
             for _ in 0..<2 {
                 let epoch = self.epoch
-                var params: JSON = ["cols": 96, "source": "desktop"]
-                let result: JSON
+                do {
+                    try await connection.connect()
+                } catch {
+                    throw error.wasNotSent ? error : DashboardError.notSent(error)
+                }
+                if !fresh, isAttached { return nil }
+                let session: LiveSession
                 if let storedID {
-                    params["session_id"] = storedID
-                    params["omit_messages"] = true
-                    if let profile { params["profile"] = profile }
-                    result = try await socket.call("session.resume", params)
+                    session = try await LiveSession.attach({
+                        try await connection.client.sessionResume(.init(
+                            sessionId: storedID, profile: profile, cols: 96, source: "desktop", omitMessages: true
+                        ))
+                    }, LiveSession.init)
                 } else {
                     // A retried create whose answer was lost gets the same session back.
-                    params["idempotency_key"] = id.uuidString
-                    result = try await socket.call("session.create", params)
+                    session = try await LiveSession.attach({
+                        try await connection.client.sessionCreate(.init(cols: 96, source: "desktop", idempotencyKey: id.uuidString))
+                    }, LiveSession.init)
                 }
                 // The socket dropped while this was answered: ask again on the new one.
                 guard epoch == self.epoch else { continue }
-                apply(result)
-                return result
+                apply(session)
+                return session
             }
             throw DashboardError.disconnected
         }
@@ -133,19 +171,51 @@ final class ChatModel: ObservableObject, Identifiable {
         return try await task.value
     }
 
-    private func apply(_ result: JSON) {
-        runtimeID = result["session_id"] as? String
-        if let key = (result["stored_session_id"] as? String) ?? (storedID == nil ? runtimeID : nil), key != storedID {
+    /// Takes the attached session. `replays`: the connection re-attached it and replays what it missed, so a reply
+    /// that was streaming is finished by the replay (or a refetch is asked for).
+    private func apply(_ session: LiveSession, replays: Bool = false) {
+        runtimeID = session.runtimeID
+        detached = false
+        if let key = session.storedID ?? (storedID == nil ? session.runtimeID : nil), key != storedID {
             storedID = key
             reportStoredID()
         }
-        let running = (result["running"] as? Bool) ?? false
-        busy = running
-        if !running, liveMessageID != nil {
+        for id in [session.runtimeID, storedID].compactMap({ $0 }) where !sessionIDs.contains(id) { sessionIDs.insert(id) }
+        updateTracking()
+        busy = session.running
+        if !replays, !session.running, liveMessageID != nil {
             // The reply that was streaming ended while detached; the stored copy replaces it.
             liveMessageID = nil
             needsResync = true
         }
+    }
+
+    // MARK: Reconnects
+
+    func gatewayReattached(_ session: LiveSession) {
+        apply(session, replays: true)
+    }
+
+    func gatewayNeedsRefetch() {
+        // A reply cut short by the lost events is replaced by the stored copy.
+        if !busy { liveMessageID = nil }
+        needsResync = true
+        if isInUse { scheduleResync() }
+    }
+
+    func gatewayReattachFailed(_ error: Error) {
+        runtimeID = nil
+        detached = false
+        needsResync = true
+        if isInUse { scheduleResync() }
+    }
+
+    /// Hermes keeps the turn running but sends its events nowhere until the connection re-attaches the session.
+    private func socketClosed() {
+        epoch += 1
+        guard runtimeID != nil, !detached else { return }
+        detached = true
+        if isInUse { scheduleResync(after: 1) }
     }
 
     // MARK: Catching up
@@ -184,7 +254,8 @@ final class ChatModel: ObservableObject, Identifiable {
             } catch {
                 if error.isCancellation { return }
                 if error.isRefusal || attempt == delays.count - 1 {
-                    if runtimeID == nil { busy = false }
+                    // Nothing will report how a turn that was running ends until the session is attached again.
+                    if runtimeID == nil || detached { busy = false }
                     if users.contains("view") { self.error = error.localizedDescription }
                     return
                 }
@@ -195,7 +266,7 @@ final class ChatModel: ObservableObject, Identifiable {
     private func scheduleResync(after seconds: UInt64 = 0) {
         Task {
             if seconds > 0 { try? await Task.sleep(nanoseconds: seconds * NSEC_PER_SEC) }
-            guard isInUse, needsResync || runtimeID == nil else { return }
+            guard isInUse, needsResync || runtimeID == nil || detached else { return }
             await resync()
         }
     }
@@ -353,12 +424,16 @@ final class ChatModel: ObservableObject, Identifiable {
             do {
                 try await attach()
                 guard let runtimeID else { throw DashboardError.rpc("Hermes didn't open the session.") }
-                var params: JSON = ["session_id": runtimeID, "text": text]
-                if queued { params["queued"] = true }
                 let wasBusy = busy
                 busy = true
                 do {
-                    try await socket.call("prompt.submit", params)
+                    do {
+                        _ = try await connection.client.promptSubmit(.init(
+                            sessionId: runtimeID, text: .string(text), queued: queued ? true : nil
+                        ))
+                    } catch is GatewayDecodingError {
+                        // Accepted; only the answer is outside the contract.
+                    }
                 } catch {
                     busy = wasBusy
                     sent = !error.wasNotSent
@@ -390,11 +465,9 @@ final class ChatModel: ObservableObject, Identifiable {
     /// corrections steered in during one tool batch, so any of these may hold it as a run of its lines. nil when
     /// Hermes can't be asked.
     private func wasDelivered(_ text: String, after: Int?) async -> Bool? {
-        runtimeID = nil
-        guard let result = try? await attach() else { return nil }
-        let inflight = result["inflight"] as? JSON
-        var live = [inflight, result["queued"] as? JSON].compactMap { $0?["user"] as? String }
-        live += inflight?["corrections"] as? [String] ?? []
+        guard let session = try? await attach(fresh: true) else { return nil }
+        var live = [session.inflightPrompt, session.queuedPrompt].compactMap { $0 }
+        live += session.corrections
         if live.contains(where: { Self.holds($0, text) }) { return true }
         guard let storedID, let history = try? await client.messages(sessionID: storedID, profile: profile) else { return nil }
         noteStored(history)
@@ -404,7 +477,7 @@ final class ChatModel: ObservableObject, Identifiable {
     }
 
     private func fail(_ error: Error, _ outcome: Delivery = .failed) -> Delivery {
-        if runtimeID == nil { busy = false }
+        if runtimeID == nil || detached { busy = false }
         if !error.isCancellation { self.error = error.localizedDescription }
         return outcome
     }
@@ -417,14 +490,16 @@ final class ChatModel: ObservableObject, Identifiable {
     }
 
     func interrupt() async {
-        if runtimeID == nil || !socket.isConnected { await resync() }
+        if !isAttached { await resync() }
         guard let runtimeID else {
             busy = false
             return
         }
         guard busy else { return }
         do {
-            try await socket.call("session.interrupt", ["session_id": runtimeID])
+            _ = try await connection.client.sessionInterrupt(.init(sessionId: runtimeID))
+        } catch is GatewayDecodingError {
+            // Interrupted; only the answer is outside the contract.
         } catch {
             busy = false
         }
@@ -432,42 +507,37 @@ final class ChatModel: ObservableObject, Identifiable {
 
     // MARK: Events
 
-    private func handle(_ event: GatewaySocket.Event) {
-        let payload = event.payload
-        switch event.type {
-        case "socket.closed":
-            epoch += 1
-            guard runtimeID != nil else { return }
-            // Hermes keeps the turn running but sends its events nowhere until a resume.
-            runtimeID = nil
-            needsResync = true
-            if isInUse { scheduleResync(after: 1) }
+    private func handle(_ event: GatewayEvent, sessionID: String?) {
+        if case let .unknown(type, payload) = event {
+            // Outside the contract (another Hermes version): the fields this chat reads, as before.
+            if let salvaged = Self.salvage(type, payload) { handle(salvaged, sessionID: sessionID) }
             return
-        case "session.reclaimed":
-            if let sid = payload["session_id"] as? String, sid == runtimeID {
+        }
+        if case let .sessionReclaimed(payload) = event {
+            if payload.sessionId == runtimeID {
                 runtimeID = nil
+                detached = false
                 busy = false
                 liveMessageID = nil
+                connection.untrack(self)
             }
             return
-        default:
-            break
         }
-        guard let runtimeID, event.sessionID == runtimeID || event.sessionID == storedID else { return }
-        switch event.type {
-        case "message.start":
+        guard let runtimeID, sessionID == runtimeID || sessionID == storedID else { return }
+        switch event {
+        case .messageStart:
             busy = true
             liveMessageID = nil
-        case "message.delta":
-            if let delta = payload["text"] as? String { appendLive(delta) }
-        case "message.interim":
+        case let .messageDelta(payload):
+            appendLive(payload.text)
+        case let .messageInterim(payload):
             // Commentary beside tool calls, sealed as its own row; streamed already unless told otherwise.
-            if (payload["already_streamed"] as? Bool) != true, let text = payload["text"] as? String, !text.isEmpty {
-                messages.append(ChatMessage(id: UUID().uuidString, role: .assistant, text: text))
+            if !payload.alreadyStreamed, !payload.text.isEmpty {
+                messages.append(ChatMessage(id: UUID().uuidString, role: .assistant, text: payload.text))
             }
             liveMessageID = nil
-        case "message.complete":
-            let final = payload["text"] as? String ?? ""
+        case let .messageComplete(payload):
+            let final = payload.text?.stringValue ?? ""
             if !final.isEmpty {
                 if let index = liveIndex { messages[index].text = final } else { startLive(final) }
             } else if let index = liveIndex, messages[index].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -476,21 +546,54 @@ final class ChatModel: ObservableObject, Identifiable {
             liveMessageID = nil
             busy = false
             completions += 1
-        case "tool.start":
-            if let row = Self.toolRow(payload) {
+        case let .toolStart(payload):
+            var tool: JSON = ["name": payload.name]
+            tool["args"] = payload.args.map { JSONValue.object($0).anyValue }
+            tool["args_text"] = payload.argsText
+            if let row = Self.toolRow(tool) {
                 messages.append(ChatMessage(id: UUID().uuidString, role: .tool, text: row))
             }
             liveMessageID = nil
-        case "session.info":
-            if let running = payload["running"] as? Bool { busy = running }
-        case "session.title":
-            if let value = payload["title"] as? String, !value.isEmpty { title = value }
-        case "error":
+        case let .sessionInfo(info):
+            if let running = info.running { busy = running }
+        case let .sessionTitle(payload):
+            if !payload.title.isEmpty { title = payload.title }
+        case let .error(payload):
             busy = false
             liveMessageID = nil
-            error = payload["message"] as? String
+            error = payload.message.isEmpty ? nil : payload.message
         default:
             break
+        }
+    }
+
+    /// The events this chat handles, rebuilt from a payload that didn't match the contract.
+    private static func salvage(_ type: String, _ payload: JSONValue?) -> GatewayEvent? {
+        let payload = payload ?? [:]
+        let text = payload["text"]?.stringValue
+        switch type {
+        case "message.delta":
+            return text.map { .messageDelta(StreamDeltaPayload(text: $0)) }
+        case "message.interim":
+            return text.map { .messageInterim(MessageInterimPayload(text: $0, alreadyStreamed: payload["already_streamed"]?.boolValue ?? false)) }
+        case "message.complete":
+            return .messageComplete(MessageCompletePayload(text: text.map(JSONValue.string)))
+        case "tool.start":
+            guard let name = payload["name"]?.stringValue ?? payload["tool_name"]?.stringValue else { return nil }
+            return .toolStart(ToolStartPayload(toolId: payload["tool_id"]?.stringValue ?? "", name: name,
+                                               args: payload["args"]?.objectValue, argsText: payload["args_text"]?.stringValue))
+        case "session.info":
+            return .sessionInfo(SessionLiveInfo(running: payload["running"]?.boolValue))
+        case "session.title":
+            return payload["title"]?.stringValue.map { .sessionTitle(SessionTitlePayload(sessionId: payload["session_id"]?.stringValue ?? "", title: $0)) }
+        case "session.reclaimed":
+            return payload["session_id"]?.stringValue.map {
+                .sessionReclaimed(SessionReclaimedPayload(sessionId: $0, storedSessionId: payload["stored_session_id"]?.stringValue ?? "", reason: ""))
+            }
+        case "error":
+            return .error(ErrorPayload(message: payload["message"]?.stringValue ?? ""))
+        default:
+            return nil
         }
     }
 

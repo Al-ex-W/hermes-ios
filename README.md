@@ -132,6 +132,16 @@ Signing is personal, so it isn't in the repo. Copy `HermesVoice/Config/Local.xcc
 `HermesVoice/Config/Local.xcconfig` (gitignored) and set your `BUNDLE_ID_PREFIX` and Apple `DEVELOPMENT_TEAM`;
 the app's bundle id becomes `$(BUNDLE_ID_PREFIX).hermesvoice`.
 
+The unit tests drive the gateway connection (reconnects, replay, server→client prompts) over a scripted socket:
+
+```bash
+xcodebuild test -project HermesVoice.xcodeproj -scheme HermesVoice -destination "platform=iOS Simulator,name=iPhone 17 Pro"
+```
+
+With [`devtools/fake_hermes.py`](devtools) running (`--port 9311 --reap-grace 1`), prefix the command with
+`TEST_RUNNER_HERMES_FAKE_URL=http://127.0.0.1:9311 TEST_RUNNER_HERMES_FAKE_REAP_GRACE=1` to also run the end-to-end
+tests against it.
+
 Run it on a **real iPhone**: CallKit doesn't provide call audio in the
 Simulator. The app falls back to a plain audio session there, so you can still test the screens.
 
@@ -158,7 +168,10 @@ Swedish is recognized as Swedish.
 
 - **Dashboard**: `POST /auth/password-login` sets a cookie. `POST /api/auth/ws-ticket` returns a single-use ticket
   for `wss://…/api/ws?ticket=…`, which carries JSON-RPC: `session.resume`, `session.create`, `prompt.submit`, and
-  streamed `message.*`, `tool.*` and `session.*` events.
+  streamed `message.*`, `tool.*` and `session.*` events. After a reconnect the app re-attaches each chat in use,
+  on screen or in a call (`session.activate`, or `session.resume` when Hermes reaped it meanwhile), and replays
+  what it missed (`session.events.since`). Other chats catch up when they are opened again. Approvals, questions
+  and passwords arrive as server→client requests and are answered from the chat.
 - **Voice server `/phone`**: the app sends `hello {call_id, session_id, title}` and gets `ready`. For each `speak`,
   the server sends `speech_start {id, text, sample_rate}`, then binary 16-bit PCM frames, then `speech_end {id}`.
   The app answers `played {id}` once it has been heard, and that is when the tool returns to Hermes. A stopped or
