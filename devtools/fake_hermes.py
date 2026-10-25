@@ -1048,7 +1048,9 @@ class ChatFeatures:
             "command.dispatch": lambda: self.command_dispatch(params),
             "model.options": lambda: self.model_options(params),
             "config.set": lambda: self.config_set(params),
+            "config.get": lambda: self.config_get(params),
             "image.attach_bytes": lambda: self.image_attach_bytes(params),
+            "image.detach": lambda: self.image_detach(params),
             "file.attach": lambda: self.file_attach(params),
             "process.list": lambda: self.process_list(params),
             "process.kill": lambda: self.process_kill(params),
@@ -1293,6 +1295,20 @@ class ChatFeatures:
                             for m, (_f, _r, i, o) in models.items()}})
         return {"providers": providers, "model": model, "provider": provider}
 
+    def config_get(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_config.py config.get for the keys the app reads: reasoning, fast and the whole config (display)."""
+        key = str(params.get("key") or "")
+        rt = self.runtimes.get(str(params.get("session_id") or ""))
+        stored = self.sessions.get(rt.key) if rt else None
+        if key == "reasoning":
+            return {"value": stored.reasoning_effort if stored else "medium", "display": "hide"}
+        if key == "fast":
+            return {"value": "fast" if stored and stored.fast else "normal"}
+        if key == "full":
+            return {"config": {"display": {"show_reasoning": True, "tool_progress": "all"},
+                               "model": {"default": stored.model if stored else "fake-hermes"}}}
+        raise RpcError(4002, f"unknown config key: {key}")
+
     async def config_set(self, params: dict[str, Any]) -> dict[str, Any]:
         """methods_config_set.py for the composer's pills: model, reasoning, fast (session-scoped)."""
         key, value = str(params.get("key") or ""), params.get("value", "")
@@ -1384,6 +1400,16 @@ class ChatFeatures:
         rt.attached_images.append(path)
         return {"attached": True, "path": path, "count": len(rt.attached_images), "remainder": "",
                 "text": f"[User attached image: {name}]", "bytes": len(data), **image_meta(name, data)}
+
+    def image_detach(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_prompt.py image.detach: drops one staged image so the next prompt doesn't carry it."""
+        rt = self.runtime(params)
+        path = str(params.get("path") or "").strip()
+        if not path:
+            raise RpcError(4015, "path required")
+        before = len(rt.attached_images)
+        rt.attached_images = [p for p in rt.attached_images if p != path]
+        return {"detached": len(rt.attached_images) != before, "count": len(rt.attached_images)}
 
     def file_attach(self, params: dict[str, Any]) -> dict[str, Any]:
         """methods_prompt.py file.attach: a workspace file as-is, anything else staged into attachments/; the
@@ -1481,7 +1507,8 @@ class ChatFeatures:
         if idem and (child := self.runtimes.get(self.idempotency.get(idem, ""))) is not None:
             return self.branch_result(child)
         parent = self.sessions[rt.key]
-        history = [m for m in parent.messages]
+        # _visible_branch_history: user and assistant rows with text; ``count`` counts those.
+        history = [m for m in parent.messages if m["role"] in ("user", "assistant") and (m.get("content") or "").strip()]
         if not history:
             raise RpcError(4008, "nothing to branch — send a message first")
         if isinstance(count := params.get("count"), int) and count > 0:
@@ -1648,11 +1675,15 @@ class ChatFeatures:
             if (rt := self.find_runtime(sid)) is not None and rt.running:
                 log(f"http DELETE /api/sessions/{sid} -> 409 (turn running)")
                 return JSONResponse({"detail": "session has an active turn; stop it first"}, status_code=409)
-            del self.sessions[sid]
             for proc in [p for p in self.processes.values() if p["session_key"] == sid]:
                 self.kill(proc, "session.delete")
-            if rt is not None:
-                self.runtimes.pop(rt.sid, None)
+            if rt is None:
+                del self.sessions[sid]
+            else:
+                # The store only: a live runtime stays bound to its sockets (session.close ends it), so its row is
+                # gone from every list while the runtime keeps what it holds.
+                stored.messages.clear()
+                stored.persisted = False
             log(f"http DELETE /api/sessions/{sid} -> 200")
             await self.broadcast("sessions.changed", {})
             return JSONResponse({"ok": True})
@@ -2026,6 +2057,7 @@ class FakeHermes(ChatFeatures):
             "session.events.since": lambda: self.events_since(params),
             "prompt.submit": lambda: self.prompt_submit(conn, params),
             "session.interrupt": lambda: self.session_interrupt(params),
+            "session.close": lambda: self.session_close(params),
             "approval.respond": lambda: self.approval_respond(params),
             "request.answer": lambda: self.request_answer(params),
             "clarify.lock": lambda: self.clarify_lock(params),
@@ -2127,6 +2159,10 @@ class FakeHermes(ChatFeatures):
             raise RpcError(4002, "text required")
         self.attach(rt, conn)  # prompt.submit rebinds the session to the submitting transport
         stored = self.sessions[rt.key]
+        truncating = any(params.get(k) is not None for k in
+                         ("truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id"))
+        if truncating:
+            survivors = self.truncate_for_submit(rt, stored, params)
         if rt.running:
             # Busy: queue (queued=True forces queue mode). Without it Hermes' default busy_input_mode
             # "interrupt" redirects or interrupts the live turn and queues the prompt; the fake interrupts + queues.
@@ -2145,7 +2181,48 @@ class FakeHermes(ChatFeatures):
         rt.running = True
         rt.turn_started_at = time.time()
         rt.loop_task = asyncio.create_task(self.turn_loop(rt, text))
-        return {"status": "streaming", "user_row_id": row["id"]}
+        return {"status": "streaming", "user_row_id": row["id"], **({"survivor_user_row_ids": survivors} if truncating else {})}
+
+    def truncate_for_submit(self, rt: Runtime, stored: StoredSession, params: dict[str, Any]) -> list[int]:
+        """methods_prompt.py _truncate_history_for_submit by durable row id: a rewind drops the target prompt and
+        everything after it, then the submitted text runs from there. Returns the surviving user row ids."""
+        if rt.running:
+            # A rewind never lands as a queued or steered prompt: the client stops the turn and retries.
+            raise RpcError(4009, "session busy")
+        if not params.get("confirm_truncate"):
+            raise RpcError(4029, "truncation parameters require confirm_truncate=true; an ordinary prompt.submit must "
+                                 "not drop session history")
+        row_id = params.get("truncate_before_row_id")
+        if not isinstance(row_id, int) or isinstance(row_id, bool):
+            raise RpcError(4004, "the fake rewinds by truncate_before_row_id only")
+        index = next((i for i, m in enumerate(stored.messages) if m["id"] == row_id and m["role"] == "user"), None)
+        if index is None:
+            raise RpcError(4018, f"target row_id {row_id} not found for session {rt.sid} (in-memory + durable)")
+        if index == 0 and not params.get("confirm_empty_truncate"):
+            raise RpcError(4028, "truncation would erase the entire session transcript; resubmit with "
+                                 "confirm_empty_truncate=true if this is intended")
+        log(f"prompt.submit: truncating {stored.key} {len(stored.messages)} -> {index} messages")
+        del stored.messages[index:]
+        rt.failed_turn = rt.inflight = None
+        stored.todo_state = None
+        return [m["id"] for m in stored.messages if m["role"] == "user"]
+
+    async def session_close(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_session.py session.close: the runtime is popped and torn down (its turn and prompts end)."""
+        rt = self.runtimes.pop(str(params.get("session_id") or ""), None)
+        if rt is None:
+            return {"closed": False}
+        for task in (rt.turn_task, rt.loop_task, rt.reap_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await self.cancel_requests(rt.sid, "session_closed")
+        self.resolve_approvals(rt, "deny", resolve_all=True)
+        rt.running = False
+        stored = self.sessions.get(rt.key)
+        if stored is not None and not stored.persisted and not stored.messages:
+            del self.sessions[rt.key]
+        log(f"session.close {rt.sid}")
+        return {"closed": True}
 
     async def session_interrupt(self, params: dict[str, Any]) -> dict[str, Any]:
         rt = self.runtimes.get(params.get("session_id") or "")

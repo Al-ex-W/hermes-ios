@@ -260,10 +260,117 @@ final class FakeHermesTests: XCTestCase {
         XCTAssertTrue(chat.transcript.items.contains { if case .reasoning = $0 { return true }; return false })
         XCTAssertTrue(chat.transcript.items.contains { if case .changedFiles = $0 { return true }; return false })
     }
+
+    // MARK: Mid-turn reloads, rewinds, deletes
+
+    func testARefetchMidTurnShowsEachSavedToolCallOnce() async throws {
+        let chat = await newChat()
+        _ = await chat.send("tools approve")
+        let approval = try await waitForPrompt(chat)
+        let before = chat.callIDs
+        XCTAssertFalse(before.isEmpty)
+
+        // Events were lost while the turn runs (an overflowed replay): the stored page already holds its rounds.
+        chat.gatewayNeedsRefetch()
+        await chat.resync()
+        XCTAssertEqual(chat.callIDs, before, "\(chat.transcript.items)")
+
+        await prompts.approve(approval.id, .once)
+        await waitUntil(timeout: 10) { !chat.busy && chat.texts.last?.hasPrefix("Found the bug") == true }
+        XCTAssertEqual(Set(chat.callIDs).count, chat.callIDs.count, "\(chat.callIDs)")
+        XCTAssertEqual(chat.userTexts, ["tools approve"])
+    }
+
+    func testOpeningASessionWhoseTurnRunsElsewhereShowsItOnce() async throws {
+        let chat = await newChat()
+        await reply(chat, "hello")
+        _ = await chat.send("tools approve")
+        let approval = try await waitForPrompt(chat)
+        let storedID = try XCTUnwrap(chat.storedID)
+
+        // Another client with its own socket: it watched nothing of the turn.
+        let other = GatewayConnection { [client] in try await WebSocketTransport.dial(client!) }
+        defer { other.disconnect() }
+        let watcher = ChatModel(client: client, connection: other,
+                                summary: SessionSummary(id: storedID, title: chat.title, lastActive: nil, profile: nil))
+        watcher.setInUse("view", true)
+        await watcher.open()
+        XCTAssertTrue(watcher.busy)
+        XCTAssertEqual(watcher.userTexts, ["hello", "tools approve"])
+        XCTAssertEqual(Set(watcher.callIDs).count, watcher.callIDs.count)
+
+        await prompts.approve(approval.id, .once)
+        await waitUntil(timeout: 10) { !chat.busy && chat.texts.last?.hasPrefix("Found the bug") == true }
+        await waitUntil(timeout: 10) { !watcher.busy && watcher.texts.last == chat.texts.last }
+        XCTAssertEqual(watcher.userTexts, ["hello", "tools approve"])
+        XCTAssertEqual(Set(watcher.callIDs).count, watcher.callIDs.count, "\(watcher.callIDs)")
+    }
+
+    func testEditingAPromptRunsTheConversationAgainFromIt() async throws {
+        let chat = await newChat()
+        await reply(chat, "first")
+        await reply(chat, "second")
+
+        // A prompt sent from here learns its stored id from a fresh copy of the transcript.
+        guard case let .user(second)? = chat.transcript.items.last(where: \.isUser) else { return XCTFail("no prompt") }
+        let edited = await chat.rewind(second, to: "second, edited")
+        XCTAssertTrue(edited, chat.error ?? "")
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply == "Echo: second, edited" }
+        XCTAssertEqual(chat.userTexts, ["first", "second, edited"])
+
+        await chat.open()
+        guard case let .user(first)? = chat.transcript.items.first(where: \.isUser) else { return XCTFail("no prompt") }
+        XCTAssertNotNil(first.rowID)
+        let rewound = await chat.rewind(first, to: "first, edited")
+        XCTAssertTrue(rewound, chat.error ?? "")
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply == "Echo: first, edited" }
+        await chat.open()
+        XCTAssertEqual(chat.texts, ["first, edited", "Echo: first, edited"], "Hermes dropped everything after it")
+    }
+
+    func testRetryReplacesTheFailedTurnAndShowsThePromptItResends() async throws {
+        let chat = await newChat()
+        _ = await chat.send("fail please")
+        await waitUntil(timeout: 5) { !chat.busy && chat.errorCount == 1 }
+
+        let ran = await chat.runSlash("/retry")
+        XCTAssertTrue(ran)
+        await waitUntil(timeout: 10) { !chat.busy && chat.errorCount == 1 && chat.transcript.items.last.map(\.isUser) == false }
+        XCTAssertEqual(chat.userTexts, ["fail please"], "one bubble with the resent words, not /retry")
+        XCTAssertEqual(chat.errorCount, 1, "the rewound turn's card went with it")
+    }
+
+    func testDeletingARunningChatStopsAndClosesItFirst() async throws {
+        let chat = await newChat()
+        _ = await chat.send("tools approve")
+        _ = try await waitForPrompt(chat)
+        XCTAssertTrue(chat.busy)
+        let storedID = try XCTUnwrap(chat.storedID)
+
+        let target = SessionMenuTarget(storedID: storedID, runtimeID: chat.attachedRuntimeID, title: chat.title)
+        try await chat.sessionActions.delete(target)
+        chat.sessionGone()
+        let sessions = try await storedSessions()
+        XCTAssertFalse(sessions.contains { $0.id == storedID })
+        await waitUntil(timeout: 5) { self.prompts.prompts(for: chat.sessionIDs).isEmpty }
+        XCTAssertFalse(chat.busy)
+    }
+
+    func testANewChatStartsWithTheEffortPickedBeforeIt() async throws {
+        // Not opened yet, so Hermes has no session for it.
+        let chat = ChatModel(client: client, connection: connection, prompts: prompts, summary: nil)
+        chat.setInUse("view", true)
+        await chat.composer.setEffort("high")
+        XCTAssertEqual(chat.composer.pendingEffort, "high")
+        await reply(chat, "hi")
+        let runtimeID = try XCTUnwrap(chat.attachedRuntimeID)
+        let effort = try await connection.client.configGet(.init(key: "reasoning", sessionId: runtimeID)).value
+        XCTAssertEqual(effort, "high")
+    }
 }
 
 @MainActor
-private extension ChatModel {
+extension ChatModel {
     /// The prompts and replies, in order.
     var texts: [String] {
         transcript.items.compactMap { item in
@@ -277,6 +384,18 @@ private extension ChatModel {
 
     var userTexts: [String] {
         transcript.items.compactMap { if case let .user(message) = $0 { return message.text }; return nil }
+    }
+
+    /// Every tool call's id, in order.
+    var callIDs: [String] {
+        transcript.items.flatMap { item -> [String] in
+            guard case let .toolRun(run) = item else { return [] }
+            return run.calls.map(\.callID)
+        }
+    }
+
+    var errorCount: Int {
+        transcript.items.filter { if case .error = $0 { return true }; return false }.count
     }
 
     /// The text of the last row when it is a reply.

@@ -1,12 +1,68 @@
 import SwiftUI
 import UIKit
 
-/// What transcript rows ask of the chat that shows them. The defaults do nothing, so rows also render in previews.
+/// What transcript rows ask of the chat that shows them. The defaults do nothing, so rows also render in previews;
+/// a nil action leaves its menu item out.
 struct TranscriptActions {
     /// An error card's recovery button.
     var recover: (ErrorRecovery, TurnError) -> Void = { _, _ in }
     /// A `MEDIA:` chip; nil leaves the chip without a tap action.
     var openMedia: ((MediaRef) -> Void)?
+    /// Loads a prompt into the composer; sending it re-runs the conversation from there with the new text.
+    var edit: ((UserMessage) -> Void)?
+    /// Re-runs the conversation from a prompt as it was (the desktop's Restore checkpoint).
+    var restore: ((UserMessage) -> Void)?
+    /// Runs the prompt before a reply again in its place.
+    var regenerate: ((AssistantText) -> Void)?
+    /// Continues the conversation up to a reply in a new session.
+    var branch: ((AssistantText) -> Void)?
+    /// Opens another session by its stored id (a delegated child's).
+    var openSession: ((String) -> Void)?
+}
+
+/// Which rows the host's display settings show (`display.show_reasoning`, `display.tool_progress`). With tool
+/// progress off, the read, search and command feed goes; cards, spoken lines and failed calls stay.
+struct TranscriptDisplay: Equatable {
+    var showReasoning = true
+    var toolProgress = true
+
+    init(showReasoning: Bool = true, toolProgress: Bool = true) {
+        self.showReasoning = showReasoning
+        self.toolProgress = toolProgress
+    }
+
+    /// From the config values: only false (or "off" for tool progress) turns a kind of row off.
+    init(showReasoning: JSONValue?, toolProgress: JSONValue?) {
+        func on(_ value: JSONValue?) -> Bool {
+            switch value {
+            case let .bool(flag)?: return flag
+            case let .int(number)?: return number != 0
+            case let .string(text)?: return !["off", "false", "0"].contains(text.trimmingCharacters(in: .whitespaces).lowercased())
+            default: return true
+            }
+        }
+        self.init(showReasoning: on(showReasoning), toolProgress: on(toolProgress))
+    }
+
+    /// `item` as shown: nil when it is hidden, a run without the calls that are.
+    func shown(_ item: TranscriptItem) -> TranscriptItem? {
+        switch item {
+        case .reasoning where !showReasoning:
+            return nil
+        case var .toolRun(run) where !toolProgress:
+            run.calls = run.calls.filter(\.showsWithoutToolProgress)
+            return run.calls.isEmpty ? nil : .toolRun(run)
+        default:
+            return item
+        }
+    }
+}
+
+extension ToolCall {
+    /// A call drawn even with tool progress off: a card, a spoken line, or a failure the user has to see.
+    var showsWithoutToolProgress: Bool {
+        Self.cardTools.contains(name) || isSpeech || status == .error || failed || (exitCode.map { $0 != 0 } ?? false)
+    }
 }
 
 private struct TranscriptActionsKey: EnvironmentKey {
@@ -24,17 +80,38 @@ extension EnvironmentValues {
 /// tool rows) packed tight, a full block gap anywhere else, and more room before each prompt.
 struct TranscriptList: View {
     let items: [TranscriptItem]
+    var display = TranscriptDisplay()
 
     var body: some View {
-        let items = items.filter(\.isDrawn)
+        let items = items.compactMap(display.shown).filter(\.isDrawn)
+        let replies = Self.turnReplies(items)
         LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                TranscriptRow(item: item)
+                TranscriptRow(item: item, actionBar: replies.contains(item.id))
                     .equatable()
                     .padding(.top, index == 0 ? 0 : Self.gap(items[index - 1], item))
                     .id(item.id)
             }
         }
+    }
+
+    /// The reply that ends each turn (its last settled reply text): the one that gets the action bar.
+    static func turnReplies(_ items: [TranscriptItem]) -> Set<String> {
+        var replies: Set<String> = []
+        var last: String?
+        for item in items {
+            switch item {
+            case .user:
+                if let last { replies.insert(last) }
+                last = nil
+            case let .assistant(text):
+                last = text.streaming ? nil : text.id
+            default:
+                continue
+            }
+        }
+        if let last { replies.insert(last) }
+        return replies
     }
 
     static func gap(_ previous: TranscriptItem, _ item: TranscriptItem) -> CGFloat {
@@ -65,16 +142,22 @@ extension TranscriptItem {
     }
 }
 
-/// One transcript row. Equatable on its item, so a streaming row redraws alone.
+/// One transcript row. Equatable on its item, so a streaming row redraws alone. `actionBar`: the reply that ends
+/// its turn, with Copy, Regenerate and Branch under it.
 struct TranscriptRow: View, Equatable {
     let item: TranscriptItem
+    var actionBar = false
 
     var body: some View {
         switch item {
         case let .user(message):
             UserBubble(message: message)
         case let .assistant(text):
-            AssistantMarkdown(text: text).padding(.leading, Theme.Spacing.messageIndent)
+            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                AssistantMarkdown(text: text)
+                if actionBar { ReplyActions(reply: text) }
+            }
+            .padding(.leading, Theme.Spacing.messageIndent)
         case let .reasoning(reasoning):
             ReasoningRow(reasoning: reasoning).padding(.leading, Theme.Spacing.messageIndent)
         case let .toolRun(run):
@@ -183,6 +266,37 @@ struct TranscriptElapsed: View {
         if total < 60 { return "\(total)s" }
         if total < 3600 { return "\(total / 60)m \(String(format: "%02d", total % 60))s" }
         return "\(total / 3600)h \(String(format: "%02d", (total % 3600) / 60))m"
+    }
+}
+
+/// The action bar under a turn's reply (`AssistantActionBar`): branch from it, copy it, run its prompt again.
+private struct ReplyActions: View {
+    let reply: AssistantText
+    @Environment(\.transcriptActions) private var actions
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            TranscriptCopyButton(text: reply.markdown, label: "Copy reply")
+            if let regenerate = actions.regenerate {
+                icon(Theme.Icon.retry, "Regenerate") { regenerate(reply) }
+            }
+            if reply.rowID != nil, let branch = actions.branch {
+                icon(Theme.Icon.branch, "Branch from here") { branch(reply) }
+            }
+        }
+        .padding(.leading, -Theme.Spacing.xs)
+    }
+
+    private func icon(_ symbol: String, _ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.Text.tertiary)
+                .frame(width: 24, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
     }
 }
 

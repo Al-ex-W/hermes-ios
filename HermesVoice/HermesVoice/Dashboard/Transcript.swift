@@ -311,6 +311,38 @@ struct ChangedFile: Hashable, Identifiable {
     var name: String { path.split(separator: "/").last.map(String.init) ?? path }
 }
 
+/// A turn Hermes runs (or kept after it failed) as `session.resume` / `session.activate` report it (`inflight`,
+/// `queued`), for a transcript that saw none of it live.
+struct LiveTurnSnapshot: Equatable {
+    struct Correction: Equatable {
+        var text: String
+        /// How much of the reply had streamed when it arrived (unicode scalars); nil from an older Hermes.
+        var offset: Int?
+    }
+
+    var prompt: String?
+    /// Everything the turn streamed so far.
+    var reply = ""
+    var streaming = false
+    var corrections: [Correction] = []
+    var error: String?
+    var errorSurface: ErrorSurface?
+    /// The prompt queued for the next turn.
+    var queued: String?
+}
+
+extension LiveTurnSnapshot {
+    init(_ inflight: InflightTurn?, queued: String?) {
+        let offsets = inflight?.correctionOffsets
+        let corrections = (inflight?.corrections ?? []).enumerated().map { index, text in
+            Correction(text: text, offset: offsets.flatMap { $0.indices.contains(index) ? $0[index] : nil })
+        }
+        let surface = inflight?.errorSurface.flatMap { try? JSONValue.object($0).decode(ErrorSurface.self) }
+        self.init(prompt: inflight?.user, reply: inflight?.assistant ?? "", streaming: inflight?.streaming ?? false,
+                  corrections: corrections, error: inflight?.error?.trimmed.nonEmpty, errorSurface: surface, queued: queued)
+    }
+}
+
 struct TodoItem: Hashable, Identifiable {
     let id: String
     var content: String
@@ -325,6 +357,9 @@ struct TodoItem: Hashable, Identifiable {
 /// handlers). No I/O, and the clock is injectable.
 struct Transcript {
     var items: [TranscriptItem] = []
+    /// Prompts for the turn after the running one (a correction Hermes held as the next turn, the prompt it has
+    /// queued): drawn after `items`, and moved into them when the running turn ends, so its rows stay above them.
+    private(set) var nextPrompts: [UserMessage] = []
     /// A turn is streaming: started, and not yet completed, failed or reported idle.
     private(set) var turnRunning = false
     /// The tool whose arguments the model is writing (`tool.generating`), until anything else arrives.
@@ -340,9 +375,13 @@ struct Transcript {
     private var liveAssistantID: String?
     private var liveReasoningID: String?
     private var liveRunID: String?
-    /// The turn's rows follow this one (the last row when it started); nil with `turnAnchored`: the transcript start.
+    /// The turn's rows follow this one (the last row when it started, or the newest correction); nil with
+    /// `turnAnchored`: the transcript start.
     private var turnAnchor: String?
     private var turnAnchored = false
+    /// Where the running turn began, which a correction doesn't move: what a reload must keep starts after it.
+    private var turnStartAnchor: String?
+    private var turnStartAnchored = false
     private var todoRevision = Int.min
     private var serial = 0
     /// Todo and reaction calls in flight: they show only if they fail.
@@ -354,14 +393,23 @@ struct Transcript {
         self.now = now
     }
 
+    /// The rows to draw: the transcript, then the prompts waiting for the next turn.
+    var rows: [TranscriptItem] { items + nextPrompts.map(TranscriptItem.user) }
+
     // MARK: Stored history
 
     /// Replaces the rows with a stored page (oldest first; a newest-first page is turned around). Turn state is
     /// kept, so live events of a turn still running continue after it. The rows named in `kept` (ones the page
     /// can't hold yet: prompts Hermes may not have stored, the turn still running) follow the stored ones in their
     /// order, and a stream whose row is kept goes on in it.
-    mutating func load(history: [JSONValue], keeping kept: Set<String> = []) {
-        let carried = kept.isEmpty ? [] : items.filter { kept.contains($0.id) }
+    /// With `live`, the turn Hermes runs is drawn after the page as far as it streamed (`project`); the ids of the
+    /// rows that made are returned.
+    @discardableResult
+    mutating func load(history: [JSONValue], keeping kept: Set<String> = [], projecting live: LiveTurnSnapshot? = nil,
+                       key: String = "live") -> Set<String> {
+        var carried = kept.isEmpty ? [] : items.filter { kept.contains($0.id) }
+        let running = runningTurnIDs
+        let corrected = turnAnchored && turnStartAnchor != turnAnchor ? turnAnchor : nil
         let streams = (assistant: liveAssistantID, reasoning: liveReasoningID, run: liveRunID, hidden: hiddenCalls)
         var rows = history.compactMap(\.objectValue)
         if let first = rows.first.flatMap(Self.rowID), let last = rows.last.flatMap(Self.rowID), first > last { rows.reverse() }
@@ -370,6 +418,9 @@ struct Transcript {
         liveReasoningID = nil
         liveRunID = nil
         turnAnchored = false
+        turnAnchor = nil
+        turnStartAnchored = false
+        turnStartAnchor = nil
         hiddenCalls = [:]
         var turnStart = 0
         for (index, row) in rows.enumerated() {
@@ -395,19 +446,215 @@ struct Transcript {
             }
         }
         if !turnRunning { endStoredTurn(from: turnStart) }
-        guard !carried.isEmpty else { return }
+        let before = Set(items.map(\.id))
+        if let live {
+            project(live, key: key, streams: !(streams.assistant.map(kept.contains) ?? false))
+        }
+        let projected = Set(items.map(\.id)).subtracting(before)
+        let projectedStream = liveAssistantID
+        guard !carried.isEmpty else { return projected }
+        // Hermes saves a running turn's tool rounds as they finish, so the page may hold rows kept from the live
+        // turn already: its copy takes their live state, and the live copy goes.
+        if turnRunning { carried = merge(carried, intoStoredFrom: Self.storedTurnStart(items)) }
         let stored = Set(items.map(\.id))
         items += carried.filter { !stored.contains($0.id) }
-        liveAssistantID = streams.assistant.flatMap { kept.contains($0) ? $0 : nil }
-        liveReasoningID = streams.reasoning.flatMap { kept.contains($0) ? $0 : nil }
-        liveRunID = streams.run.flatMap { kept.contains($0) ? $0 : nil }
-        if turnRunning { hiddenCalls = streams.hidden }
+        let present = Set(items.map(\.id))
+        liveAssistantID = streams.assistant.flatMap { kept.contains($0) && present.contains($0) ? $0 : nil } ?? projectedStream
+        liveReasoningID = streams.reasoning.flatMap { kept.contains($0) && present.contains($0) ? $0 : nil }
+        liveRunID = streams.run.flatMap { kept.contains($0) && present.contains($0) ? $0 : nil }
+        guard turnRunning else { return projected }
+        hiddenCalls = streams.hidden
+        // What is kept of the running turn follows its stored part, and a correction kept in it still leads what
+        // the turn writes next.
+        if !turnStartAnchored, let first = items.firstIndex(where: { running.contains($0.id) }) {
+            turnStartAnchored = true
+            turnStartAnchor = first > 0 ? items[first - 1].id : nil
+        }
+        if let corrected, present.contains(corrected) {
+            turnAnchored = true
+            turnAnchor = corrected
+        }
+        return projected
     }
 
-    /// The rows of the turn still running, which no stored page holds yet.
+    /// Draws a turn this transcript didn't watch from its snapshot (the desktop's `appendLiveSessionProjection`):
+    /// its prompt unless the page holds it, the reply so far after what the page already holds of it, split at the
+    /// corrections steered into it, a failure Hermes kept, and the prompt queued after it. `streams`: the reply's
+    /// last part is still being written here, so later deltas go on in it.
+    private mutating func project(_ live: LiveTurnSnapshot, key: String, streams: Bool) {
+        let start = Self.storedTurnStart(items)
+        let prompts = items[min(start, items.count)...].compactMap { item -> String? in
+            if case let .user(message) = item { return Self.normalized(message.text) }
+            return nil
+        }
+        func stored(_ text: String) -> Bool { prompts.contains(Self.normalized(Self.userText(text).text)) }
+        let promptStored = live.prompt.map(stored) ?? true
+        if let prompt = live.prompt, !promptStored {
+            appendPrompt(Self.userText(prompt), id: "\(key)-prompt", rowID: nil, timestamp: now())
+        }
+        let turnStart = promptStored ? (items.indices.contains(start) ? items[start].id : items.last?.id) : items.last?.id
+        // What the page holds of the reply (commentary saved with each tool round) isn't drawn twice.
+        let reply = live.reply
+        var cursor = reply.startIndex
+        if promptStored {
+            for case let .assistant(text) in items[min(start, items.count)...] {
+                let saved = text.source.trimmed
+                guard !saved.isEmpty, let range = reply.range(of: saved, range: cursor..<reply.endIndex),
+                      reply[cursor..<range.lowerBound].allSatisfy(\.isWhitespace) else { break }
+                cursor = range.upperBound
+            }
+        }
+        var lastCorrection: String?
+        func correct(_ correction: LiveTurnSnapshot.Correction, _ index: Int) {
+            guard !stored(correction.text), !items.contains(where: { $0.id == "\(key)-correction-\(index)" }) else { return }
+            appendPrompt(Self.userText(correction.text), id: "\(key)-correction-\(index)", rowID: nil, timestamp: now())
+            lastCorrection = "\(key)-correction-\(index)"
+        }
+        let placed = !live.corrections.isEmpty && live.corrections.allSatisfy { $0.offset != nil } && live.error == nil
+        if placed {
+            for (index, correction) in live.corrections.enumerated() {
+                let scalars = reply.unicodeScalars
+                let boundary = scalars.index(scalars.startIndex, offsetBy: min(correction.offset ?? 0, scalars.count))
+                if boundary > cursor {
+                    let segment = String(reply[cursor..<boundary])
+                    if !segment.trimmed.isEmpty {
+                        items.append(.assistant(AssistantText(id: "\(key)-segment-\(index)", source: segment.trimmed, interim: true)))
+                        syncMedia("\(key)-segment-\(index)")
+                    }
+                    cursor = boundary
+                }
+                correct(correction, index)
+            }
+        }
+        // Only leading space goes: the next delta may start mid-word.
+        let tail = String(reply[cursor...].drop(while: \.isWhitespace))
+        let running = live.streaming && live.error == nil
+        if !tail.trimmed.isEmpty {
+            let id = "\(key)-reply"
+            items.append(.assistant(AssistantText(id: id, source: running && streams ? tail : tail.trimmed,
+                                                  streaming: running && streams)))
+            syncMedia(id)
+            if running && streams { liveAssistantID = id }
+        }
+        if !placed { for (index, correction) in live.corrections.enumerated() { correct(correction, index) } }
+        // The page may hold the failure's card already (its failed-turn row).
+        if let error = live.error, !items[min(start, items.count)...].contains(where: { if case .error = $0 { return true }; return false }) {
+            appendError(Self.turnError(message: error, surface: live.errorSurface, id: "\(key)-error"))
+        }
+        guard running || turnRunning else { return }
+        turnRunning = true
+        turnStartAnchored = true
+        turnStartAnchor = turnStart
+        turnAnchored = true
+        turnAnchor = lastCorrection ?? turnStart
+        if let queued = live.queued { appendNextPrompt(queued, id: "\(key)-queued") }
+    }
+
+    /// The rows of the turn still running, which no stored page holds yet: everything after where it began,
+    /// corrections and what streamed before them included.
     var runningTurnIDs: Set<String> {
         guard turnRunning else { return [] }
-        return Set(items[min(regionStart, items.count)...].map(\.id))
+        return Set(items[min(turnStartIndex, items.count)...].map(\.id))
+    }
+
+    /// Where the newest stored turn starts in `items`: at its prompt. A user row right after tool work is a
+    /// correction Hermes saved inside the turn, not the start of one (unless that work was stopped).
+    private static func storedTurnStart(_ items: [TranscriptItem]) -> Int {
+        var index = items.count - 1
+        while index >= 0 {
+            if items[index].isUser {
+                let previous = items[..<index].last { item in
+                    switch item {
+                    case .media, .changedFiles: return false
+                    case let .system(note): return note.kind == .stopped
+                    default: return true
+                    }
+                }
+                switch previous {
+                case .toolRun?, .subagent?: break
+                default: return index
+                }
+            }
+            index -= 1
+        }
+        return 0
+    }
+
+    /// Folds kept live rows into the stored rows of the running turn (from `start`): a call the page holds takes
+    /// the live call's state, a sealed text or thinking block it holds is dropped, and a live delegation replaces
+    /// its stored card. Returns what is left to keep.
+    private mutating func merge(_ live: [TranscriptItem], intoStoredFrom start: Int) -> [TranscriptItem] {
+        var calls: [String: CallLocation] = [:]
+        // How often the page holds each text, so a live copy only stands for one saved copy.
+        var texts: [String: Int] = [:]
+        var thoughts: [String: Int] = [:]
+        for index in items.indices where index >= start {
+            switch items[index] {
+            case let .toolRun(run):
+                for (position, call) in run.calls.enumerated() { calls[call.callID] = .run(item: index, call: position) }
+            case let .subagent(delegation):
+                if let call = delegation.call { calls[call.callID] = .delegation(item: index) }
+            case let .assistant(text):
+                texts[Self.normalized(text.source), default: 0] += 1
+            case let .reasoning(reasoning):
+                thoughts[Self.normalized(reasoning.text), default: 0] += 1
+            default:
+                break
+            }
+        }
+        func saved(_ text: String, in counts: inout [String: Int]) -> Bool {
+            let key = Self.normalized(text)
+            guard let count = counts[key], count > 0 else { return false }
+            counts[key] = count - 1
+            return true
+        }
+        var dropped: Set<String> = []
+        var left: [TranscriptItem] = []
+        for item in live {
+            switch item {
+            case var .toolRun(run):
+                run.calls = run.calls.filter { call in
+                    guard let location = calls[call.callID], case .run = location else { return true }
+                    modifyCall(location) { Self.adopt(call, into: &$0) }
+                    return false
+                }
+                if run.calls.isEmpty {
+                    dropped.insert(run.id)
+                } else {
+                    left.append(.toolRun(run))
+                }
+            case let .subagent(delegation):
+                if let call = delegation.call, case let .delegation(index)? = calls[call.callID] {
+                    items[index] = .subagent(delegation)
+                    continue
+                }
+                left.append(item)
+            case let .assistant(text) where !text.streaming && saved(text.source, in: &texts):
+                dropped.insert(text.id)
+            case let .reasoning(reasoning) where !reasoning.streaming && saved(reasoning.text, in: &thoughts):
+                dropped.insert(reasoning.id)
+            case let .media(group) where dropped.contains(String(group.id.dropLast("-media".count))):
+                continue
+            default:
+                left.append(item)
+            }
+        }
+        return left
+    }
+
+    /// A stored call takes what the live copy knows beyond it.
+    private static func adopt(_ live: ToolCall, into stored: inout ToolCall) {
+        stored.args.merge(live.args) { old, _ in old }
+        stored.context = stored.context ?? live.context
+        stored.result = stored.result ?? live.result
+        stored.resultText = stored.resultText ?? live.resultText
+        stored.summary = stored.summary ?? live.summary
+        stored.inlineDiff = stored.inlineDiff ?? live.inlineDiff
+        stored.duration = stored.duration ?? live.duration
+        stored.startedAt = live.startedAt ?? stored.startedAt
+        stored.completedAt = stored.completedAt ?? live.completedAt
+        stored.done = stored.done || live.done
+        stored.interrupted = live.interrupted
     }
 
     private mutating func storeAssistant(_ row: [String: JSONValue], key: String) {
@@ -574,6 +821,35 @@ struct Transcript {
 
     mutating func remove(id: String) {
         items.removeAll { $0.id == id }
+        nextPrompts.removeAll { $0.id == id }
+    }
+
+    /// A prompt for the turn after the running one (Hermes queued it): drawn below the running turn, which keeps
+    /// streaming above it. With no turn running it is an ordinary prompt row.
+    mutating func appendNextPrompt(_ text: String, id: String) {
+        let projected = Self.userText(text)
+        guard turnRunning else { return appendPrompt(projected, id: id, rowID: nil, timestamp: now()) }
+        guard !projected.text.isEmpty || !projected.refs.isEmpty, !nextPrompts.contains(where: { $0.id == id }) else { return }
+        nextPrompts.append(UserMessage(id: id, text: projected.text, attachments: projected.refs, timestamp: now()))
+    }
+
+    /// Drops the row `id` and everything after it (a rewind re-runs the conversation from there). No turn runs
+    /// once it is cut.
+    mutating func truncate(from id: String) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items.removeSubrange(index...)
+        nextPrompts = []
+        liveAssistantID = nil
+        liveReasoningID = nil
+        liveRunID = nil
+        hiddenCalls = [:]
+        correctionSeal = nil
+        draftingTool = nil
+        turnRunning = false
+        turnAnchored = false
+        turnAnchor = nil
+        turnStartAnchored = false
+        turnStartAnchor = nil
     }
 
     private mutating func appendPrompt(_ projected: (text: String, refs: [AttachmentRef]), id: String, rowID: Int?, timestamp: Date?) {
@@ -655,9 +931,12 @@ struct Transcript {
     private mutating func startTurn() {
         sealStreams()
         settleRun()
+        flushNextPrompts()
         turnRunning = true
         turnAnchored = true
         turnAnchor = items.last?.id
+        turnStartAnchored = true
+        turnStartAnchor = turnAnchor
     }
 
     /// Marks the turn begun when its first output arrives without a `message.start` (a turn already running when
@@ -667,6 +946,10 @@ struct Transcript {
         guard !turnAnchored else { return }
         turnAnchored = true
         turnAnchor = items.last(where: \.isUser)?.id
+        if !turnStartAnchored {
+            turnStartAnchored = true
+            turnStartAnchor = turnAnchor
+        }
     }
 
     private mutating func appendText(_ delta: String) {
@@ -882,12 +1165,22 @@ struct Transcript {
         settleRun()
         turnRunning = false
         draftingTool = nil
+        flushNextPrompts()
     }
 
     private mutating func endTurn() {
         settle()
         turnAnchored = false
         turnAnchor = nil
+        turnStartAnchored = false
+        turnStartAnchor = nil
+    }
+
+    /// The prompts held for the next turn join the transcript, after the turn that ran before them.
+    private mutating func flushNextPrompts() {
+        guard !nextPrompts.isEmpty else { return }
+        items += nextPrompts.map(TranscriptItem.user)
+        nextPrompts = []
     }
 
     /// A terminal frame repeating the failure a bare `error` frame showed already settles onto that card.
@@ -1193,6 +1486,15 @@ struct Transcript {
     }
 
     // MARK: Lookup
+
+    /// Where the running turn began (corrections included in it).
+    private var turnStartIndex: Int {
+        if turnStartAnchored {
+            guard let anchor = turnStartAnchor else { return 0 }
+            if let index = items.lastIndex(where: { $0.id == anchor }) { return index + 1 }
+        }
+        return regionStart
+    }
 
     /// Where the current turn's rows start.
     private var regionStart: Int {

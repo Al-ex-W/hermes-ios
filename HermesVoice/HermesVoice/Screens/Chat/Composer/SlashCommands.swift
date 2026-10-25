@@ -25,7 +25,7 @@ protocol SlashCommandHost: AnyObject {
     /// Loads text into the composer (`/undo`).
     func prefillComposer(_ text: String)
     func performSlashAction(_ action: SlashAction) async
-    /// Hermes rewrote the stored transcript (`/compress`): show the new one.
+    /// Hermes rewrote the stored transcript (`/compress`, `/retry`, `/undo`): show the new one.
     func transcriptChanged() async
 }
 
@@ -75,6 +75,8 @@ struct SlashCommandRunner {
         "new", "reset", "clear", "branch", "fork", "model", "resume", "sessions", "switch", "stop", "title", "reasoning",
         "yolo", "help", "commands", "compress", "compact", "btw", "bg", "background", "save", "status",
     ]
+    /// The commands that rewind Hermes' stored transcript before their directive comes back.
+    nonisolated static let rewinding: Set<String> = ["retry", "undo"]
     /// The longest a `/compress` summary may take.
     static let compressTimeout: TimeInterval = 300
 
@@ -313,7 +315,8 @@ struct SlashCommandRunner {
     private enum Dispatch {
         case output(String?)
         case alias(String)
-        case send(message: String, notice: String?, display: String?)
+        /// `skill`: the message is a skill's expanded body, never shown.
+        case send(message: String, notice: String?, display: String?, skill: Bool)
         case prefill(message: String, notice: String?)
 
         init?(type: DispatchType, output: String?, target: String?, message: String?, notice: String?, display: String?) {
@@ -323,7 +326,7 @@ struct SlashCommandRunner {
                 guard let target else { return nil }
                 self = .alias(target)
             case .send, .skill:
-                self = .send(message: message ?? "", notice: notice, display: display)
+                self = .send(message: message ?? "", notice: notice, display: display, skill: type == .skill)
             case .prefill:
                 guard let message else { return nil }
                 self = .prefill(message: message, notice: notice)
@@ -334,6 +337,12 @@ struct SlashCommandRunner {
     }
 
     private func handle(_ dispatch: Dispatch, _ command: SlashCommand, _ sessionID: String) async {
+        if Self.rewinding.contains(canonical(command.name)) {
+            switch dispatch {
+            case .send, .prefill: await host.transcriptChanged()
+            default: break
+            }
+        }
         switch dispatch {
         case let .output(text):
             host.showSlashOutput(text ?? "(no output)")
@@ -343,18 +352,54 @@ struct SlashCommandRunner {
             if let notice = notice?.trimmingCharacters(in: .whitespacesAndNewlines), !notice.isEmpty { host.showSlashOutput(notice) }
             let message = message.trimmingCharacters(in: .whitespacesAndNewlines)
             if !message.isEmpty { host.prefillComposer(message) }
-        case let .send(message, notice, display):
+        case let .send(message, notice, display, skill):
             if let notice = notice?.trimmingCharacters(in: .whitespacesAndNewlines), !notice.isEmpty { host.showSlashOutput(notice) }
             let message = message.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !message.isEmpty else {
-                host.showSlashOutput("/\(command.name): empty message")
+                host.showSlashOutput("/\(command.name): \(skill ? "skill payload missing message" : "empty message")")
                 return
             }
-            // The message of a skill is its expanded body: the bubble shows the invocation instead.
-            let invocation = command.arg.isEmpty ? "/\(command.name)" : "/\(command.name) \(command.arg)"
-            let shown = display?.trimmingCharacters(in: .whitespacesAndNewlines)
-            _ = await host.sendSlashPrompt(message, display: shown?.isEmpty == false ? shown : invocation)
+            _ = await host.sendSlashPrompt(message, display: Self.shown(message, display: display, skill: skill, command: command))
         }
+    }
+
+    /// What the bubble of a directive's message shows (the desktop's `projected || skillInvocationText(message)`):
+    /// the projection Hermes sent, else the invocation a skill scaffold names, else the message itself (nil). A
+    /// skill body is never shown, so one without either shows the command typed.
+    nonisolated static func shown(_ message: String, display: String?, skill: Bool, command: SlashCommand) -> String? {
+        if let display = display?.trimmingCharacters(in: .whitespacesAndNewlines), !display.isEmpty { return display }
+        if let invocation = skillInvocation(message) { return invocation }
+        guard skill else { return nil }
+        return command.arg.isEmpty ? "/\(command.name)" : "/\(command.name) \(command.arg)"
+    }
+
+    /// The invocation a skill scaffold came from (`/work fix the leak`), or nil for ordinary prose
+    /// (`shared/src/skill-scaffold.ts`, mirroring `agent/skill_commands.py`).
+    nonisolated static func skillInvocation(_ text: String) -> String? {
+        let prefix = "[IMPORTANT: The user has invoked the "
+        guard text.hasPrefix(prefix + "\"") else { return nil }
+        let afterQuote = text.dropFirst(prefix.count + 1)
+        guard let close = afterQuote.firstIndex(of: "\"") else { return nil }
+        let name = afterQuote[..<close].trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return nil }
+        let label = name.hasPrefix("/") ? name : "/\(name)"
+        func between(_ marker: String, _ end: String, fromEnd: Bool = false) -> String {
+            guard let found = fromEnd ? text.range(of: marker, options: .backwards) : text.range(of: marker) else { return "" }
+            let tail = text[found.upperBound...]
+            let stop = tail.range(of: end)?.lowerBound ?? tail.endIndex
+            return tail[..<stop].trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let instruction: String
+        if text.contains(" skill bundle,") {
+            instruction = between("\nUser instruction: ", "\n\n[Loaded as part of the ")
+        } else if text.contains("The full skill content is loaded below.]") {
+            instruction = between("The user has provided the following instruction alongside the skill invocation: ",
+                                  "\n\n[Runtime note:", fromEnd: true)
+        } else {
+            instruction = ""
+        }
+        guard !instruction.isEmpty else { return label }
+        return "\(label) \(instruction.split(whereSeparator: \.isWhitespace).joined(separator: " "))"
     }
 
     // MARK: Catalog

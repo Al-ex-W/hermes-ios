@@ -88,23 +88,76 @@ final class StatusStackModel: ObservableObject {
     var hasRunningProcess: Bool { processes.contains { $0.state == .running } }
     var isEmpty: Bool { todos.isEmpty && liveSubagents.isEmpty && processes.isEmpty && previousTodos.isEmpty }
 
+    /// How full the context is: the live usage once a turn ran in this process, else the breakdown's estimate (a
+    /// reopened session reports no usage until then). nil while neither knows the window.
+    var context: (used: Int, max: Int, percent: Int, estimated: Bool)? {
+        if let usage, let max = usage.contextMax, max > 0 {
+            return (usage.contextUsed ?? 0, max, ContextMeter.percent(usage), usage.contextEstimated == true)
+        }
+        guard let breakdown, breakdown.contextMax > 0 else { return nil }
+        let percent = min(100, Swift.max(0, breakdown.contextPercent))
+        return (breakdown.contextUsed, breakdown.contextMax, percent, breakdown.contextEstimated)
+    }
+
     // MARK: Refreshing
 
     /// Reads the session's registry snapshots and usage; call when the chat shows, and on a new session.
     func refresh() async {
         guard let sessionID = chat?.runtimeSessionID else { return }
-        if sessionID != session {
-            session = sessionID
-            todos = []
-            subagents = []
-            processes = []
-            usage = nil
-            breakdown = nil
-            todoRevision = nil
-        }
+        if sessionID != session { reset(for: sessionID) }
         await refreshProcesses(sessionID)
         await refreshSubagents(sessionID)
+        await refreshContext()
+    }
+
+    /// Another live session: what the stack knew was the old one's.
+    private func reset(for sessionID: String) {
+        session = sessionID
+        todos = []
+        subagents = []
+        processes = []
+        usage = nil
+        breakdown = nil
+        todoRevision = nil
+    }
+
+    /// Usage and the breakdown behind the context meter, which draws from either.
+    func refreshContext() async {
+        guard let sessionID = chat?.runtimeSessionID else { return }
         await refreshUsage(sessionID)
+        await refreshBreakdown(sessionID)
+    }
+
+    /// The task list a resume or activate reported. While the turn runs it is the live one; otherwise one left
+    /// unfinished is only reviewable.
+    func restoreTodos(_ state: TodoState?, running: Bool) {
+        guard let state else { return }
+        if let sessionID = chat?.runtimeSessionID, sessionID != session { reset(for: sessionID) }
+        if let todoRevision, state.revision < todoRevision { return }
+        todoRevision = state.revision
+        let items = Self.ordered(Self.parseTodos(state.todos.map(JSONValue.object)))
+        todoLinger?.cancel()
+        if running {
+            todos = items
+        } else if !items.isEmpty {
+            todos = []
+            previousTodos = items
+        }
+    }
+
+    /// A rewind dropped the turns the task lists belonged to.
+    func clearTodos() {
+        todoLinger?.cancel()
+        todos = []
+        previousTodos = []
+    }
+
+    /// The turn ended without finishing its list: it stops claiming work in progress, and stays reviewable.
+    private func retireUnfinishedTodos() {
+        guard todos.contains(where: { $0.status == .pending || $0.status == .inProgress }) else { return }
+        todoLinger?.cancel()
+        previousTodos = todos
+        todos = []
     }
 
     /// Polls while something runs and the stack is on screen; `stopPolling` ends it.
@@ -162,10 +215,14 @@ final class StatusStackModel: ObservableObject {
         guard let sessionID = chat?.runtimeSessionID else { return }
         loadingBreakdown = true
         defer { loadingBreakdown = false }
+        await refreshBreakdown(sessionID)
+        await refreshUsage(sessionID)
+    }
+
+    private func refreshBreakdown(_ sessionID: String) async {
         if let result = try? await client.sessionContextBreakdown(.init(sessionId: sessionID, profile: profile)) {
             breakdown = result
         }
-        await refreshUsage(sessionID)
     }
 
     /// Keeps rows in place (status flips happen where they are), appends new processes, and leaves dismissed ones out.
@@ -251,7 +308,10 @@ final class StatusStackModel: ObservableObject {
         case let .sessionUsage(payload):
             usage = payload.usage
         case .messageComplete:
-            if let sessionID = chat?.runtimeSessionID { Task { await refreshUsage(sessionID) } }
+            retireUnfinishedTodos()
+            Task { await refreshContext() }
+        case .error:
+            retireUnfinishedTodos()
         case let .sessionInfo(info):
             if let usage = info.usage { self.usage = usage }
         default:

@@ -28,17 +28,24 @@ struct ComposerView: View {
     static let followUps = ["Send a follow-up", "Add more context", "Refine the request", "What's next?", "Keep it going",
                             "Push it further"]
 
-    private var showsStop: Bool { busy && !composer.hasPayload && !composer.isEditingQueued }
+    private var editing: Bool { composer.isEditingQueued || composer.editingMessage != nil }
+
+    private var showsStop: Bool { busy && !composer.hasPayload && !editing }
 
     private var canSend: Bool {
-        !disabled && (composer.hasPayload || busy || (!sender.queue.isEmpty && !composer.isEditingQueued))
+        if composer.editingMessage != nil { return !disabled && composer.hasPayload }
+        return !disabled && (composer.hasPayload || busy || (!sender.queue.isEmpty && !composer.isEditingQueued))
     }
 
     var body: some View {
         VStack(spacing: Theme.Spacing.sm) {
             CompletionList(composer: composer)
             VStack(alignment: .leading, spacing: 0) {
-                if composer.isEditingQueued { editingBanner }
+                if composer.isEditingQueued {
+                    editingBanner("Editing queued turn in composer") { composer.cancelEdit() }
+                } else if composer.editingMessage != nil {
+                    editingBanner("Editing message — sending it re-runs the chat from there") { composer.cancelMessageEdit() }
+                }
                 if !composer.attachments.isEmpty { attachmentStrip }
                 TextField(placeholder, text: $composer.draft, axis: .vertical)
                     .lineLimit(1...8)
@@ -68,12 +75,12 @@ struct ComposerView: View {
 
     private var controls: some View {
         HStack(spacing: 0) {
-            AttachMenu(composer: composer, disabled: disabled)
+            AttachMenu(composer: composer, disabled: disabled || composer.editingMessage != nil)
             ModelPill(composer: composer, disabled: disabled)
             EffortPill(composer: composer, disabled: disabled)
             Spacer(minLength: Theme.Spacing.xs)
             if let status { ContextMeter(status: status) }
-            if busy, composer.hasPayload, !composer.isEditingQueued {
+            if busy, composer.hasPayload, !editing {
                 Button { composer.queue() } label: {
                     Image(systemName: "square.stack")
                         .font(.system(size: Theme.IconSize.sm, weight: .medium))
@@ -91,7 +98,7 @@ struct ComposerView: View {
                     if showsStop {
                         RoundedRectangle(cornerRadius: 3).fill(Theme.primaryForeground).frame(width: 10, height: 10)
                     } else {
-                        Image(systemName: composer.isEditingQueued ? "checkmark" : Theme.Icon.send)
+                        Image(systemName: editing ? "checkmark" : Theme.Icon.send)
                             .font(.system(size: Theme.IconSize.sm, weight: .semibold))
                             .foregroundStyle(canSend ? Theme.primaryForeground : Theme.Text.quaternary)
                     }
@@ -102,20 +109,21 @@ struct ComposerView: View {
             }
             .buttonStyle(.plain)
             .disabled(!canSend)
-            .accessibilityLabel(showsStop ? "Stop" : composer.isEditingQueued ? "Save queued message" : "Send")
+            .accessibilityLabel(showsStop ? "Stop" : composer.isEditingQueued ? "Save queued message"
+                                : composer.editingMessage != nil ? "Send edited message" : "Send")
             .sensoryFeedback(.impact(weight: .light), trigger: sender.queue.count)
         }
         .padding(.horizontal, Theme.Spacing.xs)
         .padding(.bottom, Theme.Spacing.xs)
     }
 
-    private var editingBanner: some View {
+    private func editingBanner(_ title: String, cancel: @escaping () -> Void) -> some View {
         HStack {
-            Label("Editing queued turn in composer", systemImage: Theme.Icon.rename)
+            Label(title, systemImage: Theme.Icon.rename)
                 .hermesText(.meta)
                 .foregroundStyle(Theme.midground)
             Spacer()
-            Button("Cancel") { composer.cancelEdit() }
+            Button("Cancel", action: cancel)
                 .hermesText(.meta)
                 .buttonStyle(.plain)
                 .foregroundStyle(Theme.Text.tertiary)

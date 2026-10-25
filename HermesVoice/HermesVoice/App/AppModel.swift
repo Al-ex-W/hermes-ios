@@ -99,6 +99,19 @@ final class AppModel: ObservableObject {
         return chat
     }
 
+    /// The chat already open for a stored session, if any.
+    func existingChat(_ storedID: String) -> ChatModel? {
+        if let chat = chats[storedID] { return chat }
+        guard let call = calls.active?.chat, call.storedID == storedID else { return nil }
+        return call
+    }
+
+    /// The session was deleted: its chat lets go of the live session and leaves the cache.
+    func forget(_ storedID: String) {
+        existingChat(storedID)?.sessionGone()
+        chats[storedID] = nil
+    }
+
     func startCall(in chat: ChatModel) async {
         let address = settings.voiceServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !address.isEmpty, !settings.voiceToken.isEmpty else {

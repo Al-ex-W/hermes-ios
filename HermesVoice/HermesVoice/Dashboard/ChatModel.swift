@@ -25,6 +25,8 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// Stored rows older than the ones shown exist (`loadOlder`).
     @Published private(set) var hasOlderHistory = false
     @Published private(set) var loadingOlder = false
+    /// Which rows the host's display settings show (`display.show_reasoning`, `display.tool_progress`).
+    @Published private(set) var display = TranscriptDisplay()
 
     let id = UUID()
     /// The profile whose store holds this chat; nil for the dashboard's own.
@@ -37,7 +39,11 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
 
     /// The send decision tree and its local queue. They live with the chat, so the queue outlives the screen.
     private(set) lazy var sender = SendController(chat: self, ownedByChat: true)
-    private(set) lazy var composer = ComposerModel(sender: sender, connection: connection, profile: profile)
+    private(set) lazy var composer: ComposerModel = {
+        let composer = ComposerModel(sender: sender, connection: connection, profile: profile)
+        composer.rewind = { [weak self] message, text in await self?.rewind(message, to: text) ?? false }
+        return composer
+    }()
     private(set) lazy var status = StatusStackModel(connection: connection, chat: self, profile: profile)
 
     /// The socket dropped since the session was attached: `runtimeID` waits for the connection's re-attach.
@@ -49,7 +55,7 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     private var listeners: [UUID] = []
     private var attaching: Task<LiveSession?, Error>?
     private var resyncing: Task<Void, Never>?
-    private var lastSend: Task<Bool, Never>?
+    private var lastSend: Task<Delivery, Never>?
     private var users: Set<String> = []
     private var loaded: Bool
     /// Events were lost: the stored transcript must be fetched again.
@@ -72,6 +78,11 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// Local prompt rows Hermes may not have stored yet: delivery in flight, or it couldn't be confirmed.
     /// A history reload keeps them until it finds their text.
     private var unconfirmed: Set<String> = []
+    /// Unconfirmed rows that are corrections the running turn took: Hermes stores one when it applies it, so one
+    /// still missing once the turn is over was never applied.
+    private var corrections: Set<String> = []
+    /// The session was deleted: nothing attaches it again.
+    private var deleted = false
     /// The newest stored row id seen in a fetched transcript (ids only grow).
     private var newestStored = 0
     /// Per local prompt row, `newestStored` when it was sent: Hermes' stored copy of it can only be newer.
@@ -87,6 +98,10 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     private var slashCommand = ""
     /// A command rewrote the stored transcript: the reload keeps its output rows.
     private var keepingSlashOutput = false
+    /// A turn this chat didn't watch runs (attached mid-turn): the next reload draws it from Hermes' snapshot.
+    private var projection: LiveTurnSnapshot?
+    /// Rows drawn from a snapshot or a rewind stand in for Hermes' stored copy: fetch it once the turn ends.
+    private var reloadAfterTurn = false
 
     /// How a prompt's delivery ended.
     private enum Delivery { case delivered, failed, unknown }
@@ -129,6 +144,9 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// Attached on the live socket, so prompts can go out with `runtimeID`.
     private var isAttached: Bool { runtimeID != nil && !detached && connection.isConnected }
 
+    /// The live session while attached; nil while the chat waits for a re-attach (an id from before may be gone).
+    var attachedRuntimeID: String? { isAttached ? runtimeID : nil }
+
     /// Something was sent or shown in it, so it's no longer an empty draft.
     var hasContent: Bool { !transcript.items.isEmpty }
 
@@ -161,6 +179,15 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     func open() async {
         wantsReload = true
         await resync()
+        await refreshDisplay()
+    }
+
+    /// Reads the host's display settings for the transcript (`config.get full`).
+    func refreshDisplay() async {
+        guard let config = try? await connection.client.configGet(.init(profile: profile, key: "full")).config,
+              let settings = config["display"]?.objectValue else { return }
+        let next = TranscriptDisplay(showReasoning: settings["show_reasoning"], toolProgress: settings["tool_progress"])
+        if next != display { display = next }
     }
 
     /// The app is back in the foreground: catch up if the chat is in use and lost its session meanwhile.
@@ -182,6 +209,7 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// returns the resume/create result, or nil when already attached. `fresh` always asks Hermes again.
     @discardableResult
     private func attach(fresh: Bool = false) async throws -> LiveSession? {
+        if deleted { throw DashboardError.rpc("This session was deleted.") }
         if !fresh, isAttached { return nil }
         if let attaching {
             let result = try await attaching.value
@@ -206,16 +234,16 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                         ))
                     }, LiveSession.init)
                 } else {
-                    // A model picked before the session existed runs from its first turn. A retried create whose
-                    // answer was lost gets the same session back.
-                    let pick = composer.pendingModel
+                    // A model, effort or Fast picked before the session existed runs from its first turn. A retried
+                    // create whose answer was lost gets the same session back.
+                    let pick = composer.pendingModel, effort = composer.pendingEffort, fast = composer.pendingFast
                     session = try await LiveSession.attach({
                         try await connection.client.sessionCreate(.init(
                             profile: profile, cols: 96, source: "desktop", model: pick?.model, provider: pick?.provider,
-                            idempotencyKey: id.uuidString
+                            reasoningEffort: effort, fast: fast, idempotencyKey: id.uuidString
                         ))
                     }, LiveSession.init)
-                    if let pick { composer.pendingModelApplied(pick) }
+                    composer.pendingApplied(pick, effort: effort, fast: fast)
                 }
                 // The socket dropped while this was answered: ask again on the new one.
                 guard epoch == self.epoch else { continue }
@@ -240,6 +268,13 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
         for id in [session.runtimeID, storedID].compactMap({ $0 }) where !sessionIDs.contains(id) { sessionIDs.insert(id) }
         updateTracking()
         busy = session.running
+        if !replays, !transcript.turnRunning, session.running || session.inflight?.error != nil {
+            // A turn this chat didn't see run (or a failure Hermes kept for a client that missed it): the next
+            // reload draws it from the snapshot.
+            projection = LiveTurnSnapshot(session.inflight, queued: session.queuedPrompt)
+            needsResync = true
+        }
+        if session.running || session.todos != nil { status.restoreTodos(session.todos, running: session.running) }
         if session.running, !transcript.turnRunning {
             transcript.apply(.sessionInfo(SessionLiveInfo(running: true)))
         } else if !replays, !session.running, transcript.turnRunning {
@@ -310,7 +345,9 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                 do { try await attach() } catch { attachError = error }
                 // Show what is stored even when the live session can't be reached. A reopen while a turn
                 // streams keeps what it has: the stored copy lacks the reply in progress.
-                if !loaded || needsResync || (wantsReload && !transcript.turnRunning && !busy) { try await reloadHistory() }
+                if !loaded || needsResync || projection != nil || (wantsReload && !transcript.turnRunning && !busy) {
+                    try await reloadHistory()
+                }
                 wantsReload = false
                 if let attachError { throw attachError }
                 guard epoch == self.epoch else { continue }
@@ -401,9 +438,14 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// in `rows`), and a row of the running turn or one that arrived during the fetch (not in `before`) stays.
     private func show(_ rows: [JSONValue], before: Set<String>, pending: Set<String>) {
         noteStored(rows)
-        let local = transcript.items.compactMap { item in localPrompts[item.id].map { (row: item.id, text: $0) } }
+        let local = transcript.rows.compactMap { item in localPrompts[item.id].map { (row: item.id, text: $0) } }
         let stored = storedPrompts(Self.prompts(in: rows), local)
         let running = transcript.runningTurnIDs
+        // A prompt held for the next turn stays until Hermes stored it.
+        for prompt in transcript.nextPrompts where stored.contains(prompt.id) {
+            transcript.remove(id: prompt.id)
+            unconfirmed.remove(prompt.id)
+        }
         var keep: Set<String> = []
         for item in transcript.items where !storedItems.contains(item.id) {
             guard localPrompts[item.id] != nil else {
@@ -415,14 +457,25 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
             guard pending.contains(item.id) || unconfirmed.contains(item.id) || !before.contains(item.id) else { continue }
             if stored.contains(item.id) {
                 unconfirmed.remove(item.id)
+                corrections.remove(item.id)
+                continue
+            }
+            if corrections.contains(item.id), !busy, !transcript.turnRunning {
+                unconfirmed.remove(item.id)
+                corrections.remove(item.id)
                 continue
             }
             keep.insert(item.id)
         }
-        transcript.load(history: rows, keeping: keep)
-        storedItems = Set(transcript.items.map(\.id)).subtracting(keep)
-        localPrompts = localPrompts.filter { keep.contains($0.key) }
-        sentAfter = sentAfter.filter { keep.contains($0.key) }
+        // A turn this chat didn't watch is drawn from Hermes' snapshot, unless it ended meanwhile.
+        let live = projection.flatMap { busy || $0.error != nil ? $0 : nil }
+        projection = nil
+        let projected = transcript.load(history: rows, keeping: keep, projecting: live, key: "live-\(runtimeID ?? "session")")
+        if live != nil, busy { reloadAfterTurn = true }
+        storedItems = Set(transcript.items.map(\.id)).subtracting(keep).subtracting(projected)
+        let waiting = Set(transcript.nextPrompts.map(\.id))
+        localPrompts = localPrompts.filter { keep.contains($0.key) || waiting.contains($0.key) }
+        sentAfter = sentAfter.filter { keep.contains($0.key) || waiting.contains($0.key) }
     }
 
     private nonisolated static func isSlashOutput(_ item: TranscriptItem) -> Bool {
@@ -506,8 +559,14 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// bubble shows instead of the text (a skill command, not its expanded body).
     @discardableResult
     func send(_ text: String, queued: Bool = false, display: String? = nil) async -> Bool {
+        await sendPrompt(text, queued: queued, display: display) == .delivered
+    }
+
+    /// `send`, saying how the delivery ended. `truncate`: the stored prompt this one replaces, with everything after
+    /// it (a rewind).
+    private func sendPrompt(_ text: String, queued: Bool = false, display: String? = nil, truncate: Int? = nil) async -> Delivery {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return false }
+        guard !text.isEmpty else { return .failed }
         // Sending again what didn't get through keeps its bubble while that is still the newest prompt.
         let retry = undelivered.removeValue(forKey: text)
         let row: String
@@ -526,9 +585,9 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
         unconfirmed.insert(row)
         let checkFirst = retry?.maybeArrived == true
         let previous = lastSend
-        let task = Task { () -> Bool in
+        let task = Task { () -> Delivery in
             _ = await previous?.value
-            let outcome = await deliver(text, queued: queued, checkFirst: checkFirst, after: after)
+            let outcome = await deliver(text, queued: queued, checkFirst: checkFirst, after: after, truncate: truncate)
             switch outcome {
             case .delivered:
                 unconfirmed.remove(row)
@@ -542,7 +601,7 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                 // Stays unconfirmed, so reloads keep the row until Hermes shows it.
                 undelivered[text] = (row, true)
             }
-            return outcome == .delivered
+            return outcome
         }
         lastSend = task
         return await task.value
@@ -551,7 +610,9 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     /// Retries only what can't become a duplicate: a prompt that never left the phone, or one Hermes is shown
     /// not to have. Retries are queued so they never interrupt a running turn. `checkFirst`: an earlier send of
     /// this text may have arrived, so look before sending it again. `after`: the newest stored row id when it was sent.
-    private func deliver(_ text: String, queued: Bool, checkFirst: Bool, after: Int?) async -> Delivery {
+    /// `truncate`: a rewind to before that stored prompt, which waits out a turn still settling (4009) and is never
+    /// queued.
+    private func deliver(_ text: String, queued: Bool, checkFirst: Bool, after: Int?, truncate: Int? = nil) async -> Delivery {
         if checkFirst {
             switch await wasDelivered(text, after: after) {
             case true?:
@@ -563,8 +624,10 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                 return fail(DashboardError.disconnected, .unknown)
             }
         }
-        var queued = queued
-        for attempt in 1...3 {
+        var queued = queued && truncate == nil
+        var attempt = 1
+        var settling = 0
+        while true {
             var sent = false
             do {
                 try await attach()
@@ -574,7 +637,9 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                 do {
                     do {
                         _ = try await connection.client.promptSubmit(.init(
-                            sessionId: runtimeID, text: .string(text), queued: queued ? true : nil
+                            sessionId: runtimeID, text: .string(text), queued: queued ? true : nil,
+                            truncateBeforeRowId: truncate, confirmTruncate: truncate.map { _ in true },
+                            confirmEmptyTruncate: truncate.map { _ in true }
                         ))
                     } catch is GatewayDecodingError {
                         // Accepted; only the answer is outside the contract.
@@ -586,6 +651,10 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                 }
                 if needsResync { scheduleResync() }
                 return .delivered
+            } catch let error as GatewayRPCError where error.code == 4009 && truncate != nil && settling < 20 {
+                // The stopped turn still runs its post-turn hooks; a rewind must not land in it.
+                settling += 1
+                try? await Task.sleep(nanoseconds: 250_000_000)
             } catch {
                 if error.isRefusal { return fail(error) }
                 if sent {
@@ -597,11 +666,11 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                     }
                 }
                 if attempt == 3 { return fail(error) }
-                queued = true
+                queued = truncate == nil
                 try? await Task.sleep(nanoseconds: UInt64(attempt) * NSEC_PER_SEC)
+                attempt += 1
             }
         }
-        return .failed
     }
 
     /// After prompt.submit's answer was lost: re-attach and look for the prompt in the running turn (as its prompt,
@@ -650,12 +719,82 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
         }
     }
 
+    // MARK: Rewinding
+
+    /// Re-runs the conversation from a stored prompt with `text` in its place (the desktop's edit, restore and
+    /// regenerate): `prompt.submit` with `truncate_before_row_id` drops that prompt and everything after it, and
+    /// `text` runs from there. A running turn is stopped first, and the queue parked. False when nothing changed.
+    @discardableResult
+    func rewind(_ message: UserMessage, to text: String) async -> Bool {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+        if busy {
+            await sender.stop()
+            for _ in 0..<40 where busy { try? await Task.sleep(nanoseconds: 200_000_000) }
+            guard !busy else {
+                error = "The reply didn't stop, so the message wasn't changed."
+                return false
+            }
+        }
+        guard let rowID = await storedRowID(of: message),
+              let item = transcript.items.first(where: { if case let .user(prompt) = $0 { return prompt.rowID == rowID }; return false })
+        else {
+            error = "Hermes hasn't saved this message yet. Try again in a moment."
+            return false
+        }
+        let saved = (transcript, storedRows, storedItems, localPrompts, unconfirmed, sentAfter)
+        transcript.truncate(from: item.id)
+        storedRows = storedRows.filter { (Self.rowID($0) ?? .max) < rowID }
+        let remaining = Set(transcript.items.map(\.id))
+        storedItems.formIntersection(remaining)
+        localPrompts = localPrompts.filter { remaining.contains($0.key) }
+        unconfirmed.formIntersection(remaining)
+        sentAfter = sentAfter.filter { remaining.contains($0.key) }
+        // The turns dropped may have set a task list; it belongs to the abandoned timeline.
+        status.clearTodos()
+        switch await sendPrompt(text, truncate: rowID) {
+        case .delivered:
+            reloadAfterTurn = true
+            return true
+        case .failed:
+            (transcript, storedRows, storedItems, localPrompts, unconfirmed, sentAfter) = saved
+            return false
+        case .unknown:
+            needsResync = true
+            return false
+        }
+    }
+
+    /// Runs the prompt before `reply` again in its place.
+    func regenerate(_ reply: AssistantText) async {
+        guard let index = transcript.items.firstIndex(where: { $0.id == reply.id }),
+              case let .user(prompt)? = transcript.items[..<index].last(where: \.isUser) else { return }
+        await rewind(prompt, to: Self.promptText(prompt))
+    }
+
+    /// What a shown prompt sent: its reference chips (not its images, which Hermes held apart) before the text.
+    nonisolated static func promptText(_ message: UserMessage) -> String {
+        let refs = message.attachments.filter { $0.kind != .image }.map(\.ref).joined(separator: "\n")
+        return [refs, message.text].filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
+    /// The stored id of a shown prompt; a prompt sent from here learns it from a fresh copy of the transcript.
+    private func storedRowID(of message: UserMessage) async -> Int? {
+        if let rowID = message.rowID { return rowID }
+        try? await reloadHistory()
+        let text = Transcript.normalized(message.text)
+        for case let .user(stored) in transcript.items.reversed() where stored.rowID != nil && Transcript.normalized(stored.text) == text {
+            return stored.rowID
+        }
+        return nil
+    }
+
     // MARK: Session actions
 
     /// The whole conversation continues in a new session, which opens.
     func branch() async {
         guard let storedID else { return }
-        let target = SessionMenuTarget(storedID: storedID, runtimeID: isAttached ? runtimeID : nil, title: title, profile: profile)
+        let target = SessionMenuTarget(storedID: storedID, runtimeID: attachedRuntimeID, title: title, profile: profile)
         do {
             if case let .branched(stored, _, branchTitle) = try await sessionActions.branch(target) {
                 navigate?(.session(SessionSummary(id: stored, title: branchTitle.isEmpty ? title : branchTitle,
@@ -664,6 +803,51 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
         } catch {
             if !error.isCancellation { self.error = error.localizedDescription }
         }
+    }
+
+    /// The conversation up to `reply` continues in a new session, which opens (`session.branch` with the count
+    /// of stored user and assistant messages it keeps).
+    func branch(from reply: AssistantText) async {
+        guard let rowID = reply.rowID, let end = storedRows.firstIndex(where: { Self.rowID($0) == rowID }) else {
+            error = "Only a saved reply can start a branch."
+            return
+        }
+        guard !busy else {
+            error = "Stop the reply first, then branch."
+            return
+        }
+        let count = storedRows[...end].filter { row in
+            guard let object = row.objectValue, ["user", "assistant"].contains(object["role"]?.stringValue) else { return false }
+            return !Transcript.text(object["content"]).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.count
+        do {
+            try await attach()
+            guard let runtimeID else { throw DashboardError.rpc("Hermes didn't open the session.") }
+            let key = UUID().uuidString
+            let branched: (id: String, title: String)
+            do {
+                let result = try await connection.client.sessionBranch(.init(sessionId: runtimeID, profile: profile, count: count,
+                                                                             idempotencyKey: key))
+                branched = (result.storedSessionId, result.title)
+            } catch let error as GatewayDecodingError {
+                guard let id = error.raw["stored_session_id"]?.stringValue else { throw error }
+                branched = (id, error.raw["title"]?.stringValue ?? "")
+            }
+            navigate?(.session(SessionSummary(id: branched.id, title: branched.title.isEmpty ? title : branched.title,
+                                              lastActive: nil, profile: profile)))
+        } catch {
+            if !error.isCancellation { self.error = error.localizedDescription }
+        }
+    }
+
+    /// The session was deleted: nothing re-attaches it, and its prompts are let go.
+    func sessionGone() {
+        deleted = true
+        runtimeID = nil
+        detached = false
+        busy = false
+        endLiveTurn()
+        connection.untrack(self)
     }
 
     /// The session menu renamed it.
@@ -709,6 +893,12 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
         case .messageComplete:
             busy = false
             completions += 1
+            if reloadAfterTurn {
+                // Hermes' stored copy of the turn replaces what stood in for it.
+                reloadAfterTurn = false
+                needsResync = true
+                if isInUse { scheduleResync() }
+            }
         case let .sessionInfo(info):
             if let running = info.running { busy = running }
         case let .sessionTitle(payload):
@@ -764,12 +954,22 @@ extension ChatModel: ChatSending {
         }
     }
 
-    func submit(_ text: String, attachments: [StagedAttachment]) async -> Bool {
-        await send(StagedAttachment.promptText(text, attachments))
+    /// The bubble shows the photos sent with it as chips at once, the way Hermes' stored copy will.
+    func submit(_ text: String, attachments: [StagedAttachment], queued: Bool, display: String?) async -> Bool {
+        let prompt = StagedAttachment.promptText(text, attachments)
+        let images = StagedAttachment.imageLines(attachments)
+        let shown = images.isEmpty ? display : "\(images)\n\(display ?? prompt)"
+        return await send(prompt, queued: queued, display: shown)
+    }
+
+    func unstage(_ staged: StagedAttachment) async {
+        guard let path = staged.path, let session = staged.sessionID, session == runtimeID else { return }
+        _ = try? await connection.client.imageDetach(.init(sessionId: session, profile: profile, path: path))
     }
 
     /// Shows the correction as the user's message at once (Hermes stores it as one), and takes it back if the turn
-    /// refused it.
+    /// refused it. One Hermes holds for the next turn moves below the running turn, which goes on above it. It
+    /// stays unconfirmed until a stored copy holds it, so reloads keep it meanwhile.
     func redirect(_ text: String) async -> RedirectOutcome {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, isAttached, let runtimeID else { return .rejected }
@@ -786,8 +986,14 @@ extension ChatModel: ChatSending {
         } catch {
             outcome = .failed
         }
-        unconfirmed.remove(row)
-        if !outcome.delivered {
+        switch outcome {
+        case .redirected:
+            corrections.insert(row)
+        case .queued:
+            transcript.withdrawCorrection(row)
+            transcript.appendNextPrompt(text, id: row)
+        case .rejected, .failed:
+            unconfirmed.remove(row)
             transcript.withdrawCorrection(row)
             localPrompts[row] = nil
             sentAfter[row] = nil
@@ -856,6 +1062,7 @@ extension ChatModel: SlashCommandHost {
             needsResync = true
             if isInUse { scheduleResync() }
         }
+        await status.refreshContext()
     }
 }
 

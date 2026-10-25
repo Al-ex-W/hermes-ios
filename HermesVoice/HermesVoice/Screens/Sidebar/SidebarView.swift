@@ -11,6 +11,9 @@ struct SidebarView: View {
     @State private var renaming: SessionInfo?
     @State private var renameText = ""
     @State private var deleting: SessionInfo?
+    @State private var moving: SessionInfo?
+    @State private var moveChoices: [SessionProject] = []
+    @State private var exported: URL?
     /// Messaging platforms showing all their rows.
     @State private var expandedPlatforms: Set<String> = []
 
@@ -79,6 +82,18 @@ struct SidebarView: View {
             Button("Delete", role: .destructive) { Task { await sidebar.delete(session) } }
         } message: { session in
             Text("This will permanently delete “\(session.displayTitle)”. This cannot be undone.")
+        }
+        .confirmationDialog("Move to project", isPresented: Binding(get: { moving != nil }, set: { if !$0 { moving = nil } }),
+                            titleVisibility: .visible, presenting: moving) { session in
+            ForEach(moveChoices) { project in
+                Button(project.name) { Task { await sidebar.move(session, to: project) } }
+            }
+        } message: { _ in
+            Text(moveChoices.isEmpty ? "No other projects." : "The session's workspace moves to the project's folder.")
+        }
+        .sheet(item: Binding(get: { exported.map(SharedFile.init) }, set: { if $0 == nil { exported = nil } })) { file in
+            ShareSheet(items: [file.url])
+                .presentationDetents([.medium, .large])
         }
         .alert("Hermes", isPresented: Binding(get: { sidebar.actionError != nil }, set: { if !$0 { sidebar.actionError = nil } })) {
             Button("OK", role: .cancel) {}
@@ -274,6 +289,21 @@ struct SidebarView: View {
         }
         Button { UIPasteboard.general.string = session.id } label: {
             Label("Copy ID", systemImage: Theme.Icon.copy)
+        }
+        Divider()
+        Button { Task { await sidebar.branch(session) } } label: {
+            Label("Branch", systemImage: Theme.Icon.branch)
+        }
+        Button { Task { exported = await sidebar.export(session) } } label: {
+            Label("Export JSON", systemImage: Theme.Icon.export)
+        }
+        Button {
+            Task {
+                moveChoices = await sidebar.projects(for: session)
+                moving = session
+            }
+        } label: {
+            Label("Move to project…", systemImage: "folder")
         }
         Divider()
         Button { Task { await sidebar.setArchived(session, !session.archived) } } label: {

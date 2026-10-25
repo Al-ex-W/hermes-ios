@@ -65,7 +65,14 @@ final class ComposerModel: ObservableObject {
     /// A pick made before the chat had a session. `session.create` should carry it; it is also applied with
     /// `config.set` once the session exists.
     @Published private(set) var pendingModel: ModelPick?
+    /// Effort and Fast chosen before the chat had a session, for `session.create` (or `config.set` once it exists).
+    private(set) var pendingEffort: String?
+    private(set) var pendingFast: Bool?
     @Published var modelConfirmation: ModelConfirmation?
+    /// The stored prompt the draft replaces (Edit on a user bubble): sending it re-runs the conversation from there.
+    @Published private(set) var editingMessage: UserMessage?
+    /// Re-runs the conversation from a prompt with new text; true when it went out. Set by the chat.
+    var rewind: ((UserMessage, String) async -> Bool)?
 
     let sender: SendController
     let profile: String?
@@ -78,6 +85,8 @@ final class ComposerModel: ObservableObject {
     private var sessionID: String?
     /// The draft and attachments set aside while a queued prompt is edited in their place.
     private var editStash: (draft: String, attachments: [ComposerAttachment])?
+    /// The same, while a sent prompt is edited.
+    private var messageStash: (draft: String, attachments: [ComposerAttachment])?
     /// The next draft change came from accepting a completion.
     private var accepting = false
 
@@ -133,6 +142,8 @@ final class ComposerModel: ObservableObject {
         catalog = nil
         guard current != nil else { return }
         Task {
+            if let effort = pendingEffort { await setEffort(effort) }
+            if let fast = pendingFast { await setFast(fast) }
             if let pick = pendingModel {
                 await select(pick)
             } else {
@@ -146,6 +157,7 @@ final class ComposerModel: ObservableObject {
     /// Sends the draft (the composer clears it at once, and gets it back if nothing went out). Saving an edited
     /// queued prompt brings back the draft it set aside.
     func send() async {
+        if let message = editingMessage { return await sendEdit(of: message) }
         let text = draft, picked = attachments
         clear()
         let result = await sender.send(text, attachments: picked)
@@ -194,12 +206,52 @@ final class ComposerModel: ObservableObject {
     }
 
     func removeAttachment(_ id: UUID) {
+        guard let removed = attachments.first(where: { $0.id == id }) else { return }
         attachments.removeAll { $0.id == id }
+        Task { await sender.discard(removed) }
+    }
+
+    // MARK: Editing a sent prompt
+
+    /// Loads a sent prompt into the composer (its reference chips as `@` lines); what was being typed waits.
+    func editMessage(_ message: UserMessage) {
+        if isEditingQueued { cancelEdit() }
+        if editingMessage == nil { messageStash = (draft, attachments) }
+        editingMessage = message
+        setDraft(ChatModel.promptText(message))
+        attachments = []
+    }
+
+    func cancelMessageEdit() {
+        guard editingMessage != nil else { return }
+        editingMessage = nil
+        restoreMessageStash()
+    }
+
+    private func restoreMessageStash() {
+        let stash = messageStash
+        messageStash = nil
+        setDraft(stash?.draft ?? "")
+        attachments = stash?.attachments ?? []
+    }
+
+    /// Sends the edit as a rewind; refused, the edit stays in the composer.
+    private func sendEdit(of message: UserMessage) async {
+        let text = draft
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let rewind else { return }
+        editingMessage = nil
+        restoreMessageStash()
+        guard await rewind(message, text) == false else { return }
+        messageStash = (draft, attachments)
+        editingMessage = message
+        setDraft(text)
+        attachments = []
     }
 
     // MARK: Editing a queued prompt
 
     func edit(_ id: UUID) {
+        cancelMessageEdit()
         guard editStash == nil, let entry = sender.beginEdit(id) else { return }
         editStash = (draft, attachments)
         setDraft(entry.display ?? entry.text)
@@ -443,10 +495,8 @@ final class ComposerModel: ObservableObject {
             return
         }
         pendingModel = nil
-        let scope = pick.provider.lowercased() == "moa" ? " --session" : ""
         do {
-            let result = try await client.configSet(.init(profile: profile, key: "model",
-                                                          value: .string("\(pick.model) --provider \(pick.provider)\(scope)"),
+            let result = try await client.configSet(.init(profile: profile, key: "model", value: .string(Self.switchValue(pick)),
                                                           sessionId: session))
             if result.confirmRequired == true {
                 model = previous
@@ -464,25 +514,36 @@ final class ComposerModel: ObservableObject {
         }
     }
 
-    /// `session.create` carried the pick made before the session existed, so there is nothing left to apply.
-    func pendingModelApplied(_ pick: ModelPick) {
-        if pendingModel == pick { pendingModel = nil }
+    /// `config.set model`'s value: `<model> --provider <p>`, session-only for a MoA preset (never saved as the default).
+    nonisolated static func switchValue(_ pick: ModelPick) -> String {
+        "\(pick.model) --provider \(pick.provider)\(pick.provider.lowercased() == "moa" ? " --session" : "")"
+    }
+
+    /// `session.create` carried what was picked before the session existed, so there is nothing left to apply.
+    func pendingApplied(_ pick: ModelPick?, effort: String?, fast: Bool?) {
+        if let pick, pendingModel == pick { pendingModel = nil }
+        if let effort, pendingEffort == effort { pendingEffort = nil }
+        if let fast, pendingFast == fast { pendingFast = nil }
     }
 
     /// Switches with a confirmation Hermes asked for (an expensive model).
     func confirmSelect(_ pick: ModelPick) async {
         guard let session = chat.runtimeSessionID else { return }
         model = pick
-        _ = try? await client.configSet(.init(profile: profile, key: "model", value: .string("\(pick.model) --provider \(pick.provider)"),
+        _ = try? await client.configSet(.init(profile: profile, key: "model", value: .string(Self.switchValue(pick)),
                                              sessionId: session, confirmExpensiveModel: true))
         await refreshModel()
     }
 
-    /// `config.set reasoning <level>`; "none" turns thinking off.
+    /// `config.set reasoning <level>`; "none" turns thinking off. Without a session the choice waits for it.
     func setEffort(_ level: String) async {
         let previous = effort
         effort = level
-        guard let session = chat.runtimeSessionID else { return }
+        guard let session = chat.runtimeSessionID else {
+            pendingEffort = level
+            return
+        }
+        pendingEffort = nil
         do {
             _ = try await client.configSet(.init(profile: profile, key: "reasoning", value: .string(level), sessionId: session))
         } catch is GatewayDecodingError {
@@ -499,7 +560,11 @@ final class ComposerModel: ObservableObject {
             return
         }
         fast = enabled
-        guard let session = chat.runtimeSessionID else { return }
+        guard let session = chat.runtimeSessionID else {
+            pendingFast = enabled
+            return
+        }
+        pendingFast = nil
         do {
             _ = try await client.configSet(.init(profile: profile, key: "fast", value: .string(enabled ? "fast" : "normal"), sessionId: session))
         } catch is GatewayDecodingError {

@@ -17,16 +17,18 @@ private class FakeChat: ChatSending {
     /// Runs as a redirect is answered (the turn ending meanwhile).
     var onRedirect: (() -> Void)?
     private(set) var log: [String] = []
-    private(set) var submitted: [(text: String, attachments: [StagedAttachment])] = []
+    private(set) var submitted: [(text: String, attachments: [StagedAttachment], queued: Bool, display: String?)] = []
+    private(set) var unstaged: [StagedAttachment] = []
+    private var stagings = 0
 
     func skipPendingClarify() async {
         log.append("skip")
         hasPendingClarify = false
     }
 
-    func submit(_ text: String, attachments: [StagedAttachment]) async -> Bool {
+    func submit(_ text: String, attachments: [StagedAttachment], queued: Bool, display: String?) async -> Bool {
         log.append("submit:\(text)")
-        submitted.append((text, attachments))
+        submitted.append((text, attachments, queued, display))
         if acceptsSubmit, busyAfterSubmit { isBusy = true }
         return acceptsSubmit
     }
@@ -49,8 +51,15 @@ private class FakeChat: ChatSending {
     func stage(_ attachment: PendingAttachment) async throws -> StagedAttachment {
         log.append("stage:\(attachment.filename)")
         if let stageError { throw stageError }
+        stagings += 1
         return StagedAttachment(kind: attachment.isImage ? .image : .file, name: attachment.filename,
-                                refText: attachment.isImage ? nil : "@file:\(attachment.filename)")
+                                refText: attachment.isImage ? nil : "@file:\(attachment.filename)",
+                                path: "/staged/\(stagings)-\(attachment.filename)", sessionID: runtimeSessionID)
+    }
+
+    func unstage(_ staged: StagedAttachment) async {
+        log.append("unstage:\(staged.name)")
+        unstaged.append(staged)
     }
 }
 
@@ -256,6 +265,7 @@ final class SendControllerTests: XCTestCase {
         let result = await sender.send("next thing")
         XCTAssertEqual(result, .queued)
         XCTAssertEqual(chat.log, ["redirect:next thing", "submit:next thing"])
+        XCTAssertEqual(chat.submitted.map(\.queued), [true], "a turn still settling runs it next, never as a correction")
         XCTAssertTrue(sender.queue.isEmpty)
     }
 
@@ -328,6 +338,80 @@ final class SendControllerTests: XCTestCase {
         await sender.drainIfIdle()
         XCTAssertEqual(chat.log, ["stage:photo.jpg", "submit:one", "stage:notes.txt", "submit:two"])
         XCTAssertTrue(sender.queue.isEmpty)
+    }
+
+    func testDrainedPromptsGoOutQueuedAndDraftsDont() async {
+        _ = await sender.send("now")
+        chat.isBusy = true
+        _ = sender.queueDraft("later")
+        chat.isBusy = false
+        await sender.drainIfIdle()
+        XCTAssertEqual(chat.submitted.map(\.text), ["now", "later"])
+        XCTAssertEqual(chat.submitted.map(\.queued), [false, true])
+    }
+
+    func testSendNowAndAQueuedSkillGoOutQueuedWithTheirDisplay() async {
+        chat.isBusy = true
+        _ = sender.queuePrompt("SKILL BODY", display: "/work fix it")
+        _ = sender.queueDraft("plain")
+        chat.isBusy = false
+        await sender.sendNow(sender.queue[1].id)
+        await sender.drainIfIdle()
+        chat.isBusy = false
+        await sender.drainIfIdle()
+        XCTAssertEqual(chat.submitted.map(\.text), ["plain", "SKILL BODY"])
+        XCTAssertEqual(chat.submitted.map(\.queued), [true, true])
+        XCTAssertEqual(chat.submitted.map(\.display), [nil, "/work fix it"], "the bubble shows the invocation")
+    }
+
+    // MARK: Staged attachments
+
+    func testAnAttachmentIsStagedOncePerSession() async {
+        chat.acceptsSubmit = false
+        _ = await sender.send("look", attachments: [photo])
+        chat.acceptsSubmit = true
+        _ = await sender.send("look", attachments: [photo])
+        XCTAssertEqual(chat.log, ["stage:photo.jpg", "submit:look", "submit:look"], "a retry doesn't upload it again")
+        XCTAssertEqual(chat.submitted.last?.attachments.first?.path, "/staged/1-photo.jpg")
+
+        chat.isBusy = false
+        _ = await sender.send("again", attachments: [photo])
+        XCTAssertEqual(chat.log.suffix(2), ["stage:photo.jpg", "submit:again"], "a turn took it, so it is staged anew")
+    }
+
+    func testAnAttachmentIsStagedAgainOnANewSession() async {
+        chat.acceptsSubmit = false
+        _ = await sender.send("look", attachments: [photo])
+        chat.runtimeSessionID = "r2"
+        _ = await sender.send("look", attachments: [photo])
+        XCTAssertEqual(chat.log, ["stage:photo.jpg", "submit:look", "stage:photo.jpg", "submit:look"])
+    }
+
+    func testARemovedAttachmentIsTakenBackOffTheSession() async {
+        chat.acceptsSubmit = false
+        _ = await sender.send("look", attachments: [photo, notes])
+        await sender.discard(photo)
+        await sender.discard(notes)
+        XCTAssertEqual(chat.unstaged.map(\.path), ["/staged/1-photo.jpg"], "only an image is held apart from the prompt")
+    }
+
+    func testImagesStagedForAnotherPromptAreTakenBackBeforeSending() async {
+        chat.acceptsSubmit = false
+        _ = await sender.send("look", attachments: [photo])
+        chat.acceptsSubmit = true
+        _ = await sender.send("never mind, just text")
+        XCTAssertEqual(chat.log, ["stage:photo.jpg", "submit:look", "unstage:photo.jpg", "submit:never mind, just text"])
+    }
+
+    func testRemovingAQueuedPromptTakesBackItsImage() async {
+        chat.isBusy = true
+        _ = await sender.send("see this", attachments: [photo])
+        chat.isBusy = false
+        chat.acceptsSubmit = false
+        await sender.drainIfIdle()
+        sender.remove(sender.queue[0].id)
+        await waitUntil { !self.chat.unstaged.isEmpty }
+        XCTAssertEqual(chat.unstaged.map(\.name), ["photo.jpg"])
     }
 
     func testQueuedSlashDrainsThroughSlash() async {

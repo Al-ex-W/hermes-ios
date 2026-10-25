@@ -30,13 +30,14 @@ private final class AttachedChat: ChatSending {
     var hasPendingClarify = false
     var hasBlockingPrompt = false
     func skipPendingClarify() async {}
-    func submit(_ text: String, attachments: [StagedAttachment]) async -> Bool { true }
+    func submit(_ text: String, attachments: [StagedAttachment], queued: Bool, display: String?) async -> Bool { true }
     func redirect(_ text: String) async -> RedirectOutcome { .redirected }
     func interrupt() async {}
     func runSlash(_ command: String) async -> Bool { true }
     func stage(_ attachment: PendingAttachment) async throws -> StagedAttachment {
         StagedAttachment(kind: .file, name: attachment.filename, refText: nil)
     }
+    func unstage(_ staged: StagedAttachment) async {}
 }
 
 @MainActor
@@ -106,6 +107,39 @@ final class ComposerTests: XCTestCase {
         XCTAssertEqual(gateway.calls("command.dispatch").first?.params, ["name": "work", "arg": "fix the leak", "session_id": "r1"])
         XCTAssertEqual(host.prompts.first?.text, "SKILL BODY")
         XCTAssertEqual(host.prompts.first?.display, "/work fix the leak")
+    }
+
+    func testSendDirectiveShowsTheMessageItSends() async {
+        gateway.handlers["slash.exec"] = { _ in .error(5000, "worker crashed") }
+        gateway.handlers["command.dispatch"] = { _ in .result(["type": "send", "message": "fix the build"]) }
+        _ = await run("/queue fix the build")
+        XCTAssertEqual(host.prompts.first?.text, "fix the build")
+        XCTAssertNil(host.prompts.first?.display, "not the command typed")
+        XCTAssertEqual(host.reloads, 0)
+    }
+
+    func testRetryShowsTheRewoundTranscriptAndThePromptItResends() async {
+        gateway.handlers["slash.exec"] = { _ in .error(5000, "worker crashed") }
+        gateway.handlers["command.dispatch"] = { _ in .result(["type": "send", "message": "the original prompt"]) }
+        _ = await run("/retry")
+        XCTAssertEqual(host.reloads, 1, "Hermes rewound the failed turn: the transcript is fetched again first")
+        XCTAssertEqual(host.prompts.first?.text, "the original prompt")
+        XCTAssertNil(host.prompts.first?.display)
+    }
+
+    func testASkillScaffoldShowsItsInvocation() {
+        let single = "[IMPORTANT: The user has invoked the \"work\" skill, indicating they want you to follow its instructions. "
+            + "The full skill content is loaded below.]\n\nBODY\n\nThe user has provided the following instruction alongside "
+            + "the skill invocation: fix   the\nleak\n\n[Runtime note: x]"
+        XCTAssertEqual(SlashCommandRunner.skillInvocation(single), "/work fix the leak")
+        XCTAssertEqual(SlashCommandRunner.skillInvocation("[IMPORTANT: The user has invoked the \"work\" skill. "
+                                                          + "The full skill content is loaded below.]\n\nBODY"), "/work")
+        XCTAssertNil(SlashCommandRunner.skillInvocation("just words"))
+        let skill = SlashCommand("/work fix it")
+        XCTAssertEqual(SlashCommandRunner.shown("BODY", display: nil, skill: true, command: skill), "/work fix it",
+                       "a skill body without a projection shows the command")
+        XCTAssertEqual(SlashCommandRunner.shown(single, display: nil, skill: false, command: skill), "/work fix the leak")
+        XCTAssertEqual(SlashCommandRunner.shown("x", display: " /goal ship ", skill: false, command: skill), "/goal ship")
     }
 
     func testDispatchRoutingNoiseKeepsTheExecError() async {
@@ -217,7 +251,8 @@ final class ComposerTests: XCTestCase {
         let staged = try await connection.client.stage(.image(Data([0xff, 0xd8]), filename: "photo.jpg"), sessionID: "r1")
         XCTAssertEqual(gateway.calls("image.attach_bytes").first?.params,
                        ["session_id": "r1", "content_base64": "/9g=", "filename": "photo.jpg"])
-        XCTAssertEqual(staged, StagedAttachment(kind: .image, name: "upload-1.jpg", refText: nil))
+        XCTAssertEqual(staged, StagedAttachment(kind: .image, name: "upload-1.jpg", refText: nil, path: "/w/.hermes/upload-1.jpg",
+                                                sessionID: "r1"), "the full path is what image.detach takes")
     }
 
     func testFileStagesAsADataURL() async throws {
@@ -280,8 +315,58 @@ final class ComposerTests: XCTestCase {
         chat.runtimeSessionID = nil
         let composer = ComposerModel(sender: SendController(chat: chat), connection: connection, profile: nil)
         await composer.select(ModelPick(provider: "openai", model: "gpt-5"))
+        await composer.setEffort("high")
+        await composer.setFast(true)
         XCTAssertEqual(composer.pendingModel, ModelPick(provider: "openai", model: "gpt-5"))
+        XCTAssertEqual(composer.pendingEffort, "high")
+        XCTAssertEqual(composer.pendingFast, true)
         XCTAssertTrue(gateway.calls("config.set").isEmpty)
+
+        composer.pendingApplied(ModelPick(provider: "openai", model: "gpt-5"), effort: "high", fast: true)
+        XCTAssertNil(composer.pendingModel)
+        XCTAssertNil(composer.pendingEffort)
+        XCTAssertNil(composer.pendingFast)
+    }
+
+    func testAConfirmedMoASwitchStaysSessionOnly() async {
+        gateway.handlers["config.set"] = { _ in .result(["key": "model", "value": "council --provider moa --session"]) }
+        let composer = ComposerModel(sender: SendController(chat: AttachedChat()), connection: connection, profile: nil)
+        await composer.confirmSelect(ModelPick(provider: "moa", model: "council"))
+        XCTAssertEqual(gateway.calls("config.set").first?.params["value"], "council --provider moa --session")
+        XCTAssertEqual(gateway.calls("config.set").first?.params["confirm_expensive_model"], true)
+    }
+
+    func testEditingASentPromptSendsItAsARewind() async {
+        let composer = ComposerModel(sender: SendController(chat: AttachedChat()), connection: connection, profile: nil)
+        var rewound: [(String, String)] = []
+        composer.rewind = { message, text in
+            rewound.append((message.id, text))
+            return true
+        }
+        composer.draft = "half-typed"
+        composer.editMessage(UserMessage(id: "row-3", text: "fix the bug",
+                                         attachments: [AttachmentRef("@file:src/a.swift")!, AttachmentRef("@image:shot.png")!], rowID: 3))
+        XCTAssertEqual(composer.draft, "@file:src/a.swift\n\nfix the bug", "references ride along; images can't be sent again")
+        composer.draft = "@file:src/a.swift\n\nfix the other bug"
+        await composer.send()
+        XCTAssertEqual(rewound.map(\.0), ["row-3"])
+        XCTAssertEqual(rewound.map(\.1), ["@file:src/a.swift\n\nfix the other bug"])
+        XCTAssertNil(composer.editingMessage)
+        XCTAssertEqual(composer.draft, "half-typed")
+
+        composer.editMessage(UserMessage(id: "row-3", text: "fix the bug", rowID: 3))
+        composer.cancelMessageEdit()
+        XCTAssertEqual(composer.draft, "half-typed")
+    }
+
+    func testARefusedRewindKeepsTheEdit() async {
+        let composer = ComposerModel(sender: SendController(chat: AttachedChat()), connection: connection, profile: nil)
+        composer.rewind = { _, _ in false }
+        composer.editMessage(UserMessage(id: "row-3", text: "fix the bug", rowID: 3))
+        composer.draft = "fix it now"
+        await composer.send()
+        XCTAssertEqual(composer.editingMessage?.id, "row-3")
+        XCTAssertEqual(composer.draft, "fix it now")
     }
 
     func testEditingAQueuedPromptSetsTheDraftAside() async {

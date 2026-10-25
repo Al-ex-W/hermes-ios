@@ -17,8 +17,10 @@ protocol ChatSending: AnyObject {
     /// as an ordinary message.
     func skipPendingClarify() async
     /// Sends a prompt carrying `attachments` (staged on the live session); true once Hermes accepted it. The prompt
-    /// text is `StagedAttachment.promptText(text, attachments)`.
-    func submit(_ text: String, attachments: [StagedAttachment]) async -> Bool
+    /// text is `StagedAttachment.promptText(text, attachments)`. `queued`: it comes from the local queue, so Hermes
+    /// must run it after the current turn (`prompt.submit queued`), never as a correction of it. `display` is what
+    /// its bubble shows instead of the text (a skill invocation).
+    func submit(_ text: String, attachments: [StagedAttachment], queued: Bool, display: String?) async -> Bool
     /// Corrects the running turn with `text` (`session.redirect`).
     func redirect(_ text: String) async -> RedirectOutcome
     /// Stops the running turn (`session.interrupt`).
@@ -27,6 +29,14 @@ protocol ChatSending: AnyObject {
     func runSlash(_ command: String) async -> Bool
     /// Stages an attachment on the live session (attaching first), for the next `submit`.
     func stage(_ attachment: PendingAttachment) async throws -> StagedAttachment
+    /// Takes a staged image back off the session (`image.detach`), so no later prompt carries it.
+    func unstage(_ staged: StagedAttachment) async
+}
+
+extension ChatSending {
+    func submit(_ text: String, attachments: [StagedAttachment]) async -> Bool {
+        await submit(text, attachments: attachments, queued: false, display: nil)
+    }
 }
 
 /// How a correction of the running turn ended.
@@ -80,6 +90,10 @@ struct StagedAttachment: Hashable {
     let name: String
     /// What the prompt carries for it (`@file:…`); nil for an image, which rides the session's attached images.
     let refText: String?
+    /// Where Hermes wrote an image (what `image.detach` takes).
+    var path: String?
+    /// The live session it was staged on.
+    var sessionID: String?
 
     /// The prompt for `text` with `attachments`: their refs, a blank line, then the text (the desktop's
     /// `buildContextText`). An image without text asks what it shows.
@@ -89,6 +103,14 @@ struct StagedAttachment: Hashable {
         let joined = [refs, text].filter { !$0.isEmpty }.joined(separator: "\n\n")
         if joined.isEmpty, attachments.contains(where: { $0.kind == .image }) { return "What do you see in this image?" }
         return joined
+    }
+
+    /// What the bubble of a prompt sent with `attachments` shows for its images until Hermes' stored copy replaces
+    /// it: an `@image:` line each, as the stored turn projects them.
+    static func imageLines(_ attachments: [StagedAttachment]) -> String {
+        attachments.filter { $0.kind == .image }.map { image in
+            image.name.contains(where: \.isWhitespace) ? "@image:`\(image.name)`" : "@image:\(image.name)"
+        }.joined(separator: "\n")
     }
 }
 
@@ -112,10 +134,12 @@ extension GatewayClient {
                 ))
             } catch let error as GatewayDecodingError {
                 guard error.raw["attached"]?.boolValue == true else { throw error }
-                return StagedAttachment(kind: .image, name: Self.leaf(error.raw["path"]?.stringValue) ?? filename, refText: nil)
+                let path = error.raw["path"]?.stringValue
+                return StagedAttachment(kind: .image, name: Self.leaf(path) ?? filename, refText: nil, path: path, sessionID: sessionID)
             }
             guard result.attached else { throw AttachmentError(message: result.message ?? "Couldn't attach \(filename).") }
-            return StagedAttachment(kind: .image, name: Self.leaf(result.path) ?? result.name ?? filename, refText: nil)
+            return StagedAttachment(kind: .image, name: Self.leaf(result.path) ?? result.name ?? filename, refText: nil,
+                                    path: result.path, sessionID: sessionID)
         case let .file(data, filename, mime):
             let dataURL = "data:\(mime.isEmpty ? "application/octet-stream" : mime);base64,\(data.base64EncodedString())"
             let result: FileAttachResult
@@ -123,10 +147,10 @@ extension GatewayClient {
                 result = try await fileAttach(.init(sessionId: sessionID, profile: profile, dataUrl: dataURL, name: filename))
             } catch let error as GatewayDecodingError {
                 guard error.raw["attached"]?.boolValue == true, let ref = error.raw["ref_text"]?.stringValue, !ref.isEmpty else { throw error }
-                return StagedAttachment(kind: .file, name: error.raw["name"]?.stringValue ?? filename, refText: ref)
+                return StagedAttachment(kind: .file, name: error.raw["name"]?.stringValue ?? filename, refText: ref, sessionID: sessionID)
             }
             guard result.attached, !result.refText.isEmpty else { throw AttachmentError(message: "Couldn't attach \(filename).") }
-            return StagedAttachment(kind: .file, name: result.name, refText: result.refText)
+            return StagedAttachment(kind: .file, name: result.name, refText: result.refText, sessionID: sessionID)
         }
     }
 

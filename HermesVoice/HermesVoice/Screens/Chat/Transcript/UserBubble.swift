@@ -1,9 +1,12 @@
 import SwiftUI
 
 /// The user's prompt: a bubble on the right, its attachments as chips below it. A line said on a call keeps the
-/// green speaker style.
+/// green speaker style. Pressed, it offers Copy, Edit (the edit re-runs the conversation from it) and Run again
+/// from here.
 struct UserBubble: View {
     let message: UserMessage
+    @Environment(\.transcriptActions) private var actions
+    @State private var confirmingRestore = false
 
     var body: some View {
         VStack(alignment: .trailing, spacing: Theme.Spacing.sm) {
@@ -24,8 +27,8 @@ struct UserBubble: View {
                 Text(message.text)
                     .hermesText(.conversation)
                     .foregroundStyle(Theme.Text.primary)
-                    .textSelection(.enabled)
                     .hermesBubble()
+                    .contextMenu { menu }
             }
             if !message.attachments.isEmpty {
                 TranscriptFlowLayout(alignment: .trailing) {
@@ -37,6 +40,21 @@ struct UserBubble: View {
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
         .padding(.leading, 48)
+        .confirmationDialog("Run the conversation again from here?", isPresented: $confirmingRestore, titleVisibility: .visible) {
+            Button("Run again") { actions.restore?(message) }
+        } message: {
+            Text("This message is sent again, and everything after it is replaced.")
+        }
+    }
+
+    @ViewBuilder private var menu: some View {
+        Button("Copy", systemImage: Theme.Icon.copy) { UIPasteboard.general.string = message.text }
+        if let edit = actions.edit {
+            Button("Edit", systemImage: Theme.Icon.rename) { edit(message) }
+        }
+        if actions.restore != nil {
+            Button("Run again from here", systemImage: Theme.Icon.restore) { confirmingRestore = true }
+        }
     }
 }
 

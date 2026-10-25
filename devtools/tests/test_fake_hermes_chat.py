@@ -677,3 +677,54 @@ def test_context_breakdown_workspace_move_and_branching():
     assert child["_branched_from"] == key and child["parent_session_id"] == key and child["message_count"] == 4
     assert empty_branch == 4008 and stale == 4001
     assert contract_problems(gateway) == []
+
+
+def test_rewinds_detaches_config_reads_and_closing_before_delete():
+    png = base64.b64encode(demo_png(8, 8)).decode()
+
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                gateway = await Gateway.connect(base, http)
+                sid, key = await open_chat(gateway, reasoning_effort="high", fast=True)
+                reads = [await gateway.call("config.get", {"session_id": sid, "key": k}) for k in ("reasoning", "fast")]
+                full = await gateway.call("config.get", {"key": "full"})
+                staged = await gateway.call("image.attach_bytes", {"session_id": sid, "content_base64": png})
+                detached = await gateway.call("image.detach", {"session_id": sid, "path": staged["path"]})
+                await turn(gateway, sid, "one")
+                await turn(gateway, sid, "two")
+                rows = (await http.get(f"/api/sessions/{key}/messages")).json()["messages"]
+                second = next(r["id"] for r in rows if r["role"] == "user" and r["content"] == "two")
+                unconfirmed = await failure(gateway, "prompt.submit", {"session_id": sid, "text": "x",
+                                                                       "truncate_before_row_id": second})
+                await gateway.call("prompt.submit", {"session_id": sid, "text": "blocked approve"})
+                busy = await failure(gateway, "prompt.submit", {"session_id": sid, "text": "x", "confirm_truncate": True,
+                                                                "truncate_before_row_id": second})
+                await gateway.call("session.interrupt", {"session_id": sid})
+                await gateway.event("message.complete", timeout=10)
+                await until(lambda: not fake.runtimes[sid].running, 5)
+                rows = (await http.get(f"/api/sessions/{key}/messages")).json()["messages"]
+                second = next(r["id"] for r in rows if r["role"] == "user" and r["content"] == "two")
+                rewound = await gateway.call("prompt.submit", {"session_id": sid, "text": "two, edited",
+                                                               "confirm_truncate": True, "truncate_before_row_id": second})
+                await until(lambda: not fake.runtimes[sid].running, 10)
+                after = [r["content"] for r in (await http.get(f"/api/sessions/{key}/messages")).json()["messages"]
+                         if r["role"] == "user"]
+                deleted = (await http.delete(f"/api/sessions/{key}")).json()
+                still_live = sid in fake.runtimes
+                closed = await gateway.call("session.close", {"session_id": sid})
+                gone = sid not in fake.runtimes and key not in fake.sessions
+                await gateway.close()
+        return reads, full, detached, unconfirmed, busy, rewound, after, deleted, still_live, closed, gone, gateway
+
+    reads, full, detached, unconfirmed, busy, rewound, after, deleted, still_live, closed, gone, gateway = \
+        asyncio.run(scenario())
+    assert [r["value"] for r in reads] == ["high", "fast"], "session.create took the effort and Fast picked first"
+    assert full["config"]["display"] == {"show_reasoning": True, "tool_progress": "all"}
+    assert detached == {"detached": True, "count": 0}
+    assert (unconfirmed, busy) == (4029, 4009)
+    assert rewound["status"] == "streaming" and len(rewound["survivor_user_row_ids"]) == 1
+    assert after == ["one", "two, edited"]
+    assert deleted == {"ok": True} and still_live, "the store goes, the runtime stays until session.close"
+    assert closed == {"closed": True} and gone
+    assert contract_problems(gateway) == []

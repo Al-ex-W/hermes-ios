@@ -83,9 +83,15 @@ struct ChatScreen: View {
     }
 
     private var actions: TranscriptActions {
-        TranscriptActions(
+        let chat = chat
+        return TranscriptActions(
             recover: { recovery, _ in recover(recovery) },
-            openMedia: { ref in openMedia(ref) }
+            openMedia: { ref in openMedia(ref) },
+            edit: { message in chat.composer.editMessage(message) },
+            restore: { message in Task { await chat.rewind(message, to: ChatModel.promptText(message)) } },
+            regenerate: { reply in Task { await chat.regenerate(reply) } },
+            branch: { reply in Task { await chat.branch(from: reply) } },
+            openSession: { id in open(.session(SessionSummary(id: id, title: "Agent session", lastActive: nil, profile: chat.profile))) }
         )
     }
 
@@ -98,8 +104,9 @@ struct ChatScreen: View {
         case .chooseModel, .switchProvider:
             chat.composer.modelMenuRequested = true
         case .editMessage:
+            // The corrected prompt replaces the refused one rather than following it.
             let last = chat.transcript.items.last { $0.isUser }
-            if case let .user(message)? = last { chat.composer.prefill(message.text) }
+            if case let .user(message)? = last { chat.composer.editMessage(message) }
         case .startNewSession:
             sidebar.newSession()
         }
@@ -164,7 +171,7 @@ private struct ChatSessionMenu: View {
     private var target: SessionMenuTarget? {
         guard let id = chat.storedID, chat.hasContent else { return nil }
         let row = sidebar.row(id)
-        return SessionMenuTarget(storedID: id, runtimeID: chat.runtimeID, title: chat.title, profile: chat.profile,
+        return SessionMenuTarget(storedID: id, runtimeID: chat.attachedRuntimeID, title: chat.title, profile: chat.profile,
                                  pinned: row?.pinned ?? false, unread: row?.unread ?? false,
                                  archived: row?.archived ?? false, cwd: row?.cwd)
     }
@@ -192,7 +199,7 @@ private struct TranscriptScroll: View {
                     if chat.transcript.items.isEmpty, chat.isNewChat, !chat.busy {
                         emptyState
                     }
-                    TranscriptList(items: chat.transcript.items)
+                    TranscriptList(items: chat.transcript.rows, display: chat.display)
                     activity
                     Color.clear.frame(height: 1).id(Self.bottom)
                 }
@@ -225,14 +232,14 @@ private struct TranscriptScroll: View {
             .onChange(of: visibleBottom) {
                 if following { proxy.scrollTo(Self.bottom, anchor: .bottom) }
             }
-            .onChange(of: chat.transcript.items.last) { old, new in
+            .onChange(of: chat.transcript.rows.last) { old, new in
                 // Follow the reply while the reader is at the end; a prompt just sent always brings it back there.
                 let sent = new?.isUser == true && new?.id != old?.id
                 guard following || sent else { return }
                 proxy.scrollTo(Self.bottom, anchor: .bottom)
             }
             .overlay(alignment: .bottom) {
-                if !following, !chat.transcript.items.isEmpty {
+                if !following, !chat.transcript.rows.isEmpty {
                     Button {
                         withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(Self.bottom, anchor: .bottom) }
                     } label: {

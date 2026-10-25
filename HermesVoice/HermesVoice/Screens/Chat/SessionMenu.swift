@@ -72,7 +72,14 @@ struct SessionActions {
         _ = try await patch(target, ["archived": archived])
     }
 
+    /// Deletes the stored session. A live one is stopped and closed first (`session.interrupt`, `session.close`):
+    /// Hermes refuses to delete a session whose turn holds it, and the store alone doesn't end the runtime, its
+    /// prompts or its processes.
     func delete(_ target: SessionMenuTarget) async throws {
+        if let runtimeID = target.runtimeID {
+            _ = try? await gateway.sessionInterrupt(.init(sessionId: runtimeID, profile: target.profile))
+            _ = try? await gateway.sessionClose(.init(sessionId: runtimeID, profile: target.profile))
+        }
         _ = try await client.request("DELETE", path(target), query: target.profile.map { ["profile": $0] } ?? [:])
     }
 
@@ -88,7 +95,7 @@ struct SessionActions {
     }
 
     /// The whole conversation into a new session: from the live one (`session.branch_whole`, or `session.branch`
-    /// on an older Hermes), else from the stored one (`session.branch_stored`).
+    /// on an older Hermes), else, or once Hermes no longer has that one, from the stored one (`session.branch_stored`).
     func branch(_ target: SessionMenuTarget) async throws -> SessionMenuEvent {
         let key = UUID().uuidString
         if let runtimeID = target.runtimeID {
@@ -96,8 +103,12 @@ struct SessionActions {
                 let result = try await gateway.sessionBranchWhole(.init(sessionId: runtimeID, profile: target.profile, idempotencyKey: key))
                 return .branched(storedID: result.storedSessionId, runtimeID: result.sessionId, title: result.title)
             } catch let error as GatewayRPCError where error.code == -32601 {
-                let result = try await Self.raw { try await gateway.sessionBranch(.init(sessionId: runtimeID, profile: target.profile, idempotencyKey: key)) }
-                return try Self.branched(result)
+                do {
+                    let result = try await Self.raw { try await gateway.sessionBranch(.init(sessionId: runtimeID, profile: target.profile, idempotencyKey: key)) }
+                    return try Self.branched(result)
+                } catch let error as GatewayRPCError where error.code == 4001 || error.code == 4007 {}
+            } catch let error as GatewayRPCError where error.code == 4001 || error.code == 4007 {
+                // Reaped or reclaimed meanwhile: the stored session is still there.
             } catch let error as GatewayDecodingError {
                 return try Self.branched(error.raw)
             }
@@ -220,6 +231,7 @@ struct SessionMenu: View {
                 Label(target.unread ? "Mark as read" : "Mark as unread",
                       systemImage: target.unread ? Theme.Icon.markRead : Theme.Icon.markUnread)
             }
+            Button { UIPasteboard.general.string = target.storedID } label: { Label("Copy ID", systemImage: Theme.Icon.copy) }
             Menu {
                 if projects.isEmpty {
                     Text("No other projects")
@@ -300,13 +312,13 @@ struct SessionMenu: View {
     }
 }
 
-private struct SharedFile: Identifiable {
+struct SharedFile: Identifiable {
     let url: URL
     var id: URL { url }
 }
 
 /// The system share sheet for an exported transcript.
-private struct ShareSheet: UIViewControllerRepresentable {
+struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
 
     func makeUIViewController(context: Context) -> UIActivityViewController {

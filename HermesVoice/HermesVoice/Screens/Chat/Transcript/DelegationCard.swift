@@ -1,17 +1,26 @@
 import SwiftUI
 
 /// A `delegate_task` fan-out as the agents it runs (`DelegateTool`): one bordered row per child with its goal,
-/// model and time, and its latest activity under it. A call that failed outright dispatched nothing, so it is the
-/// plain tool row that explains why.
+/// model and time, and its latest activity under it; a child that reported its own session opens it. A call that
+/// failed outright dispatched nothing, so it is the plain tool row that explains why.
 struct DelegationCard: View {
     let delegation: Delegation
+    @Environment(\.transcriptActions) private var actions
 
     var body: some View {
         if let call = delegation.call, call.done && call.status == .error || delegation.rows.isEmpty {
             ToolRow(call: call)
         } else {
             VStack(alignment: .leading, spacing: Theme.Spacing.toolRow) {
-                ForEach(delegation.rows) { DelegateRowView(row: $0) }
+                ForEach(delegation.rows) { row in
+                    if let child = row.childSessionID, let open = actions.openSession {
+                        Button { open(child) } label: { DelegateRowView(row: row) }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Opens the agent's session")
+                    } else {
+                        DelegateRowView(row: row)
+                    }
+                }
             }
         }
     }
@@ -51,6 +60,7 @@ private struct DelegateRowView: View {
         .animation(.easeInOut(duration: 0.2), value: row.activity.last)
         .padding(.horizontal, Theme.Spacing.lg)
         .padding(.vertical, Theme.Spacing.md)
+        .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.widget))
         .overlay {
             RoundedRectangle(cornerRadius: Theme.Radius.widget)
                 .strokeBorder(Theme.Hairline.tertiary, lineWidth: Theme.hairlineWidth)

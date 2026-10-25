@@ -26,7 +26,9 @@ struct ComposerAttachment: Identifiable, Hashable {
 /// - busy with attachments, or a blocking prompt (approval, sudo, secret): it joins the local queue;
 /// - busy, nothing typed: Stop interrupts the turn (and parks the queue).
 /// The queue drains one prompt at a time whenever the chat is idle and not parked, retrying a failed send a few
-/// times before reporting it stuck.
+/// times before reporting it stuck. A drained prompt goes out `queued`, so a turn still settling runs it next
+/// instead of taking it as a correction. Hermes keeps a staged image until a turn takes it, so an attachment is
+/// staged once per live session, and one no prompt carries any more is taken back off it.
 @MainActor
 final class SendController: ObservableObject {
     struct QueuedPrompt: Identifiable, Equatable {
@@ -92,6 +94,8 @@ final class SendController: ObservableObject {
     private var failures: [UUID: Int] = [:]
     private var retry: Task<Void, Never>?
     private var observation: AnyCancellable?
+    /// What Hermes holds for each attachment (by `ComposerAttachment.id`) that no turn has taken yet.
+    private var staged: [UUID: StagedAttachment] = [:]
 
     /// `retryDelay` times the failure count is the wait before a failed queued send is tried again. `ownedByChat`:
     /// the chat holds this controller, so the controller doesn't hold it back.
@@ -143,7 +147,7 @@ final class SendController: ObservableObject {
             guard let head else { return .kept }
             return await drain(head.id) == true ? .drained : .kept
         }
-        return await deliver(text, attachments) ? (slash ? .ranSlash : .submitted) : .kept
+        return await deliver(text, attachments, queued: false) ? (slash ? .ranSlash : .submitted) : .kept
     }
 
     /// The queue button while a turn runs: holds the draft for the next turn.
@@ -175,8 +179,10 @@ final class SendController: ObservableObject {
         return .queued
     }
 
-    /// Stages the attachments, then submits; a slash command runs instead.
-    private func deliver(_ text: String, _ attachments: [ComposerAttachment]) async -> Bool {
+    /// Stages the attachments, then submits; a slash command runs instead. An attachment staged on the live session
+    /// already (an earlier attempt) isn't sent again, and images staged for prompts other than this one are taken
+    /// back first, since Hermes gives the next turn every image it holds.
+    private func deliver(_ text: String, _ attachments: [ComposerAttachment], queued: Bool, display: String? = nil) async -> Bool {
         if Self.isSlashCommand(text) {
             guard attachments.isEmpty else {
                 notice = Self.slashWithAttachments
@@ -184,16 +190,37 @@ final class SendController: ObservableObject {
             }
             return await chat.runSlash(text)
         }
-        var staged: [StagedAttachment] = []
+        var carried: [StagedAttachment] = []
         for attachment in attachments {
+            if let held = staged[attachment.id], held.sessionID == chat.runtimeSessionID {
+                carried.append(held)
+                continue
+            }
             do {
-                staged.append(try await chat.stage(attachment.pending))
+                let held = try await chat.stage(attachment.pending)
+                staged[attachment.id] = held
+                carried.append(held)
             } catch {
                 if !error.isCancellation { notice = error.localizedDescription }
                 return false
             }
         }
-        return await chat.submit(text, attachments: staged)
+        let ids = Set(attachments.map(\.id))
+        for id in staged.keys where !ids.contains(id) { await discardStaged(id) }
+        guard await chat.submit(text, attachments: carried, queued: queued, display: display) else { return false }
+        // The turn took them.
+        for id in ids { staged[id] = nil }
+        return true
+    }
+
+    /// The composer or the queue let go of an attachment: an image Hermes holds for it is taken back.
+    func discard(_ attachment: ComposerAttachment) async {
+        await discardStaged(attachment.id)
+    }
+
+    private func discardStaged(_ id: UUID) async {
+        guard let held = staged.removeValue(forKey: id) else { return }
+        if held.kind == .image { await chat.unstage(held) }
     }
 
     private func refuse(_ message: String) -> Result {
@@ -246,7 +273,7 @@ final class SendController: ObservableObject {
         guard !draining, let entry = queue.first(where: { $0.id == id }) else { return nil }
         draining = true
         defer { draining = false }
-        guard await deliver(entry.text, entry.attachments) else { return false }
+        guard await deliver(entry.text, entry.attachments, queued: true, display: entry.display) else { return false }
         failures[id] = nil
         queue.removeAll { $0.id == id }
         // The queue flows again: what's left follows.
@@ -281,10 +308,13 @@ final class SendController: ObservableObject {
     }
 
     func remove(_ id: UUID) {
+        let dropped = queue.first { $0.id == id }?.attachments ?? []
         queue.removeAll { $0.id == id }
         failures[id] = nil
         if editingID == id { editingID = nil }
         if queue.isEmpty { parked = false }
+        guard !dropped.isEmpty else { return }
+        Task { for attachment in dropped { await discard(attachment) } }
     }
 
     /// Lifts a park and lets the queue flow.
@@ -354,9 +384,10 @@ private final class GoneChat: ChatSending {
     var hasPendingClarify: Bool { false }
     var hasBlockingPrompt: Bool { false }
     func skipPendingClarify() async {}
-    func submit(_ text: String, attachments: [StagedAttachment]) async -> Bool { false }
+    func submit(_ text: String, attachments: [StagedAttachment], queued: Bool, display: String?) async -> Bool { false }
     func redirect(_ text: String) async -> RedirectOutcome { .failed }
     func interrupt() async {}
     func runSlash(_ command: String) async -> Bool { false }
     func stage(_ attachment: PendingAttachment) async throws -> StagedAttachment { throw CancellationError() }
+    func unstage(_ staged: StagedAttachment) async {}
 }

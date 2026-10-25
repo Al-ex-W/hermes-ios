@@ -474,8 +474,14 @@ final class TranscriptTests: XCTestCase {
         XCTAssertEqual(running.count, 2, "the run and the reply, not the prompt")
         XCTAssertFalse(running.contains(prompt))
 
-        transcript.load(history: [["id": 1, "role": "user", "content": "go"]], keeping: running)
+        // Hermes saved the finished round as it ended; the reply in progress isn't saved yet.
+        transcript.load(history: [
+            ["id": 1, "role": "user", "content": "go"],
+            ["id": 2, "role": "assistant", "content": "", "tool_calls": [Self.call("c1", "terminal", "{\"command\": \"ls\"}")]],
+            ["id": 3, "role": "tool", "tool_call_id": "c1", "tool_name": "terminal", "content": "{\"output\": \"a.txt\"}"],
+        ], keeping: running)
         XCTAssertEqual(kinds, ["user", "run", "assistant"])
+        XCTAssertEqual(runs.flatMap(\.calls).map(\.callID), ["c1"], "the saved round shows once")
         apply(delta("ing"))
         XCTAssertEqual(assistants.map(\.markdown), ["Looking"], "the stream went on in the kept row")
         apply(complete("Looking good"))
@@ -483,6 +489,146 @@ final class TranscriptTests: XCTestCase {
         XCTAssertEqual(assistants.map(\.markdown), ["Looking good"])
         XCTAssertEqual(runs.first?.calls.first?.output, "a.txt")
         XCTAssertTrue(transcript.runningTurnIDs.isEmpty)
+    }
+
+    private static func call(_ id: String, _ name: String, _ arguments: String) -> JSONValue {
+        ["id": .string(id), "type": "function", "function": ["name": .string(name), "arguments": .string(arguments)]]
+    }
+
+    func testReloadMidTurnFoldsTheRunningCallAndSavedCommentaryIntoTheirSavedCopies() {
+        transcript.appendUser("go", id: "local-1")
+        apply(.messageStart, start("c1", "terminal", ["command": "ls"]), finish("c1", "terminal", ["output": "a.txt"]),
+              interim("Now the tests."), start("c2", "terminal", ["command": "make test"]))
+        transcript.load(history: [
+            ["id": 1, "role": "user", "content": "go"],
+            ["id": 2, "role": "assistant", "content": "", "tool_calls": [Self.call("c1", "terminal", "{\"command\": \"ls\"}")]],
+            ["id": 3, "role": "tool", "tool_call_id": "c1", "tool_name": "terminal", "content": "{\"output\": \"a.txt\"}"],
+            ["id": 4, "role": "assistant", "content": "Now the tests.",
+             "tool_calls": [Self.call("c2", "terminal", "{\"command\": \"make test\"}")]],
+        ], keeping: transcript.runningTurnIDs)
+        XCTAssertEqual(kinds, ["user", "run", "assistant", "run"])
+        XCTAssertEqual(runs.flatMap(\.calls).map(\.callID), ["c1", "c2"])
+        XCTAssertEqual(runs.last?.calls.last?.isPending, true, "the running call still runs")
+
+        apply(finish("c2", "terminal", ["output": "ok"]), complete("All green"))
+        XCTAssertEqual(runs.flatMap(\.calls).map(\.callID), ["c1", "c2"])
+        XCTAssertEqual(runs.last?.calls.last?.output, "ok", "the saved call took the result")
+        XCTAssertEqual(assistants.map(\.markdown), ["Now the tests.", "All green"])
+    }
+
+    func testReloadMidTurnKeepsACorrectionAndWhatStreamedBeforeIt() {
+        transcript.appendUser("write a poem", id: "local-1")
+        apply(.messageStart, delta("Roses are"))
+        transcript.appendCorrection("make it about cats", id: "local-2")
+        apply(delta("Cats are"))
+        let running = transcript.runningTurnIDs
+        XCTAssertEqual(running, Set([assistants[0].id, "local-2", assistants[1].id]), "the whole turn, not just past the correction")
+
+        let page: [JSONValue] = [["id": 1, "role": "user", "content": "write a poem"]]
+        transcript.load(history: page, keeping: running)
+        XCTAssertEqual(kinds, ["user", "assistant", "user", "assistant"])
+        apply(delta(" purring"))
+        XCTAssertEqual(assistants.map(\.markdown), ["Roses are", "Cats are purring"], "the stream goes on after the correction")
+        transcript.load(history: page, keeping: transcript.runningTurnIDs)
+        XCTAssertEqual(kinds, ["user", "assistant", "user", "assistant"], "a second reload keeps them too")
+        apply(complete("Cats are purring."))
+        XCTAssertEqual(assistants.map(\.markdown), ["Roses are", "Cats are purring."])
+    }
+
+    func testAPromptHeldForTheNextTurnStaysBelowTheRunningOne() {
+        transcript.appendUser("first", id: "local-1")
+        apply(.messageStart, delta("Working"))
+        transcript.appendNextPrompt("then this", id: "local-2")
+        apply(delta(" on it"), start("c1", "terminal", ["command": "ls"]))
+        XCTAssertEqual(transcript.rows.last?.id, "local-2")
+        XCTAssertEqual(kinds, ["user", "assistant", "run"], "the running turn's rows stay above it")
+        XCTAssertEqual(assistants.map(\.markdown), ["Working on it"])
+
+        apply(finish("c1", "terminal"), complete("Done"))
+        XCTAssertEqual(kinds, ["user", "assistant", "run", "assistant", "user"], "it joins the transcript after the turn")
+        XCTAssertTrue(transcript.nextPrompts.isEmpty)
+        apply(.messageStart, delta("Next"))
+        XCTAssertEqual(Array(kinds.suffix(2)), ["user", "assistant"])
+        XCTAssertEqual(assistants.last?.markdown, "Next")
+    }
+
+    func testANextPromptWithNoTurnRunningIsAnOrdinaryPrompt() {
+        transcript.appendNextPrompt("hello", id: "local-1")
+        XCTAssertEqual(kinds, ["user"])
+        XCTAssertTrue(transcript.nextPrompts.isEmpty)
+    }
+
+    // MARK: Projection
+
+    func testProjectionDrawsATurnThisTranscriptDidntWatch() {
+        apply(.sessionInfo(SessionLiveInfo(running: true)))
+        let live = LiveTurnSnapshot(prompt: "go", reply: "Let me look.Found it", streaming: true, queued: "next one")
+        let projected = transcript.load(history: [
+            ["id": 1, "role": "user", "content": "go"],
+            ["id": 2, "role": "assistant", "content": "Let me look.", "tool_calls": [Self.call("c1", "terminal", "{}")]],
+            ["id": 3, "role": "tool", "tool_call_id": "c1", "tool_name": "terminal", "content": "{\"output\": \"x\"}"],
+        ], projecting: live, key: "live")
+        XCTAssertEqual(kinds, ["user", "assistant", "run", "assistant"], "the saved prompt and commentary aren't drawn twice")
+        XCTAssertEqual(assistants.map(\.markdown), ["Let me look.", "Found it"])
+        XCTAssertEqual(projected, ["live-reply"])
+        XCTAssertEqual(transcript.nextPrompts.map(\.text), ["next one"])
+
+        apply(delta(" — done"))
+        XCTAssertEqual(assistants.last?.markdown, "Found it — done", "deltas go on in the projected reply")
+        XCTAssertTrue(transcript.runningTurnIDs.contains("live-reply"))
+        apply(complete("Found it — done"))
+        XCTAssertEqual(kinds, ["user", "assistant", "run", "assistant", "user"])
+    }
+
+    func testProjectionPlacesCorrectionsWhereTheyArrived() {
+        apply(.sessionInfo(SessionLiveInfo(running: true)))
+        let live = LiveTurnSnapshot(prompt: "write a poem", reply: "Roses are red. Cats are", streaming: true,
+                                    corrections: [.init(text: "about cats", offset: 14)])
+        transcript.load(history: [["id": 1, "role": "user", "content": "write a poem"]], projecting: live)
+        XCTAssertEqual(kinds, ["user", "assistant", "user", "assistant"])
+        XCTAssertEqual(assistants.map(\.markdown), ["Roses are red.", "Cats are"])
+        XCTAssertEqual(assistants.map(\.streaming), [false, true])
+        apply(delta(" purring"))
+        XCTAssertEqual(assistants.last?.markdown, "Cats are purring")
+    }
+
+    func testProjectionAddsAPromptThePageLacks() {
+        apply(.sessionInfo(SessionLiveInfo(running: true)))
+        transcript.load(history: [["id": 1, "role": "user", "content": "earlier"], ["id": 2, "role": "assistant", "content": "Sure"]],
+                        projecting: LiveTurnSnapshot(prompt: "now this", reply: "On it", streaming: true))
+        XCTAssertEqual(kinds, ["user", "assistant", "user", "assistant"])
+        XCTAssertEqual(transcript.items[2].id, "live-prompt")
+    }
+
+    func testProjectionShowsAFailureHermesKept() {
+        transcript.load(history: [["id": 1, "role": "user", "content": "go"]],
+                        projecting: LiveTurnSnapshot(prompt: "go", reply: "Half", error: "provider exploded"))
+        XCTAssertEqual(kinds, ["user", "assistant", "error"])
+        XCTAssertFalse(transcript.turnRunning)
+    }
+
+    func testDisplaySettingsHideReasoningAndTheToolFeed() {
+        transcript.appendUser("go")
+        apply(.messageStart, reasoning("hmm"), start("c1", "read_file", ["path": "a"]), finish("c1", "read_file"),
+              start("c2", "terminal", ["command": "false"]), finish("c2", "terminal", ["exit_code": 1, "output": ""]),
+              complete("Done"))
+        let quiet = TranscriptDisplay(showReasoning: false, toolProgress: false)
+        let shown = transcript.items.compactMap(quiet.shown)
+        XCTAssertFalse(shown.contains { if case .reasoning = $0 { return true }; return false })
+        let calls = shown.flatMap { item -> [ToolCall] in if case let .toolRun(run) = item { return run.calls }; return [] }
+        XCTAssertEqual(calls.map(\.callID), ["c2"], "a failed command stays")
+        XCTAssertEqual(TranscriptDisplay(showReasoning: .bool(false), toolProgress: .string("off")), quiet)
+        XCTAssertEqual(TranscriptDisplay(showReasoning: nil, toolProgress: .string("all")), TranscriptDisplay())
+    }
+
+    func testTruncateDropsTheRowAndWhatFollows() {
+        transcript.appendUser("one", id: "a")
+        apply(.messageStart, delta("Uno"), complete("Uno"))
+        transcript.appendUser("two", id: "b")
+        apply(.messageStart, delta("Do"))
+        transcript.truncate(from: "b")
+        XCTAssertEqual(kinds, ["user", "assistant"])
+        XCTAssertFalse(transcript.turnRunning)
     }
 
     func testReloadPutsKeptPromptsAfterTheStoredRows() {

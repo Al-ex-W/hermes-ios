@@ -237,6 +237,8 @@ enum Theme {
         static let send = "arrow.up"
         static let stop = "stop.fill"
         static let copy = "doc.on.doc"
+        static let retry = "arrow.clockwise"
+        static let restore = "arrow.uturn.backward"
         static let tool = "wrench.and.screwdriver"
         static let terminal = "terminal"
         static let reasoning = "brain"

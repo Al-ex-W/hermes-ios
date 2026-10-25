@@ -583,16 +583,62 @@ final class SidebarModel: ObservableObject {
         }
     }
 
+    /// Deletes the session, stopping and closing the live session a chat here holds for it first.
     func delete(_ session: SessionInfo) async {
         if selection == .session(session.id) { selection = nil }
-        await mutate(session, deleted: true, { _ in }) { client in
-            try await client.deleteSession(session.id, profile: session.profile)
+        let target = target(session)
+        await mutate(session, deleted: true, { _ in }) { _ in try await actions.delete(target) }
+        if edits[session.id]?.deleted == true {
+            opened[session.id] = nil
+            app?.forget(session.id)
         }
-        if edits[session.id]?.deleted == true { opened[session.id] = nil }
+    }
+
+    /// The whole conversation continues in a new session, which opens.
+    func branch(_ session: SessionInfo) async {
+        do {
+            guard case let .branched(storedID, _, title) = try await actions.branch(target(session)) else { return }
+            let summary = SessionSummary(id: storedID, title: title.isEmpty ? session.displayTitle : title, lastActive: nil,
+                                         profile: session.profile)
+            if let chat = app?.chat(for: summary) { open(chat) }
+            scheduleRefresh()
+        } catch {
+            if !error.isCancellation { actionError = error.localizedDescription }
+        }
+    }
+
+    /// The transcript as a JSON file to share.
+    func export(_ session: SessionInfo) async -> URL? {
+        do {
+            return try await actions.export(target(session))
+        } catch {
+            if !error.isCancellation { actionError = "Couldn't export the session: \(error.localizedDescription)" }
+            return nil
+        }
+    }
+
+    /// The projects the session can move into.
+    func projects(for session: SessionInfo) async -> [SessionProject] {
+        await actions.projects(for: target(session))
+    }
+
+    func move(_ session: SessionInfo, to project: SessionProject) async {
+        let target = target(session)
+        await mutate(session, { $0.cwd = project.root }) { _ in _ = try await actions.move(target, to: project) }
+    }
+
+    private var actions: SessionActions { SessionActions(client: client, connection: connection) }
+
+    /// A row as the session actions take it, with the live session a chat here holds for it.
+    private func target(_ session: SessionInfo) -> SessionMenuTarget {
+        SessionMenuTarget(storedID: session.id, runtimeID: app?.existingChat(session.id)?.attachedRuntimeID,
+                          title: session.title ?? "", profile: session.profile, pinned: session.pinned,
+                          unread: session.unread, archived: session.archived, cwd: session.cwd)
     }
 
     /// The chat's session menu already changed `id` on Hermes: the lists show it the same way at once.
     func applied(_ event: SessionMenuEvent, to id: String) async {
+        if event == .deleted { app?.forget(id) }
         guard let session = row(id) ?? opened[id] else { return scheduleRefresh() }
         switch event {
         case let .renamed(title):

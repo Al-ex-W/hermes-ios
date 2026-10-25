@@ -1,14 +1,14 @@
 import SwiftUI
 
-/// How full the session's context is (`session.usage` context_used / max / percent), as a small ring. Tapping it
-/// opens the breakdown by category (`session.context_breakdown`).
+/// How full the session's context is (`session.usage` context_used / max / percent, or the breakdown's estimate
+/// before a turn ran here), as a small ring. Tapping it opens the breakdown by category (`session.context_breakdown`).
 struct ContextMeter: View {
     @ObservedObject var status: StatusStackModel
     @State private var showing = false
 
     var body: some View {
-        if let usage = status.usage, let max = usage.contextMax, max > 0 {
-            let percent = Self.percent(usage)
+        if let context = status.context {
+            let percent = context.percent
             Button { showing = true } label: {
                 ZStack {
                     Circle().stroke(Theme.Hairline.secondary, lineWidth: 2)
@@ -23,7 +23,7 @@ struct ContextMeter: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Context usage")
-            .accessibilityValue("\(usage.contextEstimated == true ? "about " : "")\(percent)% full")
+            .accessibilityValue("\(context.estimated ? "about " : "")\(percent)% full")
             .popover(isPresented: $showing) {
                 ContextBreakdownView(status: status)
                     .presentationCompactAdaptation(.popover)
@@ -52,6 +52,7 @@ struct ContextBreakdownView: View {
         let used = status.breakdown?.contextUsed ?? usage?.contextUsed ?? 0
         let max = status.breakdown?.contextMax ?? usage?.contextMax ?? 0
         let estimated = status.breakdown?.contextEstimated ?? usage?.contextEstimated ?? false
+        let percent = status.context?.percent ?? 0
         let categories = status.breakdown?.categories ?? []
         let sum = categories.reduce(0) { $0 + $1.tokens }
         let total = Swift.max(1, sum > 0 ? sum : used)
@@ -64,7 +65,7 @@ struct ContextBreakdownView: View {
                     .foregroundStyle(Theme.Text.tertiary)
             }
             HStack {
-                Text("\(estimated ? "~" : "")\(usage.map(ContextMeter.percent) ?? 0)% Full")
+                Text("\(estimated ? "~" : "")\(percent)% Full")
                 Spacer()
                 if let compressions = usage?.compressions {
                     Label("\(compressions) compression\(compressions == 1 ? "" : "s")", systemImage: "square.stack")
