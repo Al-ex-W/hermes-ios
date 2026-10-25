@@ -1,0 +1,39 @@
+[project]
+name = "hermes-voice-plugin"
+version = "0.1.0"
+description = "Hermes plugin: agent-initiated voice calls to the HermesVoice iPhone app (start_call / end_call)"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Al-ex-W" }
+]
+requires-python = ">=3.11"
+# What Hermes installs next to its own packages. Everything else the plugin uses (httpx, PyJWT,
+# cryptography, FastAPI) already ships with Hermes. Keep in step with plugin.yaml.
+dependencies = [
+    "h2>=4,<5",
+]
+
+[dependency-groups]
+# Test-only: stand-ins for what the Hermes venv provides, plus the fake phone's client.
+dev = [
+    "cryptography>=44",
+    "fastapi>=0.110",
+    "httpx>=0.28.1",
+    "pyjwt>=2.9",
+    "pytest>=8.3",
+    "starlette>=0.40",
+    "uvicorn>=0.30",
+    "websockets>=13",
+]
+
+[tool.uv]
+# A Hermes plugin folder, not an installable distribution.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+markers = [
+    "integration: against a real `hermes serve` in a temp home (opt-in: HERMES_VOICE_INTEGRATION=1)",
+]

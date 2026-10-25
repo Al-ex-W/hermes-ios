@@ -12,8 +12,7 @@ final class ChatModelTests: XCTestCase {
     override func setUp() async throws {
         gateway = ScriptedGateway()
         connection = gateway.connection()
-        let settings = ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "test", password: "test",
-                                          voiceServerURL: "", voiceToken: "", speechLocale: "")
+        let settings = ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "test", password: "test")
         client = try DashboardClient(settings: settings)
         gateway.handlers["session.create"] = { _ in
             .result(["session_id": "r1", "stored_session_id": "s1", "message_count": 0, "messages": [], "info": ["running": false]])

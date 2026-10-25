@@ -1,0 +1,64 @@
+name: hermes_voice
+manifest_version: 2
+version: 0.1.0
+description: "Hermes calls you on the HermesVoice iPhone app and talks with you out loud (start_call / end_call)."
+author: Al-ex-W
+license: MIT
+homepage: https://github.com/Al-ex-W/hermes-ios
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - start_call
+  - end_call
+provides_hooks:
+  - pre_llm_call
+  - on_session_end
+# APNs needs HTTP/2, which httpx only speaks with h2 installed (Hermes' own venv lacks it).
+python_dependencies:
+  - "h2>=4,<5"
+requires_env:
+  - name: ELEVENLABS_API_KEY
+    description: "ElevenLabs API key: Hermes' voice on calls, and Scribe tokens for the phone's speech recognition"
+    url: https://elevenlabs.io/app/settings/api-keys
+    secret: true
+  - name: HERMES_VOICE_APNS_KEY_PATH
+    description: "Path to the APNs auth key (.p8) on this host; needed for Hermes to ring the phone"
+  - name: HERMES_VOICE_APNS_KEY_ID
+    description: "The APNs auth key's 10-character Key ID"
+  - name: HERMES_VOICE_APNS_TEAM_ID
+    description: "Your Apple Developer Team ID (10 characters)"
+optional_env:
+  - name: HERMES_VOICE_FAKE_TTS
+    description: "Set to 1 to speak short test tones instead of calling ElevenLabs"
+config_schema:
+  voice_id:
+    type: str
+    description: "ElevenLabs voice id (default: tts.elevenlabs.voice_id, else Hermes' default voice)"
+  model_id:
+    type: str
+    description: "ElevenLabs model (default: tts.elevenlabs.streaming_model_id, else eleven_flash_v2_5)"
+  max_chars:
+    type: int
+    default: 1000
+    description: "Longest line spoken at once; the rest is cut and the agent is told"
+  ring_timeout_s:
+    type: number
+    default: 45
+    description: "How long the phone rings before the call counts as not answered"
+  sync_reply_timeout_s:
+    type: number
+    default: 600
+    description: "How long a sync start_call waits for the user's reply"
+  fake_tts:
+    type: bool
+    default: false
+    description: "Speak test tones instead of calling ElevenLabs"
+  policy:
+    type: dict
+    description: >-
+      Who may ring the phone: allowed_sources (default [desktop, dashboard, tui]), allow_owner_dms (true) with
+      owner_ids, allow_cron / allow_subagents / allow_groups (false), rings_per_session (3) per session_window_s
+      (600), rings_global (10) per global_window_s (3600), quiet_hours {start: "22:00", end: "07:00",
+      action: refuse|confirm, timezone}

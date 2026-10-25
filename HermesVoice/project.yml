@@ -16,6 +16,11 @@ targets:
       Release: Config/Base.xcconfig
     sources:
       - path: HermesVoice
+    # Push Notifications, for the VoIP pushes that ring the phone (Background Modes voip + audio are in Info.plist).
+    entitlements:
+      path: HermesVoice/HermesVoice.entitlements
+      properties:
+        aps-environment: development
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).hermesvoice

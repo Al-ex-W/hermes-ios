@@ -51,14 +51,9 @@ struct UserMessage: Hashable {
     var rowID: Int?
     var timestamp: Date?
 
-    /// A line said on a call (`[Voice] …`, `[Voice, cut off] …`) without the marker Hermes reads. Merged queue slots
-    /// (prompts joined by blank lines) are shown as they are.
-    var spoken: String? {
-        guard text.hasPrefix("[Voice"), !text.contains("\n\n"),
-              let close = text.firstIndex(of: "]"), text[...close].range(of: "^\\[Voice(, [^\\]]+)?\\]$", options: .regularExpression) != nil
-        else { return nil }
-        return String(text[text.index(after: close)...]).trimmingCharacters(in: .whitespaces)
-    }
+    /// A line said on a call (`[Voice] …`, `[Voice, cut off] …`) without the marker and hint Hermes reads, with how
+    /// the turn ended when it didn't end on its own. Merged queue slots (prompts joined by blank lines) are shown as they are.
+    var spoken: String? { VoiceTranscript.spoken(text) }
 }
 
 /// A `@kind:value` reference sent with a prompt: an attached file or image, a folder, a URL, …
@@ -1576,11 +1571,8 @@ extension Transcript {
         return (lines.joined(separator: "\n").trimmed, refs + leading + images)
     }
 
-    /// "Voice call started" for the plugin's `[Voice call started]` (and the other call notices).
-    static func callNotice(_ text: String) -> String? {
-        guard text.hasPrefix("[Voice call "), let close = text.firstIndex(of: "]") else { return nil }
-        return String(text[text.index(after: text.startIndex)..<close])
-    }
+    /// "Voice call started" for the plugin's `[Voice call started]` (and its other notices, such as "Voice line not delivered").
+    static func callNotice(_ text: String) -> String? { VoiceTranscript.notice(text) }
 
     /// The result body of a background completion (`asyncResultBody`): its producer's boundaries, not the preamble.
     static func asyncResult(_ content: String) -> String? {

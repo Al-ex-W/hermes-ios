@@ -34,23 +34,26 @@ The stored transcript keeps assistant rows with `tool_calls`, so reopening a cha
 
 ### Run it for a Simulator test
 
-Use two terminals. Both commands use the `hermes-voice-mcp` venv, so you don't need to install anything.
+The fake uses the `hermes-voice-mcp` venv, so you don't need to install anything. Calls go through its fake
+`hermes_voice` plugin (below), so the fake alone is enough for the current app:
 
 ```bash
-# 1. Voice server with fake TTS (tones), a throwaway HERMES_HOME and a known token
+cd hermes-voice-mcp
+uv run python ../devtools/fake_hermes.py --port 9311
+```
+
+In the app (the Simulator shares the Mac's loopback), sign in to **Hermes dashboard** `http://127.0.0.1:9311` with
+username `test` and password `test`.
+
+Legacy: the `[Voice call started] call_id: …` / `speak` demo of earlier app builds also needs the MCP voice server,
+started first with fake TTS (tones), a throwaway HERMES_HOME and a known token:
+
+```bash
 cd hermes-voice-mcp
 HERMES_VOICE_FAKE_TTS=1 HERMES_VOICE_TOKEN=devtoken HERMES_HOME=$(mktemp -d) \
   uv run hermes-voice-mcp --port 8765
-
-# 2. Fake Hermes dashboard
-cd hermes-voice-mcp
 uv run python ../devtools/fake_hermes.py --port 9311 --voice-url http://127.0.0.1:8765 --voice-token devtoken
 ```
-
-In the app (the Simulator shares the Mac's loopback):
-
-- **Hermes dashboard**: `http://127.0.0.1:9311`, username `test`, password `test`
-- **Hermes Voice server**: `http://127.0.0.1:8765`, token `devtoken`
 
 The fake prints every RPC, every event and every `speak` result with the prefix `FAKE`, for example
 `FAKE 20:02:30 speak result (0.4s, ok): Spoken to the user (2.1s of audio).` Stop both with Ctrl-C.
@@ -111,6 +114,20 @@ Use a short grace to test what happens when the app was backgrounded for too lon
   from 1, and the last 512 events per session are kept for `session.events.since`, including the events sent
   while no client was attached. `epoch` is the `replay_epoch` of this process: a restarted fake starts over
   with a new one. Session-less broadcasts (`session.reclaimed`) have `session_id: ""` and no `seq`.
+
+### The fake `hermes_voice` plugin
+
+`fake_voice_plugin.py` is always mounted: the plugin's routes under `/api/plugins/hermes_voice/` (`WS /phone`,
+`POST /devices`, `POST /scribe-token` with a dummy token, `GET /status` with `tts: "fake"`) and its call model (one
+call slot, ring / answer / decline, sync and async `start_call`, injected `[Voice] …` turns and notices, with the
+texts of `hermes-voice-plugin/inject.py`). Speech is a tone per word. Typing `call me sync: <text>` or
+`call me async: <text>` in a chat makes the fake agent call `start_call`; `hang up` calls `end_call`.
+
+Nothing is pushed: `POST /api/plugins/hermes_voice/debug/ring {session_id, mode, text}` rings any session and
+returns the VoIP push payload, `GET …/debug/pushes` lists them. A debug build of the app takes the payload as a
+push with `xcrun simctl openurl booted "hermesvoice://ring?call_id=<hex>&session_id=<id>&mode=sync"` (it rings
+inside the app; answer from the call panel). The module docstring has a curl recipe; `--call-ring-timeout` and
+`--call-drop-retention` shorten the timers.
 
 ### Detached sessions
 
