@@ -2,10 +2,21 @@ import AVFoundation
 import Speech
 
 /// Turns what the user says into utterances: Apple speech recognition (on-device when the language
-/// has a model on the iPhone), ended by a short pause.
+/// has a model on the iPhone), ended by a short pause. AppleSpeechProvider makes them user turns.
 final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
+    /// One finished utterance.
+    struct Utterance {
+        let text: String
+        let startedAt: Date
+        let endedAt: Date
+        /// How it ended: "apple_silence" (the pause), "apple_final" (the recognizer finished the request).
+        let detector: String
+        /// Recognition failed with words heard: they are passed on, with the error.
+        let error: String?
+    }
+
     /// Called on the main queue with each finished utterance.
-    var onUtterance: ((String) -> Void)?
+    var onUtterance: ((Utterance) -> Void)?
     /// Called on the main queue with the words heard so far ("" once they are sent or dropped).
     var onPartial: ((String) -> Void)?
     /// Called on the main queue with a notice for the user (recognition unavailable, using Apple's
@@ -18,6 +29,8 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var heard = ""
+    /// When the words in `heard` began.
+    private var heardSince: Date?
     private var silenceTimer: Timer?
     private var retry: DispatchWorkItem?
     private var requestStarted = Date()
@@ -31,15 +44,20 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
     private var status: String?
     private var paused = false
     private var running = false
-    private let pause: TimeInterval = 1.2
+    /// Silence that ends an utterance.
+    let pause: TimeInterval
+    /// The locale recognition runs in.
+    let localeIdentifier: String
 
     /// `localeIdentifier` nil or "" picks the language automatically from the user's preferred languages.
-    init(localeIdentifier: String?) {
+    init(localeIdentifier: String?, pause: TimeInterval = 1.2) {
+        self.pause = pause
         var locale = Self.automaticLocale()
         if let localeIdentifier, !localeIdentifier.isEmpty, SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) != nil {
             locale = Locale(identifier: localeIdentifier)
         }
         recognizer = SFSpeechRecognizer(locale: locale)
+        self.localeIdentifier = locale.identifier
         languageName = Locale.current.localizedString(forIdentifier: locale.identifier) ?? locale.identifier
         usesServer = recognizer?.supportsOnDeviceRecognition == false
         super.init()
@@ -75,6 +93,16 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
     func restart() {
         guard running, !paused else { return }
         beginRequest()
+    }
+
+    /// Ends the utterance in progress now (Hermes cut in, or the call is ending) and returns it, or nil when
+    /// nothing was heard. Listening goes on with a fresh request.
+    func takePartial() -> Utterance? {
+        let since = heardSince
+        let text = takeHeard()
+        guard !text.isEmpty else { return nil }
+        if running, !paused { beginRequest() }
+        return Utterance(text: text, startedAt: since ?? Date(), endedAt: Date(), detector: "", error: nil)
     }
 
     /// While paused (Hermes is speaking, or the call is muted) audio is dropped and any half-heard words discarded.
@@ -140,11 +168,12 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
                     }
                     let text = result.bestTranscription.formattedString
                     if text != self.heard {
+                        if self.heard.isEmpty, !text.isEmpty { self.heardSince = Date() }
                         self.heard = text
                         self.onPartial?(text)
                         self.armSilenceTimer()
                     }
-                    if result.isFinal { self.finishUtterance() }
+                    if result.isFinal { self.finishUtterance(detector: "apple_final") }
                 } else if let error {
                     self.recognitionFailed(error)
                 }
@@ -161,6 +190,7 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
         lock.unlock()
         task?.cancel()
         task = nil
+        heardSince = nil
         if !heard.isEmpty {
             heard = ""
             onPartial?("")
@@ -170,6 +200,7 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
     /// Recognition gave up. A request that heard something or ran a while (no speech, the server's time
     /// limit) just starts over; one that fails straight away backs off, so a persistent error can't spin.
     private func recognitionFailed(_ error: Error) {
+        let since = heardSince
         let text = takeHeard()
         if requestHeardSomething || Date().timeIntervalSince(requestStarted) >= 3 {
             failures = 0
@@ -181,25 +212,32 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
             scheduleRetry(after: min(4, 0.5 * pow(2, Double(failures - 1))))
         }
         updateStatus()
-        if !text.isEmpty { onUtterance?(text) }
+        if !text.isEmpty {
+            onUtterance?(Utterance(text: text, startedAt: since ?? Date(), endedAt: Date(), detector: "apple_error",
+                                   error: error.localizedDescription))
+        }
     }
 
     private func armSilenceTimer() {
         silenceTimer?.invalidate()
         silenceTimer = Timer.scheduledTimer(withTimeInterval: pause, repeats: false) { [weak self] _ in
-            self?.finishUtterance()
+            self?.finishUtterance(detector: "apple_silence")
         }
     }
 
-    private func finishUtterance() {
+    private func finishUtterance(detector: String) {
+        let since = heardSince
         let text = takeHeard()
         beginRequest()
-        if !text.isEmpty { onUtterance?(text) }
+        if !text.isEmpty {
+            onUtterance?(Utterance(text: text, startedAt: since ?? Date(), endedAt: Date(), detector: detector, error: nil))
+        }
     }
 
     /// The words heard so far, cleared from the screen.
     private func takeHeard() -> String {
         let text = heard.trimmingCharacters(in: .whitespacesAndNewlines)
+        heardSince = nil
         if !heard.isEmpty {
             heard = ""
             onPartial?("")

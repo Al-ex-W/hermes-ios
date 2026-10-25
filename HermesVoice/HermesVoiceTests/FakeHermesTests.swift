@@ -18,8 +18,7 @@ final class FakeHermesTests: XCTestCase {
         guard let url = ProcessInfo.processInfo.environment["HERMES_FAKE_URL"] else {
             throw XCTSkip("Set HERMES_FAKE_URL to run against devtools/fake_hermes.py.")
         }
-        let settings = ConnectionSettings(dashboardURL: url, username: "test", password: "test",
-                                          voiceServerURL: "", voiceToken: "", speechLocale: "")
+        let settings = ConnectionSettings(dashboardURL: url, username: "test", password: "test")
         let client = try DashboardClient(settings: settings)
         try await client.signIn()
         self.client = client

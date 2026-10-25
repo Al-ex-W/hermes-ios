@@ -1,167 +1,193 @@
 import Foundation
 
-/// The call's socket to the Hermes Voice server (`/phone`): announces the call, receives the
-/// speech the `speak` tool streams, and confirms when each utterance has been heard.
+/// The call's socket to the plugin as VoiceCall sees it: the real one, or a scripted one in tests.
 @MainActor
-final class VoiceLink {
-    enum Incoming {
-        case ready
-        case speechStart(id: String, text: String, sampleRate: Double)
-        case audio(Data)
-        /// `cancelled` or `error`: the utterance won't finish and its queued audio should be dropped.
-        case speechEnd(id: String, cancelled: Bool, error: String?)
-        case closed(Close, Error?)
+protocol CallLink: AnyObject {
+    var onEvent: ((VoiceLink.Event) -> Void)? { get set }
+    /// Opens the socket with a fresh ws-ticket and sends the hello. When it can't, `.closed` is reported.
+    func connect() async
+    /// `completion` gets whether the frame was written.
+    func send(_ message: PhoneMessage, completion: ((Bool) -> Void)?)
+    /// Sends `final` (a bye, say) and then closes. No event is reported for this close.
+    func close(after final: [PhoneMessage])
+}
+
+extension CallLink {
+    func send(_ message: PhoneMessage) {
+        send(message, completion: nil)
+    }
+}
+
+/// The call's socket to the Hermes Voice plugin (`/api/plugins/hermes_voice/phone` on the dashboard): rings and
+/// answers, carries the speech `start_call` streams and the user's turns, and confirms each utterance was heard.
+@MainActor
+final class VoiceLink: CallLink {
+    enum Event: Equatable {
+        case message(PluginMessage)
+        case closed(Close)
     }
 
     /// Why the socket went away.
-    enum Close {
-        /// The server rejected the token (close code 4401, or HTTP 401/403 on the handshake). Don't retry.
+    enum Close: Equatable {
+        /// The plugin rejected the ticket twice (4401), the handshake got 401/403, or the dashboard signed us out.
         case unauthorized
-        /// The server didn't accept the hello (4400).
+        /// The plugin didn't accept the hello (4400).
         case badHello
         /// A newer connection with the same call_id replaced this one (4409).
         case replaced
-        /// Network drop or server restart: worth reconnecting.
+        /// Another session holds Hermes' one call slot (4429).
+        case busy
+        /// Network drop, stall (1011) or server restart: worth reconnecting.
         case dropped
     }
 
-    /// What the `/status` preflight found wrong.
-    enum ServerError: LocalizedError {
-        case wrongToken
-        case unreachable(String)
-        case unexpected(Int)
-
-        var errorDescription: String? {
-            switch self {
-            case .wrongToken:
-                return "Wrong voice server token: the Hermes Voice server rejected it. Check the token in Settings."
-            case let .unreachable(detail):
-                return "Can't reach the Hermes Voice server (\(detail)). Check the address in Settings and that Tailscale is connected."
-            case let .unexpected(status):
-                return "The Hermes Voice server answered HTTP \(status). Check the address in Settings."
-            }
-        }
-    }
-
-    var onMessage: ((Incoming) -> Void)?
-    private let url: URL
-    private let token: String
-    private let hello: JSON
+    var onEvent: ((Event) -> Void)?
+    private let client: DashboardClient
+    private let hello: PhoneHello
     private var task: URLSessionWebSocketTask?
     private var keepalive: Timer?
+    private var lastHeard = Date()
+    /// A 4401 was answered by minting a new ticket once; the next one is final. Reset by `ready`.
+    private var reminted = false
+    /// Bumped by every connect and close, so callbacks from an earlier socket or ticket request are ignored.
+    private var generation = 0
+    /// A socket that hears nothing (not even a pong) for this long has stalled.
+    private static let stallAfter: TimeInterval = 50
 
-    init(base: URL, token: String, callID: String, sessionID: String?, title: String) {
-        url = Self.url(base, path: "phone", websocket: true)
-        self.token = token
-        var hello: JSON = ["type": "hello", "call_id": callID, "title": title]
-        hello["session_id"] = sessionID
+    init(client: DashboardClient, hello: PhoneHello) {
+        self.client = client
         self.hello = hello
     }
 
-    /// Checks the address and token before a call starts: `GET /status` with the bearer token.
-    static func preflight(base: URL, token: String) async throws {
-        var request = URLRequest(url: url(base, path: "status", websocket: false), cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let response: URLResponse
+    func connect() async {
+        reminted = false
+        await dial()
+    }
+
+    func send(_ message: PhoneMessage, completion: ((Bool) -> Void)?) {
+        guard let task, let text = try? message.encoded() else {
+            completion?(false)
+            return
+        }
+        task.send(.string(text)) { error in
+            Task { @MainActor in completion?(error == nil) }
+        }
+    }
+
+    func close(after final: [PhoneMessage]) {
+        guard let task else { return drop() }
+        // Closes once the last frame was written (or after a moment), so the bye isn't lost to the close.
+        let finish: @Sendable () -> Void = { task.cancel(with: .normalClosure, reason: nil) }
+        drop(cancelling: false)
+        guard !final.isEmpty else { return finish() }
+        for (index, message) in final.enumerated() {
+            guard let text = try? message.encoded() else { continue }
+            task.send(.string(text)) { _ in if index == final.count - 1 { finish() } }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: finish)
+    }
+
+    // MARK: Socket
+
+    /// A fresh ticket (each admits one connection), then the socket.
+    private func dial() async {
+        drop()
+        let generation = generation
+        let ticket: String
         do {
-            (_, response) = try await URLSession.shared.data(for: request)
+            ticket = try await client.webSocketTicket()
         } catch {
-            throw ServerError.unreachable(error.localizedDescription)
+            guard generation == self.generation else { return }
+            if case .signedOut? = error as? DashboardError { return report(.closed(.unauthorized)) }
+            return report(.closed(.dropped))
         }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        switch status {
-        case 200: return
-        case 401, 403: throw ServerError.wrongToken
-        default: throw ServerError.unexpected(status)
-        }
+        guard generation == self.generation else { return }
+        open(ticket: ticket)
     }
 
-    /// `base` + `path`, with the scheme the transport needs (ws/wss for the socket, http/https otherwise).
-    private static func url(_ base: URL, path: String, websocket: Bool) -> URL {
-        var components = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
-        let secure = components.scheme == "https" || components.scheme == "wss"
-        components.scheme = websocket ? (secure ? "wss" : "ws") : (secure ? "https" : "http")
-        return components.url!
-    }
-
-    func connect() {
-        close(sendBye: false)
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let socket = URLSession.shared.webSocketTask(with: request)
+    private func open(ticket: String) {
+        var components = URLComponents(url: client.url("\(VoicePluginAPI.path)/phone", query: ["ticket": ticket]), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        var request = URLRequest(url: components.url!)
+        request.setValue("hermes-voice", forHTTPHeaderField: "X-Conduit-Client")
+        let socket = client.session.webSocketTask(with: request)
+        socket.maximumMessageSize = 4 * 1024 * 1024
         task = socket
+        lastHeard = Date()
         socket.resume()
-        send(hello)
+        send(.hello(hello))
         receive(on: socket)
         keepalive = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.send(["type": "ping"]) }
+            Task { @MainActor [weak self] in self?.tick() }
         }
     }
 
-    func close(sendBye: Bool = true) {
+    private func tick() {
+        guard let task else { return }
+        if Date().timeIntervalSince(lastHeard) > Self.stallAfter {
+            // Half-open path: nothing arrives, not even pongs. A fresh socket is the way back.
+            task.cancel(with: .goingAway, reason: nil)
+            drop()
+            return report(.closed(.dropped))
+        }
+        send(.ping)
+    }
+
+    /// Forgets the current socket (cancelling it unless the caller closes it itself) and its callbacks.
+    private func drop(cancelling: Bool = true) {
+        generation += 1
         keepalive?.invalidate()
         keepalive = nil
-        guard let task else { return }
-        if sendBye { send(["type": "bye"]) }
-        self.task = nil
-        task.cancel(with: .normalClosure, reason: nil)
-    }
-
-    func played(_ id: String) {
-        send(["type": "played", "id": id])
-    }
-
-    private func send(_ object: JSON) {
-        guard let task, let data = try? JSONSerialization.data(withJSONObject: object) else { return }
-        task.send(.string(String(decoding: data, as: UTF8.self))) { _ in }
+        if cancelling { task?.cancel(with: .goingAway, reason: nil) }
+        task = nil
     }
 
     private func receive(on socket: URLSessionWebSocketTask) {
         socket.receive { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self, self.task === socket else { return }
+                self.lastHeard = Date()
                 switch result {
                 case let .success(.data(data)):
-                    self.onMessage?(.audio(data))
+                    self.report(.message(.audio(data)))
                 case let .success(.string(text)):
-                    self.handle(text)
-                case let .failure(error):
-                    let reason = Self.reason(socket)
-                    self.close(sendBye: false)
-                    self.onMessage?(.closed(reason, error))
-                    return
+                    if let message = PluginMessage.parse(text) {
+                        if case .ready = message { self.reminted = false }
+                        self.report(.message(message))
+                    }
+                case .failure:
+                    return self.closed(socket)
                 @unknown default:
                     break
                 }
-                self.receive(on: socket)
+                // The handler may have closed or replaced the socket.
+                if self.task === socket { self.receive(on: socket) }
             }
         }
     }
 
-    private static func reason(_ socket: URLSessionWebSocketTask) -> Close {
+    private func closed(_ socket: URLSessionWebSocketTask) {
         let status = (socket.response as? HTTPURLResponse)?.statusCode
-        switch socket.closeCode.rawValue {
-        case 4401: return .unauthorized
-        case 4400: return .badHello
-        case 4409: return .replaced
-        default: return status == 401 || status == 403 ? .unauthorized : .dropped
+        let code = socket.closeCode.rawValue
+        drop()
+        let reason: Close
+        switch code {
+        case 4401: reason = .unauthorized
+        case 4400: reason = .badHello
+        case 4409: reason = .replaced
+        case 4429: reason = .busy
+        default: reason = status == 401 || status == 403 ? .unauthorized : .dropped
         }
+        if reason == .unauthorized, !reminted {
+            // Tickets are single-use and short-lived: one more, freshly minted, before giving up.
+            reminted = true
+            Task { await dial() }
+            return
+        }
+        report(.closed(reason))
     }
 
-    private func handle(_ text: String) {
-        guard let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? JSON else { return }
-        let id = object["id"] as? String ?? ""
-        switch object["type"] as? String {
-        case "ready":
-            onMessage?(.ready)
-        case "speech_start":
-            let rate = (object["sample_rate"] as? NSNumber)?.doubleValue ?? 24_000
-            onMessage?(.speechStart(id: id, text: object["text"] as? String ?? "", sampleRate: rate))
-        case "speech_end":
-            let cancelled = (object["cancelled"] as? Bool) ?? false
-            onMessage?(.speechEnd(id: id, cancelled: cancelled, error: object["error"] as? String))
-        default:
-            break
-        }
+    private func report(_ event: Event) {
+        onEvent?(event)
     }
 }

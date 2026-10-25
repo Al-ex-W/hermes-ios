@@ -66,6 +66,8 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from fake_voice_plugin import FakeVoicePlugin  # the fake hermes_voice plugin: /api/plugins/hermes_voice/*, start_call
+
 SESSION_AT_COOKIE = "hermes_session_at"  # hermes_cli/dashboard_auth/cookies.py
 SESSION_PROVIDER_COOKIE = "hermes_session_provider"
 TICKET_TTL = 30  # hermes_cli/dashboard_auth/ws_tickets.py: 30 s, single use
@@ -264,6 +266,7 @@ class FakeHermes:
         self.next_seq: dict[str, int] = {}
         self.rings: OrderedDict[str, deque[tuple[int, dict[str, Any]]]] = OrderedDict()
         self.evicted_through: dict[str, int] = {}
+        self.voice_plugin = FakeVoicePlugin(self, args)
         self._seed()
 
     # ── helpers ───────────────────────────────────────────────────────────────────────────────────
@@ -1020,6 +1023,9 @@ class FakeHermes:
         try:
             await self.emit(rt, "message.start")
             for segment in segments(text):
+                if (handled := await self.voice_plugin.handle(rt, stored, segment)) is not None:
+                    replies.append(handled)  # the fake plugin's start_call / end_call turns (fake_voice_plugin.py)
+                    continue
                 if segment.startswith("[Voice call started]"):
                     match = CALL_ID.search(segment)
                     if match is None:
@@ -1297,6 +1303,7 @@ def build_app(fake: FakeHermes) -> Starlette:
         Route("/api/profiles/sessions", fake.list_sessions, methods=["GET"]),
         Route("/api/sessions/{session_id}/messages", fake.session_messages, methods=["GET"]),
         WebSocketRoute("/api/ws", fake.gateway_ws),
+        *fake.voice_plugin.routes(),
     ])
 
 
@@ -1314,6 +1321,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--replay-max", type=int, default=REPLAY_BUFFER_MAX, help="replay ring size per session")
     parser.add_argument("--contract", default=str(DEFAULT_CONTRACT),
                         help="OpenRPC contract whose param schemas reject unknown keys ('' = no check)")
+    FakeVoicePlugin.add_arguments(parser)
     return parser
 
 

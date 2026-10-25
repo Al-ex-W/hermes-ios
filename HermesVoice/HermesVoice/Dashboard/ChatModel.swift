@@ -615,11 +615,11 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
         messages.append(ChatMessage(id: id, role: .assistant, text: text))
     }
 
-    /// "🔊 …" for what Hermes said out loud through the speak tool, "🔧 name" for any other tool.
+    /// "🔊 …" for what Hermes said out loud (start_call, or the old speak tool), "🔧 name" for any other tool.
     /// Takes a tool.start payload or a stored tool call (`arguments` as a JSON string).
     nonisolated static func toolRow(_ payload: JSON) -> String? {
         guard let name = (payload["name"] as? String) ?? (payload["tool_name"] as? String) else { return nil }
-        if name.hasSuffix("speak") {
+        if name.hasSuffix("speak") || name == "start_call" {  // Hook (M6): start_call speaks its `text`
             let raw = ["args", "arguments", "input", "args_text"].lazy.compactMap { payload[$0] }.first
             var args = raw as? JSON
             if args == nil, let string = raw as? String {

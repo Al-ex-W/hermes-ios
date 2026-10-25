@@ -2,25 +2,33 @@
 
 A small iPhone app for your own [Hermes Agent](https://github.com/NousResearch/hermes-agent), modelled on
 [Hermes Conduit](https://github.com/kaishi00/hermes-conduit), with one feature at its center: **CallKit voice calls
-inside a chat, where Hermes is heard only when it chooses to speak.**
+with Hermes, where Hermes is heard only when it chooses to speak.**
 
-- You start a call from any chat. The call is a real CallKit call (Dynamic Island, Lock Screen, keeps running
-  while the phone is locked).
-- Starting the call **announces it to Hermes** with a `[Voice call started]` message in that conversation.
-- What you say is transcribed on the phone and posted to the same chat as `[Voice] …` messages.
-- Hermes' normal replies stay **text only**. You hear Hermes only when it calls the **`speak` MCP tool**, which
-  turns the text into speech with **ElevenLabs** on the Hermes host and streams it to the phone.
-- Hanging up posts `[Voice call ended]`.
+- **You call Hermes** from any chat, or **Hermes calls you**: an agent uses the `start_call` tool, and your iPhone
+  rings through a VoIP push, even when the app isn't running. Either way it is a real CallKit call (Dynamic Island,
+  Lock Screen, keeps running while the phone is locked).
+- Hermes' normal replies stay **text only**. You hear Hermes only through `start_call`, which turns the text into
+  speech with **ElevenLabs** on the Hermes host and streams it to the phone.
+- What you say is recognised on the phone (Apple speech recognition, or ElevenLabs Scribe) and goes back to the
+  conversation the call belongs to: to a `start_call` that is waiting for your answer, or into the conversation as
+  a `[Voice] …` message.
+
+Calls run through the **`hermes_voice` Hermes plugin** ([`hermes-voice-plugin/`](hermes-voice-plugin)), served by
+the Hermes dashboard itself. The older `hermes-voice-mcp` server (a `speak` MCP tool on its own port) is kept below
+as [legacy](#legacy-the-hermes-voice-mcp-server) until the [cutover](#cutover-from-hermes-voice-mcp).
 
 ```
-iPhone (HermesVoice)                          Hermes host (over Tailscale)
-┌──────────────────────┐   cookie + WS RPC    ┌─────────────────────────────┐
-│ chat, CallKit call   │ ───────────────────▶ │ hermes dashboard :9119       │
-│ STT → "[Voice] …"    │                      │   └─ Hermes agent            │
-│                      │                      │        │ MCP (streamable HTTP)│
-│ plays PCM speech  ◀──┼── /phone WebSocket ──┼─ hermes-voice-mcp :8765      │
-└──────────────────────┘                      │    speak → ElevenLabs API    │
-                                              └─────────────────────────────┘
+iPhone (HermesVoice)                           Hermes host: hermes serve :9119 (Tailscale Serve, basic auth)
+┌─────────────────────────┐  cookie + /api/ws   ┌─────────────────────────────────────────────┐
+│ chats                   │ ──────────────────▶ │ dashboard sessions (tui_gateway)            │
+│ CallKit + PushKit call  │                     │   └─ agent: start_call / end_call ─┐        │
+│ speech → user_turn      │  /api/plugins/      │                                     ▼        │
+│ plays PCM speech     ◀──┼─ hermes_voice/phone ┼── hermes_voice plugin: call hub, inject      │
+│                         │                     │      ├─ ElevenLabs TTS → PCM                │
+│          ▲ VoIP push    │                     │      ├─ Scribe tokens for the phone         │
+└──────────┼──────────────┘                     │      └─ APNs (HTTP/2, .p8 key) ──┐          │
+           └──────────────────── Apple APNs ◀────┼───────────────────────────────────┘          │
+                                                └─────────────────────────────────────────────┘
 ```
 
 ## Layout
@@ -28,97 +36,150 @@ iPhone (HermesVoice)                          Hermes host (over Tailscale)
 | Path | What |
 |---|---|
 | [`HermesVoice/`](HermesVoice) | SwiftUI iOS app (iOS 17+), generated with XcodeGen from `project.yml` |
-| [`hermes-voice-mcp/`](hermes-voice-mcp) | Python MCP server: the `speak` tool plus the phone's WebSocket |
-| [`reference/`](reference) | Read-only clones of Hermes Conduit and its notifier plugin (MIT), used as protocol reference |
+| [`hermes-voice-plugin/`](hermes-voice-plugin) | The `hermes_voice` Hermes plugin: `start_call` / `end_call`, the phone's socket, VoIP pushes, TTS |
+| [`hermes-voice-mcp/`](hermes-voice-mcp) | Legacy: the `speak` MCP server and its phone socket (until the cutover) |
+| [`devtools/`](devtools) | `fake_hermes.py`, a fake dashboard (with a fake `hermes_voice` plugin) for Simulator tests |
 
-## Setup on the Hermes host
+## Calls with the hermes_voice plugin
 
-### 1. Let the phone sign in to the dashboard
+**Hermes calls you.** In any dashboard or desktop conversation, an agent can call `start_call(text, mode)`:
 
-The app signs in to the Hermes web dashboard with a username and password, like Conduit does. Your dashboard
-currently uses only its built-in local session token, so add a sign-in to `~/.hermes/.env`:
+- With no call yet, the plugin rings your iPhone (a VoIP push straight to APNs) and speaks `text` once you
+  answer. Calling `start_call` again on the same call just speaks; it never rings twice.
+- `mode: "sync"` waits until you answer and returns `{said, ending, outcome, call_id}`: what you said, how your
+  turn ended (`end_of_speech`, `cut_off`, `hang_up`…) and how the call went (`answered`, `declined`, `no_answer`…).
+- `mode: "async"` (the default) returns `{call_id, status}` at once. What you say then arrives in the conversation
+  as a message, forced in like a correction you typed: into the running turn (`session.redirect`, else
+  `session.steer`), or as a new turn when Hermes is idle (`prompt.submit`).
+- `end_call(text?)` says an optional goodbye and hangs up.
 
-```bash
-HERMES_DASHBOARD_BASIC_AUTH_USERNAME=me
-HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=a-strong-password
-HERMES_DASHBOARD_BASIC_AUTH_SECRET=<output of: openssl rand -base64 32>
-```
+**You call Hermes.** Tap the phone button in a chat. Hermes gets a `[Voice call started] …` notice in that chat
+and answers with `start_call`. If Hermes is already ringing you from this chat, the button joins that call.
 
-Expose the dashboard on your tailnet (keep it bound to 127.0.0.1):
+What the conversation sees (the chat itself shows only what you said, or a short notice):
 
-```bash
-tailscale serve --bg 9119
-```
+| Message | When |
+|---|---|
+| `[Voice] <said> (Reply out loud with start_call; …)` | a turn of yours that no waiting `start_call` took |
+| `[Voice, cut off] …`, `[Voice, hung up] …`, `[Voice, muted] …` | the same, when the turn didn't end on its own |
+| `[Voice call started] …` | you started the call (your turns wait until this is delivered) |
+| `[Voice call not answered] …` | an async call was declined or rang out |
+| `[Voice line not delivered: …]` | the phone couldn't be rung or reached, or a line couldn't be spoken |
+| `[Voice call ended by user] …` | you hung up (unless your last turn already said so) |
 
-Tell the dashboard its public address. With a loopback bind, it rejects any other `Host` header unless the host is
-listed here, so without this every request from the phone fails with `400 Invalid Host header`. Add to
-`~/.hermes/config.yaml` the exact HTTPS origin that `tailscale serve` printed (no path, no port):
+There is one call at a time. A call belongs to the conversation that started it (and follows it through context
+compression); `start_call` from another conversation returns `busy`. Who may ring you is set in the plugin's policy
+(sources, rate limits, quiet hours; see the [plugin README](hermes-voice-plugin/README.md)).
 
-```yaml
-dashboard:
-  public_url: https://<machine>.<tailnet>.ts.net
-```
+On the iPhone, **Settings → Calls** picks the speech recognizer (Apple, or ElevenLabs Scribe with a token the
+plugin mints, so the key stays on the host), the language and how long a pause ends your turn, and shows whether
+pushes are registered and what the plugin reports.
 
-Then restart the dashboard; it reads these settings once at startup. The dashboard address for the app is
-`https://<machine>.<tailnet>.ts.net`.
+### Setup on the Hermes host
 
-### 2. ElevenLabs
+The checklist for the machine (a Linux VM with systemd here) that runs Hermes. Do it once, then the
+[cutover](#cutover-from-hermes-voice-mcp).
 
-Add your key to `~/.hermes/.env`:
+1. **Run the dashboard under systemd, with basic auth.** Put the sign-in in `~/.hermes/.env`:
 
-```bash
-ELEVENLABS_API_KEY=...
-```
+   ```bash
+   HERMES_DASHBOARD_BASIC_AUTH_USERNAME=me
+   HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=a-strong-password
+   HERMES_DASHBOARD_BASIC_AUTH_SECRET=<output of: openssl rand -base64 32>
+   ```
 
-Optional: pick a voice. The server uses, in order, `HERMES_VOICE_VOICE_ID`, then `tts.elevenlabs.voice_id` from
-`~/.hermes/config.yaml`, then Hermes' default voice. The model defaults to `eleven_flash_v2_5` (low latency,
-multilingual); override it with `HERMES_VOICE_MODEL_ID` or `tts.elevenlabs.streaming_model_id`.
+   Keep the dashboard bound to 127.0.0.1, as a user service in `~/.config/systemd/user/hermes.service`:
 
-### 3. Run the voice server
+   ```ini
+   [Unit]
+   Description=Hermes backend (hermes serve)
+   After=network-online.target
 
-```bash
-cd hermes-voice-mcp
-uv run hermes-voice-mcp
-```
+   [Service]
+   ExecStart=%h/.local/bin/hermes serve --host 127.0.0.1 --port 9119
+   Restart=on-failure
+   # 78 is Hermes refusing to start over a config error: don't restart into it forever.
+   RestartPreventExitStatus=78
 
-It listens on `127.0.0.1:8765`. It uses `HERMES_VOICE_TOKEN` if set, from `~/.hermes/.env` first and then the
-environment, as Hermes does; otherwise on first start it creates a shared token in
-`~/.hermes/hermes-voice/token`. Print it with:
+   [Install]
+   WantedBy=default.target
+   ```
 
-```bash
-uv run hermes-voice-mcp token
-```
+   ```bash
+   systemctl --user daemon-reload && systemctl --user enable --now hermes
+   loginctl enable-linger "$USER"     # keeps it running while you're logged out
+   ```
 
-To keep it running across reboots on macOS, install the launchd agent with
-`hermes-voice-mcp/launchd/install.sh` (it fills in your paths from `hermes-voice.plist.example`).
+2. **Reach it over Tailscale.** Run `tailscale serve --bg 9119`, then give the dashboard its public address in
+   `~/.hermes/config.yaml`: the exact HTTPS origin `tailscale serve` printed (no path, no port). This also turns
+   the dashboard's sign-in gate on, and it is the Host its DNS-rebinding checks accept; without it every request
+   from the phone fails with `400 Invalid Host header`.
 
-Expose it on your tailnet on its own HTTPS port:
+   ```yaml
+   dashboard:
+     public_url: https://<machine>.<tailnet>.ts.net
+     turn_isolation: false     # the default; calls need turns to run in the dashboard process
+   ```
 
-```bash
-tailscale serve --bg --https=8443 http://127.0.0.1:8765
-```
+3. **Secrets**, in `~/.hermes/.env` or Hermes' secret store (`hermes plugins install` also asks for them):
 
-The voice server address for the app is then `https://<machine>.<tailnet>.ts.net:8443`.
+   | Variable | What |
+   |---|---|
+   | `ELEVENLABS_API_KEY` | Hermes' voice, and Scribe tokens for the phone |
+   | `HERMES_VOICE_APNS_KEY_PATH` | the APNs auth key (`.p8`) from your Apple Developer account, e.g. `~/.hermes/hermes-voice/AuthKey.p8` (`chmod 600` it) |
+   | `HERMES_VOICE_APNS_KEY_ID` | that key's 10-character Key ID |
+   | `HERMES_VOICE_APNS_TEAM_ID` | your 10-character Team ID |
 
-### 4. Connect Hermes to the MCP server
+   Ringing needs a paid Apple Developer team: an APNs key, and an app build signed with the Push Notifications
+   capability.
 
-Put the token in `~/.hermes/.env` so Hermes and the server share it:
+4. **Install and enable the plugin** for each profile that should call you:
 
-```bash
-HERMES_VOICE_TOKEN=<the token from step 3>
-```
+   ```bash
+   hermes plugins install <path-to-this-repo>/hermes-voice-plugin
+   hermes plugins enable hermes_voice        # also installs its one dependency, h2 (APNs is HTTP/2 only)
+   ```
 
-Add the server to `~/.hermes/config.yaml`:
+   Optional: a voice and a policy under `plugins.entries.hermes_voice.settings` (see the plugin README). If the
+   dashboard log warns that `h2` is missing, run `hermes pm repair`.
 
-```yaml
-mcp_servers:
-  hermes_voice:
-    url: http://127.0.0.1:8765/mcp
-    headers:
-      Authorization: "Bearer ${HERMES_VOICE_TOKEN}"
-```
+5. **Restart the dashboard** (`systemctl --user restart hermes`): plugin routes are mounted at startup. Then,
+   signed in to the dashboard, open `https://<machine>.<tailnet>.ts.net/api/plugins/hermes_voice/status`: `h2`,
+   `apns_configured` and `scribe_configured` should be `true`, and `tts` should be `"elevenlabs"`.
 
-Then run `/reload-mcp` in Hermes (or restart the gateway). Hermes now has the tool `mcp__hermes_voice__speak`.
+6. **On the iPhone:** Tailscale with On-Demand (calls can't reach Hermes without it; the app says so when that's
+   the problem), sign in to the dashboard, open the app once so it registers for pushes, and use
+   **Settings → Calls → Check**.
+
+### Cutover from hermes-voice-mcp
+
+Do this in one go, together with installing the app build that talks to the plugin (it has no voice-server
+settings any more):
+
+1. Remove `mcp_servers.hermes_voice` from `~/.hermes/config.yaml` and run `/reload-mcp` in Hermes.
+2. Stop the old server: `launchctl bootout gui/$(id -u)/io.github.hermes-ios.voice` for the launchd agent that
+   `hermes-voice-mcp/launchd/install.sh` installed (or stop however you ran `uv run hermes-voice-mcp`), and drop
+   its tailnet mapping with `tailscale serve --https=8443 off`.
+3. `HERMES_VOICE_TOKEN` in `~/.hermes/.env` is no longer used and can go.
+
+**Rollback:** put the `mcp_servers.hermes_voice` entry back, `/reload-mcp`, start the old server and its
+`tailscale serve` mapping again, and reinstall the previous app build. The plugin can stay installed.
+
+### Known limits
+
+- **Tool Search.** Current Hermes defers plugin tools behind its `tool_search` / `tool_describe` / `tool_call`
+  bridge (`tools.tool_search.enabled: auto`): the model sees `start_call` in the bridge's catalog listing and calls
+  it through `tool_call`, describing it first if it hasn't yet. `tools.tool_search.enabled: off` lists every tool
+  directly, at the price of a bigger prompt.
+- **Steer timing.** During a long tool batch, Hermes reads an injected turn after the batch. A redirect Hermes
+  accepts in the very moment its last model reply completes is dropped with that turn (a steer would be carried
+  into the next turn), so that one thing you said never reaches the conversation.
+- Calls work for conversations hosted by the dashboard process (dashboard and desktop sessions), with
+  `dashboard.turn_isolation` off. Calls from other processes (CLI, messaging gateways, cron) come later.
+- Half duplex: the mic is off while Hermes speaks. If you're mid-sentence when Hermes starts, it waits up to 3 s,
+  then what it heard so far goes in as `cut_off`.
+- The Simulator has no VoIP pushes, CallKit audio or microphone: there calls ring inside the app only, Hermes can
+  be heard, and you answer by typing. Debug builds take `hermesvoice://ring?call_id=…&session_id=…` as a push.
 
 ## Building the app
 
@@ -130,39 +191,40 @@ open HermesVoice.xcodeproj
 
 Signing is personal, so it isn't in the repo. Copy `HermesVoice/Config/Local.xcconfig.example` to
 `HermesVoice/Config/Local.xcconfig` (gitignored) and set your `BUNDLE_ID_PREFIX` and Apple `DEVELOPMENT_TEAM`;
-the app's bundle id becomes `$(BUNDLE_ID_PREFIX).hermesvoice`.
+the app's bundle id becomes `$(BUNDLE_ID_PREFIX).hermesvoice`. For Hermes to ring the phone, the team must be a
+paid one with the Push Notifications capability (the app also uses the `voip` and `audio` background modes).
 
-The unit tests drive the gateway connection (reconnects, replay, server→client prompts) over a scripted socket:
+In the app, enter the **Hermes dashboard** address (`https://<machine>.<tailnet>.ts.net`), username and password.
+
+## Testing
 
 ```bash
-xcodebuild test -project HermesVoice.xcodeproj -scheme HermesVoice -destination "platform=iOS Simulator,name=iPhone 17 Pro"
+# The plugin (call hub, streaming, ring protocol, injection, policy, APNs, routes) against stubbed Hermes modules
+cd hermes-voice-plugin && uv run pytest -q
+
+# The plugin inside a real `hermes serve` in a temp home (opt-in, about 30 s; needs a Hermes install)
+HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
+
+# The legacy MCP server, and the fake dashboard with its fake plugin
+cd hermes-voice-mcp && uv run pytest -q && uv run pytest -q ../devtools/tests
+
+# The app's unit tests
+cd HermesVoice && xcodebuild test -project HermesVoice.xcodeproj -scheme HermesVoice \
+  -destination "platform=iOS Simulator,name=iPhone 17 Pro"
 ```
 
-With [`devtools/fake_hermes.py`](devtools) running (`--port 9311 --reap-grace 1`), prefix the command with
-`TEST_RUNNER_HERMES_FAKE_URL=http://127.0.0.1:9311 TEST_RUNNER_HERMES_FAKE_REAP_GRACE=1` to also run the end-to-end
-tests against it.
+The integration test starts Hermes with its own interpreter in a temp `HOME` and `HERMES_HOME` (nothing outside
+them is written), signs in with basic auth, drives conversations over `/api/ws` with a stub OpenAI-compatible model
+that calls `start_call`, and plays the phone on `/phone`: a sync call that returns what was said, an async call
+whose turns are injected (a new turn while idle, a redirect while a turn runs), a declined call, one that rings
+out, `busy`, an unreachable phone, and the dashboard's auth on the socket. Only APNs is replaced, by a recorder. It
+looks for Hermes at `~/.hermes/hermes-agent`; set `HERMES_AGENT_DIR` or `HERMES_PYTHON` otherwise.
 
-Run it on a **real iPhone**: CallKit doesn't provide call audio in the
-Simulator. The app falls back to a plain audio session there, so you can still test the screens.
-
-In the app, enter:
-
-- **Hermes dashboard**: the address from step 1, plus the username and password.
-- **Hermes Voice server**: the address from step 3 and the token. The app checks both with the server before each
-  call, and reports a wrong token or an unreachable server separately.
-
-In **Settings** you can also pick the **speech language**. Automatic follows your iPhone's preferred languages, so
-Swedish is recognized as Swedish.
-
-## Using it
-
-1. Open a chat (or start a new one) and tap the phone button.
-2. The call connects, and Hermes gets the announcement with a `call_id`. It answers with a short spoken hello.
-   The announcement and the end notice are queued, so they never interrupt a task Hermes is running.
-3. Talk. After a short pause, what you said is posted as a `[Voice]` message. The mic is paused while Hermes is
-   speaking, so it doesn't hear itself.
-4. Text replies appear in the chat as usual. Rows marked 🔊 show what Hermes said out loud.
-5. Tap **End** (or hang up from the Lock Screen or Dynamic Island).
+With [`devtools/fake_hermes.py`](devtools) running (`--port 9311 --reap-grace 1`), prefix the `xcodebuild test`
+command with `TEST_RUNNER_HERMES_FAKE_URL=http://127.0.0.1:9311 TEST_RUNNER_HERMES_FAKE_REAP_GRACE=1` to also run
+the app's end-to-end tests against it. The fake serves the plugin's routes too: typing `call me sync: …` in a chat
+makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/ring` returns a push payload for
+`xcrun simctl openurl booted "hermesvoice://ring?…"` (see `devtools/fake_voice_plugin.py`).
 
 ## How the pieces talk
 
@@ -170,25 +232,48 @@ Swedish is recognized as Swedish.
   for `wss://…/api/ws?ticket=…`, which carries JSON-RPC: `session.resume`, `session.create`, `prompt.submit`, and
   streamed `message.*`, `tool.*` and `session.*` events. After a reconnect the app re-attaches each chat in use,
   on screen or in a call (`session.activate`, or `session.resume` when Hermes reaped it meanwhile), and replays
-  what it missed (`session.events.since`). Other chats catch up when they are opened again. Approvals, questions
-  and passwords arrive as server→client requests and are answered from the chat.
-- **Voice server `/phone`**: the app sends `hello {call_id, session_id, title}` and gets `ready`. For each `speak`,
-  the server sends `speech_start {id, text, sample_rate}`, then binary 16-bit PCM frames, then `speech_end {id}`.
-  The app answers `played {id}` once it has been heard, and that is when the tool returns to Hermes. A stopped or
-  failed `speak` ends with `speech_end {id, cancelled}` or `{id, error}` instead, and the app drops the rest at once.
-- **Routing**: Hermes doesn't tell MCP servers which chat a tool call came from. So the announcement gives Hermes a
-  random 32-character `call_id`, and `speak` must pass it back. An unknown or ended `call_id` is refused, never
-  routed to some other call. Other Hermes sessions (cron jobs, other chats) can't talk into your call because
-  they never see the id.
+  what it missed (`session.events.since`). Approvals, questions and passwords arrive as server→client requests and
+  are answered from the chat.
+- **Calls**: `wss://…/api/plugins/hermes_voice/phone?ticket=…`, with a fresh ticket for every connect. The app
+  says `hello {call_id, session_id, title, initiated_by: user|push, app_version}` and gets `ready {call_id,
+  state}`; for a push it says `ringing`, then `answered` or `declined`. Speech comes as `speech_start {id, text,
+  sample_rate, format}`, binary 16-bit PCM and `speech_end {id}`; the app answers `played {id}` once it was heard.
+  What you say goes as `user_turn {call_id, text, ending {kind, …}, provider, language, started_at, ended_at}`.
+  The plugin ends a call with `cancel {reason}` while it rings or `ended {outcome}` once live; the app hangs up
+  with `bye {reason}`. Close codes: 4401 auth (the app mints one more ticket, then gives up), 4400 bad hello, 4409
+  replaced by a newer link, 4429 another conversation holds the call, 1011 a stalled link (the app reconnects).
+  The [plugin README](hermes-voice-plugin/README.md) has the details.
+- **Ringing**: the plugin sends a VoIP push `{call_id, session_id, profile, mode, title}` to every iPhone that
+  registered (`POST /api/plugins/hermes_voice/devices`). The app turns the 32-hex `call_id` into the CallKit UUID
+  by inserting dashes, reports the call to CallKit at once, then signs in if it has to and opens the chat and the
+  link.
 
-## Limits
+## Legacy: the hermes-voice-mcp server
 
-- Half duplex: you can't talk over Hermes. The mic resumes when its speech finishes.
-- Speech recognition uses your preferred languages (or the one picked in Settings), on-device when the iPhone has
-  that language's model; otherwise Apple's servers transcribe the call, and the call screen says so.
-- Calls are started from the phone only. Hermes ringing you would need PushKit and an APNs key.
+Until the cutover, the old setup keeps working for earlier app builds: the app announces a call with
+`[Voice call started] call_id: …`, posts what you say as `[Voice] …` messages, and Hermes speaks with the `speak`
+MCP tool, passing that `call_id` back (MCP tools aren't told which chat called them).
+
+1. **ElevenLabs**: `ELEVENLABS_API_KEY` in `~/.hermes/.env`. The voice is `HERMES_VOICE_VOICE_ID`, else
+   `tts.elevenlabs.voice_id`, else Hermes' default; the model is `HERMES_VOICE_MODEL_ID`, else
+   `tts.elevenlabs.streaming_model_id`, else `eleven_flash_v2_5`.
+2. **Run the server**: `cd hermes-voice-mcp && uv run hermes-voice-mcp` (on 127.0.0.1:8765). It uses
+   `HERMES_VOICE_TOKEN`, else creates a token in `~/.hermes/hermes-voice/token` (`uv run hermes-voice-mcp token`
+   prints it). On macOS, `hermes-voice-mcp/launchd/install.sh` installs it as a launchd agent. Expose it with
+   `tailscale serve --bg --https=8443 http://127.0.0.1:8765`.
+3. **Connect Hermes**: `HERMES_VOICE_TOKEN=<token>` in `~/.hermes/.env`, and in `~/.hermes/config.yaml`:
+
+   ```yaml
+   mcp_servers:
+     hermes_voice:
+       url: http://127.0.0.1:8765/mcp
+       headers:
+         Authorization: "Bearer ${HERMES_VOICE_TOKEN}"
+   ```
+
+   then `/reload-mcp`. Hermes gets the tool `mcp__hermes_voice__speak`.
 
 ## Credits
 
-Built after studying Hermes Conduit by kaishi00 and its notifier plugin, both MIT-licensed (see `reference/*/LICENSE`).
-The code here is new, but its dashboard protocol knowledge comes from those projects.
+Built after studying Hermes Conduit by kaishi00 and its notifier plugin, both MIT-licensed. The code here is new,
+but its dashboard protocol knowledge comes from those projects.
