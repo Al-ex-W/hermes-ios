@@ -271,14 +271,15 @@ final class VoiceCallTests: XCTestCase {
     }
 
     func testAnsweredGoesOutWithoutAudioAfterAWhile() async {
-        let call = pushCall { $0.answerAudioWait = 0.2 }
+        // Long enough that the "not yet" check below can't race it on a slow scheduler.
+        let call = pushCall { $0.answerAudioWait = 1.5 }
         call.begin()
         await waitUntil { self.links.first?.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: true))
         call.answer()
         await settle(0.05)
         XCTAssertEqual(link.types, ["ringing"])
-        await waitUntil { self.link.types == ["ringing", "answered"] }
+        await waitUntil(timeout: 5) { self.link.types == ["ringing", "answered"] }
         XCTAssertEqual(call.state, .live)
         // The audio coming up later doesn't say it again.
         call.audioDidActivate()
