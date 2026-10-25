@@ -116,3 +116,25 @@ def test_a_call_the_user_started_finds_its_session_in_any_profile(core, fake):
     delivery = core.inject.TuiInjector().deliver(owner, "[Voice] hi")
     assert delivery.ok and fake.host.methods_called() == ["session.redirect"]
     assert owner.runtime_sid == "rt-s1"
+
+
+def test_a_reopened_conversation_never_streams_to_the_dashboards_stdout(core, fake):
+    """This thread has no client: unbound, the host falls back to its stdout (the dashboard's log), and a
+    conversation the plugin reopened would stream every later frame there. Each method runs with the host's drop
+    sink bound instead, and the binding ends with the call."""
+    owner = _owner(core, "stored-1")
+    fake.host.answers.update({"session.redirect": "rejected", "session.steer": "rejected"})
+    delivery = core.inject.TuiInjector().deliver(owner, "[Voice] still here")
+    assert delivery.ok and delivery.via == "submit"
+    assert fake.host.methods_called() == ["session.resume", "session.redirect", "session.steer", "prompt.submit"]
+    assert all(bound is fake.host.drop for bound in fake.host.bound)
+    assert fake.host.sessions["rt-resumed-stored-1"]["transport"] is fake.host.drop
+    assert fake.host.stdout.frames == []
+    assert fake.host.current.get() is None  # reset after each call
+
+
+def test_without_a_drop_sink_the_methods_still_run(core, fake, monkeypatch):
+    monkeypatch.delattr(fake.host.module, "_detached_ws_transport")
+    fake.host.add("s1")
+    delivery = core.inject.TuiInjector().deliver(_owner(core), "[Voice] hi")
+    assert delivery.ok and fake.host.bound == [fake.host.stdout]

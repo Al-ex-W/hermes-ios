@@ -18,6 +18,10 @@ from fake_voice_plugin import ASYNC_LINE, ENDED_BY_USER, HELLO_TEXT, NOT_ANSWERE
     SYNC_LINE
 
 STATUS = f"{PREFIX}/status"
+# The real plugin's notes on async start_call results (hermes-voice-plugin/hub.py start_call).
+_HEARD_AS = " What the user says arrives as [Voice] messages; answer them with start_call."
+SPEAKING_NOTE = "Your line is being spoken." + _HEARD_AS
+RINGING_NOTE = "The phone is ringing; your line is spoken once the user answers." + _HEARD_AS
 
 
 def stamp(moment: float | None = None) -> str:
@@ -165,7 +169,7 @@ def test_a_user_initiated_call_announces_itself_and_every_turn_is_injected():
     assert greeting["format"] == "pcm_s16le"
     assert announced["text"] == "Call connected."
     assert announced["tools"] == [("start_call", {"text": HELLO_TEXT, "mode": "async"},
-                                   {"call_id": call_id, "status": "speaking"})]
+                                   {"call_id": call_id, "status": "speaking", "note": SPEAKING_NOTE})]
     assert live["calls"] == 1
     assert live["active_call"] == {"call_id": call_id, "session_id": live["active_call"]["session_id"],
                                    "title": live["active_call"]["title"], "state": "live", "initiated_by": "user"}
@@ -214,8 +218,9 @@ def test_a_sync_call_rings_returns_the_reply_and_injects_turns_from_before_the_l
     assert start["text"] == SYNC_LINE
     [(name, args, result)] = replied["tools"]
     assert (name, args) == ("start_call", {"text": SYNC_LINE, "mode": "sync"})
+    # The plugin's sync shape (hub._sync): `ending` is the turn's kind.
     assert result == {"said": "blue please", "outcome": "answered", "call_id": push["call_id"],
-                      "ending": {"kind": "end_of_speech", "detector": "apple_silence", "detail": 1.2}}
+                      "ending": "end_of_speech"}
     assert replied["text"] == "You said: blue please"
     assert followup["text"] == "You said: never mind"
     assert cut_off["text"] == "You said (cut off): never mind"
@@ -253,12 +258,12 @@ def test_an_async_call_rung_from_the_debug_route_force_injects_the_reply():
                             "title": rung["push"]["title"]}
     assert pushes == [rung["push"]]
     assert rang["tools"] == [("start_call", {"text": "Ping from the test", "mode": "async"},
-                              {"call_id": rung["call_id"], "status": "ringing"})]
+                              {"call_id": rung["call_id"], "status": "ringing", "note": RINGING_NOTE})]
     assert rang["text"] == "Ringing your phone."
     assert ready["state"] == "ringing" and line["text"] == "Ping from the test"
     assert answer["text"] == "You said: pong back"
     assert injected["tools"] == [("start_call", {"text": "You said: pong back", "mode": "async"},
-                                  {"call_id": rung["call_id"], "status": "speaking"})]
+                                  {"call_id": rung["call_id"], "status": "speaking", "note": SPEAKING_NOTE})]
     assert rows[0] == "call me async: Ping from the test" and rows[1] == f"[Voice] pong back {REPLY_HINT}"
     assert unknown.status_code == 404
 
@@ -346,7 +351,8 @@ def test_an_unanswered_call_is_cancelled_after_the_ring_timeout():
     assert notified == {"text": "The call was not answered.", "tools": []}
     [(_, args, result)] = unreached["tools"]
     assert args == {"text": "are you there?", "mode": "sync"}
-    assert result == {"said": "", "ending": None, "outcome": "unreachable", "call_id": pushes[-1]["call_id"]}
+    assert result == {"said": "", "ending": None, "outcome": "unreachable", "call_id": pushes[-1]["call_id"],
+                      "note": "The phone never answered the ring (it may be offline). Reply in text."}
     assert unreached["text"] == "The call ended without a reply (unreachable)."
     assert rows[1] == f"{NOT_ANSWERED} The user didn't take the call (they didn't pick up). Reply in text."
     assert len(rows) == 3  # the sync outcome was returned, not injected
@@ -387,13 +393,14 @@ def test_the_call_slot_is_busy_for_other_sessions_and_reused_by_its_own():
         asyncio.run(scenario())
     assert busy_close == 4429
     [(_, _, refused)] = busy["tools"]
-    assert refused["status"] == "busy" and refused["call_id"] is None and "Chat A" in refused["detail"]
+    assert refused["status"] == "busy" and refused["call_id"] is None and "Chat A" in refused["note"]
     assert reused["tools"] == [("start_call", {"text": "still here", "mode": "async"},
-                                {"call_id": call_id, "status": "speaking"})]
+                                {"call_id": call_id, "status": "speaking", "note": SPEAKING_NOTE})]
     assert again["text"] == "still here" and pushes == []  # the live call was reused: nothing rang
     assert stray_cancel == {"type": "cancel", "reason": "unknown_call"}
     assert goodbye["text"] == "Goodbye from fake Hermes."
-    assert hung_up["tools"][0][2] == {"call_id": call_id, "status": "ended", "outcome": "ended_by_agent"}
+    assert hung_up["tools"][0][2] == {"call_id": call_id, "outcome": "ended_by_agent",
+                                      "note": "Hung up. Spoken to the user."}
     assert hung_up["text"] == "Hung up." and ended == {"type": "ended", "outcome": "ended_by_agent"}
     assert free["calls"] == 0
 

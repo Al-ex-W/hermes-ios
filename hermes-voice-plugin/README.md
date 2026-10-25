@@ -20,9 +20,13 @@ on-device, or ElevenLabs Scribe with a single-use token this plugin mints, so th
 ## Install
 
 ```bash
-hermes plugins install <path-to-this-repo>/hermes-voice-plugin   # asks for the secrets below
+hermes plugins install Al-ex-W/hermes-ios/hermes-voice-plugin   # asks for the secrets below
 hermes plugins enable hermes_voice      # prepares its Python dependency, h2 (APNs needs HTTP/2)
 ```
+
+`hermes plugins install` clones Git sources only; a bare path is read as GitHub `owner/repo` shorthand. From a local
+clone of this repo, run `hermes plugins install "file://$PWD#hermes-voice-plugin"` in its root (it installs the
+checked-out branch as committed; `--ref <commit-sha>` pins a commit).
 
 Restart the dashboard afterwards: plugin routes are mounted at startup. The tools only show in the dashboard
 process (where the phone's socket is), and not with `dashboard.turn_isolation` on. With Hermes' Tool Search on

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import importlib.util
 import json
 import socket
@@ -43,15 +44,45 @@ def _load(name: str, path: Path) -> Any:
 # ── fake Hermes ────────────────────────────────────────────────────────────────────────────────────────────
 
 
+class Sink:
+    """A host transport: ``_stdio_transport`` (the dashboard's stdout) records what it is given; the drop sink
+    (``_detached_ws_transport``) takes nothing."""
+
+    def __init__(self, keeps: bool) -> None:
+        self.keeps = keeps
+        self.frames: list[dict] = []
+
+    def write(self, obj: dict) -> bool:
+        if self.keeps:
+            self.frames.append(obj)
+        return self.keeps
+
+    def close(self) -> None:
+        pass
+
+
 class FakeHost:
-    """``tui_gateway.server``: live sessions and the session methods inject.py calls."""
+    """``tui_gateway.server``: live sessions and the session methods inject.py calls. Like Hermes, a method takes
+    the request's bound transport (``tui_gateway.transport``), else falls back to stdout, and a session's events
+    go to the transport its record holds."""
 
     ANY = object()
 
     def __init__(self) -> None:
         self.module = types.ModuleType("tui_gateway.server")
+        self.transport_module = types.ModuleType("tui_gateway.transport")
+        self.current: contextvars.ContextVar[Any] = contextvars.ContextVar("fake_gateway_transport", default=None)
+        self.transport_module.current_transport = self.current.get
+        self.transport_module.bind_transport = self.current.set
+        self.transport_module.reset_transport = self.current.reset
+        self.stdout = Sink(keeps=True)
+        self.drop = Sink(keeps=False)
+        self.module._stdio_transport = self.stdout
+        self.module._detached_ws_transport = self.drop
         self.sessions: dict[str, dict] = {}
         self.calls: list[tuple[str, dict]] = []
+        # The transport each method call ran with (the bound one, else stdout), in call order.
+        self.bound: list[Any] = []
         # What each method answers: a status string, ("error", code) or a callable(params) -> response.
         self.answers: dict[str, Any] = {
             "session.redirect": "redirected", "session.steer": "queued", "prompt.submit": "streaming",
@@ -91,9 +122,13 @@ class FakeHost:
     def _method(self, name: str) -> Callable[[str, dict], dict]:
         def handle(rid: str, params: dict) -> dict:
             self.calls.append((name, dict(params)))
+            transport = self.current.get() or self.stdout
+            self.bound.append(transport)
             if name == "session.resume":
                 live = self.find_live(params["session_id"])
-                sid = live[0] if live else self.add(params["session_id"], f"rt-resumed-{params['session_id']}")
+                # A reopened conversation streams to the transport it was resumed with (server.py).
+                sid = live[0] if live else self.add(params["session_id"], f"rt-resumed-{params['session_id']}",
+                                                    transport=transport)
                 return {"result": {"session_id": sid}}
             if params.get("session_id") not in self.sessions:
                 return {"error": {"code": 4001, "message": "session not found"}}
@@ -102,6 +137,11 @@ class FakeHost:
                 return answer(params)
             if isinstance(answer, tuple):
                 return {"error": {"code": answer[1], "message": "refused"}}
+            record = self.sessions[params["session_id"]]
+            if record.get("transport") is not None:  # the turn's events (message.delta, tool.start, ...)
+                record["transport"].write({"jsonrpc": "2.0", "method": "event",
+                                           "params": {"type": "message.delta", "session_id": params["session_id"],
+                                                      "payload": {"text": params.get("text")}}})
             return {"result": {"status": answer, "text": params.get("text")}}
 
         return handle
@@ -131,6 +171,12 @@ class FakeHermes:
         self.subagent_parent: Any = None
         self.interrupted: set[int] = set()
         self.interrupt_all = False
+        # Thread ids Hermes asked to yield (tools.interrupt.request_yield); yield_all: every thread.
+        self.yields: set[int] = set()
+        self.yield_all = False
+        self.yields_taken = 0
+        # app.state.bound_host of the dashboard's web server: set once it serves (start_server).
+        self.bound_host: Optional[str] = "127.0.0.1"
         self.tickets: set[str] = set()
         self.host_allowed = True
         self.waits = 0
@@ -176,6 +222,20 @@ class FakeHermes:
             return threading.Thread(target=lambda: context.run(target, *args, **(kwargs or {})), name=name,
                                     daemon=daemon)
 
+        def consume_yield(thread_id: Optional[int]) -> bool:
+            if thread_id is None or not (fake.yield_all or thread_id in fake.yields):
+                return False
+            fake.yield_all = False
+            fake.yields.discard(thread_id)
+            fake.yields_taken += 1
+            return True
+
+        class State:
+            def __getattr__(self, name: str) -> Any:  # like Starlette's State: missing names raise
+                if name == "bound_host" and fake.bound_host is not None:
+                    return fake.bound_host
+                raise AttributeError(name)
+
         def ws_auth_ok(ws: Any) -> bool:
             ticket = ws.query_params.get("ticket", "")
             if ticket in fake.tickets:
@@ -191,11 +251,17 @@ class FakeHermes:
         module("hermes_cli.profiles", get_active_profile_name=lambda: "default")
         module("hermes_cli.web_server_chat", _ws_auth_ok=ws_auth_ok,
                _ws_request_is_allowed=lambda ws: fake.host_allowed)
+        module("hermes_cli.web_server", app=types.SimpleNamespace(state=State()))
         module("tools.approval_human_wait", human_wait_window=human_wait_window, activity_heartbeat=activity_heartbeat)
         module("tools.interrupt",
-               is_interrupted=lambda: fake.interrupt_all or threading.get_ident() in fake.interrupted)
+               is_interrupted=lambda: fake.interrupt_all or threading.get_ident() in fake.interrupted,
+               consume_yield=consume_yield,
+               acting_for_tid=contextvars.ContextVar("fake_acting_for_tid", default=None))
         module("gateway.session_context", get_session_env=lambda name, default="": fake.env.get(name, default))
+        if "tui_gateway" not in sys.modules:
+            monkeypatch.setitem(sys.modules, "tui_gateway", types.ModuleType("tui_gateway"))
         monkeypatch.setitem(sys.modules, "tui_gateway.server", self.host.module)
+        monkeypatch.setitem(sys.modules, "tui_gateway.transport", self.host.transport_module)
 
 
 # ── fakes for the hub's collaborators ──────────────────────────────────────────────────────────────────────

@@ -51,6 +51,9 @@ HELPER = "/api/plugins/hermes_voice_it"
 PUBLIC_HOST = "hermes-voice-it.invalid"
 MODEL_ID = "voice-it-model"
 READY = re.compile(r"HERMES_DASHBOARD_READY port=(\d+)")
+# A JSON-RPC event frame as the session host writes it to a transport (stdout's included).
+EVENT_FRAME = re.compile(r'"method"\s*:\s*"event"')
+REAP_GRACE_S = 2.0
 
 _STRIP_SUFFIXES = ("_API_KEY", "_TOKEN", "_BASE_URL", "_SECRET", "_ACCESS_KEY", "_KEY_ID", "_KEY", "_PASSWORD")
 _STRIP_PREFIXES = ("HERMES_", "OPENAI", "ANTHROPIC", "OPENROUTER", "AWS_", "AZURE_", "GOOGLE_", "GEMINI", "PYTEST_",
@@ -399,6 +402,8 @@ class Sandbox:
             no_proxy="*",
             TZ="UTC",
             HERMES_VOICE_FAKE_TTS="1",
+            # A conversation whose client went away is reaped this long after (default 20 s).
+            HERMES_TUI_WS_ORPHAN_REAP_GRACE_S=str(REAP_GRACE_S),
         )
         return env
 

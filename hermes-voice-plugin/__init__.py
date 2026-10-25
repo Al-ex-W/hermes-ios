@@ -63,12 +63,13 @@ def register(ctx: Any) -> None:
             logger.warning("hermes_voice: could not register the %s hook", name, exc_info=True)
 
 
-def _pre_llm_call(session_id: Any = None, parent_session_id: Any = None, **_: Any) -> None:
+def _pre_llm_call(session_id: Any = None, parent_session_id: Any = None, user_message: Any = None,
+                  **_: Any) -> None:
     hub = _core("hub")
     if not hub.routes_mounted():
         return None  # not the dashboard process: no calls here
     try:
-        hub.get_hub().note_turn_start(str(session_id or ""), str(parent_session_id or ""))
+        hub.get_hub().note_turn_start(str(session_id or ""), str(parent_session_id or ""), user_message)
     except Exception:  # noqa: BLE001 - a hook must never break a turn
         logger.debug("hermes_voice: pre_llm_call hook failed", exc_info=True)
     return None

@@ -1,13 +1,30 @@
 import AVFoundation
 
+/// The call's audio as VoiceCall uses it: the microphone tap, and playback of Hermes' speech with a callback once
+/// it has been heard. `CallAudio` in the app; tests script it.
+@MainActor
+protocol CallAudioPlayback: AnyObject {
+    var onEvent: ((CallAudio.Event) -> Void)? { get set }
+    func start(onInput: @escaping @Sendable (AVAudioPCMBuffer) -> Void)
+    func suspend()
+    func stop()
+    func setSampleRate(_ rate: Double)
+    /// Queues little-endian Int16 samples; false when they were dropped (the engine isn't running).
+    @discardableResult func enqueue(pcm16 data: Data) -> Bool
+    /// Calls `done` once everything queued so far has played. `heard` is false when it didn't all reach the
+    /// speaker: dropped while the engine was down, or flushed, or lost with an engine restart.
+    func whenPlayedBack(_ done: @escaping (_ heard: Bool) -> Void)
+    func flush()
+}
+
 /// One voice-processing AVAudioEngine for the call: echo-cancelled microphone input, and a player for
-/// Hermes' speech (16-bit PCM from ElevenLabs, via the Hermes Voice server).
+/// Hermes' speech (16-bit PCM from ElevenLabs, via the Hermes Voice plugin).
 ///
 /// iOS stops the engine underneath the call on a route change (AirPods, a car), an interruption or a
 /// media-services reset. Each time the graph is rebuilt on a fresh engine against the new hardware
-/// format; speech queued on the old one is dropped and its played-back callbacks complete at once.
+/// format; speech queued on the old one is dropped and its played-back callbacks complete at once, as not heard.
 @MainActor
-final class CallAudio {
+final class CallAudio: CallAudioPlayback {
     enum Event {
         /// The engine (re)started; the microphone format may have changed.
         case running
@@ -32,8 +49,11 @@ final class CallAudio {
     private var engineObserver: NSObjectProtocol?
     private var sessionObservers: [NSObjectProtocol] = []
     private var rebuildTask: Task<Void, Never>?
-    /// Played-back callbacks still waiting, by marker number.
-    private var markers: [UInt64: () -> Void] = [:]
+    /// Played-back callbacks still waiting, by marker number; each is told whether its audio was heard.
+    private var markers: [UInt64: (Bool) -> Void] = [:]
+    /// Audio was lost since the last played-back marker: dropped while the engine was down, or queued on an engine
+    /// that was torn down. The next marker reports its audio as not heard.
+    private var lostAudio = false
     private var nextMarker: UInt64 = 0
     /// When everything scheduled so far should have finished playing.
     private var queuedUntil: Date?
@@ -104,12 +124,22 @@ final class CallAudio {
         play(player)
     }
 
-    /// Queues little-endian Int16 samples. Dropped while the engine is down.
-    func enqueue(pcm16 data: Data) {
-        guard let engine, let player, engine.isRunning else { return recoverIfStopped() }
+    /// Queues little-endian Int16 samples. Dropped while the engine is down (before CallKit activated the audio,
+    /// or while iOS has it), which the next played-back marker reports.
+    @discardableResult
+    func enqueue(pcm16 data: Data) -> Bool {
+        guard let engine, let player, engine.isRunning else {
+            if data.count >= 2 { lostAudio = true }
+            recoverIfStopped()
+            return false
+        }
         let frames = data.count / 2
-        guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)),
-              let out = buffer.floatChannelData?[0] else { return }
+        guard frames > 0 else { return true }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)),
+              let out = buffer.floatChannelData?[0] else {
+            lostAudio = true
+            return false
+        }
         buffer.frameLength = AVAudioFrameCount(frames)
         data.withUnsafeBytes { raw in
             let samples = raw.bindMemory(to: Int16.self)
@@ -119,18 +149,22 @@ final class CallAudio {
         queuedUntil = max(queuedUntil ?? now, now).addingTimeInterval(Double(frames) / format.sampleRate)
         player.scheduleBuffer(buffer, completionHandler: nil)
         if !player.isPlaying { play(player) }
+        return true
     }
 
-    /// Calls `done` on the main actor once everything queued so far has been heard, or dropped
-    /// (flush, engine restart, stop). If playback stalls, the queue is dropped after its length plus a grace.
-    func whenPlayedBack(_ done: @escaping () -> Void) {
+    /// Calls `done` on the main actor once everything queued so far has been heard (`true`), or dropped
+    /// (`false`: flush, engine restart, stop, or audio lost before it). If playback stalls, the queue is dropped
+    /// after its length plus a grace.
+    func whenPlayedBack(_ done: @escaping (_ heard: Bool) -> Void) {
+        let lost = lostAudio
+        lostAudio = false
         guard let engine, let player, engine.isRunning,
-              let marker = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else { return done() }
+              let marker = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else { return done(false) }
         marker.frameLength = 1
         marker.floatChannelData?[0][0] = 0
         nextMarker &+= 1
         let id = nextMarker
-        markers[id] = done
+        markers[id] = { heard in done(heard && !lost) }
         player.scheduleBuffer(marker, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor in self?.completeMarker(id) }
         }
@@ -145,13 +179,14 @@ final class CallAudio {
     }
 
     /// Drops anything still queued (the speech was cancelled, or the link went away) and completes
-    /// every pending played-back callback.
+    /// every pending played-back callback, as not heard. What is queued next starts clean.
     func flush() {
         queuedUntil = nil
         if let engine, let player, engine.isRunning {
             player.stop()
             play(player)
         }
+        lostAudio = false
         completeMarkers()
     }
 
@@ -235,8 +270,9 @@ final class CallAudio {
         play(player)
     }
 
-    /// Drops the engine and everything queued on it; pending played-back callbacks complete.
+    /// Drops the engine and everything queued on it; pending played-back callbacks complete, as not heard.
     private func tearDownEngine() {
+        if let queuedUntil, queuedUntil > Date() { lostAudio = true }
         if let engineObserver { NotificationCenter.default.removeObserver(engineObserver) }
         engineObserver = nil
         if let engine {
@@ -266,14 +302,16 @@ final class CallAudio {
         rebuild(fatal: true)
     }
 
+    /// A marker's audio played back.
     private func completeMarker(_ id: UInt64) {
-        markers.removeValue(forKey: id)?()
+        markers.removeValue(forKey: id)?(true)
     }
 
+    /// Every pending marker's audio was dropped.
     private func completeMarkers() {
         let pending = markers.sorted { $0.key < $1.key }.map(\.value)
         markers.removeAll()
-        pending.forEach { $0() }
+        pending.forEach { $0(false) }
     }
 
     // MARK: Notifications

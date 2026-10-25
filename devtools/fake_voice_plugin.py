@@ -106,6 +106,22 @@ ENDING_MARKERS = {"end_of_speech": "", "cut_off": "cut off", "hang_up": "hung up
                   "dropped": "line dropped", "provider_error": "speech recognition failed"}
 REPLY_HINT = "(Reply out loud with start_call; your text replies are not spoken.)"
 HUNG_UP_HINT = "(The user hung up, so the call is over; reply in text.)"
+# The notes on start_call results (hermes-voice-plugin/hub.py: start_call, _outcome_note).
+ASYNC_NOTES = {
+    "ringing": "The phone is ringing; your line is spoken once the user answers.",
+    "speaking": "Your line is being spoken.",
+    "ended": "The call ended before your line could be spoken.",
+}
+ASYNC_HINT = " What the user says arrives as [Voice] messages; answer them with start_call."
+OUTCOME_NOTES = {
+    "no_answer": "The user didn't pick up. Reply in text.",
+    "declined": "The user declined the call. Reply in text.",
+    "push_failed": "The phone couldn't be rung: the push failed. Reply in text.",
+    "unreachable": "The phone never answered the ring (it may be offline). Reply in text.",
+    "lost": "The call's connection was lost. Reply in text.",
+    "ended_by_user": "The user hung up. Reply in text.",
+    "ended_by_agent": "The call was ended with end_call.",
+}
 
 # The prefixes the fake agent recognizes the plugin's notices by.
 STARTED = "[Voice call started]"
@@ -890,36 +906,42 @@ class FakeVoicePlugin:
                 if call.waiter is not None and not call.waiter.event.is_set():
                     return self.refusal(key, mode, "busy", "Another start_call is already waiting for the user.")
                 call.waiter = waiter
-            status = "queued" if call.state == "ringing" else "speaking"
+            status = "ringing" if call.state == "ringing" else "speaking"
         self.notify_ring(key, {"ok": not call.over.is_set(), "call_id": call.call_id, "mode": mode, "status": status,
                                "push": push})
         if mode == "async":
             if not call.over.is_set():
                 self.spawn(self.say_async(call, text))
-            return {"call_id": call.call_id, "status": status}
+            return {"call_id": call.call_id, "status": status, "note": ASYNC_NOTES.get(status, "") + ASYNC_HINT}
         return await self.converse(call, text, waiter)
 
-    def refusal(self, key: str, mode: str, outcome: str, detail: str) -> dict[str, Any]:
-        self.log(f"start_call from {key} refused: {outcome} ({detail})")
-        self.notify_ring(key, {"ok": False, "outcome": outcome, "detail": detail})
+    def refusal(self, key: str, mode: str, outcome: str, note: str) -> dict[str, Any]:
+        """The plugin's refusal shapes (hub._refusal): sync {said, ending, outcome, call_id, note}, async
+        {call_id, status, note}."""
+        self.log(f"start_call from {key} refused: {outcome} ({note})")
+        self.notify_ring(key, {"ok": False, "outcome": outcome, "note": note})
         if mode == "sync":
-            return {"said": "", "ending": None, "outcome": outcome, "call_id": None, "detail": detail}
-        return {"call_id": None, "status": outcome, "detail": detail}
+            return {"said": "", "ending": None, "outcome": outcome, "call_id": None, "note": note}
+        return {"call_id": None, "status": outcome, "note": note}
 
     async def converse(self, call: Call, text: str, waiter: Waiter) -> dict[str, Any]:
-        def result(outcome: str | None, **extra: Any) -> dict[str, Any]:
-            return {"said": "", "ending": None, "outcome": outcome or "ended_by_user", "call_id": call.call_id,
-                    **extra}
+        """A sync start_call's result as the plugin returns it (hub._sync): `ending` is the turn's kind, and a call
+        that ended without a reply carries a `note` on its outcome."""
+        def result(outcome: str | None, note: str = "") -> dict[str, Any]:
+            outcome = outcome or "ended_by_user"
+            note = note or OUTCOME_NOTES.get(outcome, "")
+            return {"said": "", "ending": None, "outcome": outcome, "call_id": call.call_id,
+                    **({"note": note} if note else {})}
 
         try:
             status, detail = await self.say(call, text, waiter)
             if status == "over":
                 return result(call.outcome)
             if status == "tts_failed":
-                return result("tts_failed", detail=detail)
+                return result("tts_failed", f"Could not speak: {detail}")
             await first_of(waiter.event, call.over)
             if (turn := waiter.turn) is not None:
-                return {"said": turn.text, "ending": turn.ending,
+                return {"said": " ".join(turn.text.split()), "ending": turn.kind,
                         "outcome": "ended_by_user" if turn.kind == "hang_up" else "answered", "call_id": call.call_id}
             return result(call.outcome)
         finally:
@@ -927,13 +949,16 @@ class FakeVoicePlugin:
                 call.waiter = None
 
     async def end_call(self, stored: Any, text: str | None) -> dict[str, Any]:
+        """end_call's result as the plugin returns it: {call_id, outcome, note}."""
         call = self.call
         if call is None or call.owner != stored.key:
-            return {"status": "no_call"}
+            return {"call_id": None, "outcome": None, "note": "This conversation has no voice call running."}
+        note = ""
         if text and call.state == "live":
-            await self.say(call, text)
+            status, _ = await self.say(call, text)
+            note = " Spoken to the user." if status == "played" else ""
         self.finish(call, "ended_by_agent")
-        return {"call_id": call.call_id, "status": "ended", "outcome": "ended_by_agent"}
+        return {"call_id": call.call_id, "outcome": "ended_by_agent", "note": f"Hung up.{note}"}
 
     # ── the fake agent (fake_hermes.py run_turn) ─────────────────────────────────────────────────────
 
@@ -1000,18 +1025,17 @@ class FakeVoicePlugin:
             result = await self.tool(rt, stored, "start_call", {"text": text, "mode": mode})
             return self.describe(mode, result)
         result = await self.tool(rt, stored, "end_call", {"text": GOODBYE})
-        return "Hung up." if result.get("status") == "ended" else "There is no call to hang up."
+        return "Hung up." if result.get("outcome") == "ended_by_agent" else "There is no call to hang up."
 
     @staticmethod
     def describe(mode: str, result: dict[str, Any]) -> str:
-        if detail := result.get("detail"):
-            return f"No call: {detail}"
+        if result.get("call_id") is None and (note := result.get("note")):
+            return f"No call: {note}"  # refused (busy, not_allowed)
         if mode == "async":
-            return {"ringing": "Ringing your phone.", "queued": "Your phone is still ringing; I'll say it when you "
-                    "answer.", "speaking": "Said it on the call."}.get(result.get("status"),
-                                                                         f"The call failed: {result.get('status')}.")
+            return {"ringing": "Ringing your phone.", "speaking": "Said it on the call."}.get(
+                result.get("status"), f"The call failed: {result.get('status')}.")
         if result.get("said"):
-            kind = (result.get("ending") or {}).get("kind")
+            kind = result.get("ending")
             return f"You said: {result['said']}" + ("" if kind == "end_of_speech" else f" ({kind})")
         return f"The call ended without a reply ({result.get('outcome')})."
 

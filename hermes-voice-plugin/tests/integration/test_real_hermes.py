@@ -13,7 +13,7 @@ from typing import AsyncIterator
 import pytest
 import websockets
 
-from hermes_sandbox import PREFIX, PUBLIC_HOST, Dashboard, Gateway, Phone
+from hermes_sandbox import EVENT_FRAME, PREFIX, PUBLIC_HOST, REAP_GRACE_S, Dashboard, Gateway, Phone
 from scenario import start_call_result
 
 pytestmark = pytest.mark.integration
@@ -239,3 +239,39 @@ def test_rings_that_are_declined_unanswered_or_busy(hermes):
     assert push4["call_id"] != push2["call_id"]
     assert late == {"type": "cancel", "reason": "unreachable"}  # a push that comes in too late is cancelled
     assert "[Voice call not answered] The user didn't take the call (they didn't pick up)." in seen
+
+
+def test_a_conversation_the_plugin_reopens_streams_only_to_its_clients(hermes):
+    """Nobody has the conversation open any more (its client left and Hermes reaped it), and the user calls into
+    it: the plugin reopens it (session.resume) to deliver the call's texts. The plugin's thread has no client, so
+    unless it binds Hermes' drop sink, every later frame of that conversation (tool arguments with what is
+    spoken, replies, reasoning) goes to the dashboard's stdout, i.e. its log."""
+    sandbox, model, _ = hermes
+
+    async def scenario():
+        async with signed_in(sandbox) as (_, gateway):
+            sid, stored = await new_session(gateway, "Reopened call")
+            await turn_done(gateway, sid, await submit(gateway, sid, "hello there"))
+        await asyncio.sleep(REAP_GRACE_S + 3)  # the client is gone: its conversation is reaped
+        before = len(EVENT_FRAME.findall(sandbox.log_tail(10**8)))
+        async with signed_in(sandbox) as (dashboard, _):
+            phone = await Phone.dial(dashboard, uuid.uuid4().hex, "user", session_id=stored, title="Reopened call")
+            call_id = phone.ready["call_id"]
+            await asyncio.to_thread(model.wait_for, f"(call {call_id})")  # the [Voice call started] notice
+            await phone.say("from the reopened chat")
+            await phone.heard("You said from the reopened chat.", timeout=60)  # the reopened conversation ran
+            code = await phone.hang_up()
+
+            async def ended_notice():
+                mine = [d for d in await dashboard.deliveries() if d["call_id"] == call_id]
+                return mine if any(d["text"].startswith("[Voice call ended by user]") for d in mine) else None
+
+            deliveries = await until(ended_notice, what="the ended notice")
+            await asyncio.sleep(1.0)  # the turn it started streams meanwhile
+        after = len(EVENT_FRAME.findall(sandbox.log_tail(10**8)))
+        return phone.ready, code, deliveries, before, after
+
+    ready, code, deliveries, before, after = asyncio.run(scenario())
+    assert ready["state"] == "live" and code == 1000
+    assert deliveries and all(d["ok"] for d in deliveries), deliveries
+    assert (before, after) == (0, 0), "event frames reached the dashboard's stdout"

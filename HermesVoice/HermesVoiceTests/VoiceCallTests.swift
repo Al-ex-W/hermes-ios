@@ -1,5 +1,48 @@
+import AVFoundation
 import XCTest
 @testable import HermesVoice
+
+/// Scripted call audio: runs once started (as CallAudio does when CallKit activates the session), drops what it is
+/// given while it isn't running, and reports a line as heard only if none of it was dropped.
+@MainActor
+final class FakeAudio: CallAudioPlayback {
+    var onEvent: ((CallAudio.Event) -> Void)?
+    private(set) var running = false
+    private(set) var starts = 0
+    private var lost = false
+
+    func start(onInput: @escaping @Sendable (AVAudioPCMBuffer) -> Void) {
+        guard !running else { return }
+        running = true
+        starts += 1
+        onEvent?(.running)
+    }
+
+    func suspend() {
+        running = false
+    }
+
+    func stop() {
+        running = false
+    }
+
+    func setSampleRate(_ rate: Double) {}
+
+    func enqueue(pcm16 data: Data) -> Bool {
+        if !running { lost = true }
+        return running
+    }
+
+    func whenPlayedBack(_ done: @escaping (Bool) -> Void) {
+        let heard = running && !lost
+        lost = false
+        done(heard)
+    }
+
+    func flush() {
+        lost = false
+    }
+}
 
 /// A scripted plugin link: records what the phone sends, and lets a test deliver plugin messages or drop it.
 @MainActor
@@ -113,6 +156,7 @@ final class VoiceCallTests: XCTestCase {
     private let callID = "00112233445566778899aabbccddeeff"
     private var links: [FakeLink] = []
     private var speech: [FakeSpeech] = []
+    private var audio: [FakeAudio] = []
     private var attachError: Error?
     private var chat: ChatModel!
     private var ended: [VoiceCall.EndCause] = []
@@ -121,6 +165,7 @@ final class VoiceCallTests: XCTestCase {
     override func setUp() async throws {
         links = []
         speech = []
+        audio = []
         ended = []
         attachError = nil
         gateway = ScriptedGateway()
@@ -147,6 +192,11 @@ final class VoiceCallTests: XCTestCase {
                 let provider = FakeSpeech(id: id, callID: callID)
                 self.speech.append(provider)
                 return provider
+            },
+            makeAudio: { [unowned self] in
+                let audio = FakeAudio()
+                self.audio.append(audio)
+                return audio
             }
         )
         environment.attach = { [unowned self] _ in if let error = self.attachError { throw error } }
@@ -172,12 +222,13 @@ final class VoiceCallTests: XCTestCase {
         return call
     }
 
-    /// A call the user started, live, listening with a FakeSpeech.
+    /// A call the user started, live with its audio running, listening with a FakeSpeech.
     private func liveCall() async -> (VoiceCall, FakeSpeech) {
         let call = userCall()
         call.begin()
         await waitUntil { self.links.count == 1 && self.link.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: false))
+        call.audioDidActivate()
         call.startSpeech(.apple)
         return (call, speech[speech.count - 1])
     }
@@ -198,6 +249,10 @@ final class VoiceCallTests: XCTestCase {
         XCTAssertEqual(call.state, .ringing)
 
         call.answer()
+        // CallKit brings the audio up after the answer; the plugin speaks the moment it hears `answered`.
+        XCTAssertEqual(link.types, ["ringing"])
+        XCTAssertEqual(call.state, .connecting)
+        call.audioDidActivate()
         XCTAssertEqual(link.types, ["ringing", "answered"])
         XCTAssertEqual(call.state, .live)
         XCTAssertTrue(ended.isEmpty)
@@ -207,10 +262,43 @@ final class VoiceCallTests: XCTestCase {
         let call = pushCall()
         call.begin()
         call.answer()
+        call.audioDidActivate()
         XCTAssertEqual(call.state, .connecting)
         await waitUntil { self.links.first?.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: true))
         XCTAssertEqual(link.types, ["ringing", "answered"])
+        XCTAssertEqual(call.state, .live)
+    }
+
+    func testAnsweredGoesOutWithoutAudioAfterAWhile() async {
+        let call = pushCall { $0.answerAudioWait = 0.2 }
+        call.begin()
+        await waitUntil { self.links.first?.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: true))
+        call.answer()
+        await settle(0.05)
+        XCTAssertEqual(link.types, ["ringing"])
+        await waitUntil { self.link.types == ["ringing", "answered"] }
+        XCTAssertEqual(call.state, .live)
+        // The audio coming up later doesn't say it again.
+        call.audioDidActivate()
+        XCTAssertEqual(link.types, ["ringing", "answered"])
+    }
+
+    func testAnsweredIsSaidAgainWhenALinkDroppedWhileTheCallRang() async {
+        let call = pushCall()
+        call.begin()
+        await waitUntil { self.links.first?.connects == 1 }
+        call.answer()
+        call.audioDidActivate()
+        link.drop()  // before it heard `answered`
+        await waitUntil { self.links.count == 2 && self.link.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: true))
+        XCTAssertEqual(link.types, ["ringing", "answered"])
+        link.drop()  // after: the plugin's call is live now
+        await waitUntil { self.links.count == 3 && self.link.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: false))
+        XCTAssertTrue(link.types.isEmpty)
         XCTAssertEqual(call.state, .live)
     }
 
@@ -272,6 +360,7 @@ final class VoiceCallTests: XCTestCase {
         await waitUntil { self.links.first?.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: true))
         call.answer()
+        call.audioDidActivate()
         await settle(0.4)
         XCTAssertEqual(call.state, .live)
         XCTAssertTrue(ended.isEmpty)
@@ -388,6 +477,31 @@ final class VoiceCallTests: XCTestCase {
         await waitUntil { self.links.count == 2 && self.link.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: false))
         XCTAssertEqual(link.sent, [.played("u1")])
+    }
+
+    func testALineThatDidntReachTheSpeakerIsNotAcked() async {
+        // A user call whose audio isn't up yet (CallKit activates it after the call starts).
+        let call = userCall()
+        defer { withExtendedLifetime(call) {} }
+        call.begin()
+        await waitUntil { self.links.first?.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: false))
+        link.deliver(.speechStart(id: "u1", text: "Hello", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        link.deliver(.speechEnd(id: "u1", cancelled: false, error: nil))
+        XCTAssertTrue(link.sent.isEmpty, "dropped audio is never confirmed as heard")
+        XCTAssertFalse(call.hermesSpeaking, "the microphone listens again")
+        // Once the audio runs, lines are heard and acked.
+        call.audioDidActivate()
+        link.deliver(.speechStart(id: "u2", text: "Hi again", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        link.deliver(.speechEnd(id: "u2", cancelled: false, error: nil))
+        XCTAssertEqual(link.sent, [.played("u2")])
+        // A reconnect repeats only the heard one.
+        link.drop()
+        await waitUntil { self.links.count == 2 && self.link.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: false))
+        XCTAssertEqual(link.sent, [.played("u2")])
     }
 
     // MARK: Turns

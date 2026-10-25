@@ -169,6 +169,21 @@ def is_interrupted() -> bool:
         return False
 
 
+def take_yield() -> bool:
+    """Hermes asked the tool on this thread to yield (this takes the request). A message that reaches the
+    conversation while its tools run (``redirect()`` during tool execution: a steer plus ``request_yield`` on the
+    tool threads) is delivered only once the tool returns."""
+    try:
+        from tools.interrupt import acting_for_tid, consume_yield
+    except ImportError:
+        return False
+    try:
+        tids = {threading.get_ident(), acting_for_tid.get()}
+        return any([consume_yield(tid) for tid in tids if tid is not None])
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ── the calling session ────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -237,6 +252,40 @@ def methods() -> Optional[dict]:
     server = tui_server()
     table = getattr(server, "_methods", None) if server is not None else None
     return table if isinstance(table, dict) else None
+
+
+@contextlib.contextmanager
+def detached_transport() -> Iterator[None]:
+    """Run host methods with Hermes' drop sink as the request's transport. With no client bound, the host falls
+    back to its stdio transport, so a conversation the plugin reopens (``session.resume``) or queues into
+    (``session.redirect`` -> ``queued``) would stream every later frame of it (tool arguments, replies,
+    reasoning) to the dashboard's stdout, i.e. its log. The drop sink is where Hermes parks conversations whose
+    client went away; a client that opens the conversation later attaches as usual."""
+    server = tui_server()
+    transport = sys.modules.get("tui_gateway.transport")
+    sink = getattr(server, "_detached_ws_transport", None) if server is not None else None
+    bind = getattr(transport, "bind_transport", None)
+    reset = getattr(transport, "reset_transport", None)
+    if sink is None or not callable(bind) or not callable(reset):
+        yield
+        return
+    token = bind(sink)
+    try:
+        yield
+    finally:
+        reset(token)
+
+
+def dashboard_serving() -> bool:
+    """This process runs the dashboard's web server (``start_server`` set ``app.state.bound_host``), rather than
+    only importing it: other processes import ``hermes_cli.web_server`` too (a TUI resume that shows an attached
+    image does), which mounts the plugin's routes without ever serving them."""
+    web = sys.modules.get("hermes_cli.web_server")
+    state = getattr(getattr(web, "app", None), "state", None) if web is not None else None
+    try:
+        return bool(getattr(state, "bound_host", None))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def live_record(runtime_sid: str) -> Optional[dict]:

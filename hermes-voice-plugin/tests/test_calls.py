@@ -91,6 +91,7 @@ def test_sync_call_returns_the_reply_that_follows_its_line(core, fake, make_hub)
     assert result == {"said": "Yes, ship it.", "ending": "end_of_speech", "outcome": "answered",
                       "call_id": result["call_id"]}
     assert fake.waits == 1  # waited inside human_wait_window
+    assert fake.beats > 0  # and kept Hermes' inactivity watchdog quiet meanwhile
     assert injected == []  # the waiter took the turn: nothing injected
 
 
@@ -498,6 +499,12 @@ def test_the_tools_show_only_where_calls_work(core, fake, monkeypatch):
     fake.install(monkeypatch)
     monkeypatch.setitem(sys.__dict__, "_hermes_voice_routes_mounted", False)
     assert core.tools.available() is False
+    monkeypatch.setitem(sys.__dict__, "_hermes_voice_routes_mounted", True)
+    assert core.tools.available() is True
+    # The routes are mounted whenever hermes_cli.web_server is imported (a TUI resume that shows an image
+    # imports it): only a process whose web server runs (start_server set bound_host) serves the phone.
+    fake.bound_host = None
+    assert core.tools.available() is False and core.hub.routes_mounted() is False
 
 
 def test_register_adds_tools_skill_and_hooks(core, fake, make_hub):
@@ -567,3 +574,237 @@ def test_a_sync_call_returns_a_hang_up_without_a_notice_on_top(core, fake, make_
     result, texts = asyncio.run(scenario())
     assert (result["said"], result["ending"], result["outcome"]) == ("no that's all", "hang_up", "ended_by_user")
     assert len(texts) == 1 and texts[0].startswith("[Voice call started]"), texts
+
+
+# ── reply routing ──────────────────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_reply_kept_through_a_reconnect_is_still_the_reply(core, fake, make_hub):
+    """The line played, the link dropped before the ack went out, and the user answered meanwhile. On the next
+    link the phone repeats the ack and then sends the reply: the reply started before the plugin saw the ack,
+    and is still the one the sync start_call gets."""
+    fake.host.add("s1")
+    hub = make_hub()
+
+    async def scenario():
+        async with serving(core) as port:
+            first = await Phone.dial(port, fake, auto_ack=False)
+            await hub.injector.wait_for(1)  # [Voice call started]
+            pending = asyncio.create_task(tool(core.tools.start_call, {"text": "Deploy now?", "mode": "sync"}))
+            end = await first.expect("speech_end")
+            await first.socket.close()  # dropped: no bye, no ack
+            await first.reader
+            answered_at = iso()  # the user answers while the link is down; the phone keeps the turn
+            await asyncio.sleep(1.5)
+            second = await Phone.dial(port, fake, call_id=first.call_id, auto_ack=False)
+            await second.send({"type": "played", "id": end["id"]})
+            await second.say("yes deploy", started_at=answered_at)
+            result = await asyncio.wait_for(pending, 5)
+            await asyncio.sleep(0.2)
+            injected = hub.injector.texts()
+            await second.hang_up()
+            return result, injected
+
+    result, injected = asyncio.run(scenario())
+    assert (result["said"], result["outcome"]) == ("yes deploy", "answered"), result
+    assert len(injected) == 1 and injected[0].startswith("[Voice call started]"), injected
+
+
+def test_an_unconfirmed_line_takes_a_reply_that_started_after_it_was_heard(core, fake, make_hub, monkeypatch):
+    fake.host.add("s1")
+    hub = make_hub()
+    monkeypatch.setattr(core.hub, "PLAYBACK_MARGIN", 0.5)
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake, auto_ack=False)
+            await hub.injector.wait_for(1)
+            pending = asyncio.create_task(tool(core.tools.start_call, {"text": "Still there?", "mode": "sync"}))
+            await phone.expect("speech_end")
+            started = iso(offset=0.3)  # after the 0.2 s line played, within the margin
+            await until(lambda: hub.slot.waiter is not None and hub.slot.waiter.line.state == "unconfirmed")
+            await phone.say("yes I am", started_at=started)
+            result = await asyncio.wait_for(pending, 5)
+            await phone.hang_up()
+            return result
+
+    result = asyncio.run(scenario())
+    assert (result["said"], result["outcome"]) == ("yes I am", "answered"), result
+
+
+def test_a_newer_sync_call_takes_over_the_wait(core, fake, make_hub):
+    """Two sync start_calls on one call (parallel tool calls in one batch): the first returns at once, the second
+    gets the reply."""
+    fake.host.add("s1")
+    hub = make_hub()
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake)
+            await hub.injector.wait_for(1)
+            first = asyncio.create_task(tool(core.tools.start_call, {"text": "One?", "mode": "sync"}))
+            await phone.expect("speech_end")
+            second = asyncio.create_task(tool(core.tools.start_call, {"text": "Or two?", "mode": "sync"}))
+            superseded = await asyncio.wait_for(first, 3)
+            end = await phone.expect("speech_end")
+            await until(lambda: end["id"] in phone.played_at)
+            await asyncio.sleep(0.1)
+            await phone.say("two")
+            reply = await asyncio.wait_for(second, 5)
+            await phone.hang_up()
+            return superseded, reply
+
+    superseded, reply = asyncio.run(scenario())
+    assert superseded["status"] == "superseded" and superseded["call_id"] == reply["call_id"]
+    assert (reply["said"], reply["outcome"]) == ("two", "answered")
+
+
+def test_a_sync_wait_yields_to_a_message_hermes_holds_for_it(core, fake, make_hub):
+    """Hermes delivers a message that arrives while tools run (a typed one, or an injected [Voice] turn) once the
+    tool returns, and asks the tool to yield: the sync wait returns, the call and its line carry on."""
+    fake.host.add("s1")
+    hub = make_hub()
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake)
+            await hub.injector.wait_for(1)
+            pending = asyncio.create_task(tool(core.tools.start_call, {"text": "Shall I?", "mode": "sync"}))
+            end = await phone.expect("speech_end")
+            await until(lambda: end["id"] in phone.played_at)
+            fake.yield_all = True  # what redirect() during tool execution does: request_yield on the tool threads
+            result = await asyncio.wait_for(pending, 3)
+            await phone.say("go ahead")
+            texts = await hub.injector.wait_for(2)
+            await phone.hang_up()
+            return result, end, texts, hub.slot
+
+    result, end, texts, slot = asyncio.run(scenario())
+    assert result["status"] == "yielded" and "was spoken" in result["note"], result
+    assert fake.yields_taken == 1
+    assert not end.keys() & {"cancelled", "error"}  # the line was not stopped
+    assert texts[1].startswith("[Voice] go ahead")  # with no waiter, the reply is injected
+
+
+# ── policy through the hub ─────────────────────────────────────────────────────────────────────────────────
+
+
+def test_rings_are_rate_limited_per_conversation_and_overall(core, fake, make_hub):
+    for key in ("s1", "s2", "s3"):
+        fake.host.add(key)
+    hub = make_hub(pusher=FakePusher(ok=False, reason="no phone"), settings=core.config.Settings(
+        fake_tts=True, policy=core.config.PolicyConfig(rings_per_session=2, rings_global=3)))
+
+    def ring(session_id: str) -> dict:
+        return asyncio.run(tool(core.tools.start_call, {"text": "Hi", "mode": "sync"}, session_id=session_id))
+
+    first = [ring("s1")["outcome"] for _ in range(3)]
+    assert first == ["push_failed", "push_failed", "not_allowed"]
+    assert ring("s2")["outcome"] == "push_failed"  # the third ring overall
+    refused = ring("s3")
+    assert refused["outcome"] == "not_allowed" and "Too many calls" in refused["note"]
+    entries = [json.loads(line) for line in (fake.home / "hermes-voice" / "rings.jsonl").read_text().splitlines()]
+    assert [e.get("reason") for e in entries if e["event"] == "refused"] == ["rate_session", "rate_global"]
+
+
+def test_quiet_hours_confirm_takes_the_users_own_reply_as_the_go_ahead(core, fake, make_hub, tmp_path):
+    from datetime import datetime
+
+    fake.host.add("s1")
+    pusher = FakePusher()
+    now = [datetime(2026, 10, 25, 23, 0).timestamp()]
+    settings = core.config.Settings(fake_tts=True, policy=core.config.PolicyConfig(
+        quiet_hours=core.config.QuietHours(start=22 * 60, end=7 * 60, action="confirm")))
+    hub = make_hub(pusher=pusher, settings=settings, policy=core.policy.Policy(
+        lambda: settings, log_dir=lambda: tmp_path / "hermes-voice", clock=lambda: now[0]))
+
+    def ring() -> dict:
+        now[0] += 1
+        return asyncio.run(tool(core.tools.start_call, {"text": "Hi"}))
+
+    def turn(message: object) -> None:
+        now[0] += 1
+        hub.note_turn_start("s1", "", message)  # what the pre_llm_call hook passes on
+
+    assert ring()["status"] == "not_allowed"
+    # Turns Hermes starts by itself, and the plugin's own injections, are not the user saying yes.
+    for automatic in ("[Continuing toward your standing goal]\nGoal: ship it", "[Voice] okay (Reply out loud...)",
+                      "[IMPORTANT: Background process 7 exited (exit code 0).]", None):
+        turn(automatic)
+        assert ring()["status"] == "not_allowed", automatic
+    turn("yes, call me now")
+    assert ring()["status"] == "ringing" and pusher.pushed.wait(5)
+
+
+def test_a_kanban_worker_counts_as_a_scheduled_job(core, fake, make_hub, monkeypatch):
+    fake.host.add("s1")
+    pusher = FakePusher()
+    make_hub(pusher=pusher)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    result = asyncio.run(tool(core.tools.start_call, {"text": "Done", "mode": "sync"}))
+    assert result["outcome"] == "not_allowed" and "Scheduled jobs" in result["note"] and pusher.payloads == []
+
+
+# ── a call that ends while its phone link is coming up ─────────────────────────────────────────────────────
+
+
+class _RacingSocket:
+    """A phone socket driven by hand; `on_ready` runs while the plugin sends `ready` (the await in which
+    another thread can end the call)."""
+
+    def __init__(self, hello: dict, on_ready=None) -> None:
+        self.incoming: asyncio.Queue = asyncio.Queue()
+        self.incoming.put_nowait({"type": "websocket.receive", "text": json.dumps(hello)})
+        self.on_ready = on_ready
+        self.sent: list[dict] = []
+        self.closed = None
+
+    async def accept(self) -> None:
+        pass
+
+    async def receive(self) -> dict:
+        return await self.incoming.get()
+
+    async def send_json(self, message: dict) -> None:
+        self.sent.append(message)
+        if message["type"] == "ready" and self.on_ready is not None:
+            self.on_ready()
+            await asyncio.sleep(0.05)  # the close-out the ending scheduled runs now
+
+    async def close(self, code: int = 1000) -> None:
+        self.closed = code
+        self.incoming.put_nowait({"type": "websocket.disconnect", "code": code})
+
+
+@pytest.mark.parametrize("when", ["before ready", "while sending ready"])
+def test_a_call_that_ends_while_its_link_comes_up_turns_the_link_away(core, fake, make_hub, when):
+    fake.host.add("s1")
+    pusher = FakePusher()
+    hub = make_hub(pusher=pusher)
+
+    async def admitted() -> None:
+        return None
+
+    async def scenario():
+        hub.capture_loop()
+        started = await tool(core.tools.start_call, {"text": "Hi"})
+        call = hub.slot
+        hello = {"type": "hello", "call_id": started["call_id"], "initiated_by": "push", "app_version": "test"}
+        end = lambda: hub.finish(call, "ended_by_agent")  # noqa: E731
+        if when == "before ready":
+            admit = hub.admit
+            hub.admit = lambda message: (lambda verdict: (end(), verdict)[1])(admit(message))
+            socket = _RacingSocket(hello)
+        else:
+            socket = _RacingSocket(hello, on_ready=end)
+        await asyncio.wait_for(hub.serve_phone(socket, lambda ws: admitted()), 5)
+        await asyncio.sleep(0.1)
+        return socket, call
+
+    socket, call = asyncio.run(scenario())
+    cancel = {"type": "cancel", "reason": "ended_by_agent"}
+    if when == "before ready":
+        assert socket.sent == [cancel]  # never a ready {state: "ended"}
+    else:
+        assert socket.sent == [{"type": "ready", "call_id": call.call_id, "state": "ringing"}, cancel]
+    assert socket.closed == 1000 and hub.links == {} and hub.dropped == {}

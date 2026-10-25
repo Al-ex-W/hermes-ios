@@ -112,3 +112,23 @@ def test_the_ring_log_records_decisions_and_outcomes(core, fake, make_hub, tmp_p
     hub.finish(call, "no_answer")
     last = json.loads((tmp_path / "hermes-voice" / "rings.jsonl").read_text().splitlines()[-1])
     assert (last["event"], last["outcome"], last["call_id"]) == ("ended", "no_answer", "b" * 32)
+
+
+@pytest.mark.parametrize(
+    ("message", "own"),
+    [
+        ("yes, call me", True),
+        ("  sure ", True),
+        ([{"type": "text", "text": "yes please"}, {"type": "image_url", "image_url": {"url": "x"}}], True),
+        ("", False),
+        (None, False),
+        ([{"type": "image_url", "image_url": {"url": "x"}}], False),
+        ("[Voice] yes call me (Reply out loud with start_call; your text replies are not spoken.)", False),
+        ("[Voice call ended by user] Reply in text from now on", False),
+        ("[Continuing toward your standing goal]\nGoal: ship it", False),
+        ("[System note: Your previous turn was interrupted mid-run", False),
+        ("[IMPORTANT: Background process 12 exited (exit code 0).", False),
+    ],
+)
+def test_only_the_users_own_messages_count_as_a_go_ahead(core, message, own):
+    assert core.policy.users_own_message(message) is own

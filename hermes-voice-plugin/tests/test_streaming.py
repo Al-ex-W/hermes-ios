@@ -201,14 +201,15 @@ def test_cancelled_line_tells_phone(core, fake, make_hub, phase):
     assert follow_up.status == "played", follow_up
 
 
-def test_tts_failure_ends_the_line_with_an_error(core, fake, make_hub):
-    class BrokenSpeech:
-        async def stream(self, text: str, voice_id: Optional[str] = None) -> AsyncIterator[bytes]:
-            yield b"\x00\x00" * 2400
-            raise RuntimeError("ElevenLabs returned HTTP 401.")
+class _BrokenSpeech:
+    async def stream(self, text: str, voice_id: Optional[str] = None) -> AsyncIterator[bytes]:
+        yield b"\x00\x00" * 2400
+        raise RuntimeError("ElevenLabs returned HTTP 401.")
 
+
+def test_tts_failure_ends_the_line_with_an_error(core, fake, make_hub):
     fake.host.add("s1")
-    make_hub(tts=BrokenSpeech())
+    make_hub(tts=_BrokenSpeech())
 
     async def scenario():
         async with serving(core) as port:
@@ -222,6 +223,39 @@ def test_tts_failure_ends_the_line_with_an_error(core, fake, make_hub):
     assert result["outcome"] == "tts_failed", result
     assert result["note"] == "Could not speak: ElevenLabs returned HTTP 401."
     assert end["error"] == "ElevenLabs returned HTTP 401."
+
+
+@pytest.mark.parametrize("trouble", ["tts", "drop", "hang up"])
+def test_an_async_line_that_isnt_delivered_is_told_to_the_conversation(core, fake, make_hub, monkeypatch, trouble):
+    """async start_call has returned already: the agent learns of a line the user didn't get from an injected
+    "[Voice line not delivered: …]" notice, unless the call itself is over (its own notice says that)."""
+    monkeypatch.setattr(core.hub, "RECONNECT_GRACE", 0.3)
+    fake.host.add("s1")
+    hub = make_hub(tts=_BrokenSpeech() if trouble == "tts" else PacedSpeech(delay=0.05))
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake)
+            await hub.injector.wait_for(1)  # [Voice call started]
+            started = await tool(core.tools.start_call, {"text": " ".join(["word"] * 40)})
+            await asyncio.wait_for(phone.heard_audio.wait(), 5)
+            if trouble == "drop":
+                await phone.socket.close()  # no bye: the line is cut off, the call waits for a reconnect
+            elif trouble == "hang up":
+                await phone.hang_up()
+            texts = await hub.injector.wait_for(2)
+            await asyncio.sleep(0.5)
+            return started, hub.injector.texts()
+
+    started, texts = asyncio.run(scenario())
+    assert started["status"] == "speaking"
+    if trouble == "tts":
+        assert texts[1:] == ["[Voice line not delivered: Could not speak: ElevenLabs returned HTTP 401.]"]
+    elif trouble == "drop":
+        assert texts[1].startswith("[Voice line not delivered: The phone lost its connection while speaking")
+        assert len(texts) == 2
+    else:
+        assert texts[1:] == ["[Voice call ended by user] Reply in text from now on; don't call back unless they ask."]
 
 
 def test_invalid_voice_id_in_config_never_reaches_the_url(core, fake):

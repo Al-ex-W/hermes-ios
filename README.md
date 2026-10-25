@@ -136,9 +136,13 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
 4. **Install and enable the plugin** for each profile that should call you:
 
    ```bash
-   hermes plugins install <path-to-this-repo>/hermes-voice-plugin
+   hermes plugins install Al-ex-W/hermes-ios/hermes-voice-plugin   # GitHub: this repo's default branch
    hermes plugins enable hermes_voice        # also installs its one dependency, h2 (APNs is HTTP/2 only)
    ```
+
+   `hermes plugins install` only clones Git sources, and reads a bare path as GitHub `owner/repo` shorthand. For a
+   local clone, run `hermes plugins install "file://$PWD#hermes-voice-plugin"` in the repo's root: it installs what
+   is committed on the checked-out branch. `--ref <commit-sha>` pins one commit.
 
    Optional: a voice and a policy under `plugins.entries.hermes_voice.settings` (see the plugin README). If the
    dashboard log warns that `h2` is missing, run `hermes pm repair`.
@@ -236,8 +240,9 @@ makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/rin
   are answered from the chat.
 - **Calls**: `wss://…/api/plugins/hermes_voice/phone?ticket=…`, with a fresh ticket for every connect. The app
   says `hello {call_id, session_id, title, initiated_by: user|push, app_version}` and gets `ready {call_id,
-  state}`; for a push it says `ringing`, then `answered` or `declined`. Speech comes as `speech_start {id, text,
-  sample_rate, format}`, binary 16-bit PCM and `speech_end {id}`; the app answers `played {id}` once it was heard.
+  state}`; for a push it says `ringing`, then `answered` (once the call's audio runs) or `declined`. Speech comes
+  as `speech_start {id, text, sample_rate, format}`, binary 16-bit PCM and `speech_end {id}`; the app answers
+  `played {id}` once all of it was heard (a line whose audio was dropped gets no ack).
   What you say goes as `user_turn {call_id, text, ending {kind, …}, provider, language, started_at, ended_at}`.
   The plugin ends a call with `cancel {reason}` while it rings or `ended {outcome}` once live; the app hangs up
   with `bye {reason}`. Close codes: 4401 auth (the app mints one more ticket, then gives up), 4400 bad hello, 4409

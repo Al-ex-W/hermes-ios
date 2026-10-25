@@ -16,8 +16,9 @@ Phone protocol on ``/api/plugins/hermes_voice/phone`` (JSON text frames plus bin
 - close codes: 4401 auth, 4400 bad hello, 4409 replaced by a newer link for the call, 4429 another conversation
   holds the call slot, 1011 the link stopped taking frames (the phone reconnects)
 
-Turn routing: a sync ``start_call`` waiting on the call takes the first turn that started after the phone
-confirmed its line played; every other turn is force-injected into the owner's conversation (``inject.py``).
+Turn routing: a sync ``start_call`` waiting on the call takes the first turn that reached the plugin after the
+phone confirmed its line played (``Waiter.accepts``); every other turn is force-injected into the owner's
+conversation (``inject.py``).
 
 Threads: tool handlers run on agent threads, the socket on the dashboard's event loop (captured on the first
 request). Call state is guarded by ``lock``; links and speech run on the loop only.
@@ -42,7 +43,7 @@ from typing import Any, Awaitable, Callable, Optional
 from . import hermes, inject, push
 from .config import Settings
 from .config import current as current_settings
-from .policy import Policy
+from .policy import Policy, users_own_message
 from .tts import SAMPLE_RATE, ElevenLabs, TextToSpeech
 
 try:
@@ -72,8 +73,8 @@ NOTICE_TIMEOUT = 2.0
 SEND_TIMEOUT = 5.0
 # How long end_call waits for its goodbye to be heard.
 GOODBYE_WAIT = 60.0
-# A turn may start this much before the phone's played ack (clocks of phone and host differ a little).
-TURN_CLOCK_SLACK = 0.5
+# How far the phone's clock (a turn's started_at) may be behind the host's.
+TURN_CLOCK_SLACK = 1.0
 HISTORY_LIMIT = 50
 
 OUTCOMES = frozenset({
@@ -232,7 +233,10 @@ class Line:
         self.note = note
         self.state = "queued"
         self.result: Optional[SpeakResult] = None
-        # Wall-clock time the phone confirmed it played (or when it was given up on unconfirmed).
+        # Wall-clock (host) times: speech_start first went out; the phone should have finished playing it (the
+        # audio's length after its first frame, or the speech_end send if streaming was slower); its played ack.
+        self.sent_at: Optional[float] = None
+        self.heard_by: Optional[float] = None
         self.played_at: Optional[float] = None
         self.done = threading.Event()
         self.task: Optional[asyncio.Task] = None
@@ -247,8 +251,22 @@ class Waiter:
         self.superseded = False
 
     def accepts(self, turn: Turn) -> bool:
-        played = self.line.played_at
-        return played is not None and turn.started_at >= played - TURN_CLOCK_SLACK
+        """Whether `turn` is the reply to this line (called under the hub's lock as the turn arrives).
+
+        The phone's mic is paused while a line plays, and it sends a line's ``played`` before any turn that
+        follows it (after a reconnect too: the ack is repeated on ``ready``, ahead of the turns kept meanwhile).
+        So a turn that arrives after the ack and started after the line went out is the reply, however late the
+        ack got here. ``started_at`` is the phone's clock, compared with the host's only against the start of the
+        line, which is a line's length away from any real reply. A turn that Hermes' speech cut off began before
+        that speech. A line the phone never confirmed takes turns that started after it should have been heard."""
+        line = self.line
+        if turn.ending == "cut_off":
+            return False
+        if line.played_at is not None and line.sent_at is not None:
+            return turn.started_at >= line.sent_at - TURN_CLOCK_SLACK
+        if line.state == "unconfirmed" and line.heard_by is not None:
+            return turn.started_at >= line.heard_by - TURN_CLOCK_SLACK
+        return False
 
 
 class Call:
@@ -677,8 +695,10 @@ class CallHub:
         with hermes.human_wait():
             while True:
                 interrupted = hermes.is_interrupted()
+                # A message for the conversation is parked until this tool returns: let it through.
+                yielded = not interrupted and hermes.take_yield()
                 with self.lock:
-                    result = self._sync_result(call, waiter, interrupted, time.monotonic() > deadline)
+                    result = self._sync_result(call, waiter, interrupted, time.monotonic() > deadline, yielded)
                     if result is not None:
                         if call.waiter is waiter:
                             call.waiter = None
@@ -690,7 +710,8 @@ class CallHub:
             self.cancel_line(call, line)
         return result
 
-    def _sync_result(self, call: Call, waiter: Waiter, interrupted: bool, late: bool) -> Optional[dict[str, Any]]:
+    def _sync_result(self, call: Call, waiter: Waiter, interrupted: bool, late: bool,
+                     yielded: bool = False) -> Optional[dict[str, Any]]:
         line = waiter.line
         if waiter.turn is not None:
             turn = waiter.turn
@@ -709,6 +730,11 @@ class CallHub:
             return {"call_id": call.call_id, "status": "interrupted",
                     "note": "Stopped waiting. The call stays open; what the user says next arrives as a [Voice] "
                             "message."}
+        if yielded:
+            spoken = "was spoken" if line.played_at is not None else "is still being spoken"
+            return {"call_id": call.call_id, "status": "yielded",
+                    "note": f"Stopped waiting: a message for you came in (it follows this result). The call stays "
+                            f"open and your line {spoken}; what the user says next arrives as a [Voice] message."}
         if late:
             return _sync(call, "", None, "answered",
                          "The user hasn't answered yet; their reply will arrive as a [Voice] message.")
@@ -751,8 +777,6 @@ class CallHub:
     def _settle(self, call: Call, line: Line, result: SpeakResult) -> bool:
         """Record a line's result (under lock). True when the conversation should hear that it failed."""
         line.state, line.result = result.status, result
-        if line.played_at is None and result.status == "unconfirmed":
-            line.played_at = time.time()
         try:
             call.lines.remove(line)
         except ValueError:
@@ -786,6 +810,8 @@ class CallHub:
             try:
                 if not await utterance.send():
                     return SpeakResult("not_connected", self.problem(call))
+                with self.lock:
+                    line.sent_at = time.time()
                 sent = 0
                 audio_started: Optional[float] = None
                 carry = b""
@@ -808,7 +834,10 @@ class CallHub:
                 # The phone plays as audio arrives: it finishes `seconds` after the first frame, or just
                 # after the last one if the stream was slower than real time.
                 now = loop.time()
-                wait_until = min(max((audio_started or now) + seconds, now) + PLAYBACK_MARGIN, give_up_at)
+                playing_until = max((audio_started or now) + seconds, now)
+                with self.lock:
+                    line.heard_by = time.time() + (playing_until - now)
+                wait_until = min(playing_until + PLAYBACK_MARGIN, give_up_at)
                 try:
                     await asyncio.wait_for(played.wait(), max(0.0, wait_until - loop.time()))
                 except asyncio.TimeoutError:
@@ -867,11 +896,25 @@ class CallHub:
                 await _turn_away(ws, call)
                 return
             assert call is not None
-            await ws.send_json({"type": "ready", "call_id": call.call_id, "state": call.state})
-            link, previous = self.connect_link(call.call_id, ws)
+            # The call can end on another thread (ring timer, end_call, a failed push) at any point here. Its
+            # close-out runs on this loop and closes whatever link the call has by then, so the link is
+            # registered under the same lock that ends calls: either the call is already over (turned away
+            # here), or it ends later and the close-out finds this link.
             with self.lock:
-                call.connected = True
+                state = call.state
+            if state == "ended":
+                await _turn_away(ws, call)
+                return
+            await ws.send_json({"type": "ready", "call_id": call.call_id, "state": state})
+            previous = None
+            with self.lock:
+                if call.state != "ended":
+                    link, previous = self.connect_link(call.call_id, ws)
+                    call.connected = True
                 live = call.state == "live"
+            if link is None:
+                await _turn_away(ws, call)
+                return
             if previous is not None:
                 # Closed in the background: a replaced link that stopped reading must not hold up this one.
                 self.retire(previous.socket, 4409)
@@ -985,16 +1028,18 @@ class CallHub:
 
     # ── hooks ────────────────────────────────────────────────────────────────────────────────────────────
 
-    def note_turn_start(self, session_id: str, parent_session_id: str = "") -> None:
+    def note_turn_start(self, session_id: str, parent_session_id: str = "", user_message: Any = None) -> None:
         """pre_llm_call: the conversation is busy now; if it is the call's owner under a new id (compression
-        rotated it), the call follows."""
+        rotated it), the call follows. A turn the user wrote themselves counts as their go-ahead for a call
+        during quiet hours (``action: confirm``); Hermes' own follow-up turns and this plugin's injections don't."""
         if not session_id:
             return
         self.busy[session_id] = time.time()
         if len(self.busy) > 500:
             for key in list(self.busy)[:100]:
                 self.busy.pop(key, None)
-        self.policy.note_user_turn(session_id)
+        if users_own_message(user_message):
+            self.policy.note_user_turn(session_id)
         with self.lock:
             call = self.slot
         if call is None or call.owner.owns(session_id):
@@ -1258,4 +1303,6 @@ def mark_routes_mounted() -> None:
 
 
 def routes_mounted() -> bool:
-    return bool(sys.__dict__.get(_ROUTES_KEY))
+    """The phone's routes are mounted in this process and it serves them: the dashboard's web server is running
+    here (other processes import it, and so mount the routes, without serving anything)."""
+    return bool(sys.__dict__.get(_ROUTES_KEY)) and hermes.dashboard_serving()

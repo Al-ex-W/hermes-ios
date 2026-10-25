@@ -40,7 +40,9 @@ current turn (Hermes reads it after the tool calls in flight finish), or starts 
   `{said, ending, outcome, call_id}` — `said` is their words, `ending` how their turn ended (`end_of_speech`,
   `cut_off`, `hang_up`, `muted`, `dropped`, `provider_error`). Use it for a question you need answered before you
   go on. Words the user says while your line is still playing don't count as the reply; they arrive as a
-  `[Voice]` message instead.
+  `[Voice]` message instead. A sync call can also return `{call_id, status, note}` without a reply: `interrupted`
+  (the user pressed Stop), `yielded` (a message for you came in; it follows the result) or `superseded` (a newer
+  sync `start_call` waits instead). The call stays open, and the reply comes as a `[Voice]` message.
 
 ## Outcomes
 

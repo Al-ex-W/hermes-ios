@@ -10,6 +10,9 @@ host's own method table, the way the desktop client would (pattern from Hermes C
 The target is the owner's live runtime session (``server._find_live_session_by_key``), else the stored id is
 reopened with ``session.resume`` (which follows a compression rotation to its tip). A stale runtime id (4001 /
 4007) is resolved again once.
+
+Every host method runs with Hermes' drop sink bound as its transport (``hermes.detached_transport``): this thread
+has no client, and the host's fallback is its stdout, where a reopened conversation would stream from then on.
 """
 
 from __future__ import annotations
@@ -178,7 +181,8 @@ class TuiInjector:
 
 def _call(table: dict, method: str, params: dict) -> Any:
     try:
-        return table[method](f"hermes-voice-{uuid.uuid4().hex[:12]}", params)
+        with hermes.detached_transport():
+            return table[method](f"hermes-voice-{uuid.uuid4().hex[:12]}", params)
     except Exception as error:  # noqa: BLE001 - a host method blowing up is a refusal, not a crash
         logger.warning("hermes_voice: %s failed: %s", method, type(error).__name__, exc_info=True)
         return {"error": {"code": 5000, "message": f"{method} failed ({type(error).__name__})"}}

@@ -7,7 +7,8 @@ import Foundation
 /// The plugin also posts the call's notices to Hermes, so the phone never sends prompts for the call.
 ///
 /// A call the user starts goes live once the plugin is ready. A call Hermes rings (a VoIP push) rings until the
-/// user answers, declines, or `ringTimeout` passes; the plugin speaks only after `answered`.
+/// user answers, declines, or `ringTimeout` passes; the plugin speaks only after `answered`, which goes out once the
+/// call's audio runs. A line is acknowledged as `played` only if all of it reached the speaker.
 @MainActor
 final class VoiceCall: ObservableObject, Identifiable {
     enum State: Equatable { case ringing, connecting, live, ended(String?) }
@@ -29,6 +30,8 @@ final class VoiceCall: ObservableObject, Identifiable {
         var makeLink: @MainActor (PhoneHello) -> CallLink
         /// A provider for (which recognizer, call id).
         var makeSpeech: @MainActor (SpeechProviderID, String) -> SpeechProvider
+        /// The speaker and microphone.
+        var makeAudio: @MainActor () -> CallAudioPlayback = { CallAudio() }
         /// Opens the chat's session on the gateway, so the hello can carry its stored id.
         var attach: @MainActor (ChatModel) async throws -> Void = { try await $0.ensureAttached() }
         /// Matches the plugin's ring timeout.
@@ -39,6 +42,8 @@ final class VoiceCall: ObservableObject, Identifiable {
         var reconnectDelays: [Double] = [0.5, 1, 2, 4, 8, 8, 15, 15]
         /// How long a call declined before its link was up keeps trying to tell the plugin.
         var declineLinger: TimeInterval = 10
+        /// How long an answered call waits for CallKit to bring up its audio before it says `answered` anyway.
+        var answerAudioWait: TimeInterval = 5
 
         static func live(client: DashboardClient, settings: CallSettings) -> Environment {
             Environment(
@@ -84,7 +89,7 @@ final class VoiceCall: ObservableObject, Identifiable {
     var onConnected: (() -> Void)?
 
     private let environment: Environment
-    private let audio = CallAudio()
+    private let audio: CallAudioPlayback
     private let input = AudioInputTap()
     private var speech: SpeechProvider?
     private var speechEvents: Task<Void, Never>?
@@ -92,6 +97,10 @@ final class VoiceCall: ObservableObject, Identifiable {
     /// The current link said `ready`.
     private var linkReady = false
     private var answered: Bool
+    /// The user answered and the plugin, still ringing on the current link, hasn't been told (see `sendAnswer`).
+    private var answerOwed = false
+    private var answerAudioTimer: Task<Void, Never>?
+    private var answerAudioWaitOver = false
     private var began = false
     private var audioBegan = false
     private var connected = false
@@ -142,6 +151,7 @@ final class VoiceCall: ObservableObject, Identifiable {
         uuid = CallID.uuid(from: self.callID) ?? UUID()
         self.push = push
         self.environment = environment
+        audio = environment.makeAudio()
         speechProvider = settings.provider
         answered = initiatedBy == .user
         state = initiatedBy == .push ? .ringing : .connecting
@@ -163,18 +173,38 @@ final class VoiceCall: ObservableObject, Identifiable {
         Task { await connect() }
     }
 
-    /// The user answered a call that rang.
+    /// The user answered a call that rang. The plugin hears it once the call's audio runs (`sendAnswer`).
     func answer() {
         guard !answered, !isEnded else { return }
         answered = true
         ringTimer?.cancel()
         ringTimer = nil
-        if linkReady {
-            link?.send(.answered)
-            goLive()
-        } else {
-            state = .connecting
+        state = .connecting
+        let wait = environment.answerAudioWait
+        answerAudioTimer = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.answerAudioWaitOver = true
+            self.sendAnswer()
         }
+        if linkReady {
+            answerOwed = true
+            sendAnswer()
+        }
+    }
+
+    /// Tells the plugin the call was answered, once the call's audio runs. The plugin speaks Hermes' first line the
+    /// moment it hears `answered`, and CallKit activates the audio only after the answer: told earlier, the line
+    /// would arrive before there is an engine to play it. If the audio isn't up after `answerAudioWait`, it goes out
+    /// anyway (what can't be played then isn't acknowledged as heard).
+    private func sendAnswer() {
+        guard answerOwed, linkReady, !isEnded else { return }
+        guard audioStarts > 0 || answerAudioWaitOver else { return }
+        answerOwed = false
+        answerAudioTimer?.cancel()
+        answerAudioTimer = nil
+        link?.send(.answered)
+        goLive()
     }
 
     /// Hung up (or declined) on this phone. What was heard of an unfinished sentence goes to Hermes first.
@@ -302,9 +332,13 @@ final class VoiceCall: ObservableObject, Identifiable {
             recentlyPlayed.forEach { link?.send(.played($0)) }
             if ringing {
                 if initiatedBy == .push { link?.send(.ringing) }
-                if answered { link?.send(.answered) }
+                if answered {
+                    answerOwed = true
+                    sendAnswer()
+                }
+            } else if answered {
+                goLive()
             }
-            if answered { goLive() }
         case let .cancel(reason):
             link?.close(after: [])
             link = nil
@@ -350,6 +384,7 @@ final class VoiceCall: ObservableObject, Identifiable {
     private func linkClosed(_ reason: VoiceLink.Close) {
         link = nil
         linkReady = false
+        answerOwed = false  // the next `ready` says whether the plugin still rings
         // Audio on the next link follows a fresh speech_start.
         streamingSpeech = nil
         deferTimer?.cancel()
@@ -455,6 +490,7 @@ final class VoiceCall: ObservableObject, Identifiable {
         speechGeneration += 1
         reconnectTask?.cancel()
         ringTimer?.cancel()
+        answerAudioTimer?.cancel()
         deferTimer?.cancel()
         deferTimer = nil
         deferred.removeAll()
@@ -624,12 +660,16 @@ final class VoiceCall: ObservableObject, Identifiable {
             }
             completeSpeech.insert(id)
             let generation = speechGeneration
-            audio.whenPlayedBack { [weak self] in
+            audio.whenPlayedBack { [weak self] heard in
                 guard let self, generation == self.speechGeneration else { return }
-                // Acked on whichever link is up now (the plugin carries pending acks across reconnects);
-                // the next `ready` repeats it in case it is lost with a dying socket or sent while none is up.
-                self.link?.send(.played(id))
-                self.recentlyPlayed = Array((self.recentlyPlayed + [id]).suffix(4))
+                // Only a line that all reached the speaker is acked: the plugin then takes what the user says next
+                // as the reply to it. Unacked, it counts as unconfirmed (the user may not have heard it).
+                if heard {
+                    // Acked on whichever link is up now (the plugin carries pending acks across reconnects);
+                    // the next `ready` repeats it in case it is lost with a dying socket or sent while none is up.
+                    self.link?.send(.played(id))
+                    self.recentlyPlayed = Array((self.recentlyPlayed + [id]).suffix(4))
+                }
                 self.finishSpeech(id)
             }
         default:
@@ -690,6 +730,7 @@ final class VoiceCall: ObservableObject, Identifiable {
             // A rebuilt engine may tap the mic in a new format.
             if audioStarts > 0 { speech?.audioRestarted() }
             audioStarts += 1
+            sendAnswer()
             if !speakerChosen {
                 // Once per call: start on the loudspeaker unless a headset or car already has the call.
                 speakerChosen = true

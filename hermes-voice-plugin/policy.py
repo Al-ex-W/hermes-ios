@@ -112,6 +112,7 @@ class Policy:
         return bool(refused and wrote and wrote > refused and now - refused < CONFIRM_WINDOW_S)
 
     def note_user_turn(self, session_id: str) -> None:
+        """The user wrote in this conversation (only their own messages: see ``users_own_message``)."""
         if session_id:
             with self.lock:
                 self.user_turn_at[session_id] = self.clock()
@@ -144,6 +145,23 @@ class Policy:
                     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         except OSError:
             logger.warning("hermes_voice: could not write the ring log", exc_info=True)
+
+
+def users_own_message(message: Any) -> bool:
+    """Whether a turn's message (``pre_llm_call``'s ``user_message``) is one the user wrote. Hermes starts turns on
+    its own too, each with a bracketed text: goal continuation ("[Continuing toward your standing goal]"),
+    "[System note: …]" after a crash, "[IMPORTANT: Background process …]" notices; this plugin injects
+    "[Voice …]". None of those is the user saying yes to a call. Fails closed: a message of the user's own that
+    starts with "[" doesn't count either, so at worst the agent asks again."""
+    if isinstance(message, str):
+        text = message
+    elif isinstance(message, list):  # multimodal content parts
+        text = " ".join(str(part.get("text") or "") for part in message
+                        if isinstance(part, dict) and part.get("type") in ("text", "input_text"))
+    else:
+        return False
+    text = text.lstrip()
+    return bool(text) and not text.startswith("[")
 
 
 def _surface(origin: hermes.Origin) -> str:
