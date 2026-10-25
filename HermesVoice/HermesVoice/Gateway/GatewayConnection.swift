@@ -110,31 +110,40 @@ struct LiveSession: Equatable {
     /// `stored_session_id` when the result has it (create does, resume doesn't).
     var storedID: String?
     var running = false
-    /// The running turn's prompt, the corrections steered into it, and the prompt queued after it.
-    var inflightPrompt: String?
-    var corrections: [String] = []
+    /// The running turn as Hermes holds it (its prompt, the reply so far, the corrections steered into it, a
+    /// failure kept for a client that missed it), the prompt queued after it, and the session's task list.
+    var inflight: InflightTurn?
     var queuedPrompt: String?
+    var todos: TodoState?
 
-    init(runtimeID: String, storedID: String? = nil, running: Bool = false, inflightPrompt: String? = nil,
-         corrections: [String] = [], queuedPrompt: String? = nil) {
+    var inflightPrompt: String? { inflight?.user }
+    var corrections: [String] { inflight?.corrections ?? [] }
+
+    init(runtimeID: String, storedID: String? = nil, running: Bool = false, inflight: InflightTurn? = nil,
+         queuedPrompt: String? = nil, todos: TodoState? = nil) {
         self.runtimeID = runtimeID
         self.storedID = storedID
         self.running = running
-        self.inflightPrompt = inflightPrompt
-        self.corrections = corrections
+        self.inflight = inflight
         self.queuedPrompt = queuedPrompt
+        self.todos = todos
+    }
+
+    init(runtimeID: String, storedID: String? = nil, running: Bool = false, inflightPrompt: String?,
+         corrections: [String] = [], queuedPrompt: String? = nil) {
+        let inflight = inflightPrompt == nil && corrections.isEmpty
+            ? nil : InflightTurn(user: inflightPrompt, corrections: corrections.isEmpty ? nil : corrections)
+        self.init(runtimeID: runtimeID, storedID: storedID, running: running, inflight: inflight, queuedPrompt: queuedPrompt)
     }
 
     init(_ result: SessionResumeResult) {
         self.init(runtimeID: result.sessionId, storedID: result.storedSessionId, running: result.running ?? false,
-                  inflightPrompt: result.inflight?.user, corrections: result.inflight?.corrections ?? [],
-                  queuedPrompt: result.queued?.user)
+                  inflight: result.inflight, queuedPrompt: result.queued?.user, todos: result.todoState)
     }
 
     init(_ result: SessionActivateResult) {
         self.init(runtimeID: result.sessionId, storedID: result.storedSessionId, running: result.running ?? false,
-                  inflightPrompt: result.inflight?.user, corrections: result.inflight?.corrections ?? [],
-                  queuedPrompt: result.queued?.user)
+                  inflight: result.inflight, queuedPrompt: result.queued?.user, todos: result.todoState)
     }
 
     init(_ result: SessionCreateResult) {
@@ -145,11 +154,13 @@ struct LiveSession: Equatable {
         guard let runtimeID = raw["session_id"]?.stringValue, !runtimeID.isEmpty else {
             throw DashboardError.rpc("Hermes didn't open the session.")
         }
-        let inflight = raw["inflight"]
+        var inflight = try? raw["inflight"]?.decode(InflightTurn.self)
+        if inflight == nil, let user = raw["inflight"]?["user"]?.stringValue {
+            inflight = InflightTurn(user: user, corrections: raw["inflight"]?["corrections"]?.arrayValue?.compactMap(\.stringValue))
+        }
         self.init(runtimeID: runtimeID, storedID: raw["stored_session_id"]?.stringValue,
-                  running: raw["running"]?.boolValue ?? false, inflightPrompt: inflight?["user"]?.stringValue,
-                  corrections: inflight?["corrections"]?.arrayValue?.compactMap(\.stringValue) ?? [],
-                  queuedPrompt: raw["queued"]?["user"]?.stringValue)
+                  running: raw["running"]?.boolValue ?? false, inflight: inflight,
+                  queuedPrompt: raw["queued"]?["user"]?.stringValue, todos: try? raw["todo_state"]?.decode(TodoState.self))
     }
 
     /// Runs a typed attach call; a result that doesn't match the contract is read from its raw form instead.

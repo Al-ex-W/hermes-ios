@@ -237,6 +237,8 @@ enum Theme {
         static let send = "arrow.up"
         static let stop = "stop.fill"
         static let copy = "doc.on.doc"
+        static let retry = "arrow.clockwise"
+        static let restore = "arrow.uturn.backward"
         static let tool = "wrench.and.screwdriver"
         static let terminal = "terminal"
         static let reasoning = "brain"
@@ -465,6 +467,36 @@ extension View {
     /// Font and line height of a `Theme.TextStyle`, scaled with Dynamic Type.
     func hermesText(_ style: Theme.TextStyle) -> some View {
         modifier(TextStyleModifier(style: style))
+    }
+
+    /// A form page (sign-in, settings): rows on the page background over the sidebar tone, token hairlines.
+    func hermesForm() -> some View {
+        scrollContentBackground(.hidden)
+            .background(Theme.sidebar)
+    }
+
+    /// A form section's rows (`hermesForm`).
+    func hermesFormRows() -> some View {
+        listRowBackground(Theme.background)
+            .listRowSeparatorTint(Theme.Hairline.secondary)
+    }
+}
+
+/// A form section's header or footer text.
+struct FormNote: View {
+    let text: String
+    var color: Color = Theme.Text.tertiary
+
+    init(_ text: String, color: Color = Theme.Text.tertiary) {
+        self.text = text
+        self.color = color
+    }
+
+    var body: some View {
+        Text(LocalizedStringKey(text))
+            .hermesText(.caption)
+            .foregroundStyle(color)
+            .textCase(nil)
     }
 }
 

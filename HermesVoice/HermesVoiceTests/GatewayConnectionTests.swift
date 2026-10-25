@@ -400,17 +400,20 @@ final class GatewayConnectionTests: XCTestCase {
         gateway.answersPings = false
         let connection = gateway.connection {
             $0.heartbeatInterval = 0.05
-            $0.heartbeatDeadline = 0.25
+            // Wide next to the push spacing, so a slow scheduler can't fake a missed heartbeat.
+            $0.heartbeatDeadline = 1.0
         }
         try await connection.connect()
-        for _ in 0..<12 {
+        // Frames keep coming for well past one deadline while pings stay unanswered.
+        let start = Date()
+        while Date().timeIntervalSince(start) < 2.5 {
             gateway.current.push(event: "sessions.changed")
             await settle(0.05)
         }
         XCTAssertTrue(gateway.sockets[0].isOpen)
         XCTAssertEqual(connection.state, .connected)
 
-        await waitUntil { connection.state == .disconnected }
+        await waitUntil(timeout: 5) { connection.state == .disconnected }
         XCTAssertTrue(gateway.sockets[0].closedByClient)
     }
 

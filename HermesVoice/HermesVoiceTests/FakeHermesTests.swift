@@ -40,7 +40,7 @@ final class FakeHermesTests: XCTestCase {
     }
 
     private func newChat() async -> ChatModel {
-        let chat = ChatModel(client: client, connection: connection, summary: nil)
+        let chat = ChatModel(client: client, connection: connection, prompts: prompts, summary: nil)
         chat.setInUse("view", true)
         await chat.open()
         return chat
@@ -49,7 +49,11 @@ final class FakeHermesTests: XCTestCase {
     private func reply(_ chat: ChatModel, _ text: String) async {
         let sent = await chat.send(text)
         XCTAssertTrue(sent, "\(text): \(chat.error ?? "")")
-        await waitUntil(timeout: 5) { !chat.busy && chat.messages.last?.role == .assistant }
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply != nil }
+    }
+
+    private func storedSessions() async throws -> [SessionSummary] {
+        try await client.profileSessions(profile: SidebarOptions.allProfiles, limit: 100, minMessages: 1).rows.map(\.summary)
     }
 
     private func waitForPrompt(_ chat: ChatModel) async throws -> PromptCenter.Prompt {
@@ -58,16 +62,16 @@ final class FakeHermesTests: XCTestCase {
     }
 
     func testStoredChatShowsHistoryAndStreamsAReply() async throws {
-        let sessions = try await client.sessions()
+        let sessions = try await storedSessions()
         let welcome = try XCTUnwrap(sessions.first { $0.title == "Fake Hermes welcome" })
-        let chat = ChatModel(client: client, connection: connection, summary: welcome)
+        let chat = ChatModel(client: client, connection: connection, prompts: prompts, summary: welcome)
         chat.setInUse("view", true)
         await chat.open()
 
         XCTAssertNil(chat.error)
-        XCTAssertTrue(chat.messages.contains { $0.role == .tool && $0.text == "🔊 This line was spoken in an earlier call." })
+        XCTAssertTrue(chat.spokenLines.contains("This line was spoken in an earlier call."), "\(chat.transcript.items)")
         await reply(chat, "hello there")
-        XCTAssertEqual(chat.messages.last?.text, "Echo: hello there")
+        XCTAssertEqual(chat.lastReply, "Echo: hello there")
     }
 
     func testNewChatIsStoredAndTitled() async throws {
@@ -76,11 +80,11 @@ final class FakeHermesTests: XCTestCase {
         chat.onStoredID = { reported = $0 }
         await reply(chat, "first words")
 
-        XCTAssertEqual(chat.messages.map(\.text), ["first words", "Echo: first words"])
+        XCTAssertEqual(chat.texts, ["first words", "Echo: first words"])
         XCTAssertNotNil(reported)
         XCTAssertEqual(reported, chat.storedID)
         await waitUntil { chat.title != "New chat" }
-        let listed = try await client.sessions()
+        let listed = try await storedSessions()
         XCTAssertTrue(listed.contains { $0.id == reported })
     }
 
@@ -91,21 +95,21 @@ final class FakeHermesTests: XCTestCase {
         let approval = try await waitForPrompt(chat)
         guard case .approval = approval.kind else { return XCTFail("\(approval.kind)") }
         await prompts.approve(approval.id, .once)
-        await waitUntil(timeout: 5) { !chat.busy && chat.messages.last?.text.hasPrefix("Approved (once)") == true }
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply?.hasPrefix("Approved (once)") == true }
 
         _ = await chat.send("clarify please")
         let clarify = try await waitForPrompt(chat)
         await prompts.answerClarify(clarify.id, answers: ["q0": "Green", "q1": #"["Logs","Metrics"]"#, "q2": nil])
-        await waitUntil(timeout: 5) { !chat.busy && chat.messages.last?.text.hasPrefix("Clarify submitted") == true }
-        XCTAssertTrue(chat.messages.last?.text.contains("q2: (skipped)") == true, chat.messages.last?.text ?? "")
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply?.hasPrefix("Clarify submitted") == true }
+        XCTAssertTrue(chat.lastReply?.contains("q2: (skipped)") == true, chat.lastReply ?? "")
 
         _ = await chat.send("sudo now")
         let sudo = try await waitForPrompt(chat)
         await prompts.answerValue(sudo.id, "pw")
-        await waitUntil(timeout: 5) { !chat.busy && chat.messages.last?.text.hasPrefix("Got a sudo password (2 characters)") == true }
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply?.hasPrefix("Got a sudo password (2 characters)") == true }
 
         await reply(chat, "window please")
-        XCTAssertTrue(chat.messages.last?.text.hasPrefix("window.read declined by every client") == true, chat.messages.last?.text ?? "")
+        XCTAssertTrue(chat.lastReply?.hasPrefix("window.read declined by every client") == true, chat.lastReply ?? "")
         XCTAssertTrue(prompts.prompts.isEmpty)
     }
 
@@ -115,7 +119,7 @@ final class FakeHermesTests: XCTestCase {
         transports.last?.close()
 
         await reply(chat, "two")
-        XCTAssertEqual(chat.messages.last?.text, "Echo: two")
+        XCTAssertEqual(chat.lastReply, "Echo: two")
         XCTAssertEqual(transports.count, 2)
         XCTAssertEqual(chat.sessionIDs.count, 2, "the same runtime id came back (stored id + runtime id)")
     }
@@ -135,10 +139,10 @@ final class FakeHermesTests: XCTestCase {
         try await Task.sleep(nanoseconds: UInt64((grace + 1.5) * 1_000_000_000))
 
         await reply(chat, "two")
-        XCTAssertEqual(chat.messages.last?.text, "Echo: two")
+        XCTAssertEqual(chat.lastReply, "Echo: two")
         XCTAssertEqual(chat.sessionIDs.count, 3, "resume made a new runtime id")
         await settle(0.5)
-        XCTAssertEqual(chat.messages.map(\.text), ["one", "Echo: one", "two", "Echo: two"])
+        XCTAssertEqual(chat.texts, ["one", "Echo: one", "two", "Echo: two"])
     }
 
     func testChatNotInUseIsLeftReapedUntilOpened() async throws {
@@ -160,7 +164,7 @@ final class FakeHermesTests: XCTestCase {
         await idle.open()
         await reply(idle, "four")
         await settle(0.5)
-        XCTAssertEqual(idle.messages.map(\.text), ["one", "Echo: one", "four", "Echo: four"])
+        XCTAssertEqual(idle.texts, ["one", "Echo: one", "four", "Echo: four"])
     }
 
     func testTurnCutOffWhileOfflineStopsSpinningWhenCatchingUpGivesUp() async throws {
@@ -181,5 +185,230 @@ final class FakeHermesTests: XCTestCase {
 
         await waitUntil(timeout: 30) { chat.error != nil }
         XCTAssertFalse(chat.busy, "nothing would end the spinner while offline")
+    }
+
+    // MARK: Composer
+
+    func testComposerSendsAndQueuesWhatTheRunningTurnRefuses() async throws {
+        let chat = await newChat()
+        let first = await chat.sender.send("first")
+        XCTAssertEqual(first, .submitted)
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply == "Echo: first" }
+
+        _ = await chat.sender.send("delegate this")
+        await waitUntil(timeout: 5) { chat.busy }
+        // The fake has no session.redirect, so the correction waits in the local queue for the next turn.
+        let correction = await chat.sender.send("follow up")
+        XCTAssertEqual(correction, .queued)
+        await waitUntil(timeout: 10) { !chat.busy && chat.lastReply == "Echo: follow up" }
+        XCTAssertTrue(chat.sender.queue.isEmpty)
+        XCTAssertEqual(chat.userTexts, ["first", "delegate this", "follow up"])
+        XCTAssertTrue(chat.transcript.items.contains { if case .subagent = $0 { return true }; return false })
+    }
+
+    func testTypingOverAClarifySkipsItAndSendsTheWords() async throws {
+        let chat = await newChat()
+        _ = await chat.sender.send("clarify please")
+        _ = try await waitForPrompt(chat)
+        XCTAssertTrue(chat.hasPendingClarify)
+
+        _ = await chat.sender.send("never mind")
+        XCTAssertFalse(chat.hasPendingClarify)
+        await waitUntil(timeout: 10) { !chat.busy && chat.lastReply == "Echo: never mind" }
+        XCTAssertTrue(chat.texts.contains("Clarify cancelled."), "\(chat.texts)")
+    }
+
+    func testSlashCommandOutputShowsInTheTranscript() async throws {
+        let chat = await newChat()
+        await reply(chat, "hello")
+        let result = await chat.sender.send("/help")
+        XCTAssertEqual(result, .ranSlash)
+        XCTAssertTrue(chat.transcript.items.contains { item in
+            if case let .system(note) = item, case .slash("/help") = note.kind { return !note.text.isEmpty }
+            return false
+        }, "\(chat.transcript.items)")
+    }
+
+    func testAttachedFileRidesThePromptAsAChip() async throws {
+        let chat = await newChat()
+        let file = ComposerAttachment(pending: .file(Data("hello".utf8), filename: "notes.txt", mime: "text/plain"))
+        let result = await chat.sender.send("read this", attachments: [file])
+        XCTAssertEqual(result, .submitted, chat.error ?? "")
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply != nil }
+        guard case let .user(prompt)? = chat.transcript.items.first(where: \.isUser) else { return XCTFail("no prompt") }
+        XCTAssertEqual(prompt.text, "read this")
+        XCTAssertEqual(prompt.attachments.map(\.kind), [.file])
+
+        await chat.open()
+        guard case let .user(stored)? = chat.transcript.items.first(where: \.isUser) else { return XCTFail("no stored prompt") }
+        XCTAssertNotNil(stored.rowID, "the reload shows Hermes' copy")
+        XCTAssertEqual(stored.attachments.map(\.kind), [.file])
+    }
+
+    func testReopeningShowsTheStoredTurnInPlaceOfTheLiveOne() async throws {
+        let chat = await newChat()
+        _ = await chat.send("think tools")
+        await waitUntil(timeout: 10) { !chat.busy && chat.transcript.items.contains { if case .changedFiles = $0 { return true }; return false } }
+        let reply = chat.texts.last
+        XCTAssertNotNil(reply)
+
+        await chat.open()
+        guard case let .user(prompt)? = chat.transcript.items.first(where: \.isUser) else { return XCTFail("no prompt") }
+        XCTAssertNotNil(prompt.rowID, "the stored prompt replaced the local one")
+        XCTAssertEqual(chat.userTexts, ["think tools"])
+        XCTAssertEqual(chat.texts.last, reply)
+        XCTAssertTrue(chat.transcript.items.contains { if case .reasoning = $0 { return true }; return false })
+        XCTAssertTrue(chat.transcript.items.contains { if case .changedFiles = $0 { return true }; return false })
+    }
+
+    // MARK: Mid-turn reloads, rewinds, deletes
+
+    func testARefetchMidTurnShowsEachSavedToolCallOnce() async throws {
+        let chat = await newChat()
+        _ = await chat.send("tools approve")
+        let approval = try await waitForPrompt(chat)
+        let before = chat.callIDs
+        XCTAssertFalse(before.isEmpty)
+
+        // Events were lost while the turn runs (an overflowed replay): the stored page already holds its rounds.
+        chat.gatewayNeedsRefetch()
+        await chat.resync()
+        XCTAssertEqual(chat.callIDs, before, "\(chat.transcript.items)")
+
+        await prompts.approve(approval.id, .once)
+        await waitUntil(timeout: 10) { !chat.busy && chat.texts.last?.hasPrefix("Found the bug") == true }
+        XCTAssertEqual(Set(chat.callIDs).count, chat.callIDs.count, "\(chat.callIDs)")
+        XCTAssertEqual(chat.userTexts, ["tools approve"])
+    }
+
+    func testOpeningASessionWhoseTurnRunsElsewhereShowsItOnce() async throws {
+        let chat = await newChat()
+        await reply(chat, "hello")
+        _ = await chat.send("tools approve")
+        let approval = try await waitForPrompt(chat)
+        let storedID = try XCTUnwrap(chat.storedID)
+
+        // Another client with its own socket: it watched nothing of the turn.
+        let other = GatewayConnection { [client] in try await WebSocketTransport.dial(client!) }
+        defer { other.disconnect() }
+        let watcher = ChatModel(client: client, connection: other,
+                                summary: SessionSummary(id: storedID, title: chat.title, lastActive: nil, profile: nil))
+        watcher.setInUse("view", true)
+        await watcher.open()
+        XCTAssertTrue(watcher.busy)
+        XCTAssertEqual(watcher.userTexts, ["hello", "tools approve"])
+        XCTAssertEqual(Set(watcher.callIDs).count, watcher.callIDs.count)
+
+        await prompts.approve(approval.id, .once)
+        await waitUntil(timeout: 10) { !chat.busy && chat.texts.last?.hasPrefix("Found the bug") == true }
+        await waitUntil(timeout: 10) { !watcher.busy && watcher.texts.last == chat.texts.last }
+        XCTAssertEqual(watcher.userTexts, ["hello", "tools approve"])
+        XCTAssertEqual(Set(watcher.callIDs).count, watcher.callIDs.count, "\(watcher.callIDs)")
+    }
+
+    func testEditingAPromptRunsTheConversationAgainFromIt() async throws {
+        let chat = await newChat()
+        await reply(chat, "first")
+        await reply(chat, "second")
+
+        // A prompt sent from here learns its stored id from a fresh copy of the transcript.
+        guard case let .user(second)? = chat.transcript.items.last(where: \.isUser) else { return XCTFail("no prompt") }
+        let edited = await chat.rewind(second, to: "second, edited")
+        XCTAssertTrue(edited, chat.error ?? "")
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply == "Echo: second, edited" }
+        XCTAssertEqual(chat.userTexts, ["first", "second, edited"])
+
+        await chat.open()
+        guard case let .user(first)? = chat.transcript.items.first(where: \.isUser) else { return XCTFail("no prompt") }
+        XCTAssertNotNil(first.rowID)
+        let rewound = await chat.rewind(first, to: "first, edited")
+        XCTAssertTrue(rewound, chat.error ?? "")
+        await waitUntil(timeout: 5) { !chat.busy && chat.lastReply == "Echo: first, edited" }
+        await chat.open()
+        XCTAssertEqual(chat.texts, ["first, edited", "Echo: first, edited"], "Hermes dropped everything after it")
+    }
+
+    func testRetryReplacesTheFailedTurnAndShowsThePromptItResends() async throws {
+        let chat = await newChat()
+        _ = await chat.send("fail please")
+        await waitUntil(timeout: 5) { !chat.busy && chat.errorCount == 1 }
+
+        let ran = await chat.runSlash("/retry")
+        XCTAssertTrue(ran)
+        await waitUntil(timeout: 10) { !chat.busy && chat.errorCount == 1 && chat.transcript.items.last.map(\.isUser) == false }
+        XCTAssertEqual(chat.userTexts, ["fail please"], "one bubble with the resent words, not /retry")
+        XCTAssertEqual(chat.errorCount, 1, "the rewound turn's card went with it")
+    }
+
+    func testDeletingARunningChatStopsAndClosesItFirst() async throws {
+        let chat = await newChat()
+        _ = await chat.send("tools approve")
+        _ = try await waitForPrompt(chat)
+        XCTAssertTrue(chat.busy)
+        let storedID = try XCTUnwrap(chat.storedID)
+
+        let target = SessionMenuTarget(storedID: storedID, runtimeID: chat.attachedRuntimeID, title: chat.title)
+        try await chat.sessionActions.delete(target)
+        chat.sessionGone()
+        let sessions = try await storedSessions()
+        XCTAssertFalse(sessions.contains { $0.id == storedID })
+        await waitUntil(timeout: 5) { self.prompts.prompts(for: chat.sessionIDs).isEmpty }
+        XCTAssertFalse(chat.busy)
+    }
+
+    func testANewChatStartsWithTheEffortPickedBeforeIt() async throws {
+        // Not opened yet, so Hermes has no session for it.
+        let chat = ChatModel(client: client, connection: connection, prompts: prompts, summary: nil)
+        chat.setInUse("view", true)
+        await chat.composer.setEffort("high")
+        XCTAssertEqual(chat.composer.pendingEffort, "high")
+        await reply(chat, "hi")
+        let runtimeID = try XCTUnwrap(chat.attachedRuntimeID)
+        let effort = try await connection.client.configGet(.init(key: "reasoning", sessionId: runtimeID)).value
+        XCTAssertEqual(effort, "high")
+    }
+}
+
+@MainActor
+extension ChatModel {
+    /// The prompts and replies, in order.
+    var texts: [String] {
+        transcript.items.compactMap { item in
+            switch item {
+            case let .user(message): return message.text
+            case let .assistant(text) where !text.interim: return text.markdown
+            default: return nil
+            }
+        }
+    }
+
+    var userTexts: [String] {
+        transcript.items.compactMap { if case let .user(message) = $0 { return message.text }; return nil }
+    }
+
+    /// Every tool call's id, in order.
+    var callIDs: [String] {
+        transcript.items.flatMap { item -> [String] in
+            guard case let .toolRun(run) = item else { return [] }
+            return run.calls.map(\.callID)
+        }
+    }
+
+    var errorCount: Int {
+        transcript.items.filter { if case .error = $0 { return true }; return false }.count
+    }
+
+    /// The text of the last row when it is a reply.
+    var lastReply: String? {
+        if case let .assistant(text)? = transcript.items.last { return text.markdown }
+        return nil
+    }
+
+    /// What Hermes said out loud through the speak tool.
+    var spokenLines: [String] {
+        transcript.items.flatMap { item -> [String] in
+            guard case let .toolRun(run) = item else { return [] }
+            return run.calls.filter { $0.name.hasSuffix("speak") }.compactMap { $0.args["text"]?.stringValue }
+        }
     }
 }
