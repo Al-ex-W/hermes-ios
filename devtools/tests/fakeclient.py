@@ -30,8 +30,9 @@ def free_port() -> int:
 
 @asynccontextmanager
 async def serving(**options: Any) -> AsyncIterator[tuple[FakeHermes, str]]:
-    """Run a fake Hermes on a free port; yields it and its ``host:port``. Options override the CLI defaults."""
-    args = build_parser().parse_args(["--voice-url", "", "--contract", CONTRACT_PATH])
+    """Run a fake Hermes on a free port; yields it and its ``host:port``. Options override the CLI defaults; the
+    store starts with only the welcome chat unless ``seed="demo"``."""
+    args = build_parser().parse_args(["--voice-url", "", "--contract", CONTRACT_PATH, "--seed", "minimal"])
     for name, value in options.items():
         setattr(args, name, value)
     fake = FakeHermes(args)

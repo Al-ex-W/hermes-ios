@@ -1,12 +1,32 @@
 import SwiftUI
 
+/// Sign-in to the Hermes dashboard (and the call server), on the app's form surfaces.
 struct LoginView: View {
     @EnvironmentObject private var model: AppModel
     @State private var draft = ConnectionSettings.load()
     @State private var working = false
 
+    private var canSignIn: Bool {
+        !working && !draft.dashboardURL.isEmpty && !draft.username.isEmpty && !draft.password.isEmpty
+            && VoiceServerFields.addressError(draft.voiceServerURL) == nil
+    }
+
     var body: some View {
         Form {
+            Section {
+                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                    Text("Hermes")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(Theme.Text.primary)
+                    Text("Connect to the dashboard your agent runs on.")
+                        .hermesText(.body)
+                        .foregroundStyle(Theme.Text.tertiary)
+                }
+                .padding(.vertical, Theme.Spacing.sm)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 0, leading: Theme.Spacing.xs, bottom: 0, trailing: 0))
+            }
+
             Section {
                 TextField(text: $draft.dashboardURL, prompt: Text(verbatim: "https://machine.tailnet.ts.net")) { Text("Address") }
                     .keyboardType(.URL)
@@ -20,15 +40,17 @@ struct LoginView: View {
                 SecureField("Password", text: $draft.password)
                     .textContentType(.password)
             } header: {
-                Text("Hermes dashboard")
+                FormNote("Hermes dashboard")
             } footer: {
-                Text("The address of `hermes dashboard` (port 9119), for example through Tailscale Serve.")
+                FormNote("The address of `hermes dashboard` (port 9119), for example through Tailscale Serve.")
             }
+            .hermesFormRows()
 
             VoiceServerFields(url: $draft.voiceServerURL, token: $draft.voiceToken)
             SpeechLanguageSection(selection: $draft.speechLocale)
-
-            Section {
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                 Button {
                     working = true
                     draft.voiceServerURL = draft.voiceServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -38,18 +60,31 @@ struct LoginView: View {
                         working = false
                     }
                 } label: {
-                    HStack {
-                        Text("Sign in")
-                        if working { Spacer(); ProgressView() }
+                    ZStack {
+                        if working {
+                            ProgressView().tint(Theme.primaryForeground)
+                        } else {
+                            Text("Sign in").hermesText(.button)
+                        }
                     }
+                    .frame(maxWidth: .infinity, minHeight: 40)
+                    .foregroundStyle(Theme.primaryForeground)
+                    .background(Theme.primary.opacity(canSignIn || working ? 1 : 0.45),
+                                in: RoundedRectangle(cornerRadius: Theme.Radius.control))
+                    .contentShape(Rectangle())
                 }
-                .disabled(working || draft.dashboardURL.isEmpty || draft.username.isEmpty || draft.password.isEmpty
-                    || VoiceServerFields.addressError(draft.voiceServerURL) != nil)
-            } footer: {
-                if let error = model.error { Text(error).foregroundStyle(.red) }
+                .buttonStyle(.plain)
+                .disabled(!canSignIn)
+                if let error = model.error { FormNote(error, color: Theme.destructive) }
             }
+            .padding(.horizontal, Theme.Spacing.xl)
+            .padding(.vertical, Theme.Spacing.lg)
+            .background(Theme.sidebar)
         }
-        .navigationTitle("Hermes Voice")
+        .hermesForm()
+        .navigationTitle("Sign in")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Theme.sidebar, for: .navigationBar)
     }
 }
 
@@ -74,13 +109,14 @@ struct VoiceServerFields: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
         } header: {
-            Text("Hermes Voice server")
+            FormNote("Hermes Voice server")
         } footer: {
-            VStack(alignment: .leading, spacing: 4) {
-                if let error = Self.addressError(url) { Text(error).foregroundStyle(.red) }
-                Text("Where `hermes-voice-mcp` runs. Get the token on the host with `hermes-voice-mcp token`.")
+            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                if let error = Self.addressError(url) { FormNote(error, color: Theme.destructive) }
+                FormNote("Where `hermes-voice-mcp` runs. Get the token on the host with `hermes-voice-mcp token`.")
             }
         }
+        .hermesFormRows()
     }
 }
 
@@ -99,8 +135,9 @@ struct SpeechLanguageSection: View {
             }
             .pickerStyle(.navigationLink)
         } footer: {
-            Text("The language you speak on calls. Automatic follows your iPhone's preferred languages.")
+            FormNote("The language you speak on calls. Automatic follows your iPhone's preferred languages.")
         }
+        .hermesFormRows()
     }
 
     private var options: [String] {
@@ -114,6 +151,7 @@ struct SpeechLanguageSection: View {
     }
 }
 
+/// The connection's settings: who is signed in, and the call server.
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -124,18 +162,29 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("Hermes dashboard") {
-                LabeledContent("Address", value: model.settings.dashboardURL)
-                LabeledContent("User", value: model.settings.username)
+            Section {
+                LabeledContent("Address") {
+                    Text(model.settings.dashboardURL).foregroundStyle(Theme.Text.tertiary).lineLimit(1).truncationMode(.middle)
+                }
+                LabeledContent("User") {
+                    Text(model.settings.username).foregroundStyle(Theme.Text.tertiary)
+                }
                 Button("Sign out", role: .destructive) {
                     model.signOut()
                     dismiss()
                 }
+                .foregroundStyle(Theme.destructive)
+            } header: {
+                FormNote("Hermes dashboard")
             }
+            .hermesFormRows()
             VoiceServerFields(url: $url, token: $token)
             SpeechLanguageSection(selection: $speechLocale)
         }
+        .hermesForm()
         .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Theme.sidebar, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Done") {

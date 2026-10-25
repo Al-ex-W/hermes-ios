@@ -64,7 +64,8 @@ def test_sign_in_sessions_and_a_streamed_turn():
 
 def test_reconnect_activates_the_session_and_replays_what_was_missed():
     async def scenario():
-        async with serving(reap_grace=0.3) as (fake, base):
+        # The grace outlasts the 0.3 s turn: a shorter one can reap the session before the second socket attaches.
+        async with serving(reap_grace=1.0) as (fake, base):
             async with signed_in(base) as http:
                 first = await Gateway.connect(base, http)
                 sid, _ = await start_session(first)
@@ -75,7 +76,7 @@ def test_reconnect_activates_the_session_and_replays_what_was_missed():
                 second = await Gateway.connect(base, http)
                 activated = await second.call("session.activate", {"session_id": sid, "omit_messages": True})
                 replay = await second.call("session.events.since", {"session_id": sid, "last_seen": start["seq"]})
-                await asyncio.sleep(0.6)  # past the grace: the re-attach cancelled the reap
+                await asyncio.sleep(1.5)  # past the grace: the re-attach cancelled the reap
                 alive = sid in fake.runtimes
                 await second.call("prompt.submit", {"session_id": sid, "text": "and now"})
                 live = await second.event("message.start")
