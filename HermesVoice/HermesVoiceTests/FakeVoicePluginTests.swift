@@ -41,8 +41,31 @@ final class FakeVoicePluginTests: XCTestCase {
         messages.contains { if case let .speechEnd(end, false, nil) = $0 { return end == id } else { return false } }
     }
 
+    private var closes: [VoiceLink.Close] {
+        events.compactMap { if case let .closed(reason) = $0 { return reason } else { return nil } }
+    }
+
+    /// Waits for `condition` while the link is up: a link the plugin closed (busy, say) fails at once, saying why.
+    private func waitOnLink(timeout: TimeInterval, file: StaticString = #filePath, line: UInt = #line,
+                            _ condition: () -> Bool) async {
+        await waitUntil(timeout: timeout, file: file, line: line) { condition() || !self.closes.isEmpty }
+        XCTAssertEqual(closes, [], "the plugin closed the link", file: file, line: line)
+    }
+
+    /// Waits until the plugin let the call go after a bye, so a bye it never read fails the test that hung up
+    /// rather than the next one (as busy: the plugin would hold the slot for a reconnect).
+    private func waitForCallToEnd(file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while let call = try await VoicePluginAPI.status(client).activeCall {
+            guard Date() < deadline else {
+                return XCTFail("the plugin still holds call \(call.callID) (\(call.state)) after the bye", file: file, line: line)
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
     private func session() async throws -> SessionSummary {
-        let sessions = try await client.sessions()
+        let sessions = try await client.profileSessions(profile: SidebarOptions.allProfiles, limit: 100, minMessages: 1).rows.map(\.summary)
         return try XCTUnwrap(sessions.first, "the fake seeds sessions")
     }
 
@@ -60,10 +83,10 @@ final class FakeVoicePluginTests: XCTestCase {
         let callID = CallID.make()
         let link = link(PhoneHello(callID: callID, sessionID: session.id, title: session.title, initiatedBy: .user))
         await link.connect()
-        await waitUntil(timeout: 5) { self.messages.contains(.ready(callID: callID, ringing: false)) }
+        await waitOnLink(timeout: 5) { self.messages.contains(.ready(callID: callID, ringing: false)) }
 
         // The plugin announces the call to the session; the fake agent greets with start_call.
-        await waitUntil(timeout: 10) { self.speechStarts.first.map { self.speechEnded($0.id) } ?? false }
+        await waitOnLink(timeout: 10) { self.speechStarts.first.map { self.speechEnded($0.id) } ?? false }
         let greeting = try XCTUnwrap(speechStarts.first)
         XCTAssertTrue(events.contains { if case .message(.audio) = $0 { return true } else { return false } }, "PCM frames")
         link.send(.played(greeting.id))
@@ -71,11 +94,32 @@ final class FakeVoicePluginTests: XCTestCase {
         let now = Date()
         link.send(.userTurn(UserTurn(callID: callID, text: "blue", ending: .endOfSpeech(detector: "typed", detail: nil),
                                      provider: .apple, language: "en-US", startedAt: now, endedAt: now)))
-        await waitUntil(timeout: 10) { self.speechStarts.count >= 2 }
+        await waitOnLink(timeout: 10) { self.speechStarts.count >= 2 }
         XCTAssertTrue(speechStarts[1].text.contains("blue"), speechStarts[1].text)
 
         link.close(after: [.bye("hang_up")])
         XCTAssertFalse(events.contains { if case .closed = $0 { return true } else { return false } })
+        try await waitForCallToEnd()
+    }
+
+    func testHangingUpWhileHermesSpeaksEndsTheCall() async throws {
+        // The bye goes out while the plugin is still streaming the greeting: it must read it and end the call,
+        // not take the close for a dropped link and hold the call for a reconnect.
+        let session = try await session()
+        let callID = CallID.make()
+        let link = VoiceLink(client: client, hello: PhoneHello(callID: callID, sessionID: session.id, title: session.title,
+                                                               initiatedBy: .user))
+        var hungUp = false
+        link.onEvent = { [weak self, weak link] event in
+            self?.events.append(event)
+            if !hungUp, case .message(.speechStart) = event {
+                hungUp = true
+                link?.close(after: [.bye("hang_up")])
+            }
+        }
+        await link.connect()
+        await waitOnLink(timeout: 10) { hungUp }
+        try await waitForCallToEnd()
     }
 
     func testAgentRingsAndThePhoneAnswers() async throws {
@@ -87,11 +131,12 @@ final class FakeVoicePluginTests: XCTestCase {
 
         let link = link(PhoneHello(callID: push.callID, sessionID: push.sessionID, title: push.title, initiatedBy: .push))
         await link.connect()
-        await waitUntil(timeout: 5) { self.messages.contains(.ready(callID: push.callID, ringing: true)) }
+        await waitOnLink(timeout: 5) { self.messages.contains(.ready(callID: push.callID, ringing: true)) }
         link.send(.ringing)
         link.send(.answered)
-        await waitUntil(timeout: 10) { self.speechStarts.contains { $0.text.contains("Pick a color") } }
+        await waitOnLink(timeout: 10) { self.speechStarts.contains { $0.text.contains("Pick a color") } }
         link.close(after: [.bye("hang_up")])
+        try await waitForCallToEnd()
     }
 
     func testUnknownPushCallIsCancelled() async throws {

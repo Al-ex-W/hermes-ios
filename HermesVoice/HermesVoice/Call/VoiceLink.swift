@@ -8,7 +8,8 @@ protocol CallLink: AnyObject {
     func connect() async
     /// `completion` gets whether the frame was written.
     func send(_ message: PhoneMessage, completion: ((Bool) -> Void)?)
-    /// Sends `final` (a bye, say) and then closes. No event is reported for this close.
+    /// Sends `final` (a bye, say) and then closes, once the plugin has closed its end (it does after a bye) or after
+    /// a moment. No event is reported for this close.
     func close(after final: [PhoneMessage])
 }
 
@@ -76,15 +77,32 @@ final class VoiceLink: CallLink {
 
     func close(after final: [PhoneMessage]) {
         guard let task else { return drop() }
-        // Closes once the last frame was written (or after a moment), so the bye isn't lost to the close.
-        let finish: @Sendable () -> Void = { task.cancel(with: .normalClosure, reason: nil) }
         drop(cancelling: false)
-        guard !final.isEmpty else { return finish() }
-        for (index, message) in final.enumerated() {
-            guard let text = try? message.encoded() else { continue }
-            task.send(.string(text)) { _ in if index == final.count - 1 { finish() } }
+        let frames = final.compactMap { try? $0.encoded() }
+        guard !frames.isEmpty else { return task.cancel(with: .normalClosure, reason: nil) }
+        Self.linger(task, sending: frames, upTo: Self.closeLinger)
+    }
+
+    /// How long a closing socket waits for the plugin to close it after the last frame.
+    private static let closeLinger: TimeInterval = 5
+
+    /// Sends `frames`, then reads (and drops) what the plugin still sends until it closes the socket, as it does
+    /// after a bye, and only then closes this end; after `seconds` it closes anyway. Closing as soon as the bye was
+    /// written shut the socket while the plugin was still streaming speech: its next audio frame failed (broken
+    /// pipe) before it had read the bye, the bye went with the connection, and it held the call (and Hermes' one
+    /// call slot) for a reconnect.
+    private nonisolated static func linger(_ task: URLSessionWebSocketTask, sending frames: [String], upTo seconds: TimeInterval) {
+        let finish: @Sendable () -> Void = { task.cancel(with: .normalClosure, reason: nil) }
+        for frame in frames { task.send(.string(frame)) { _ in } }
+        drain(task, then: finish)
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: finish)
+    }
+
+    private nonisolated static func drain(_ task: URLSessionWebSocketTask, then finish: @escaping @Sendable () -> Void) {
+        task.receive { result in
+            if case .failure = result { return finish() }
+            drain(task, then: finish)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: finish)
     }
 
     // MARK: Socket

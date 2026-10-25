@@ -98,8 +98,12 @@ Use a short grace to test what happens when the app was backgrounded for too lon
     Hermes; Hermes answers 4007 only when a reap races the call.
   - `session.events.since {session_id, last_seen}` returns `{events, latest_seq, truncated, count, epoch,
     open_requests}`. `truncated` is true when events after `last_seen` fell out of the ring.
-  - `prompt.submit`, which returns `{status: "streaming" | "queued"}`
+  - `prompt.submit`, which returns `{status: "streaming" | "queued"}`. With `truncate_before_row_id` and
+    `confirm_truncate` it is a rewind: that prompt row and everything after it are dropped before the text runs
+    (4009 while a turn runs, 4029 without `confirm_truncate`).
   - `session.interrupt`, which also withdraws the session's open requests
+  - `session.close`, which ends the runtime with its turn and open requests. `DELETE /api/sessions/:id` removes
+    only the stored rows (409 while a turn runs), as in Hermes.
   - `approval.respond {session_id, choice, all?, request_id?}` returns `{resolved}`. It also finds the approval by
     `request_id` or a stored session id when the runtime id is stale.
   - `request.answer {id, result}` and `clarify.lock {request_id, question_id, answer}` return `{status: "ok" |

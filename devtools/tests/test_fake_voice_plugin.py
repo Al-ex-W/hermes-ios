@@ -111,8 +111,8 @@ class Phone:
         return [f["type"] for f in self.frames if isinstance(f, dict)]
 
 
-async def start_session(gateway: Gateway) -> tuple[str, str]:
-    created = await gateway.call("session.create", {"source": "desktop"})
+async def start_session(gateway: Gateway, **params: Any) -> tuple[str, str]:
+    created = await gateway.call("session.create", {"source": "desktop", **params})
     return created["session_id"], created["stored_session_id"]
 
 
@@ -266,6 +266,22 @@ def test_an_async_call_rung_from_the_debug_route_force_injects_the_reply():
                                   {"call_id": rung["call_id"], "status": "speaking", "note": SPEAKING_NOTE})]
     assert rows[0] == "call me async: Ping from the test" and rows[1] == f"[Voice] pong back {REPLY_HINT}"
     assert unknown.status_code == 404
+
+
+def test_the_push_carries_the_profile_of_the_chat_that_rang():
+    """hub.py sends call.owner.profile: the app opens the ringing chat under that profile, not under default."""
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                gateway = await Gateway.connect(base, http)
+                _, key = await start_session(gateway, profile="research")
+                rung = (await http.post(f"{PREFIX}/debug/ring", json={"session_id": key, "mode": "async"})).json()
+                await turn(gateway)
+                await gateway.close()
+            return key, rung
+
+    key, rung = asyncio.run(scenario())
+    assert rung["ok"] is True and rung["push"]["session_id"] == key and rung["push"]["profile"] == "research"
 
 
 def test_a_declined_call_returns_declined_to_sync_and_notifies_async():

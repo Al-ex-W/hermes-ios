@@ -699,7 +699,10 @@ class FakeVoicePlugin:
         call = self.claim(Call(uuid.uuid4().hex, key, title, "push", "ringing", mode=mode, first_text=text,
                                waiter=waiter))
         call.notice_sent.set()  # an agent call has no "[Voice call started]" notice
-        push = {"call_id": call.call_id, "session_id": key, "profile": "default", "mode": mode, "title": title}
+        # The owning chat's profile, as hub.py sends call.owner.profile: the app opens the chat under it.
+        stored = self.fake.sessions.get(key)
+        profile = (stored.profile if stored is not None else "") or "default"
+        push = {"call_id": call.call_id, "session_id": key, "profile": profile, "mode": mode, "title": title}
         self.pushes.append(push)
         where = (f"{len(self.devices)} registered device(s)" if self.devices
                  else "no device registered: the Simulator can't get VoIP pushes")

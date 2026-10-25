@@ -4,7 +4,6 @@ import Foundation
 final class AppModel: ObservableObject {
     @Published var settings = ConnectionSettings.load()
     @Published private(set) var signedIn = false
-    @Published private(set) var sessions: [SessionSummary] = []
     @Published var error: String?
     /// How calls listen (provider, language, end of speech).
     @Published var callSettings = CallSettings.load() {
@@ -82,37 +81,23 @@ final class AppModel: ObservableObject {
         client = nil
         chats.removeAll()
         generation += 1
-        sessions = []
         settings.password = ""
         settings.save()
         error = nil
         signedIn = false
     }
 
-    func refresh() async {
-        guard let client else { return }
-        do {
-            let sessions = try await client.sessions()
-            guard client === self.client else { return }
-            self.sessions = sessions
-            error = nil
-        } catch {
-            guard client === self.client, !error.isCancellation else { return }
-            self.error = error.localizedDescription
-        }
-    }
-
-    /// The app is back in the foreground: check the gateway connection, catch up the chats in use, refresh the list.
+    /// The app is back in the foreground: check the gateway connection and catch up the chats in use.
     func didBecomeActive() {
         guard signedIn else { return }
         connection?.probe()
         for chat in chats.values { chat.wake() }
         calls.active?.chat.wake()
-        Task { await refresh() }
     }
 
-    /// The chat for a stored session (always the same model for one session), or a new chat when `summary` is nil.
-    func chat(for summary: SessionSummary?) -> ChatModel? {
+    /// The chat for a stored session (always the same model for one session), or a new chat in `profile` when
+    /// `summary` is nil.
+    func chat(for summary: SessionSummary?, profile: String? = nil) -> ChatModel? {
         guard let client, let connection else { return nil }
         if let summary {
             if let existing = chats[summary.id] { return existing }
@@ -121,7 +106,7 @@ final class AppModel: ObservableObject {
                 return call
             }
         }
-        let chat = ChatModel(client: client, connection: connection, summary: summary)
+        let chat = ChatModel(client: client, connection: connection, prompts: prompts, summary: summary, profile: profile)
         if let summary {
             chats[summary.id] = chat
         } else {
@@ -134,6 +119,19 @@ final class AppModel: ObservableObject {
             }
         }
         return chat
+    }
+
+    /// The chat already open for a stored session, if any.
+    func existingChat(_ storedID: String) -> ChatModel? {
+        if let chat = chats[storedID] { return chat }
+        guard let call = calls.active?.chat, call.storedID == storedID else { return nil }
+        return call
+    }
+
+    /// The session was deleted: its chat lets go of the live session and leaves the cache.
+    func forget(_ storedID: String) {
+        existingChat(storedID)?.sessionGone()
+        chats[storedID] = nil
     }
 
     func startCall(in chat: ChatModel) async {

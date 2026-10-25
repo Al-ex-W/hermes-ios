@@ -33,6 +33,21 @@ The "agent" is scripted. Per prompt it streams a short turn (~0.3 s):
   anything else                             -> "Echo: <text>"
 Prompts queued while a turn runs merge into one slot (Hermes' text-only queue merge) and run after it.
 
+Chat screens (M2). More trigger words, combinable in one prompt, each turn ending with session.usage:
+  think     thinking.delta + reasoning.delta, then the text; message.complete carries ``reasoning``
+  tools     tool.generating/start/complete for search_files, terminal (output + exit code), patch and write_file
+            (diffs, a changed-files summary) and a background terminal that shows up in process.list
+  todo      two todo_list calls, each followed by todo.updated
+  delegate  delegate_task with subagent.spawn_requested/start/thinking/tool/progress/complete
+  image     a MEDIA: line pointing at an image GET /api/media serves (the last attached one, if any)
+  fail      message.complete {status: "error", error, error_surface {layer, code, retryable}}
+RPCs: commands.catalog, complete.slash/path, slash.exec, command.dispatch, model.options, config.set,
+image.attach_bytes, file.attach, process.list/kill/stop, subagent.list, session.usage, session.context_breakdown,
+session.workspace.move, session.branch, projects.list. REST: GET /api/profiles, /api/profiles/sessions/sidebar,
+/api/sessions/search, /api/media; PATCH and DELETE /api/sessions/{id}. ``--seed demo`` (the default) adds chats
+across two projects, two profiles and several days (one pinned, one archived, one unread, a cron and a Telegram
+one); ``--seed minimal`` keeps only the welcome chat.
+
 Run (from hermes-voice-mcp, to reuse its venv):
   uv run python ../devtools/fake_hermes.py --port 9311 --voice-url http://127.0.0.1:8765 --voice-token <token>
 Sign in as test / test. Every RPC, event, server request and speak result is logged to stdout with the prefix FAKE.
@@ -42,13 +57,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import inspect
 import json
 import os
+import posixpath
 import re
 import secrets
+import struct
 import time
 import uuid
+import zlib
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -142,17 +162,42 @@ class StoredSession:
     persisted: bool = False
     # The call_id of the "[Voice call started]" still running in this chat (the model would remember it).
     call_id: str | None = None
+    # Sidebar flags and workspace (sessions columns), the runtime the chat runs on, and its usage counters.
+    profile: str = "default"
+    archived: bool = False
+    pinned: bool = False
+    hidden: bool = False
+    unread: bool = False
+    cwd: str = ""
+    git_branch: str | None = None
+    git_repo_root: str | None = None
+    parent_session_id: str | None = None
+    branched_from: str | None = None
+    model: str = "fake-hermes"
+    provider: str = "fake"
+    reasoning_effort: str = "medium"
+    fast: bool = False
+    usage: dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0, "reasoning": 0, "calls": 0})
+    tool_call_count: int = 0
+    todo_state: dict[str, Any] | None = None
 
     def row(self) -> dict[str, Any]:
         visible = [m for m in self.messages if m["role"] in ("user", "assistant")]
         first_user = next((m["content"] for m in self.messages if m["role"] == "user"), "") or ""
         now = time.time()
-        return {
+        row = {
             "id": self.key, "source": self.source, "title": self.title, "preview": first_user[:60],
             "started_at": self.started_at, "last_active": self.last_active, "ended_at": None,
-            "message_count": len(visible), "profile": "default", "is_default_profile": True,
-            "is_active": now - self.last_active < 300, "archived": False, "pinned": False, "hidden": False,
+            "message_count": len(visible), "profile": self.profile, "is_default_profile": self.profile == "default",
+            "is_active": now - self.last_active < 300, "archived": self.archived, "pinned": self.pinned,
+            "hidden": self.hidden, "unread": self.unread, "cwd": self.cwd or None, "git_branch": self.git_branch,
+            "git_repo_root": self.git_repo_root, "model": self.model, "input_tokens": self.usage["input"],
+            "output_tokens": self.usage["output"], "tool_call_count": self.tool_call_count,
+            "parent_session_id": self.parent_session_id,
         }
+        if self.branched_from:
+            row["_branched_from"] = self.branched_from
+        return row
 
 
 @dataclass(eq=False)
@@ -216,6 +261,15 @@ class Runtime:
     loop_task: asyncio.Task | None = None
     turn_task: asyncio.Task | None = None
     reap_task: asyncio.Task | None = None
+    # M2: images staged for the next prompt (image.attach_bytes), the ones the running turn took, what the
+    # demos noted for the turn's close, a failed turn kept as ``inflight`` until the next one, and a model
+    # switch deferred while a turn runs.
+    attached_images: list[str] = field(default_factory=list)
+    image_counter: int = 0
+    turn_images: list[str] = field(default_factory=list)
+    notes: TurnNotes | None = None
+    failed_turn: dict[str, Any] | None = None
+    pending_model: tuple[str, str] | None = None
 
 
 class Conn:
@@ -242,7 +296,1444 @@ class Conn:
             return False
 
 
-class FakeHermes:
+# ── M2: chat (sidebar, transcript, composer) ──────────────────────────────────────────────────────
+# Shapes from hermes_cli/web_routers/{profiles,sessions,files}.py, tui_gateway/{methods_tools,methods_complete,
+# methods_prompt,prompt_attachments,methods_config_set,methods_session,methods_subagents,methods_projects,
+# tool_progress,session_auto_continue,user_messages}.py, tools/{todo_tool,delegate_tool_progress,process_registry,
+# file_operations_common}.py and agent/{display,error_surface,context_breakdown,turn_failure_copy}.py.
+
+HOUR, DAY = 3600, 86400
+DEMO_HOME = "/home/demo"
+DEMO_HERMES_HOME = f"{DEMO_HOME}/.hermes"
+DEMO_IMAGES = f"{DEMO_HERMES_HOME}/images"
+DEMO_ATTACHMENTS = f"{DEMO_HERMES_HOME}/attachments"
+DEMO_IMAGE = f"{DEMO_IMAGES}/fake-hermes-demo.png"
+TOOL_SECONDS = 0.04
+# Long enough for a client to call subagent.list between subagent.start and subagent.complete.
+SUBAGENT_SECONDS = 0.15
+ATTACH_MAX_BYTES = 25 * 1024 * 1024
+# hermes_cli/cli_terminal_input.py _IMAGE_EXTENSIONS (no HEIC: a phone must convert first).
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".svg", ".ico"})
+IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"), (b"GIF87a", ".gif"), (b"GIF89a", ".gif"),
+               (b"BM", ".bmp"))
+MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp", ".bmp": "image/bmp"}
+REF_NEEDS_QUOTING = re.compile(r"""[\s()\[\]{}<>"'`]""")
+FILE_REF = re.compile(r"""@file:(`[^`]+`|"[^"]+"|'[^']+'|\S+)""")
+DATA_URL = re.compile(r"^data:[^;,]*(?:;[^;,=]+=[^;,]+)*;base64,(.*)$", re.DOTALL | re.IGNORECASE)
+NUMBERED_TITLE = re.compile(r"^(.*?) #(\d+)$")
+MAX_TITLE_LENGTH = 100
+
+DEMO_PROFILES = (
+    {"name": "default", "path": DEMO_HERMES_HOME, "is_default": True, "skill_count": 12, "description": ""},
+    {"name": "research", "path": f"{DEMO_HERMES_HOME}/profiles/research", "is_default": False, "skill_count": 4,
+     "description": "Reads papers and writes short summaries"},
+)
+# (id, slug, name, color, git branch); each project's folder is DEMO_HOME/projects/<slug>.
+DEMO_PROJECTS = (
+    ("p_a7a5c0de", "atlas", "Atlas", "#0053fd", "main"),
+    ("p_be4c0a11", "beacon", "Beacon", "#c2410c", "release/1.4"),
+)
+
+AUTH_PY = ('import time\n\nTOKEN_TTL = 900\n\n\ndef issue_token(user, now=None):\n    now = now or time.time()\n'
+           '    return {"sub": user.id, "exp": now + TOKEN_TTL}\n')
+AUTH_DIFF = ("--- a/src/atlas/auth.py\n+++ b/src/atlas/auth.py\n@@ -5,4 +5,5 @@ TOKEN_TTL = 900\n \n"
+             " def issue_token(user, now=None):\n-    now = now or time.time()\n+    if now is None:\n"
+             "+        now = time.time()\n     return {\"sub\": user.id, \"exp\": now + TOKEN_TTL}\n")
+CHANGELOG_MD = "# Changelog\n\n## 0.3.0\n- Token refresh.\n"
+CHANGELOG_NEW = "# Changelog\n\n## Unreleased\n- Fix tokens issued with `now=0`.\n\n## 0.3.0\n- Token refresh.\n"
+CHANGELOG_DIFF = ("--- a/CHANGELOG.md\n+++ b/CHANGELOG.md\n@@ -1,4 +1,7 @@\n # Changelog\n \n+## Unreleased\n"
+                  "+- Fix tokens issued with `now=0`.\n+\n ## 0.3.0\n - Token refresh.\n")
+PYTEST_FAILED = ("F...                                                                     [100%]\n"
+                 "=================================== FAILURES ===================================\n"
+                 "___________________________ test_token_at_epoch_zero ___________________________\n"
+                 "    def test_token_at_epoch_zero():\n"
+                 ">       assert issue_token(User(id=1), now=0)[\"exp\"] == TOKEN_TTL\n"
+                 "E       AssertionError: assert 1793001234.5 == 900\n"
+                 "tests/test_auth.py:14: AssertionError\n1 failed, 3 passed in 0.12s")
+PYTEST_PASSED = "....                                                                     [100%]\n4 passed in 0.11s"
+SEARCH_RESULT = {"total_count": 2, "matches": [
+    {"path": "src/atlas/auth.py", "line": 6, "content": "def issue_token(user, now=None):"},
+    {"path": "tests/test_auth.py", "line": 3, "content": "from atlas.auth import TOKEN_TTL, issue_token"}]}
+DEMO_FILES = {
+    "notes.md": "# Notes\n\n- Try the new release flow.\n- Clean up old branches.\n- Read the storage RFC.\n",
+    "projects/atlas/AGENTS.md": "# Atlas\n\nRun `pytest -q` before you commit. Keep functions small.\n",
+    "projects/atlas/README.md": "# Atlas\n\nA tiny token service.\n",
+    "projects/atlas/CHANGELOG.md": CHANGELOG_MD,
+    "projects/atlas/pyproject.toml": '[project]\nname = "atlas"\nversion = "0.3.0"\n',
+    "projects/atlas/src/atlas/__init__.py": "",
+    "projects/atlas/src/atlas/auth.py": AUTH_PY,
+    "projects/atlas/src/atlas/storage.py": "def load_user(uid):\n    ...\n\n\ndef save_user(user):\n    ...\n",
+    "projects/atlas/tests/test_auth.py": ("from atlas.auth import TOKEN_TTL, issue_token\n\n\n"
+                                         "def test_token_at_epoch_zero():\n    ...\n"),
+    "projects/atlas/tests/test_storage.py": "def test_round_trip():\n    ...\n",
+    "projects/beacon/README.md": "# Beacon\n\nA small status server.\n",
+    "projects/beacon/package.json": '{\n  "name": "beacon",\n  "version": "1.4.0"\n}\n',
+    "projects/beacon/docs/release-notes.md": "# Release notes\n",
+    "projects/beacon/src/index.ts": "export { serve } from './server'\n",
+    "projects/beacon/src/server.ts": "export function serve(port = 8080) {}\n",
+}
+
+# agent/context_breakdown.py _CATEGORIES: (id, color, label, fixed fake size; rules and conversation are measured).
+CONTEXT_CATEGORIES = (
+    ("system_prompt", "var(--context-usage-system)", "System prompt", 3200),
+    ("tool_definitions", "var(--context-usage-tools)", "Tool definitions", 9800),
+    ("rules", "var(--context-usage-rules)", "Rules", 0),
+    ("skills", "var(--context-usage-skills)", "Skills", 1400),
+    ("memory", "var(--context-usage-memory)", "Memory", 600),
+    ("conversation", "var(--context-usage-conversation)", "Conversation", 0),
+)
+CONTEXT_MAX = 200_000
+
+# (slug, name, {model: (fast, reasoning, input price, output price)}).
+DEMO_PROVIDERS = (
+    ("fake", "Fake", {"fake-hermes": (True, True, "$1.00", "$4.00"), "fake-hermes-mini": (False, False, "free", "free"),
+                      "fake-hermes-max": (True, True, "$15.00", "$75.00")}),
+    ("echo-cloud", "Echo Cloud", {"echo-1": (False, True, "$0.50", "$1.50"),
+                                  "echo-2-pro": (True, True, "$3.00", "$12.00")}),
+)
+EXPENSIVE_MODELS = {"fake-hermes-max"}
+REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+# methods_config_set.py _REASONING_DISPLAY_WORDS and _FAST_WORDS.
+REASONING_DISPLAY = {"show": "show", "on": "show", "hide": "hide", "off": "hide", "full": "full", "all": "full",
+                     "clamp": "clamp", "collapse": "clamp", "short": "clamp"}
+FAST_WORDS = {"fast": "fast", "on": "fast", "normal": "normal", "off": "normal", "auto": "auto", "cold": "cold",
+              "ultrafast": "ultrafast"}
+
+# hermes_cli/commands.py COMMAND_REGISTRY, a slice: (name, description, category, args_hint, aliases, subcommands,
+# desktop, argument_mode).
+SLASH_COMMANDS = (
+    ("new", "Start a new session (fresh session ID + history)", "Session", "[name]", ("reset",), (), None, None),
+    ("retry", "Retry the last message (resend to agent)", "Session", "", (), (), None, None),
+    ("undo", "Back up N user turns and re-prompt (default 1)", "Session", "[N]", (), (), None, None),
+    ("title", "Set a title for the current session", "Session", "[name]", (), (), None, None),
+    ("branch", "Branch the current session (new thread on Discord/Telegram/Slack/Matrix; --here stays here)",
+     "Session", "[--here] [name]", ("fork",), (), None, None),
+    ("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what "
+     "would happen)", "Session", "[here [N] | focus topic | --preview|--dry-run]", ("compact",), (), None, None),
+    ("queue", "Queue a prompt for the next turn, or list/edit/rm/move/clear queued prompts", "Session",
+     "[<prompt>|list|edit N <prompt>|rm N|move A B|clear]", ("q",), ("list", "edit", "rm", "move", "clear", "add"),
+     None, None),
+    ("stop", "Kill all running background processes", "Session", "", (), (), None, None),
+    ("status", "Show session, model, token, and context info", "Session", "", (), (), None, None),
+    ("model", "Switch model (session-scoped; --global to persist)", "Configuration",
+     "[model] [--provider name] [--reasoning level] [--global|--session] [--refresh]", (), (), "hidden", None),
+    ("personality", "Set a predefined personality", "Configuration", "[name]", (), (), None, "options"),
+    ("reasoning", "Manage reasoning effort and display", "Configuration", "[level|show|hide|full|clamp] [--global]",
+     (), (*REASONING_LEVELS, "show", "hide", "on", "off", "full", "clamp", "--global"), None, None),
+    ("fast", "Fast mode — OpenAI Priority Processing / Anthropic Fast Mode (normal/fast/auto/cold)",
+     "Configuration", "[normal|fast|auto|cold|status] [--global]",
+     (), ("normal", "fast", "auto", "cold", "status", "on", "off", "--global"), "advanced", None),
+    ("help", "Show available commands (/help skills lists skill commands, /help <text> filters)", "Info",
+     "[skills|<filter>]", (), (), None, None),
+    ("usage", "Show token usage and rate limits; `reset` redeems a banked Codex limit reset", "Info",
+     "[reset [--force]]", (), (), None, None),
+)
+COMMAND_ALIASES = {alias: command[0] for command in SLASH_COMMANDS for alias in command[4]}
+PERSONALITIES = {"none": "clear personality overlay", "concise": "Keep responses brief and to the point.",
+                 "teacher": "Explain step by step."}
+SKILL_COMMANDS = {"/release-notes": ("Draft release notes from the commits since the last tag", 7),
+                  "/review-pr": ("Review the current branch like a careful reviewer", 2)}
+# config quick_commands: name -> (type, command, canned output).
+QUICK_COMMANDS = {"uptime": ("exec", "uptime", "10:24  up 3 days,  2:11, 1 user, load averages: 1.20 1.05 0.98")}
+AT_HINTS = (("@diff", "git diff"), ("@staged", "staged diff"), ("@file:", "attach file"),
+            ("@folder:", "attach folder"), ("@url:", "fetch url"), ("@git:", "git log"))
+
+DEMO_REASONING = ("The prompt asks me to think first. I will check what is being asked, weigh two readings of it, "
+                  "and then answer in one line.")
+DEMO_FAILURE = "HTTP 429: rate limit reached for this model, retry after 20s"
+FAILED_TURN_NOTICE = "Your request was not processed. Send it again if you still want me to carry it out."
+PARTIAL_FAILED_TURN_NOTICE = ("This turn did not complete. Some actions may already have run; verify their effects "
+                              "before resending.")
+DIFF_ANSI = {"file": "\033[38;2;180;160;255m", "hunk": "\033[38;2;150;150;150m", "minus": "\033[38;2;255;120;120m",
+             "plus": "\033[38;2;120;220;120m", "dim": "\033[38;2;140;140;140m"}
+
+
+@dataclass
+class TurnNotes:
+    """What the demos of one turn leave for its close."""
+
+    images: list[str] = field(default_factory=list)
+    reasoning: str = ""
+    error: tuple[str, dict[str, Any]] | None = None
+    tools_ran: bool = False
+    calls: int = 0
+
+
+def project_path(slug: str) -> str:
+    return f"{DEMO_HOME}/projects/{slug}"
+
+
+def demo_dirs() -> set[str]:
+    dirs = {DEMO_HOME, DEMO_HERMES_HOME, DEMO_IMAGES, DEMO_ATTACHMENTS}
+    for rel in DEMO_FILES:
+        parent = posixpath.dirname(f"{DEMO_HOME}/{rel}")
+        while parent.startswith(DEMO_HOME):
+            dirs.add(parent)
+            parent = posixpath.dirname(parent)
+    return dirs
+
+
+def git_info(cwd: str) -> tuple[str | None, str | None]:
+    """(branch, repo root) of a fake workspace: only the project folders are repositories."""
+    for _pid, slug, _name, _color, branch in DEMO_PROJECTS:
+        root = project_path(slug)
+        if cwd == root or cwd.startswith(root + "/"):
+            return branch, root
+    return None, None
+
+
+def project_ref(cwd: str) -> dict[str, Any] | None:
+    for pid, slug, name, _color, _branch in DEMO_PROJECTS:
+        root = project_path(slug)
+        if cwd and (cwd == root or cwd.startswith(root + "/")):
+            return {"id": pid, "slug": slug, "name": name, "primary_path": root}
+    return None
+
+
+def tool_context(name: str, args: dict[str, Any]) -> str:
+    """The 80-char argument preview of a tool row (agent/display.py build_tool_preview)."""
+    if name == "todo_list":
+        todos = args.get("todos")
+        if todos is None:
+            return "reading task list"
+        return f"{'updating' if args.get('merge') else 'planning'} {len(todos)} task(s)"
+    key = {"terminal": "command", "read_file": "path", "write_file": "path", "patch": "path",
+           "search_files": "pattern", "delegate_task": "goal"}.get(name)
+    key = key or next((k for k in ("query", "text", "command", "path", "name", "prompt", "code", "goal") if k in args),
+                      None)
+    value = args.get(key) if key else None
+    return " ".join(str(value).split())[:80] if value else ""
+
+
+def tool_rows(tool_id: str, name: str, args: dict[str, Any], result: Any,
+              metadata: dict[str, Any] | None = None) -> list[tuple[str, str, dict[str, Any]]]:
+    """The stored assistant tool call + tool result rows of one call (metadata is the display sidecar)."""
+    call = {"id": tool_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+    tool_extra: dict[str, Any] = {"tool_call_id": tool_id, "tool_name": name}
+    if metadata:
+        tool_extra["display_metadata"] = {"tool_result_metadata": metadata}
+    return [("assistant", "", {"tool_calls": [call], "finish_reason": "tool_calls"}),
+            ("tool", json.dumps(result, ensure_ascii=False), tool_extra)]
+
+
+def inline_diff(diff: str) -> str:
+    """tool.complete ``inline_diff``: the CLI rendering (review header, ``a/x → b/x``, colored hunks)."""
+    lines, from_file = ["  ┊ review diff"], None
+    for raw in diff.splitlines():
+        if raw.startswith("--- "):
+            from_file = raw[4:].strip()
+            continue
+        if raw.startswith("+++ "):
+            lines.append(f"{DIFF_ANSI['file']}{from_file or 'a/?'} → {raw[4:].strip()}\033[0m")
+            continue
+        color = next((c for p, c in (("@@", "hunk"), ("-", "minus"), ("+", "plus"), (" ", "dim")) if raw.startswith(p)),
+                     None)
+        lines.append(f"{DIFF_ANSI[color]}{raw}\033[0m" if color else raw)
+    return "\n".join(lines)
+
+
+def diff_stats(diff: str) -> tuple[int, int]:
+    body = [line for line in diff.splitlines() if not line.startswith(("--- ", "+++ "))]
+    return sum(line.startswith("+") for line in body), sum(line.startswith("-") for line in body)
+
+
+def demo_png(width: int = 64, height: int = 40, rgb: tuple[int, int, int] = (0x00, 0x53, 0xFD)) -> bytes:
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+def image_meta(name: str, data: bytes) -> dict[str, Any]:
+    """server.py _image_meta: name, plus size and a 512px-tile token estimate when the header is readable."""
+    meta: dict[str, Any] = {"name": name}
+    size = None
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        size = struct.unpack(">II", data[16:24])
+    elif data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        size = struct.unpack("<HH", data[6:10])
+    if size and size[0] > 0 and size[1] > 0:
+        width, height = size
+        meta.update(width=width, height=height, token_estimate=((width + 511) // 512) * ((height + 511) // 512) * 85)
+    return meta
+
+
+def decode_base64(raw: str, pattern: re.Pattern[str] | None = None) -> bytes | None:
+    """Strip an optional ``data:…;base64,`` wrapper and whitespace, then decode strictly; None when invalid."""
+    cleaned = (raw or "").strip()
+    if pattern is not None and (match := pattern.match(cleaned)):
+        cleaned = match.group(1)
+    try:
+        return base64.b64decode(re.sub(r"\s+", "", cleaned), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def format_ref(value: str) -> str:
+    if not value or not REF_NEEDS_QUOTING.search(value):
+        return value
+    return next((f"{q}{value}{q}" for q in ("`", '"', "'") if q not in value), value)
+
+
+def sanitize_title(title: str | None) -> str | None:
+    cleaned = " ".join(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]", "",
+                              title or "").split())
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_TITLE_LENGTH:
+        raise ValueError(f"Title too long ({len(cleaned)} chars, max {MAX_TITLE_LENGTH})")
+    return cleaned
+
+
+def turn_error_text(error: str, surface: dict[str, Any]) -> str:
+    """tui_gateway/user_messages.py turn_error_text for the provider rate-limit failure."""
+    provider = f" ({surface['provider']})" if surface.get("provider") else ""
+    return (f"The model provider is rate-limiting requests{provider}. Your message was not answered.\n"
+            f"Details: {error}\nWait a moment, then /retry.")
+
+
+def busy_message(command: str) -> str:
+    return (f"session busy — Hermes is still replying. Stop the current reply first (Stop button, "
+            f"or Ctrl+C in a terminal), then run /{command.lstrip('/')}.")
+
+
+def csv_list(value: str | None) -> list[str]:
+    return [s.strip() for s in (value or "").split(",") if s.strip()]
+
+
+def pinned_window(rows: list[dict[str, Any]], offset: int, cap: int) -> list[dict[str, Any]]:
+    """``rows[offset:offset+cap]`` plus every pinned row past it (profiles.py _pinned_window)."""
+    window = rows[offset:offset + cap]
+    window.extend(r for r in rows[offset + cap:] if r.get("pinned"))
+    return window
+
+
+def search_snippet(content: str, tokens: list[str]) -> str | None:
+    """An FTS5 ``snippet(…, '>>>', '<<<', '...', 40)`` lookalike for ``tok1* tok2*`` (every token must prefix a word);
+    None when the content doesn't match."""
+    words = content.split()
+    stems = [re.sub(r"\W", "", w.lower()) for w in words]
+    if not all(any(s.startswith(t) for s in stems) for t in tokens):
+        return None
+    hits = [i for i, s in enumerate(stems) if any(s.startswith(t) for t in tokens)]
+    start = max(0, min(hits[0] - 10, len(words) - 40))
+    shown = [f">>>{w}<<<" if i in hits else w for i, w in enumerate(words[start:start + 40], start)]
+    return ("..." if start else "") + " ".join(shown) + ("..." if start + 40 < len(words) else "")
+
+
+class ChatFeatures:
+    """M2: the sidebar REST routes, the composer RPCs and the demo turns behind the chat screens. Mixed into
+    FakeHermes, whose state (sessions, runtimes, emit, add_row…) it uses."""
+
+    sessions: dict[str, StoredSession]
+    runtimes: dict[str, Runtime]
+
+    def _init_chat(self, args: argparse.Namespace) -> None:
+        self.seed_mode = getattr(args, "seed", "demo")
+        self.dirs = demo_dirs()
+        self.files: dict[str, bytes] = {f"{DEMO_HOME}/{rel}": text.encode() for rel, text in DEMO_FILES.items()}
+        self.media: dict[str, bytes] = {DEMO_IMAGE: demo_png()}
+        self.processes: dict[str, dict[str, Any]] = {}
+        self.subagents: dict[str, dict[str, dict[str, Any]]] = {}
+        now = int(time.time())
+        self.projects = [{
+            "id": pid, "slug": slug, "name": name, "icon": None, "color": color, "board_slug": None,
+            "primary_path": project_path(slug), "archived": False, "created_at": now - 60 * DAY,
+            "folders": [{"path": project_path(slug), "label": None, "is_primary": True, "added_at": now - 60 * DAY}],
+        } for pid, slug, name, color, _branch in DEMO_PROJECTS]
+
+    # ── seed ──────────────────────────────────────────────────────────────────────────────────────
+
+    def _seed_demo(self) -> None:
+        """Chats across two projects, two profiles and several days, for the sidebar's groups and filters."""
+        atlas, beacon = project_path("atlas"), project_path("beacon")
+        todos = [{"id": "1", "content": "Reproduce the flaky test", "status": "completed"},
+                 {"id": "2", "content": "Fix the token clock", "status": "completed"},
+                 {"id": "3", "content": "Re-run the suite", "status": "completed"}]
+        turns: list[tuple[str, str, dict[str, Any]]] = [
+            ("user", "test_token_at_epoch_zero fails now and then. Can you find out why?", {})]
+        for name, args, result, metadata in (
+                ("todo_list", {"todos": todos[:1] + [dict(t, status="pending") for t in todos[1:]]},
+                 {"todos": todos[:1] + [dict(t, status="pending") for t in todos[1:]], "revision": 1}, None),
+                ("search_files", {"pattern": "def issue_token", "path": "src"}, SEARCH_RESULT, None),
+                ("terminal", {"command": "pytest -q tests/test_auth.py"},
+                 {"output": PYTEST_FAILED, "exit_code": 1, "error": None}, None),
+                ("patch", {"mode": "replace", "path": "src/atlas/auth.py", "old_string": "    now = now or time.time()",
+                           "new_string": "    if now is None:\n        now = time.time()"},
+                 {"success": True, "diff": AUTH_DIFF, "files_modified": ["src/atlas/auth.py"]},
+                 {"inline_diff": inline_diff(AUTH_DIFF)}),
+                ("todo_list", {"todos": todos, "merge": True}, {"todos": todos, "revision": 2}, None),
+                ("terminal", {"command": "pytest -q tests/test_auth.py"},
+                 {"output": PYTEST_PASSED, "exit_code": 0, "error": None}, None)):
+            turns += tool_rows("call_" + secrets.token_hex(6), name, args, result, metadata)
+        turns.append(("assistant", "`issue_token` treated `now=0` as missing because of `now or time.time()`. It "
+                      "checks `now is None` now, and the test passes:\n\n```python\nif now is None:\n"
+                      "    now = time.time()\n```", {"finish_reason": "stop", "reasoning": (
+                          "The failure only shows up when now is 0, which is falsy, so `or` replaces it. "
+                          "Checking for None fixes it without changing other callers.")}))
+        flaky = self.seed_chat("Fix flaky login test", age=2 * HOUR, cwd=atlas, pinned=True, turns=turns,
+                               usage=(18400, 2100, 7))
+        flaky.tool_call_count = 6
+        flaky.todo_state = {"todos": todos, "revision": 2}
+        self.start_process(flaky, "python -m http.server 8000", atlas, age=HOUR)
+        self.seed_chat("Refactor storage layer", age=26 * HOUR, cwd=atlas, unread=True, usage=(5200, 640, 1), turns=[
+            ("user", "Sketch a plan to split storage.py into a reader and a writer.", {}),
+            ("assistant", "Here is a plan:\n\n1. Move `load_*` into `storage/reader.py`.\n2. Move `save_*` into "
+             "`storage/writer.py`.\n3. Keep `storage/__init__.py` re-exporting both so imports keep working.\n\n"
+             "Want me to start with step 1?", {"finish_reason": "stop"})])
+        self.seed_chat("Release notes draft", age=3 * DAY, cwd=beacon, usage=(4100, 520, 1), turns=[
+            ("user", "Draft release notes for 1.4.", {}),
+            ("assistant", "## Beacon 1.4\n\n| Area | Change |\n|---|---|\n| Server | Graceful shutdown on SIGTERM |\n"
+             "| CLI | `beacon serve --port` |\n| Docs | A new quick start |\n\n```bash\nnpm install beacon@1.4.0\n```",
+             {"finish_reason": "stop"})])
+        self.seed_chat("Benchmark ideas", age=9 * DAY, cwd=beacon, archived=True, usage=(2600, 300, 1), turns=[
+            ("user", "List ideas for a benchmark of the server.", {}),
+            ("assistant", "- Requests per second at 1, 10 and 100 connections\n- p99 latency under load\n"
+             "- Memory after an hour", {"finish_reason": "stop"})])
+        self.seed_chat("Old onboarding notes", age=35 * DAY, cwd=DEMO_HOME, usage=(1900, 210, 1), turns=[
+            ("user", "Summarize notes.md", {}),
+            ("assistant", "It lists three things to look at later: the new release flow, old branches to clean "
+             "up, and the storage RFC.", {"finish_reason": "stop"})])
+        self.seed_chat("Paper summary", age=2 * DAY, profile="research", usage=(3300, 410, 1), turns=[
+            ("user", "Summarize the attention paper in three sentences.", {}),
+            ("assistant", "It replaces recurrence with self-attention. Every token attends to every other token "
+             "in parallel. That trains faster and translates better.", {"finish_reason": "stop"})])
+        self.seed_chat("Daily digest", age=5 * HOUR, source="cron", usage=(900, 80, 1), turns=[
+            ("user", "Run the daily digest job.", {}),
+            ("assistant", "Nothing new in the watched folders today.", {"finish_reason": "stop"})])
+        self.seed_chat("Telegram chat", age=50 * 60, source="telegram", usage=(700, 60, 1), turns=[
+            ("user", "remind me what we decided about the release", {}),
+            ("assistant", "Ship 1.4 on Thursday, after the docs review.", {"finish_reason": "stop"})])
+
+    def seed_chat(self, title: str, *, age: float, turns: list[tuple[str, str, dict[str, Any]]], cwd: str = "",
+                  profile: str = "default", source: str = "desktop", pinned: bool = False, archived: bool = False,
+                  unread: bool = False, usage: tuple[int, int, int] = (0, 0, 0)) -> StoredSession:
+        last = time.time() - age
+        started = last - 30 * len(turns)
+        branch, root = git_info(cwd)
+        key = datetime.fromtimestamp(started).strftime("%Y%m%d_%H%M%S_") + secrets.token_hex(3)
+        stored = StoredSession(key=key, source=source, title=title, started_at=started, profile=profile, cwd=cwd,
+                               git_branch=branch, git_repo_root=root, pinned=pinned, archived=archived, unread=unread)
+        stored.usage.update(input=usage[0], output=usage[1], calls=usage[2])
+        self.sessions[key] = stored
+        for index, (role, content, extra) in enumerate(turns):
+            row = self.add_row(stored, role, content, **extra)
+            row["timestamp"] = started + 30 * (index + 1)
+        stored.last_active = last
+        return stored
+
+    # ── helpers ───────────────────────────────────────────────────────────────────────────────────
+
+    def runtime(self, params: dict[str, Any], message: str = "session not found") -> Runtime:
+        rt = self.runtimes.get(str(params.get("session_id") or ""))
+        if rt is None:
+            raise RpcError(4001, message)
+        return rt
+
+    def chat_info(self, stored: StoredSession | None) -> dict[str, Any]:
+        """The SessionLiveInfo fields the chat screens read (model pills, workspace, project, usage)."""
+        if stored is None:
+            return {}
+        return {"model": stored.model, "provider": stored.provider, "reasoning_effort": stored.reasoning_effort,
+                "fast": stored.fast, "service_tier": "priority" if stored.fast else "", "cwd": stored.cwd,
+                "branch": stored.git_branch, "project": project_ref(stored.cwd), "usage": self.usage_snapshot(stored)}
+
+    def apply_create_params(self, stored: StoredSession, params: dict[str, Any]) -> None:
+        """session.create's composer picks: workspace, model, effort, Fast, profile."""
+        if cwd := str(params.get("cwd") or ""):
+            stored.cwd = posixpath.normpath(cwd.replace("~", DEMO_HOME, 1) if cwd.startswith("~") else cwd)
+            stored.git_branch, stored.git_repo_root = git_info(stored.cwd)
+        if model := str(params.get("model") or ""):
+            stored.model = model
+            stored.provider = str(params.get("provider") or "") or self.provider_of(model) or stored.provider
+        if effort := str(params.get("reasoning_effort") or ""):
+            stored.reasoning_effort = effort
+        if params.get("fast") is not None:
+            stored.fast = bool(params.get("fast"))
+        if profile := str(params.get("profile") or ""):
+            stored.profile = profile
+
+    def usage_snapshot(self, stored: StoredSession) -> dict[str, Any]:
+        """server.py _get_usage: cumulative session counters plus the context window fields."""
+        used = sum(tokens for _, _, _, tokens in self.context_categories(stored))
+        u = stored.usage
+        return {"model": stored.model, "input": u["input"], "output": u["output"], "reasoning": u["reasoning"],
+                "prompt": u["input"], "completion": u["output"], "total": u["input"] + u["output"],
+                "calls": u["calls"], "compressions": 0, "context_used": used, "context_max": CONTEXT_MAX,
+                "context_percent": max(0, min(100, round(used / CONTEXT_MAX * 100))),
+                "context_source": "provider_usage", "context_estimated": False}
+
+    def context_categories(self, stored: StoredSession) -> list[tuple[str, str, str, int]]:
+        conversation = sum(len(m.get("content") or "") for m in stored.messages) // 4
+        rules = len(self.files.get(f"{stored.git_repo_root}/AGENTS.md", b"")) // 4 if stored.git_repo_root else 0
+        sizes = {"rules": rules, "conversation": conversation}
+        return [(cid, color, label, sizes.get(cid, fixed)) for cid, color, label, fixed in CONTEXT_CATEGORIES
+                if sizes.get(cid, fixed) > 0 or cid == "conversation"]
+
+    def count_turn_usage(self, stored: StoredSession, rt: Runtime, final: str) -> None:
+        notes = rt.notes or TurnNotes()
+        u = stored.usage
+        u["input"] += sum(tokens for *_, tokens in self.context_categories(stored)) * (1 + notes.calls)
+        u["output"] += max(1, len(final) // 4) + 40 * notes.calls
+        u["reasoning"] += len(notes.reasoning) // 4
+        u["calls"] += 1 + notes.calls
+
+    def provider_of(self, model: str) -> str | None:
+        return next((slug for slug, _name, models in DEMO_PROVIDERS if model in models), None)
+
+    def capabilities(self, model: str) -> tuple[bool, bool]:
+        """(fast, reasoning) of a model; unknown models get neither."""
+        for _slug, _name, models in DEMO_PROVIDERS:
+            if model in models:
+                return models[model][0], models[model][1]
+        return False, False
+
+    def is_dir(self, path: str) -> bool:
+        return path in self.dirs
+
+    def entries(self, directory: str) -> list[tuple[str, bool]]:
+        """(name, is_dir) of one fake directory, sorted."""
+        prefix = directory.rstrip("/") + "/"
+        names = {p[len(prefix):].split("/", 1)[0] for p in (*self.files, *self.dirs) if p.startswith(prefix)}
+        return sorted((n, self.is_dir(prefix + n)) for n in names if n)
+
+    def stage_turn_images(self, rt: Runtime, text: str) -> str:
+        """Hand the staged images to the turn being submitted; the stored user row shows them as ``@image:`` refs."""
+        rt.turn_images, rt.attached_images = rt.attached_images, []
+        if not rt.turn_images:
+            return text
+        return text + "\n\n" + "\n".join(f"@image:{format_ref(p)}" for p in rt.turn_images)
+
+    def turn_attachment_notes(self, rt: Runtime, text: str) -> list[str]:
+        """What the scripted agent says about this turn's images and ``@file:`` refs."""
+        notes = rt.notes or TurnNotes()
+        out = []
+        if notes.images:
+            out.append(f"I got {len(notes.images)} image(s): " + ", ".join(posixpath.basename(p) for p in notes.images))
+        stored = self.sessions.get(rt.key)
+        workspace = (stored.cwd if stored else "") or DEMO_HOME
+        for match in FILE_REF.finditer(text):
+            ref = match.group(1).strip("`\"'")
+            path = ref if ref.startswith("/") else posixpath.normpath(f"{workspace}/{ref}")
+            if (data := self.files.get(path)) is not None:
+                out.append(f"Read @file:{format_ref(ref)} ({len(data)} bytes).")
+            else:
+                out.append(f"@file:{format_ref(ref)} was not found.")
+        return out
+
+    def after_turn(self, rt: Runtime) -> None:
+        """A failed turn stays as ``inflight`` until the next one; a model picked mid-turn applies now."""
+        rt.inflight = rt.failed_turn
+        if rt.pending_model and (stored := self.sessions.get(rt.key)):
+            stored.model, stored.provider = rt.pending_model
+            if not self.capabilities(stored.model)[0]:
+                stored.fast = False
+        rt.pending_model = None
+
+    # ── demo turns ────────────────────────────────────────────────────────────────────────────────
+
+    def chat_demos(self) -> dict[str, Callable[[Runtime, StoredSession], Awaitable[str]]]:
+        """Trigger word -> demo, in the order they run within a turn."""
+        return {"think": self.demo_think, "tools": self.demo_tools, "todo": self.demo_todo,
+                "delegate": self.demo_delegate, "image": self.demo_image, "fail": self.demo_fail}
+
+    async def run_native_tool(self, rt: Runtime, stored: StoredSession, name: str, args: dict[str, Any],
+                              result: Any, *, metadata: dict[str, Any] | None = None,
+                              extra: dict[str, Any] | None = None,
+                              work: Callable[[str], Awaitable[None]] | None = None) -> str:
+        """One built-in tool call (tool_progress.py): tool.generating, tool.start, the work, tool.complete with the
+        parsed result and display metadata, then the stored assistant + tool rows."""
+        tool_id = "call_" + secrets.token_hex(6)
+        await self.emit(rt, "tool.generating", {"name": name})
+        await asyncio.sleep(TOOL_SECONDS)
+        await self.emit(rt, "tool.start", {"tool_id": tool_id, "name": name, "context": tool_context(name, args),
+                                           "args": args})
+        started = time.monotonic()
+        if work is not None:
+            await work(tool_id)
+        await asyncio.sleep(TOOL_SECONDS)
+        await self.emit(rt, "tool.complete", {"tool_id": tool_id, "name": name, "args": args, **(metadata or {}),
+                                              "duration_s": round(time.monotonic() - started, 3), "result": result,
+                                              **(extra or {})})
+        for role, content, row_extra in tool_rows(tool_id, name, args, result, metadata):
+            self.add_row(stored, role, content, **row_extra)
+        stored.tool_call_count += 1
+        if rt.notes is not None:
+            rt.notes.calls += 1
+            rt.notes.tools_ran = True
+        return tool_id
+
+    async def demo_think(self, rt: Runtime, stored: StoredSession) -> str:
+        await self.emit(rt, "thinking.delta", {"text": "(◔_◔) pondering…"})
+        for chunk in chunks(DEMO_REASONING, STREAM_CHUNKS):
+            await asyncio.sleep(STREAM_SECONDS / STREAM_CHUNKS)
+            await self.emit(rt, "reasoning.delta", {"text": chunk})
+        if rt.notes is not None:
+            rt.notes.reasoning += DEMO_REASONING
+        return "After thinking it over: the answer is 42."
+
+    async def demo_tools(self, rt: Runtime, stored: StoredSession) -> str:
+        workspace = stored.cwd or project_path("atlas")
+        await self.run_native_tool(rt, stored, "search_files", {"pattern": "def issue_token", "path": "src"},
+                                   SEARCH_RESULT)
+        test = {"command": "pytest -q tests/test_auth.py"}
+        await self.run_native_tool(rt, stored, "terminal", test, {"output": PYTEST_FAILED, "exit_code": 1,
+                                                                  "error": None})
+        await self.run_native_tool(
+            rt, stored, "patch", {"mode": "replace", "path": "src/atlas/auth.py",
+                                  "old_string": "    now = now or time.time()",
+                                  "new_string": "    if now is None:\n        now = time.time()"},
+            {"success": True, "diff": AUTH_DIFF, "files_modified": ["src/atlas/auth.py"]},
+            metadata={"inline_diff": inline_diff(AUTH_DIFF)})
+        await self.run_native_tool(
+            rt, stored, "write_file", {"path": "CHANGELOG.md", "content": CHANGELOG_NEW},
+            {"bytes_written": len(CHANGELOG_NEW.encode()), "dirs_created": False, "verified": True},
+            metadata={"inline_diff": inline_diff(CHANGELOG_DIFF)})
+        await self.run_native_tool(rt, stored, "terminal", test, {"output": PYTEST_PASSED, "exit_code": 0,
+                                                                  "error": None})
+        server = {"command": "python -m http.server 8000", "background": True}
+        proc = self.start_process(stored, server["command"], workspace)
+        await self.run_native_tool(rt, stored, "terminal", server, {
+            "output": "Background process started", "session_id": proc["id"], "pid": proc["pid"], "exit_code": 0,
+            "error": None})
+        changed = [(path, *diff_stats(diff)) for path, diff in (("src/atlas/auth.py", AUTH_DIFF),
+                                                                ("CHANGELOG.md", CHANGELOG_DIFF))]
+        return ("Found the bug, fixed it and re-ran the tests (1 failed, then 4 passed). The preview server runs "
+                f"in the background as `{proc['id']}`.\n\n{len(changed)} files changed:\n"
+                + "\n".join(f"- `{path}` +{added} -{removed}" for path, added, removed in changed))
+
+    async def demo_todo(self, rt: Runtime, stored: StoredSession) -> str:
+        plan = [{"id": "1", "content": "Reproduce the flaky test", "status": "completed"},
+                {"id": "2", "content": "Fix the token clock", "status": "in_progress"},
+                {"id": "3", "content": "Add a regression test", "status": "pending"}]
+        await self.write_todos(rt, stored, plan, merge=False)
+        progress = [{"id": "2", "content": "Fix the token clock", "status": "completed"},
+                    {"id": "3", "content": "Add a regression test", "status": "in_progress"}]
+        state = await self.write_todos(rt, stored, progress, merge=True)
+        done = sum(t["status"] == "completed" for t in state["todos"])
+        return f"Planned {len(state['todos'])} tasks; {done} done so far."
+
+    async def write_todos(self, rt: Runtime, stored: StoredSession, todos: list[dict[str, Any]],
+                          merge: bool) -> dict[str, Any]:
+        """One todo_list call: tool.complete carries the snapshot, then a full-snapshot todo.updated."""
+        current = list((stored.todo_state or {}).get("todos") or []) if merge else []
+        by_id = {t["id"]: i for i, t in enumerate(current)}
+        for todo in todos:
+            if todo["id"] in by_id:
+                current[by_id[todo["id"]]] = {**current[by_id[todo["id"]]], **todo}
+            else:
+                current.append(dict(todo))
+        state = {"todos": current, "revision": int((stored.todo_state or {}).get("revision") or 0) + 1}
+        summary = {"total": len(current), **{s: sum(t["status"] == s for t in current)
+                                             for s in ("pending", "in_progress", "completed", "cancelled")}}
+        await self.run_native_tool(rt, stored, "todo_list", {"todos": todos, "merge": merge},
+                                   {**state, "summary": summary}, extra=state)
+        stored.todo_state = state
+        await self.emit(rt, "todo.updated", state)
+        return state
+
+    async def demo_delegate(self, rt: Runtime, stored: StoredSession) -> str:
+        goal = "Survey the storage layer for unused helpers"
+        summary = "storage.py has two helpers; save_user is only used by tests. Nothing else is unused."
+        sid = f"sa-0-{secrets.token_hex(4)}"
+        base = {"goal": goal, "task_count": 1, "task_index": 0, "subagent_id": sid,
+                "child_session_id": self.new_key(), "delegation_id": "dlg_" + secrets.token_hex(6), "depth": 1,
+                "model": stored.model, "toolsets": ["file", "terminal"]}
+        roster = self.subagents.setdefault(rt.sid, {})
+        started = time.time()
+        entry = {"task_index": 0, "status": "completed", "summary": summary, "api_calls": 3, "duration_seconds": 0.0,
+                 "exit_reason": "completed"}
+        result = {"results": [entry], "total_duration_seconds": 0.0}
+
+        async def work(tool_id: str) -> None:
+            await self.emit(rt, "subagent.spawn_requested", {**base, "tool_count": 0, "text": goal})
+            roster[sid] = {"subagent_id": sid, "parent_id": None, "depth": 1, "goal": goal,
+                           "delegation_id": base["delegation_id"], "model": stored.model, "started_at": started,
+                           "status": "running", "tool_count": 0, "last_tool": "", "accepting_steer": True}
+            await self.emit(rt, "subagent.start", {**base, "tool_count": 0, "text": goal})
+            await self.emit(rt, "subagent.thinking", {**base, "tool_count": 0,
+                                                      "text": "Listing the storage helpers first."})
+            for count, (tool, preview) in enumerate((("search_files", "def "), ("read_file", "src/atlas/storage.py")),
+                                                    1):
+                await asyncio.sleep(SUBAGENT_SECONDS)
+                roster[sid].update(tool_count=count, last_tool=tool)
+                await self.emit(rt, "subagent.tool", {**base, "tool_count": count, "tool_name": tool,
+                                                      "text": preview, "tool_preview": preview})
+            await self.emit(rt, "subagent.progress", {**base, "tool_count": 2, "text": "🔀 search_files, read_file"})
+            await asyncio.sleep(SUBAGENT_SECONDS)
+            roster.pop(sid, None)
+            duration = round(time.time() - started, 2)
+            entry["duration_seconds"] = result["total_duration_seconds"] = duration
+            await self.emit(rt, "subagent.complete", {
+                **base, "tool_count": 2, "text": summary[:160], "status": "completed", "summary": summary,
+                "duration_seconds": duration, "input_tokens": 1830, "output_tokens": 212,
+                "reasoning_tokens": 0, "api_calls": 3, "files_read": ["src/atlas/storage.py"],
+                "output_tail": [{"tool": "read_file", "preview": "def load_user(uid): …", "is_error": False}]})
+
+        try:
+            await self.run_native_tool(rt, stored, "delegate_task", {"goal": goal, "toolsets": ["file", "terminal"]},
+                                       result, work=work)
+        finally:
+            roster.pop(sid, None)
+        return f"The subagent reports: {summary}"
+
+    async def demo_image(self, rt: Runtime, stored: StoredSession) -> str:
+        path = rt.notes.images[-1] if rt.notes and rt.notes.images else DEMO_IMAGE
+        return f"Here is the image:\n\nMEDIA:{path}"
+
+    async def demo_fail(self, rt: Runtime, stored: StoredSession) -> str:
+        if rt.notes is not None:
+            name = next((n for slug, n, _ in DEMO_PROVIDERS if slug == stored.provider), stored.provider)
+            rt.notes.error = (DEMO_FAILURE, {"layer": "provider", "code": "rate_limit", "retryable": True,
+                                             "provider": stored.provider, "model": stored.model,
+                                             "provider_label": name})
+        return ""
+
+    async def fail_turn(self, rt: Runtime, stored: StoredSession, partial: str, usage: dict[str, Any]) -> None:
+        """The terminal error frame (session_auto_continue.py _emit_terminal_turn_error) and the failed-turn row
+        that closes the durable turn (agent/conversation_loop.py)."""
+        assert rt.notes is not None and rt.notes.error is not None
+        error, surface = rt.notes.error
+        if partial:
+            self.add_row(stored, "assistant", partial, finish_reason="error")
+        self.add_row(stored, "assistant", PARTIAL_FAILED_TURN_NOTICE if rt.notes.tools_ran else FAILED_TURN_NOTICE,
+                     display_kind="failed_turn", display_metadata={"error": error, "error_surface": surface})
+        rt.failed_turn = {"user": (rt.inflight or {}).get("user", ""), "assistant": partial, "streaming": False,
+                          "error": error, "status": "error", "recoverable": True, "error_surface": surface}
+        await self.emit(rt, "message.complete", {
+            "text": partial or turn_error_text(error, surface), "usage": usage, "status": "error", "error": error,
+            "recoverable": True, "error_surface": surface, **({"partial": True} if partial else {})})
+
+    def start_process(self, stored: StoredSession, command: str, cwd: str, age: float = 0) -> dict[str, Any]:
+        """A tracked background process owned by the stored session (tools/process_registry.py)."""
+        proc = {"id": "proc_" + secrets.token_hex(6), "session_key": stored.key, "command": command, "cwd": cwd,
+                "pid": 40000 + secrets.randbelow(20000), "started_at": time.time() - age, "exited": False,
+                "exit_code": None, "exited_at": None, "completion_reason": None,
+                "output": "Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...\n"}
+        self.processes[proc["id"]] = proc
+        return proc
+
+    @staticmethod
+    def process_entry(proc: dict[str, Any]) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "session_id": proc["id"], "command": proc["command"][:200], "cwd": proc["cwd"], "pid": proc["pid"],
+            "owner_task_id": proc["session_key"],
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(proc["started_at"])),
+            "uptime_seconds": int(time.time() - proc["started_at"]),
+            "status": "exited" if proc["exited"] else "running", "output_preview": proc["output"][-200:],
+            "output_tail": proc["output"][-4000:]}
+        if proc["exited"]:
+            entry.update(exit_code=proc["exit_code"], exited_at=proc["exited_at"],
+                         completion_reason=proc["completion_reason"])
+        return entry
+
+    def kill(self, proc: dict[str, Any], source: str) -> dict[str, Any]:
+        if proc["exited"]:
+            return {"status": "already_exited", "session_id": proc["id"], "exit_code": proc["exit_code"],
+                    "completion_reason": proc["completion_reason"], "output": proc["output"]}
+        proc.update(exited=True, exit_code=-15, exited_at=time.time(), completion_reason="killed")
+        return {"status": "killed", "session_id": proc["id"], "completion_reason": "killed",
+                "termination_source": source, "output": proc["output"]}
+
+    # ── RPCs ──────────────────────────────────────────────────────────────────────────────────────
+
+    def chat_methods(self, conn: Conn, params: dict[str, Any]) -> dict[str, Callable[[], Any]]:
+        return {
+            "commands.catalog": self.commands_catalog,
+            "complete.slash": lambda: self.complete_slash(params),
+            "complete.path": lambda: self.complete_path(params),
+            "slash.exec": lambda: self.slash_exec(params),
+            "command.dispatch": lambda: self.command_dispatch(params),
+            "model.options": lambda: self.model_options(params),
+            "config.set": lambda: self.config_set(params),
+            "config.get": lambda: self.config_get(params),
+            "image.attach_bytes": lambda: self.image_attach_bytes(params),
+            "image.detach": lambda: self.image_detach(params),
+            "file.attach": lambda: self.file_attach(params),
+            "process.list": lambda: self.process_list(params),
+            "process.kill": lambda: self.process_kill(params),
+            "process.stop": lambda: {"killed": self.stop_processes("process.stop")},
+            "subagent.list": lambda: {"subagents": list(self.subagents.get(self.runtime(
+                params, "session not found or not owned by this transport").sid, {}).values()), "delegations": []},
+            "session.usage": lambda: self.usage_snapshot(self.sessions[self.runtime(params).key]),
+            "session.context_breakdown": lambda: self.context_breakdown(params),
+            "session.workspace.move": lambda: self.workspace_move(params),
+            "session.branch": lambda: self.session_branch(conn, params),
+            "projects.list": lambda: {"projects": [dict(p) for p in self.projects], "active_id": None},
+        }
+
+    def commands_catalog(self) -> dict[str, Any]:
+        """methods_tools.py commands.catalog: registry pairs by category, quick commands, then skills."""
+        pairs: list[list[str]] = []
+        canon: dict[str, str] = {}
+        commands: dict[str, dict[str, Any]] = {}
+        categories: dict[str, list[list[str]]] = {}
+        sub: dict[str, list[str]] = {}
+
+        def add(key: str, desc: str, category: str) -> None:
+            canon[key.lower()] = key
+            pairs.append([key, desc])
+            categories.setdefault(category, []).append([key, desc])
+
+        for name, desc, category, hint, aliases, subs, desktop, mode in SLASH_COMMANDS:
+            meta = {"argument_mode": mode or ("options" if subs else "text" if hint else None), "desktop": desktop}
+            commands.update({f"/{key}": dict(meta) for key in (name, *aliases)})
+            add(f"/{name}", f"{desc} (usage: /{name} {hint})" if hint else desc, category)
+            canon.update({f"/{alias}": f"/{name}" for alias in aliases})
+            if subs:
+                sub[f"/{name}"] = list(subs)
+        for name, (kind, command, _output) in sorted(QUICK_COMMANDS.items()):
+            add(f"/{name}", f"{kind}: {command}", "User commands")
+        skills = {}
+        for key, (desc, used) in sorted(SKILL_COMMANDS.items()):
+            pairs.append([key, desc])
+            skills[key] = {"usage": used, "origin": "local"}
+        return {"pairs": pairs, "sub": sub, "canon": canon, "commands": commands,
+                "categories": [{"name": n, "pairs": rows} for n, rows in categories.items()], "skills": skills,
+                "skill_count": len(skills), "warning": ""}
+
+    def complete_slash(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_complete.py complete.slash: command names after ``/``, then argument words."""
+        text = str(params.get("text") or "")
+        if not text.startswith("/"):
+            return {"items": []}
+        if " " not in text:
+            word = text[1:].lower()
+            items = [{"text": f"{name} " if name == word else name, "display": f"/{name}", "meta": desc,
+                      "kind": "command"}
+                     for name, desc, *_ in SLASH_COMMANDS if name.startswith(word)]
+            items += [{"text": key[1:], "display": key, "meta": f"⚡ {desc}", "kind": "skill"}
+                      for key, (desc, _used) in sorted(SKILL_COMMANDS.items()) if key[1:].startswith(word)]
+            return {"items": items, "replace_from": 1}
+        base, _, rest = text[1:].partition(" ")
+        base = COMMAND_ALIASES.get(base.lower(), base.lower())
+        partial = "" if rest.endswith(" ") or not rest.split() else rest.split()[-1].lower()
+        choices: list[tuple[str, str]] = []
+        if base == "model":
+            choices = [(m, name) for _slug, name, models in DEMO_PROVIDERS for m in models]
+        elif base == "personality":
+            choices = list(PERSONALITIES.items())
+        else:
+            choices = [(s, "") for c in SLASH_COMMANDS if c[0] == base for s in c[5]]
+        items = [{"text": choice, "display": choice, "meta": meta, "kind": "command"}
+                 for choice, meta in choices if choice.startswith(partial) and choice != partial]
+        return {"items": items, "replace_from": text.rfind(" ") + 1}
+
+    def complete_path(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_complete.py complete.path over the fake workspace: ``@`` hints, fuzzy ``@name``, listings."""
+        word = str(params.get("word") or "")
+        if not word:
+            return {"items": []}
+        rt = self.runtimes.get(str(params.get("session_id") or ""))
+        stored = self.sessions.get(rt.key) if rt else None
+        root = str(params.get("cwd") or "") or (stored.cwd if stored else "") or DEMO_HOME
+        is_context = word.startswith("@")
+        query = word[1:] if is_context else word
+        if is_context and not query:
+            return {"items": [{"text": t, "display": t, "meta": m} for t, m in AT_HINTS] + self.profile_mentions("")}
+        if is_context and (query in ("file", "folder") or query.startswith(("file:", "folder:"))):
+            tag, _, path_part = query.partition(":")
+        else:
+            tag, path_part = "", query
+        bare = is_context and path_part and "/" not in path_part
+        if bare and len(path_part.strip()) >= 2 and tag != "folder":
+            items = self.fuzzy_paths(root, path_part, tag)
+        else:
+            items = self.listing(root, word, path_part, tag, is_context)
+        if bare and not tag:
+            items = self.profile_mentions(path_part) + items
+        return {"items": items}
+
+    def profile_mentions(self, prefix: str) -> list[dict[str, Any]]:
+        return [{"text": f"@{p['name']}", "display": f"@{p['name']}", "meta": p["description"] or "agent profile"}
+                for p in DEMO_PROFILES if p["name"].startswith(prefix.lower())]
+
+    def fuzzy_paths(self, root: str, query: str, tag: str) -> list[dict[str, Any]]:
+        prefix = root.rstrip("/") + "/"
+        ranked = []
+        for path in sorted({*self.files, *self.dirs}):
+            if not path.startswith(prefix) or "/." in path[len(prefix) - 1:]:
+                continue
+            rel, name, is_dir = path[len(prefix):], posixpath.basename(path), self.is_dir(path)
+            lowered, q = name.lower(), query.lower()
+            if q in lowered:
+                ranked.append((0 if lowered.startswith(q) else 1, not is_dir, len(rel), rel, name, is_dir))
+        ranked.sort()
+        return [{"text": f"@{'folder' if is_dir else tag or 'file'}:{rel}{'/' if is_dir else ''}",
+                 "display": name + ("/" if is_dir else ""), "meta": "dir" if is_dir else posixpath.dirname(rel)}
+                for *_, rel, name, is_dir in ranked[:30]]
+
+    def listing(self, root: str, word: str, path_part: str, tag: str, is_context: bool) -> list[dict[str, Any]]:
+        expanded = path_part.replace("~", DEMO_HOME, 1) if path_part.startswith("~") else path_part or "."
+        if expanded in (".", "") or expanded.endswith("/"):
+            search, match = expanded or ".", ""
+        else:
+            search, match = posixpath.dirname(expanded) or ".", posixpath.basename(expanded)
+        search = posixpath.normpath(search if search.startswith("/") else f"{root}/{search}")
+        items = []
+        for entry, is_dir in self.entries(search):
+            if match and not entry.lower().startswith(match.lower()):
+                continue
+            if is_context and not tag and entry.startswith("."):
+                continue
+            if tag and (tag == "folder") != is_dir:
+                continue
+            rel = posixpath.relpath(f"{search}/{entry}", root)
+            suffix = "/" if is_dir else ""
+            if is_context:
+                text = f"@{tag or ('folder' if is_dir else 'file')}:{rel}{suffix}"
+            elif word.startswith("~"):
+                text = "~/" + posixpath.relpath(f"{search}/{entry}", DEMO_HOME) + suffix
+            else:
+                text = ("./" if word.startswith("./") else "") + rel + suffix
+            items.append({"text": text, "display": entry + suffix, "meta": "dir" if is_dir else ""})
+        return items[:30]
+
+    async def slash_exec(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_tools.py slash.exec: live commands answer here; skills, quick and pending-input commands go
+        through command.dispatch."""
+        rt = self.runtime(params)
+        stored = self.sessions[rt.key]
+        cmd = str(params.get("command") or "").strip()
+        if not cmd:
+            raise RpcError(4004, "empty command")
+        parts = cmd.lstrip("/").split(maxsplit=1)
+        base, arg = COMMAND_ALIASES.get(parts[0].lower(), parts[0].lower()), (parts[1] if len(parts) > 1 else "")
+        if f"/{base}" in SKILL_COMMANDS:
+            raise RpcError(4018, f"skill command: use command.dispatch for /{base}")
+        if base in QUICK_COMMANDS or base in ("queue", "retry"):
+            return await self.command_dispatch({"name": base, "arg": arg, "session_id": rt.sid})
+        if base == "help":
+            lines = []
+            for category in dict.fromkeys(c[2] for c in SLASH_COMMANDS):
+                lines.append(category)
+                lines += [f"  /{n}{' ' + h if h else ''} — {d}" for n, d, c, h, *_ in SLASH_COMMANDS if c == category]
+            lines.append("Skills: " + ", ".join(sorted(SKILL_COMMANDS)))
+            return {"output": "\n".join(lines)}
+        if base == "stop":
+            return {"output": f"Stopped {self.stop_processes('slash.stop')} background process(es)."}
+        if base in ("usage", "status"):
+            u = self.usage_snapshot(stored)
+            lines = [f"Model: {stored.model} ({stored.provider})", f"Tokens: {u['input']} in, {u['output']} out",
+                     f"API calls: {u['calls']}",
+                     f"Context: {u['context_used']:,} / {u['context_max']:,} ({u['context_percent']}%)"]
+            if base == "status":
+                lines = [f"Session: {stored.key}", f"Title: {stored.title or '(untitled)'}",
+                         f"Workspace: {stored.cwd or DEMO_HOME}", f"Reasoning: {stored.reasoning_effort}",
+                         f"Fast: {'on' if stored.fast else 'off'}", *lines]
+            return {"output": "\n".join(lines)}
+        if base == "title":
+            if not arg.strip():
+                return {"output": f"Title: {stored.title or '(untitled)'}"}
+            title = self.set_title(stored, arg)
+            await self.emit(rt, "session.title", {"session_id": stored.key, "title": title or ""})
+            return {"output": f"Title set: {title}"}
+        if base in ("model", "reasoning", "fast"):
+            if base == "model" and not arg.strip():
+                return {"output": f"Current model: {stored.model} (provider: {stored.provider})"}
+            result = await self.config_set({"key": base, "value": arg.strip(), "session_id": rt.sid})
+            return {"output": f"{base}: {result['value']}" + (" (applies after this turn)" if result.get("deferred")
+                                                              else "")}
+        if base in {c[0] for c in SLASH_COMMANDS}:
+            return {"output": f"/{base} is not simulated by fake Hermes."}
+        raise RpcError(4018, f"not a quick/plugin/bundle/skill command: {base}")
+
+    async def command_dispatch(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_tools.py command.dispatch: quick > skill > built-in (/queue, /retry)."""
+        name = str(params.get("name") or "").lstrip("/").lower()
+        name = COMMAND_ALIASES.get(name, name)
+        arg = str(params.get("arg") or "")
+        rt = self.runtimes.get(str(params.get("session_id") or ""))
+        if name in QUICK_COMMANDS:
+            return {"type": "exec", "output": QUICK_COMMANDS[name][2]}
+        if f"/{name}" in SKILL_COMMANDS:
+            desc, _used = SKILL_COMMANDS[f"/{name}"]
+            message = (f'[SYSTEM: The user invoked the "{name}" skill. {desc}.]\n\n'
+                       f"User instruction: {arg or '(none)'}")
+            return {"type": "skill", "message": message, "name": name,
+                    "display": f"/{name}" + (f" {arg}" if arg else "")}
+        if name == "queue":
+            if not arg:
+                raise RpcError(4004, "usage: /queue <prompt>")
+            return {"type": "send", "message": arg}
+        if name == "retry":
+            return self.retry(rt)
+        raise RpcError(4018, f"not a quick/plugin/bundle/skill command: {name}")
+
+    def retry(self, rt: Runtime | None) -> dict[str, Any]:
+        """/retry rewinds the last user turn out of the history and sends it again."""
+        if rt is None:
+            raise RpcError(4001, "no active session to retry")
+        if rt.running:
+            raise RpcError(4009, busy_message("retry"))
+        if rt.attached_images:
+            raise RpcError(4018, "retry cannot safely reconstruct or combine attached media")
+        stored = self.sessions[rt.key]
+        index = next((i for i in range(len(stored.messages) - 1, -1, -1) if stored.messages[i]["role"] == "user"),
+                     None)
+        if index is None:
+            raise RpcError(4018, "no previous user message to retry")
+        content = stored.messages[index]["content"] or ""
+        del stored.messages[index:]
+        rt.failed_turn = rt.inflight = None
+        return {"type": "send", "message": content}
+
+    def model_options(self, params: dict[str, Any]) -> dict[str, Any]:
+        rt = self.runtimes.get(str(params.get("session_id") or ""))
+        stored = self.sessions.get(rt.key) if rt else None
+        model, provider = (stored.model, stored.provider) if stored else ("fake-hermes", "fake")
+        providers = []
+        for slug, name, models in DEMO_PROVIDERS:
+            providers.append({
+                "slug": slug, "name": name, "models": list(models), "total_models": len(models),
+                "is_current": slug == provider, "is_user_defined": False, "source": "built-in", "authenticated": True,
+                "capabilities": {m: {"fast": fast, "reasoning": reasoning, "can_disable_reasoning": reasoning}
+                                 for m, (fast, reasoning, _i, _o) in models.items()},
+                "pricing": {m: {"input": i, "output": o, "cache": None, "free": i == "free" and o == "free"}
+                            for m, (_f, _r, i, o) in models.items()}})
+        return {"providers": providers, "model": model, "provider": provider}
+
+    def config_get(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_config.py config.get for the keys the app reads: reasoning, fast and the whole config (display)."""
+        key = str(params.get("key") or "")
+        rt = self.runtimes.get(str(params.get("session_id") or ""))
+        stored = self.sessions.get(rt.key) if rt else None
+        if key == "reasoning":
+            return {"value": stored.reasoning_effort if stored else "medium", "display": "hide"}
+        if key == "fast":
+            return {"value": "fast" if stored and stored.fast else "normal"}
+        if key == "full":
+            return {"config": {"display": {"show_reasoning": True, "tool_progress": "all"},
+                               "model": {"default": stored.model if stored else "fake-hermes"}}}
+        raise RpcError(4002, f"unknown config key: {key}")
+
+    async def config_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_config_set.py for the composer's pills: model, reasoning, fast (session-scoped)."""
+        key, value = str(params.get("key") or ""), params.get("value", "")
+        sid = str(params.get("session_id") or "")
+        rt = self.runtimes.get(sid)
+        if rt is None and sid and key in ("model", "fast", "reasoning") and params.get("scope") != "global":
+            raise RpcError(4001, "session not found")
+        stored = self.sessions.get(rt.key) if rt else None
+        word = str(value or "").strip().lower()
+        if key == "model":
+            result = self.set_model(rt, stored, str(value or "").strip(), bool(params.get("confirm_expensive_model")))
+            if result.get("confirm_required") or result.get("deferred"):
+                return result
+        elif key == "reasoning":
+            if word in REASONING_DISPLAY:
+                return {"key": key, "value": REASONING_DISPLAY[word]}
+            if word not in REASONING_LEVELS:
+                raise RpcError(4002, f"unknown reasoning value: {value}")
+            if stored is not None:
+                stored.reasoning_effort = word
+            result = {"key": key, "value": word}
+        elif key == "fast":
+            current = "fast" if stored and stored.fast else "normal"
+            if word == "status":
+                return {"key": key, "value": current}
+            mode = FAST_WORDS.get(word, ("normal" if current == "fast" else "fast") if word in ("", "toggle") else None)
+            if mode is None:
+                raise RpcError(4002, f"unknown fast mode: {value}")
+            if mode in ("fast", "ultrafast") and stored is not None and not self.capabilities(stored.model)[0]:
+                raise RpcError(4002, f"{mode} mode is not available for this model")
+            if stored is not None:
+                stored.fast = mode in ("fast", "ultrafast")
+            result = {"key": key, "value": mode}
+        else:
+            raise RpcError(4002, f"unknown config key: {key}")
+        if rt is not None:
+            await self.emit(rt, "session.info", self.info(rt))
+        return result
+
+    def set_model(self, rt: Runtime | None, stored: StoredSession | None, value: str,
+                  confirmed: bool) -> dict[str, Any]:
+        if not value:
+            raise RpcError(4002, "model value required")
+        if rt is None or stored is None:
+            raise RpcError(4001, "config.set model requires a live session; to change the profile default run "
+                           "/setup, or use the Models page (dashboard) / Settings -> Models (Desktop)")
+        tokens = value.split()
+        model = tokens[0]
+        provider = tokens[tokens.index("--provider") + 1] if "--provider" in tokens[:-1] else self.provider_of(model)
+        if provider is None or self.provider_of(model) != provider:
+            raise RpcError(4002, f"unknown model: {value}")
+        base = {"key": "model", "value": model, "warning": "", "scope": "session"}
+        if model in EXPENSIVE_MODELS and not confirmed:
+            return {**base, "confirm_required": True,
+                    "confirm_message": f"{model} costs $15.00/M input and $75.00/M output tokens. Switch anyway?"}
+        if rt.running:
+            rt.pending_model = (model, provider)
+            return {**base, "confirm_required": False, "confirm_message": "", "deferred": True}
+        stored.model, stored.provider = model, provider
+        if not self.capabilities(model)[0]:
+            stored.fast = False
+        return {**base, "confirm_required": False, "confirm_message": ""}
+
+    def image_attach_bytes(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_prompt.py image.attach_bytes: base64 in, queued for the next prompt.submit."""
+        rt = self.runtime(params)
+        raw = str(params.get("content_base64") or params.get("data") or "").strip()
+        if not raw:
+            raise RpcError(4015, "content_base64 required")
+        data = decode_base64(raw, re.compile(r"^data:image/[a-zA-Z0-9.+-]*;base64,(.*)$", re.DOTALL))
+        if data is None:
+            raise RpcError(4017, "data is not valid base64")
+        if not data:
+            raise RpcError(4017, "image is empty")
+        if len(data) > ATTACH_MAX_BYTES:
+            raise RpcError(4018, f"image too large ({len(data)} bytes; cap is {ATTACH_MAX_BYTES // 2 ** 20} MB)")
+        filename = str(params.get("filename") or "")
+        hint = str(params.get("ext") or "").strip().lower()
+        hint = hint if not hint or hint.startswith(".") else "." + hint
+        ext = posixpath.splitext(filename or (f"x{hint}" if hint else ""))[1].lower()
+        ext = ext or next((e for sig, e in IMAGE_MAGIC if data.startswith(sig)),
+                          ".webp" if data[:4] == b"RIFF" and data[8:12] == b"WEBP" else ".png")
+        if ext not in IMAGE_EXTENSIONS:
+            raise RpcError(4016, f"unsupported image extension: {ext}")
+        rt.image_counter += 1
+        name = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{rt.image_counter}{ext}"
+        path = f"{DEMO_IMAGES}/{name}"
+        self.media[path] = data
+        rt.attached_images.append(path)
+        return {"attached": True, "path": path, "count": len(rt.attached_images), "remainder": "",
+                "text": f"[User attached image: {name}]", "bytes": len(data), **image_meta(name, data)}
+
+    def image_detach(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_prompt.py image.detach: drops one staged image so the next prompt doesn't carry it."""
+        rt = self.runtime(params)
+        path = str(params.get("path") or "").strip()
+        if not path:
+            raise RpcError(4015, "path required")
+        before = len(rt.attached_images)
+        rt.attached_images = [p for p in rt.attached_images if p != path]
+        return {"detached": len(rt.attached_images) != before, "count": len(rt.attached_images)}
+
+    def file_attach(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_prompt.py file.attach: a workspace file as-is, anything else staged into attachments/; the
+        reply's ``ref_text`` goes into the prompt."""
+        rt = self.runtime(params)
+        stored = self.sessions[rt.key]
+        raw, data_url, name = (str(params.get(k) or "").strip() for k in ("path", "data_url", "name"))
+        if not raw and not data_url:
+            raise RpcError(4015, "path or data_url required")
+        workspace = stored.cwd or DEMO_HOME
+        resolved = posixpath.normpath(raw if raw.startswith("/") else f"{workspace}/{raw}") if raw else ""
+        if resolved in self.files and resolved.startswith(workspace.rstrip("/") + "/"):
+            target, uploaded = resolved, False
+        else:
+            if resolved in self.files:
+                payload, filename = self.files[resolved], posixpath.basename(resolved)
+            elif data_url:
+                decoded = decode_base64(data_url, DATA_URL)
+                if decoded is None:
+                    raise RpcError(5028, "invalid data_url payload")
+                payload = decoded
+                filename = posixpath.basename(name or raw)
+            else:
+                raise RpcError(5028, "file not found on gateway and no data_url provided")
+            filename = re.sub(r"[\x00-\x1f]+", "_", filename).strip().strip(".") or "attachment"
+            stem, suffix = posixpath.splitext(filename)
+            target, counter = f"{DEMO_ATTACHMENTS}/{filename}", 2
+            while target in self.files:
+                target, counter = f"{DEMO_ATTACHMENTS}/{stem or 'attachment'}-{counter}{suffix}", counter + 1
+            self.files[target] = payload
+            uploaded = True
+        prefix = workspace.rstrip("/") + "/"
+        ref_path = target[len(prefix):] if target.startswith(prefix) else target
+        return {"attached": True, "name": posixpath.basename(target), "path": target, "ref_path": ref_path,
+                "ref_text": f"@file:{format_ref(ref_path)}", "uploaded": uploaded}
+
+    def process_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        key = self.runtime(params).key
+        return {"processes": [self.process_entry(p) for p in self.processes.values() if p["session_key"] == key]}
+
+    def process_kill(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_tools.py process.kill: ONE process, scoped to the caller's session (process.stop kills all)."""
+        rt = self.runtime(params)
+        proc_id = str(params.get("process_id") or "")
+        if not proc_id:
+            raise RpcError(4012, "process_id required")
+        proc = self.processes.get(proc_id)
+        if proc is None or proc["session_key"] != rt.key:
+            raise RpcError(4044, f"no such process: {proc_id}")
+        return self.kill(proc, "process.kill")
+
+    def stop_processes(self, source: str) -> int:
+        running = [p for p in self.processes.values() if not p["exited"]]
+        for proc in running:
+            self.kill(proc, source)
+        return len(running)
+
+    def context_breakdown(self, params: dict[str, Any]) -> dict[str, Any]:
+        stored = self.sessions[self.runtime(params).key]
+        categories = [{"color": color, "id": cid, "label": label, "tokens": tokens}
+                      for cid, color, label, tokens in self.context_categories(stored)]
+        total = sum(c["tokens"] for c in categories)
+        files = []
+        if stored.git_repo_root and (rules := self.files.get(f"{stored.git_repo_root}/AGENTS.md")) is not None:
+            files.append({"label": "AGENTS.md", "path": f"{stored.git_repo_root}/AGENTS.md", "chars": len(rules),
+                          "est_tokens": len(rules) // 4, "loaded": True, "status": "loaded"})
+        return {"categories": categories, "context_max": CONTEXT_MAX,
+                "context_percent": max(0, min(100, round(total / CONTEXT_MAX * 100))), "context_used": total,
+                "estimated_total": total, "context_estimated": False, "context_source": "provider_usage",
+                "model": stored.model, "context_files": files}
+
+    async def workspace_move(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_session.py session.workspace.move: re-home a STORED session (by key); a live one follows."""
+        key, raw = str(params.get("session_key") or "").strip(), str(params.get("cwd") or "").strip()
+        if not key:
+            raise RpcError(4007, "session_key required")
+        if not raw:
+            raise RpcError(4016, "cwd required")
+        cwd = posixpath.normpath(raw.replace("~", DEMO_HOME, 1) if raw.startswith("~") else raw)
+        if not self.is_dir(cwd):
+            raise RpcError(4017, f"working directory does not exist: {raw}")
+        stored = self.sessions.get(key)
+        if stored is None:
+            raise RpcError(4007, "session not found")
+        stored.cwd = cwd
+        stored.git_branch, stored.git_repo_root = git_info(cwd)
+        if (rt := self.find_runtime(key)) is not None:
+            await self.emit(rt, "session.info", self.info(rt))
+        return {"cwd": cwd, "branch": stored.git_branch, "git_repo_root": stored.git_repo_root}
+
+    def session_branch(self, conn: Conn, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_session.py _branch_live: a new stored session with the parent's history, bound to this client."""
+        rt = self.runtime(params)
+        idem = str(params.get("idempotency_key") or "")
+        if idem and (child := self.runtimes.get(self.idempotency.get(idem, ""))) is not None:
+            return self.branch_result(child)
+        parent = self.sessions[rt.key]
+        # _visible_branch_history: user and assistant rows with text; ``count`` counts those.
+        history = [m for m in parent.messages if m["role"] in ("user", "assistant") and (m.get("content") or "").strip()]
+        if not history:
+            raise RpcError(4008, "nothing to branch — send a message first")
+        if isinstance(count := params.get("count"), int) and count > 0:
+            history = history[:count]
+        title = params.get("name") or self.next_title(parent.title or "branch")
+        child_stored = StoredSession(
+            key=self.new_key(), source=parent.source, title=title, profile=parent.profile, cwd=parent.cwd,
+            git_branch=parent.git_branch, git_repo_root=parent.git_repo_root, model=parent.model,
+            provider=parent.provider, reasoning_effort=parent.reasoning_effort, fast=parent.fast,
+            parent_session_id=parent.key, branched_from=parent.key)
+        for row in history:
+            copy = {**row, "id": self.next_row_id, "session_id": child_stored.key}
+            self.next_row_id += 1
+            child_stored.messages.append(copy)
+        child_stored.persisted = True
+        self.sessions[child_stored.key] = child_stored
+        child = Runtime(sid=uuid.uuid4().hex[:8], key=child_stored.key)
+        self.attach(child, conn)
+        self.runtimes[child.sid] = child
+        if idem:
+            self.idempotency[idem] = child.sid
+        return self.branch_result(child)
+
+    def branch_result(self, child: Runtime) -> dict[str, Any]:
+        stored = self.sessions[child.key]
+        return {"session_id": child.sid, "stored_session_id": stored.key, "title": stored.title or "",
+                "parent": stored.parent_session_id or "", "message_count": len(stored.messages),
+                "messages": gateway_messages(stored), "info": self.info(child)}
+
+    def next_title(self, base_title: str) -> str:
+        """hermes_state_titles.py get_next_title_in_lineage: "chat" -> "chat #2" -> "chat #3"."""
+        match = NUMBERED_TITLE.match(base_title)
+        base = match.group(1) if match else base_title
+        titles = [s.title for s in self.sessions.values() if s.title == base or (s.title or "").startswith(base + " #")]
+        if not titles:
+            return base
+        numbers = [int(m.group(2)) for m in (NUMBERED_TITLE.match(t or "") for t in titles) if m]
+        return f"{base} #{max([1, *numbers]) + 1}"
+
+    def set_title(self, stored: StoredSession, title: str) -> str | None:
+        """A user title: sanitized, unique across sessions; empty clears it (ValueError otherwise)."""
+        cleaned = sanitize_title(title)
+        if cleaned and (other := next((s for s in self.sessions.values()
+                                       if s.title == cleaned and s.key != stored.key), None)):
+            raise ValueError(f"Title '{cleaned}' is already in use by session {other.key}")
+        stored.title = cleaned
+        return cleaned
+
+    # ── REST ──────────────────────────────────────────────────────────────────────────────────────
+
+    def listed(self, stored: StoredSession, *, min_messages: int = 0, archived: str = "exclude",
+               profile: str = "all") -> bool:
+        if not stored.persisted or stored.hidden or stored.row()["message_count"] < min_messages:
+            return False
+        if (archived == "exclude" and stored.archived) or (archived == "only" and not stored.archived):
+            return False
+        return profile in ("all", "") or stored.profile == profile
+
+    async def list_profiles(self, request: Request) -> Response:
+        if not self.authed(request):
+            return self.unauthorized(request)
+        profiles = [{"name": p["name"], "path": p["path"], "is_default": p["is_default"], "model": "fake-hermes",
+                     "provider": "fake", "has_env": True, "skill_count": p["skill_count"], "gateway_running": False,
+                     "description": p["description"], "description_auto": False, "display_name": "",
+                     "bot_title": "", "distribution_name": None, "distribution_version": None,
+                     "distribution_source": None, "has_alias": False, "role": None} for p in DEMO_PROFILES]
+        log("http GET /api/profiles -> 200")
+        return JSONResponse({"profiles": profiles})
+
+    async def sidebar_sessions(self, request: Request) -> Response:
+        """profiles.py /api/profiles/sessions/sidebar: recents / cron / messaging slices in one call."""
+        if not self.authed(request):
+            log("http GET /api/profiles/sessions/sidebar -> 401")
+            return self.unauthorized(request)
+        q = request.query_params
+        try:
+            caps = {key: min(max(int(q.get(f"{key}_limit", default)), 1), 500)
+                    for key, default in (("recents", 20), ("cron", 50), ("messaging", 100))}
+        except ValueError:
+            return JSONResponse({"detail": "limits must be integers"}, status_code=422)
+        scope = (q.get("recents_profile") or "all").strip() or "all"
+        excludes = {"recents": csv_list(q.get("recents_exclude")), "messaging": csv_list(q.get("messaging_exclude"))}
+        rows = [s.row() for s in self.sessions.values() if self.listed(s, min_messages=1, profile=scope)]
+        rows.sort(key=lambda r: r["last_active"] or r["started_at"], reverse=True)
+
+        def pick(key: str) -> list[dict[str, Any]]:
+            if key == "cron":
+                return [r for r in rows if r["source"] == "cron"]
+            return [r for r in rows if r["source"] not in excludes[key]]
+
+        recents = pick("recents")
+        names = [p["name"] for p in DEMO_PROFILES if scope == "all" or p["name"] == scope]
+        usage = {name: {"tokens": sum(r["input_tokens"] + r["output_tokens"] for r in rows if r["profile"] == name),
+                        "cost_usd": 0.0} for name in names}
+        truncated = {name: sum(r["profile"] == name for r in recents) >= caps["recents"] for name in names}
+        messaging = pick("messaging")
+        log(f"http GET /api/profiles/sessions/sidebar -> 200 ({len(recents)} recents)")
+        return JSONResponse({
+            "recents": {"sessions": pinned_window(recents, 0, caps["recents"]), "profiles_truncated": truncated,
+                        "profiles_usage": usage},
+            "cron": {"sessions": pinned_window(pick("cron"), 0, caps["cron"])},
+            "messaging": {"sessions": pinned_window(messaging, 0, caps["messaging"]), "total": len(messaging)},
+            "errors": [], "storage": {}})
+
+    async def search_sessions(self, request: Request) -> Response:
+        """sessions.py /api/sessions/search: id matches first, then message content (prefix words), one profile."""
+        if not self.authed(request):
+            log("http GET /api/sessions/search -> 401")
+            return self.unauthorized(request)
+        q = request.query_params
+        query = (q.get("q") or "").strip()
+        if not query:
+            return JSONResponse({"results": []})
+        limit = max(1, min(int(q.get("limit") or 20), 100))
+        profile = q.get("profile") or "default"
+        include = [q["source"]] if q.get("source") else csv_list(q.get("sources"))
+        exclude = set(csv_list(q.get("exclude_sources")))
+        candidates = [s for s in self.sessions.values() if s.persisted and s.profile == profile
+                      and (not include or s.source in include) and s.source not in exclude]
+        candidates.sort(key=lambda s: s.last_active, reverse=True)
+        tokens = [re.sub(r"\W", "", t.lower()) for t in query.split() if re.sub(r"\W", "", t)]
+        results: dict[str, dict[str, Any]] = {}
+
+        def add(stored: StoredSession, snippet: str, role: str | None) -> None:
+            if stored.key in results or len(results) >= limit:
+                return
+            row = stored.row()
+            results[stored.key] = {
+                "snippet": snippet, "role": role, "source": stored.source, "model": stored.model,
+                "session_started": stored.started_at, "session_id": stored.key, "lineage_root": stored.key,
+                "profile": profile, "is_default_profile": profile == "default",
+                **{k: row[k] for k in ("id", "title", "started_at", "ended_at", "last_active", "is_active",
+                                       "message_count", "tool_call_count", "input_tokens", "output_tokens",
+                                       "preview", "parent_session_id", "archived")}}
+
+        for stored in candidates:
+            if query.lower() in stored.key.lower():
+                add(stored, stored.row()["preview"] or f"Session ID: {stored.key}", None)
+        for stored in candidates:
+            for message in stored.messages:
+                if message["role"] in ("user", "assistant") and tokens and \
+                        (snippet := search_snippet(message.get("content") or "", tokens)):
+                    add(stored, snippet, message["role"])
+                    break
+        log(f"http GET /api/sessions/search q={query!r} -> 200 ({len(results)} results)")
+        return JSONResponse({"results": list(results.values())})
+
+    async def manage_session(self, request: Request) -> Response:
+        """sessions.py PATCH (title / archived / hidden / pinned / unread) and DELETE /api/sessions/{id}."""
+        sid = request.path_params["session_id"]
+        if not self.authed(request):
+            log(f"http {request.method} /api/sessions/{sid} -> 401")
+            return self.unauthorized(request)
+        if problem := self.origin_problem(request):
+            log(f"http {request.method} /api/sessions/{sid} -> 403", problem)
+            return JSONResponse({"detail": problem}, status_code=403)
+        stored = self.sessions.get(sid)
+        if stored is not None and not stored.persisted:
+            stored = None
+        if request.method == "DELETE":
+            if stored is None:
+                log(f"http DELETE /api/sessions/{sid} -> 200 (already absent)")
+                return JSONResponse({"ok": True, "already_absent": True})
+            if (rt := self.find_runtime(sid)) is not None and rt.running:
+                log(f"http DELETE /api/sessions/{sid} -> 409 (turn running)")
+                return JSONResponse({"detail": "session has an active turn; stop it first"}, status_code=409)
+            for proc in [p for p in self.processes.values() if p["session_key"] == sid]:
+                self.kill(proc, "session.delete")
+            if rt is None:
+                del self.sessions[sid]
+            else:
+                # The store only: a live runtime stays bound to its sockets (session.close ends it), so its row is
+                # gone from every list while the runtime keeps what it holds.
+                stored.messages.clear()
+                stored.persisted = False
+            log(f"http DELETE /api/sessions/{sid} -> 200")
+            await self.broadcast("sessions.changed", {})
+            return JSONResponse({"ok": True})
+        if stored is None:
+            log(f"http PATCH /api/sessions/{sid} -> 404")
+            return JSONResponse({"detail": "Session not found"}, status_code=404)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - FastAPI answers a malformed body with 422
+            return JSONResponse({"detail": "invalid JSON body"}, status_code=422)
+        body = body if isinstance(body, dict) else {}
+        flags = ("archived", "hidden", "pinned", "unread")
+        if body.get("title") is None and all(body.get(f) is None for f in flags):
+            return JSONResponse({"detail": "Nothing to update; provide 'title', 'archived', 'hidden', 'pinned', "
+                                           "and/or 'unread'."}, status_code=400)
+        if body.get("title") is not None:
+            try:
+                self.set_title(stored, str(body["title"]))
+            except ValueError as exc:
+                log(f"http PATCH /api/sessions/{sid} -> 400 ({exc})")
+                return JSONResponse({"detail": str(exc)}, status_code=400)
+        result: dict[str, Any] = {"ok": True}
+        for flag in flags:
+            if body.get(flag) is not None:
+                setattr(stored, flag, bool(body[flag]))
+                result[flag] = bool(body[flag])
+        result["title"] = stored.title or ""
+        log(f"http PATCH /api/sessions/{sid} -> 200 {short(result)}")
+        await self.broadcast("sessions.changed", {})
+        return JSONResponse(result)
+
+    async def get_media(self, request: Request) -> Response:
+        """files.py /api/media: a gateway-local image as a data URL for clients that can't read its disk."""
+        if not self.authed(request):
+            return self.unauthorized(request)
+        path = posixpath.normpath(request.query_params.get("path") or "")
+        ext = posixpath.splitext(path)[1].lower()
+        if ext not in MEDIA_TYPES:
+            return JSONResponse({"detail": "Unsupported media type"}, status_code=415)
+        if not path.startswith(DEMO_HERMES_HOME + "/"):
+            return JSONResponse({"detail": "Path outside media roots"}, status_code=403)
+        if (data := self.media.get(path)) is None:
+            return JSONResponse({"detail": "File not found"}, status_code=404)
+        log(f"http GET /api/media {path} -> 200 ({len(data)} bytes)")
+        return JSONResponse({"data_url": f"data:{MEDIA_TYPES[ext]};base64,{base64.b64encode(data).decode()}"})
+
+
+class FakeHermes(ChatFeatures):
     def __init__(self, args: argparse.Namespace) -> None:
         self.username = args.username
         self.password = args.password
@@ -267,7 +1758,10 @@ class FakeHermes:
         self.rings: OrderedDict[str, deque[tuple[int, dict[str, Any]]]] = OrderedDict()
         self.evicted_through: dict[str, int] = {}
         self.voice_plugin = FakeVoicePlugin(self, args)
+        self._init_chat(args)
         self._seed()
+        if self.seed_mode == "demo":
+            self._seed_demo()
 
     # ── helpers ───────────────────────────────────────────────────────────────────────────────────
 
@@ -317,7 +1811,7 @@ class FakeHermes:
             "model": "fake-hermes", "provider": "fake", "tools": {}, "skills": {}, "cwd": "",
             "running": rt.running, "turn_started_at": rt.turn_started_at,
             "title": (stored.title if stored else None) or "", "stored_session_id": rt.key,
-            "profile_name": "default", "lazy": False,
+            "profile_name": stored.profile if stored else "default", "lazy": False, **self.chat_info(stored),
         }
 
     def find_runtime(self, key: str) -> Runtime | None:
@@ -353,7 +1847,8 @@ class FakeHermes:
         pending = approval_payload(rt.approvals[0].data) if rt.approvals else None
         for key, value in (("inflight", dict(rt.inflight) if rt.inflight else None),
                            ("queued", {"user": rt.queued} if rt.queued else None),
-                           ("pending_approval", pending), ("open_requests", self.open_requests(rt.sid))):
+                           ("pending_approval", pending), ("open_requests", self.open_requests(rt.sid)),
+                           ("todo_state", stored.todo_state if stored else None)):
             if value:
                 payload[key] = value
         return payload
@@ -436,15 +1931,24 @@ class FakeHermes:
         q = request.query_params
         limit, offset = int(q.get("limit", 20)), int(q.get("offset", 0))
         min_messages = int(q.get("min_messages", 0))
-        rows = [s.row() for s in self.sessions.values() if s.persisted]
-        rows = [r for r in rows if r["message_count"] >= min_messages]
-        excluded = {s.strip() for s in (q.get("exclude_sources") or "").split(",") if s.strip()}
-        rows = [r for r in rows if r["source"] not in excluded]
-        key = "last_active" if q.get("order", "recent") == "recent" else "started_at"
+        archived, order = q.get("archived", "exclude"), q.get("order", "recent")
+        if archived not in ("exclude", "only", "include"):
+            return JSONResponse({"detail": "archived must be one of: exclude, only, include"}, status_code=400)
+        if order not in ("created", "recent"):
+            return JSONResponse({"detail": "order must be one of: created, recent"}, status_code=400)
+        profile = q.get("profile") or "all"
+        rows = [s.row() for s in self.sessions.values()
+                if self.listed(s, min_messages=min_messages, archived=archived, profile=profile)]
+        included = [q["source"]] if q.get("source") else csv_list(q.get("sources"))
+        excluded = set(csv_list(q.get("exclude_sources")))
+        rows = [r for r in rows if r["source"] not in excluded and (not included or r["source"] in included)]
+        key = "last_active" if order == "recent" else "started_at"
         rows.sort(key=lambda r: r[key], reverse=True)
-        window = rows[offset:offset + limit]
+        window = pinned_window(rows, offset, limit)
+        totals = {p["name"]: sum(r["profile"] == p["name"] for r in rows) for p in DEMO_PROFILES
+                  if profile == "all" or p["name"] == profile}
         log(f"http GET /api/profiles/sessions -> 200 ({len(window)} of {len(rows)})")
-        return JSONResponse({"sessions": window, "total": len(rows), "profile_totals": {"default": len(rows)},
+        return JSONResponse({"sessions": window, "total": len(rows), "profile_totals": totals,
                              "limit": limit, "offset": offset, "errors": [], "storage": {}})
 
     async def session_messages(self, request: Request) -> Response:
@@ -467,7 +1971,7 @@ class FakeHermes:
         else:
             page = rows[offset:offset + limit]
         log(f"http GET /api/sessions/{sid}/messages -> 200 ({len(page)} rows)")
-        return JSONResponse({"session_id": sid, "profile": "default", "messages": page,
+        return JSONResponse({"session_id": sid, "profile": stored.profile, "messages": page,
                              "pagination": {"limit": limit, "offset": offset, "order": order, "returned": len(page)}})
 
     # ── WebSocket gateway ─────────────────────────────────────────────────────────────────────────
@@ -556,10 +2060,11 @@ class FakeHermes:
             "session.events.since": lambda: self.events_since(params),
             "prompt.submit": lambda: self.prompt_submit(conn, params),
             "session.interrupt": lambda: self.session_interrupt(params),
+            "session.close": lambda: self.session_close(params),
             "approval.respond": lambda: self.approval_respond(params),
             "request.answer": lambda: self.request_answer(params),
             "clarify.lock": lambda: self.clarify_lock(params),
-        }.get(method)
+        }.get(method) or self.chat_methods(conn, params).get(method)
         if handler is None:
             return _err(rid, -32601, f"unknown method: {method} — the client and the Hermes backend are out of sync "
                         "(different versions); run `hermes update` and restart both")
@@ -589,6 +2094,7 @@ class FakeHermes:
                     "info": self.info(rt)}
         stored = StoredSession(key=self.new_key(), source=str(params.get("source") or "desktop"),
                                title=params.get("title") or None)
+        self.apply_create_params(stored, params)
         self.sessions[stored.key] = stored
         rt = Runtime(sid=uuid.uuid4().hex[:8], key=stored.key)
         self.attach(rt, conn)
@@ -625,7 +2131,8 @@ class FakeHermes:
         return {"session_id": rt.sid, "resumed": key, "message_count": len(stored.messages),
                 "messages": [] if omit else gateway_messages(stored), "messages_omitted": omit,
                 "info": self.info(rt), "inflight": None, "running": False, "session_key": key,
-                "started_at": stored.started_at, "status": "idle"}
+                "started_at": stored.started_at, "status": "idle",
+                **({"todo_state": stored.todo_state} if stored.todo_state else {})}
 
     def session_activate(self, conn: Conn, params: dict[str, Any]) -> dict[str, Any]:
         """Re-attach by RUNTIME id (methods_session.py): 4001 once the runtime is gone (reaped, or never existed)."""
@@ -655,6 +2162,10 @@ class FakeHermes:
             raise RpcError(4002, "text required")
         self.attach(rt, conn)  # prompt.submit rebinds the session to the submitting transport
         stored = self.sessions[rt.key]
+        truncating = any(params.get(k) is not None for k in
+                         ("truncate_before_user_ordinal", "truncate_before_row_id", "truncate_before_message_id"))
+        if truncating:
+            survivors = self.truncate_for_submit(rt, stored, params)
         if rt.running:
             # Busy: queue (queued=True forces queue mode). Without it Hermes' default busy_input_mode
             # "interrupt" redirects or interrupts the live turn and queues the prompt; the fake interrupts + queues.
@@ -669,11 +2180,52 @@ class FakeHermes:
                 log(f"busy prompt without queued: interrupting the running turn of {rt.sid}")
                 rt.turn_task.cancel()
             return {"status": "queued"}
-        row = self.add_row(stored, "user", text)
+        row = self.add_row(stored, "user", self.stage_turn_images(rt, text))
         rt.running = True
         rt.turn_started_at = time.time()
         rt.loop_task = asyncio.create_task(self.turn_loop(rt, text))
-        return {"status": "streaming", "user_row_id": row["id"]}
+        return {"status": "streaming", "user_row_id": row["id"], **({"survivor_user_row_ids": survivors} if truncating else {})}
+
+    def truncate_for_submit(self, rt: Runtime, stored: StoredSession, params: dict[str, Any]) -> list[int]:
+        """methods_prompt.py _truncate_history_for_submit by durable row id: a rewind drops the target prompt and
+        everything after it, then the submitted text runs from there. Returns the surviving user row ids."""
+        if rt.running:
+            # A rewind never lands as a queued or steered prompt: the client stops the turn and retries.
+            raise RpcError(4009, "session busy")
+        if not params.get("confirm_truncate"):
+            raise RpcError(4029, "truncation parameters require confirm_truncate=true; an ordinary prompt.submit must "
+                                 "not drop session history")
+        row_id = params.get("truncate_before_row_id")
+        if not isinstance(row_id, int) or isinstance(row_id, bool):
+            raise RpcError(4004, "the fake rewinds by truncate_before_row_id only")
+        index = next((i for i, m in enumerate(stored.messages) if m["id"] == row_id and m["role"] == "user"), None)
+        if index is None:
+            raise RpcError(4018, f"target row_id {row_id} not found for session {rt.sid} (in-memory + durable)")
+        if index == 0 and not params.get("confirm_empty_truncate"):
+            raise RpcError(4028, "truncation would erase the entire session transcript; resubmit with "
+                                 "confirm_empty_truncate=true if this is intended")
+        log(f"prompt.submit: truncating {stored.key} {len(stored.messages)} -> {index} messages")
+        del stored.messages[index:]
+        rt.failed_turn = rt.inflight = None
+        stored.todo_state = None
+        return [m["id"] for m in stored.messages if m["role"] == "user"]
+
+    async def session_close(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_session.py session.close: the runtime is popped and torn down (its turn and prompts end)."""
+        rt = self.runtimes.pop(str(params.get("session_id") or ""), None)
+        if rt is None:
+            return {"closed": False}
+        for task in (rt.turn_task, rt.loop_task, rt.reap_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await self.cancel_requests(rt.sid, "session_closed")
+        self.resolve_approvals(rt, "deny", resolve_all=True)
+        rt.running = False
+        stored = self.sessions.get(rt.key)
+        if stored is not None and not stored.persisted and not stored.messages:
+            del self.sessions[rt.key]
+        log(f"session.close {rt.sid}")
+        return {"closed": True}
 
     async def session_interrupt(self, params: dict[str, Any]) -> dict[str, Any]:
         rt = self.runtimes.get(params.get("session_id") or "")
@@ -1000,11 +2552,13 @@ class FakeHermes:
             rt.turn_task = asyncio.create_task(self.run_turn(rt, next_text))
             await asyncio.wait({rt.turn_task})
             if rt.turn_task.cancelled():  # cancelled before it started: still close the turn
-                await self.emit(rt, "message.complete", {"text": "", "status": "interrupted", "usage": usage(0)})
+                await self.emit(rt, "message.complete", {"text": "", "status": "interrupted",
+                                                         "usage": self.usage_snapshot(self.sessions[rt.key])})
             rt.turn_task = None
             rt.running = False
             rt.inflight = None
             rt.turn_started_at = None
+            self.after_turn(rt)
             await self.emit(rt, "session.info", self.info(rt))
             next_text, rt.queued = rt.queued, None
             if next_text is not None:
@@ -1018,6 +2572,7 @@ class FakeHermes:
     async def run_turn(self, rt: Runtime, text: str) -> None:
         stored = self.sessions[rt.key]
         rt.inflight = {"user": text, "assistant": "", "streaming": True}
+        rt.notes, rt.turn_images, rt.failed_turn = TurnNotes(images=rt.turn_images), [], None
         replies: list[str] = []
         streamed = ""
         try:
@@ -1047,15 +2602,25 @@ class FakeHermes:
                     replies.append(reply if ok and result.startswith("Spoken") else f"{reply} (speak: {result})")
                 else:
                     replies.append(await self.reply_to(rt, stored, segment))
-            final = "\n\n".join(replies)
+            replies += self.turn_attachment_notes(rt, text)
+            final = "\n\n".join(reply for reply in replies if reply)
             for chunk in chunks(final, STREAM_CHUNKS):
                 await asyncio.sleep(STREAM_SECONDS / STREAM_CHUNKS)
                 streamed += chunk
                 rt.inflight["assistant"] = streamed
                 await self.emit(rt, "message.delta", {"text": chunk})
-            self.add_row(stored, "assistant", final, finish_reason="stop")
-            await self.emit(rt, "message.complete", {"text": final, "usage": usage(len(final.split())),
-                                                     "status": "complete"})
+            # Live usage reaches the client before the close (server.py _start_usage_ticker).
+            self.count_turn_usage(stored, rt, final)
+            snapshot = self.usage_snapshot(stored)
+            await self.emit(rt, "session.usage", {"usage": snapshot})
+            reasoning = rt.notes.reasoning
+            if rt.notes.error is not None:
+                await self.fail_turn(rt, stored, final, snapshot)
+            else:
+                self.add_row(stored, "assistant", final, finish_reason="stop",
+                             **({"reasoning": reasoning} if reasoning else {}))
+                await self.emit(rt, "message.complete", {"text": final, "usage": snapshot, "status": "complete",
+                                                         **({"reasoning": reasoning} if reasoning else {})})
             if stored.title is None:
                 stored.title = title_for(text)
                 await self.emit(rt, "session.title", {"session_id": stored.key, "title": stored.title})
@@ -1063,18 +2628,20 @@ class FakeHermes:
             log(f"turn on {rt.sid} interrupted")
             if streamed:
                 self.add_row(stored, "assistant", streamed, finish_reason="interrupted")
-            await self.emit(rt, "message.complete", {"text": streamed, "usage": usage(0), "status": "interrupted",
+            await self.emit(rt, "message.complete", {"text": streamed, "usage": self.usage_snapshot(stored),
+                                                     "status": "interrupted",
                                                      **({"partial": True} if streamed else {})})
 
     async def reply_to(self, rt: Runtime, stored: StoredSession, segment: str) -> str:
-        """Plain text: echo it, or ask the client what its trigger words call for."""
+        """Plain text: echo it, or run the chat demos and ask the client what its trigger words call for."""
         demos = {"approve": self.demo_approval, "clarify": self.demo_clarify, "secret": self.demo_secret,
                  "sudo": self.demo_sudo, "window": self.demo_window}
         lowered = segment.lower()
+        shows = [demo for word, demo in self.chat_demos().items() if word in lowered]
         asks = [demo for word, demo in demos.items() if word in lowered]
-        if not asks:
+        if not asks and not shows:
             return f"Echo: {segment}"
-        return "\n\n".join([await demo(rt, stored) for demo in asks])
+        return "\n\n".join(part for part in [await demo(rt, stored) for demo in (*shows, *asks)] if part)
 
     async def demo_approval(self, rt: Runtime, stored: StoredSession) -> str:
         choice: str | None = None
@@ -1251,10 +2818,6 @@ def describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
-def usage(output: int) -> dict[str, Any]:
-    return {"model": "fake-hermes", "input": 0, "output": output, "total": output, "calls": 1}
-
-
 def segments(text: str) -> list[str]:
     """A merged queue slot is prompts joined by blank lines; split it back where a new [Voice…] prompt begins."""
     parts: list[str] = []
@@ -1281,16 +2844,26 @@ def title_for(text: str) -> str:
 
 
 def gateway_messages(stored: StoredSession | None) -> list[dict[str, Any]]:
-    """session.resume ``messages`` (tui_gateway/session_history.py _history_to_messages): {role, text} rows."""
+    """session.resume ``messages`` (tui_gateway/session_history.py _history_to_messages): {role, text} rows, tool
+    rows with their args (edit tools also with the stored result), reasoning and display kinds."""
     out: list[dict[str, Any]] = []
-    for row in stored.messages if stored else []:
+    rows = stored.messages if stored else []
+    results = {row.get("tool_call_id"): row for row in rows if row["role"] == "tool"}
+    for row in rows:
         if row["role"] in ("user", "assistant") and row.get("content"):
-            out.append({"role": row["role"], "text": row["content"]})
+            message = {"role": row["role"], "text": row["content"], "timestamp": row["timestamp"], "row_id": row["id"]}
+            for key in ("reasoning", "display_kind", "display_metadata"):
+                if row.get(key):
+                    message[key] = row[key]
+            out.append(message)
         for call in row.get("tool_calls") or []:
             fn = call.get("function") or {}
-            args = json.loads(fn.get("arguments") or "{}")
-            context = args.get("text") or args.get("command") or ""
-            out.append({"role": "tool", "name": fn.get("name"), "context": str(context)[:80]})
+            name, args = fn.get("name"), json.loads(fn.get("arguments") or "{}")
+            tool: dict[str, Any] = {"role": "tool", "name": name, "context": tool_context(name, args)[:80],
+                                    "tool_call_id": call.get("id"), **({"args": args} if args else {})}
+            if name in ("write_file", "patch") and (result := results.get(call.get("id"))) is not None:
+                tool["content"] = result.get("content")
+            out.append(tool)
     return out
 
 
@@ -1304,6 +2877,12 @@ def build_app(fake: FakeHermes) -> Starlette:
         Route("/api/sessions/{session_id}/messages", fake.session_messages, methods=["GET"]),
         WebSocketRoute("/api/ws", fake.gateway_ws),
         *fake.voice_plugin.routes(),
+        # M2: chat screens.
+        Route("/api/profiles", fake.list_profiles, methods=["GET"]),
+        Route("/api/profiles/sessions/sidebar", fake.sidebar_sessions, methods=["GET"]),
+        Route("/api/sessions/search", fake.search_sessions, methods=["GET"]),
+        Route("/api/sessions/{session_id}", fake.manage_session, methods=["PATCH", "DELETE"]),
+        Route("/api/media", fake.get_media, methods=["GET"]),
     ])
 
 
@@ -1322,6 +2901,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract", default=str(DEFAULT_CONTRACT),
                         help="OpenRPC contract whose param schemas reject unknown keys ('' = no check)")
     FakeVoicePlugin.add_arguments(parser)
+    parser.add_argument("--seed", choices=("demo", "minimal"), default="demo",
+                        help="stored chats at start: demo (two projects, two profiles, pinned/archived/unread, cron "
+                             "and Telegram chats) or minimal (only the welcome chat)")
     return parser
 
 

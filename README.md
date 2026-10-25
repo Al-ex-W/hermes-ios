@@ -226,7 +226,10 @@ looks for Hermes at `~/.hermes/hermes-agent`; set `HERMES_AGENT_DIR` or `HERMES_
 
 With [`devtools/fake_hermes.py`](devtools) running (`--port 9311 --reap-grace 1`), prefix the `xcodebuild test`
 command with `TEST_RUNNER_HERMES_FAKE_URL=http://127.0.0.1:9311 TEST_RUNNER_HERMES_FAKE_REAP_GRACE=1` to also run
-the app's end-to-end tests against it. The fake serves the plugin's routes too: typing `call me sync: …` in a chat
+the app's end-to-end tests against it. Add `-test-timeouts-enabled YES -default-test-execution-time-allowance 60
+-collect-test-diagnostics never` so a stuck test fails within a minute: the allowance covers only the tests, and
+after a failure xcodebuild otherwise gathers `simctl diagnose`, which can hold the run for ten minutes or more once
+the tests are done. The fake serves the plugin's routes too: typing `call me sync: …` in a chat
 makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/ring` returns a push payload for
 `xcrun simctl openurl booted "hermesvoice://ring?…"` (see `devtools/fake_voice_plugin.py`).
 

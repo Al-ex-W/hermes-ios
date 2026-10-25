@@ -69,14 +69,7 @@ struct SessionSummary: Identifiable, Hashable {
     let profile: String?
 }
 
-struct ChatMessage: Identifiable, Equatable {
-    enum Role: String { case user, assistant, tool, system }
-    let id: String
-    var role: Role
-    var text: String
-}
-
-/// REST side of the Hermes dashboard (port 9119): cookie sign-in, sessions, messages, socket tickets.
+/// REST side of the Hermes dashboard (port 9119): cookie sign-in, requests, transcripts, socket tickets.
 final class DashboardClient {
     let base: URL
     private let username: String
@@ -184,59 +177,16 @@ final class DashboardClient {
         return ticket
     }
 
-    func sessions() async throws -> [SessionSummary] {
-        let result = try await request("GET", "/api/profiles/sessions", query: [
-            "limit": "100", "offset": "0", "min_messages": "1", "archived": "exclude",
-            "order": "recent", "exclude_sources": "cron",
-        ]) as? JSON
-        let rows = result?["sessions"] as? [JSON] ?? []
-        return rows.compactMap { row in
-            if (row["hidden"] as? Bool) == true { return nil }
-            guard let id = (row["id"] ?? row["session_id"]).flatMap(Self.string) else { return nil }
-            let title = (row["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (row["preview"] as? String) ?? "Untitled"
-            let stamp = ["last_active", "updated_at", "last_message_at", "created_at"].lazy.compactMap { row[$0] }.first
-            let profile = (row["profile"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            return SessionSummary(id: id, title: title, lastActive: stamp.flatMap(Self.date), profile: profile)
-        }
-    }
-
-    /// The stored transcript, oldest first. `profile` picks the store; nil reads the dashboard's own.
-    func messages(sessionID: String, profile: String? = nil) async throws -> [ChatMessage] {
+    /// `limit` rows of the stored transcript, `offset` rows back from the newest, oldest first. `profile` picks
+    /// the store; nil reads the dashboard's own.
+    func messageRows(sessionID: String, profile: String? = nil, limit: Int = 200, offset: Int = 0) async throws -> [JSONValue] {
         let encoded = sessionID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionID
-        var query = ["limit": "200", "offset": "0", "order": "latest", "include_compacted": "true", "inline_images": "false"]
+        var query = ["limit": "\(limit)", "offset": "\(offset)", "order": "latest", "include_compacted": "true", "inline_images": "false"]
         if let profile { query["profile"] = profile }
         let result = try await request("GET", "/api/sessions/\(encoded)/messages", query: query) as? JSON
-        var rows = (result?["messages"] ?? result?["data"]) as? [JSON] ?? []
-        if let first = rows.first?["id"] as? Int, let last = rows.last?["id"] as? Int, first > last { rows.reverse() }
-        return rows.flatMap(Self.message)
-    }
-
-    /// One stored row as chat rows: its text, then for an assistant row one tool row per tool call,
-    /// so "🔊 …" rows (what Hermes said out loud) survive reopening the chat.
-    static func message(_ row: JSON) -> [ChatMessage] {
-        if (row["display_kind"] as? String) == "hidden" { return [] }
-        guard let role = (row["role"] as? String).flatMap(ChatMessage.Role.init(rawValue:)), role != .system, role != .tool else { return [] }
-        let id = string(row["id"] as Any) ?? UUID().uuidString
-        let text = (row["display_content"] as? String) ?? text(from: row["content"])
-        var result: [ChatMessage] = []
-        if !text.isEmpty { result.append(ChatMessage(id: id, role: role, text: text)) }
-        if role == .assistant, let calls = row["tool_calls"] as? [JSON] {
-            for (index, call) in calls.enumerated() {
-                let function = call["function"] as? JSON ?? [:]
-                var payload: JSON = [:]
-                payload["name"] = function["name"]
-                payload["arguments"] = function["arguments"]
-                guard let line = ChatModel.toolRow(payload) else { continue }
-                result.append(ChatMessage(id: "\(id)-tool-\(index)", role: .tool, text: line))
-            }
-        }
-        return result
-    }
-
-    static func text(from content: Any?) -> String {
-        if let string = content as? String { return string }
-        if let parts = content as? [JSON] { return parts.compactMap { $0["text"] as? String }.joined() }
-        return ""
+        var rows = ((result?["messages"] ?? result?["data"]) as? [Any] ?? []).map(JSONValue.init(any:))
+        if let first = rows.first?["id"]?.intValue, let last = rows.last?["id"]?.intValue, first > last { rows.reverse() }
+        return rows
     }
 
     static func string(_ value: Any) -> String? {
