@@ -1,5 +1,9 @@
 """The ``start_call`` and ``end_call`` tools (toolset ``voice``). Their descriptions carry the operating rules,
-because plugin skills are not listed in the system prompt; the ``voice-calls`` skill has the rest."""
+because plugin skills are not listed in the system prompt; the ``voice-calls`` skill has the rest.
+
+They work from any session: in the dashboard process (which serves the phone) they use its call hub directly;
+anywhere else (CLI, Ink TUI, messaging gateway, cron, compute-host children) they go through the hub's socket
+(``remote.py``). Where there is no dashboard to reach, ``start_call`` says so (``not_available``)."""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import json
 import logging
 from typing import Any
 
-from . import hermes, hub
+from . import hermes, hub, remote
 
 logger = logging.getLogger("hermes_voice")
 
@@ -27,8 +31,9 @@ START_CALL: dict[str, Any] = {
         "call_id}. Say short, natural, spoken sentences: no Markdown, lists, code or URLs (put detail in your text "
         "reply). Ring only when the user asked to be called or for news they'd want right away, never for routine "
         "updates. One call at a time: outcome \"busy\" means the user is on a call with another conversation; "
-        "\"not_allowed\" means their call settings refuse it; after \"[Voice call ended by user]\" or a declined "
-        f"call, don't ring again unless asked. Details: {SKILL_REF}."
+        "\"not_allowed\" means their call settings refuse it; \"not_available\" means calls can't be placed from "
+        "here (the note says why). After \"[Voice call ended by user]\" or a declined call, don't ring again "
+        f"unless asked. Details: {SKILL_REF}."
     ),
     "parameters": {
         "type": "object",
@@ -66,15 +71,16 @@ END_CALL: dict[str, Any] = {
 
 
 def available() -> bool:
-    """Shown to the model only where calls work: the dashboard process that serves the phone's socket and hosts
-    the conversation itself (not a compute-host child, not with dashboard.turn_isolation; other processes come
-    with M6b)."""
+    """Always shown: the tools work wherever the dashboard's hub is (this process, or its socket for every other
+    Hermes process), and where it isn't, ``start_call`` answers ``not_available`` with the reason instead of the
+    tool silently missing. (``reachable()`` tells whether a hub is there.)"""
+    return True
+
+
+def reachable() -> bool:
+    """This process serves the phone, or the dashboard's hub socket is there for it."""
     try:
-        if hermes.is_compute_host_child() or not hub.routes_mounted():
-            return False
-        if hermes.methods() is None:
-            return False
-        return not hermes.turn_isolation()
+        return hub.routes_mounted() or remote.reachable()
     except Exception:  # noqa: BLE001 - a check must never raise
         return False
 
@@ -88,6 +94,8 @@ def start_call(args: Any, session_id: Any = None, task_id: Any = None, **_: Any)
             return _answer({"error": "text is required: the words to say out loud."})
         if mode not in ("async", "sync"):
             return _answer({"error": 'mode must be "async" or "sync".'})
+        if not hub.routes_mounted():
+            return _answer(remote.start_call(session_id, text, mode))
         origin = hermes.origin(session_id)
         if not origin.session_id:
             return _answer(hub._refusal(mode, "not_allowed", "This conversation can't place a call."))
@@ -101,8 +109,11 @@ def end_call(args: Any, session_id: Any = None, task_id: Any = None, **_: Any) -
     args = args if isinstance(args, dict) else {}
     try:
         text = args.get("text")
+        text = text if isinstance(text, str) else ""
+        if not hub.routes_mounted():
+            return _answer(remote.end_call(session_id, text))
         origin = hermes.origin(session_id)
-        return _answer(hub.get_hub().end_call(origin, text if isinstance(text, str) else ""))
+        return _answer(hub.get_hub().end_call(origin, text))
     except Exception:  # noqa: BLE001
         logger.warning("hermes_voice: end_call failed", exc_info=True)
         return _answer({"error": "Couldn't hang up."})

@@ -14,6 +14,7 @@ provides_tools:
   - end_call
 provides_hooks:
   - pre_llm_call
+  - post_llm_call
   - on_session_end
 # APNs needs HTTP/2, which httpx only speaks with h2 installed (Hermes' own venv lacks it).
 python_dependencies:
@@ -58,7 +59,12 @@ config_schema:
   policy:
     type: dict
     description: >-
-      Who may ring the phone: allowed_sources (default [desktop, dashboard, tui]), allow_owner_dms (true) with
-      owner_ids, allow_cron / allow_subagents / allow_groups (false), rings_per_session (3) per session_window_s
-      (600), rings_global (10) per global_window_s (3600), quiet_hours {start: "22:00", end: "07:00",
-      action: refuse|confirm, timezone}
+      Who may ring the phone: allowed_sources (default [desktop, dashboard, tui, cli, local]), allow_owner_dms
+      (true) with owner_ids (empty: the gateway's allowlist or pairing names the owner), allow_cron /
+      allow_subagents / allow_groups (false), rings_per_session (3) per session_window_s (600), rings_global (10)
+      per global_window_s (3600), quiet_hours {start: "22:00", end: "07:00", action: refuse|confirm, timezone}
+  alerts:
+    type: dict
+    description: >-
+      Alert pushes to the phone (an approval or a question waiting, a turn done) for dashboard conversations no
+      client has open: enabled (true), approval / clarify / turn_done (true), grace_s (5), previews (true)

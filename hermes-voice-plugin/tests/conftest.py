@@ -3,6 +3,7 @@ and hubs built from fakes. Helpers live in support.py."""
 
 from __future__ import annotations
 
+import os
 import types
 from pathlib import Path
 from typing import Any
@@ -11,14 +12,19 @@ import pytest
 
 from support import PLUGIN_DIR, FakeHermes, FakePusher, PacedSpeech, RecordingInjector, _load
 
+# The dashboard's hub opens its socket for other processes once it serves; the tests open their own (test_remote).
+os.environ["HERMES_VOICE_HUB_SOCKET"] = "0"
+
 
 @pytest.fixture(scope="session")
 def core() -> types.SimpleNamespace:
     """The plugin's core modules (one shared copy, as in Hermes) and the dashboard API module."""
     loader = _load("hermes_voice_loader", PLUGIN_DIR / "loader.py")
-    names = ("hub", "tools", "inject", "policy", "push", "tts", "config", "hermes")
+    names = ("hub", "tools", "inject", "policy", "push", "tts", "config", "hermes", "notify")
     mods = types.SimpleNamespace(loader=loader, **{n: loader.module(n, PLUGIN_DIR) for n in names})
     mods.api = _load("hermes_dashboard_plugin_hermes_voice", PLUGIN_DIR / "dashboard" / "plugin_api.py")
+    # The routes start the process's alert watcher; tests drive their own watchers' ticks instead.
+    mods.notify.stop()
     return mods
 
 

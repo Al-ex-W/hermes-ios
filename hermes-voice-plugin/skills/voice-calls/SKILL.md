@@ -43,6 +43,9 @@ current turn (Hermes reads it after the tool calls in flight finish), or starts 
   `[Voice]` message instead. A sync call can also return `{call_id, status, note}` without a reply: `interrupted`
   (the user pressed Stop), `yielded` (a message for you came in; it follows the result) or `superseded` (a newer
   sync `start_call` waits instead). The call stays open, and the reply comes as a `[Voice]` message.
+- From a messaging chat (Telegram, Discord …) a sync wait lasts at most Hermes' limit on waiting for a person in
+  one tool call (`approvals.timeout` + 60 s, about 6 minutes by default). Past it the result is `answered` with an
+  empty `said` and a note saying so; the reply then arrives as a `[Voice]` message.
 
 ## Outcomes
 
@@ -57,6 +60,7 @@ current turn (Hermes reads it after the tool calls in flight finish), or starts 
 | `ended_by_agent` | You hung up with `end_call` | — |
 | `busy` | They're on a call with another conversation | Reply in text |
 | `not_allowed` | Their call settings refuse this call (source, how often, quiet hours) | Follow the note |
+| `not_available` | Calls can't be placed from here: no Hermes dashboard with this plugin runs on the host, or (async, from a chat) Hermes doesn't let the plugin start a turn there | Follow the note (a sync call may still work); else reply in text |
 
 With `mode: "async"` the endings come as messages: `[Voice call not answered]`, `[Voice line not delivered: …]`,
 `[Voice call ended by user]`, `[Voice call ended: …]`.
@@ -71,5 +75,7 @@ With `mode: "async"` the endings come as messages: `[Voice call not answered]`, 
 ## When to ring
 
 Ring when the user asked to be called ("call me when it's done") or for news they would want right away. Never for
-routine updates. Calls from scheduled jobs, subagents and group chats are refused by default, and the user may
-have quiet hours: with `not_allowed` the note says what to do (sometimes: ask in text first, then call again).
+routine updates. You can call from any conversation on this host (dashboard, desktop, CLI, TUI, or the user's own
+direct messages to Hermes); calls from scheduled jobs, subagents, group chats and other people's chats are refused
+by default, and the user may have quiet hours: with `not_allowed` the note says what to do (sometimes: ask in text
+first, then call again).

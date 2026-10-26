@@ -20,6 +20,10 @@ Turn routing: a sync ``start_call`` waiting on the call takes the first turn tha
 phone confirmed its line played (``Waiter.accepts``); every other turn is force-injected into the owner's
 conversation (``inject.py``).
 
+The hub lives in the dashboard process. Conversations in other Hermes processes reach it over a local socket
+(``hubsock.py``, opened once the dashboard serves): their calls carry a ``route`` that hands each turn to the
+conversation's own process, which injects it there (``remote.py``).
+
 Threads: tool handlers run on agent threads, the socket on the dashboard's event loop (captured on the first
 request). Call state is guarded by ``lock``; links and speech run on the loop only.
 """
@@ -29,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -43,7 +48,7 @@ from typing import Any, Awaitable, Callable, Optional
 from . import hermes, inject, push
 from .config import Settings
 from .config import current as current_settings
-from .policy import Policy, users_own_message
+from .policy import Policy, is_messaging, users_own_message
 from .tts import SAMPLE_RATE, ElevenLabs, TextToSpeech
 
 try:
@@ -76,10 +81,12 @@ GOODBYE_WAIT = 60.0
 # How far the phone's clock (a turn's started_at) may be behind the host's.
 TURN_CLOCK_SLACK = 1.0
 HISTORY_LIMIT = 50
+# How long after the dashboard's import the hub waits for it to serve before opening its socket.
+SOCKET_WAIT_LIMIT = 600.0
 
 OUTCOMES = frozenset({
     "answered", "no_answer", "declined", "push_failed", "unreachable", "lost", "tts_failed", "ended_by_user",
-    "ended_by_agent", "busy", "not_allowed",
+    "ended_by_agent", "busy", "not_allowed", "not_available",
 })
 # Ended by the phone itself: nothing to tell it.
 PHONE_ENDED = frozenset({"declined", "ended_by_user"})
@@ -115,7 +122,7 @@ class Owner:
 
     def __init__(self, session_id: str, runtime_sid: str = "", profile: str = "default",
                  profile_home: Optional[str] = None, scoped: bool = False, title: str = "",
-                 source: str = "") -> None:
+                 source: str = "", key: str = "", remote: bool = False) -> None:
         self.lock = threading.Lock()
         self.session_id = session_id
         self.lineage: set[str] = {session_id} if session_id else set()
@@ -126,11 +133,16 @@ class Owner:
         self.scoped = scoped
         self.title = title
         self.source = source
+        # Hermes' route key for the conversation (a messaging chat keeps it through compression).
+        self.key = key
+        # The conversation runs in another process: its turns go there (``Call.route``), not into this one.
+        self.remote = remote
 
     @classmethod
-    def from_origin(cls, origin: hermes.Origin) -> "Owner":
+    def from_origin(cls, origin: hermes.Origin, remote: bool = False) -> "Owner":
         return cls(origin.session_id, origin.runtime_sid, origin.profile, origin.profile_home,
-                   scoped=bool(origin.runtime_sid), title=origin.title, source=origin.source)
+                   scoped=bool(origin.runtime_sid), title=origin.title, source=_surface_of(origin),
+                   key=origin.session_key, remote=remote)
 
     def rekey(self, session_id: str, runtime_sid: str = "") -> None:
         with self.lock:
@@ -144,6 +156,8 @@ class Owner:
     def matches(self, origin: hermes.Origin) -> bool:
         with self.lock:
             if origin.session_id and origin.session_id in self.lineage:
+                return True
+            if origin.session_key and origin.session_key == self.key:
                 return True
             return bool(origin.runtime_sid and origin.runtime_sid == self.runtime_sid)
 
@@ -269,6 +283,33 @@ class Waiter:
         return False
 
 
+class Signals:
+    """What a sync wait listens to and keeps going while it waits. The default is the tool's own thread in this
+    process: Stop (``is_interrupted``), Hermes asking the tool to yield, Hermes' human-wait window and the
+    inactivity heartbeat. A wait for a tool in another process gets these from that process (``hubsock.py``)."""
+
+    def interrupted(self) -> bool:
+        return hermes.is_interrupted()
+
+    def take_yield(self) -> bool:
+        return hermes.take_yield()
+
+    def window(self) -> Any:
+        return hermes.human_wait()
+
+    def beater(self) -> Callable[[], None]:
+        return hermes.heartbeat("voice call")
+
+
+@dataclass
+class Begun:
+    """What starting a call (or speaking into one) did: an async ``start_call``'s result, or a sync one's waiter."""
+
+    result: dict[str, Any]
+    call: Optional["Call"] = None
+    waiter: Optional[Waiter] = None
+
+
 class Call:
     def __init__(self, hub: "CallHub", call_id: str, owner: Owner, initiated_by: str, state: str) -> None:
         self.call_id = call_id
@@ -287,6 +328,8 @@ class Call:
         self.waiter: Optional[Waiter] = None
         self.ring_timer: Optional[threading.Timer] = None
         self.hang_up_turn = False  # an injected "[Voice, hung up]" turn already told the agent
+        # Where turns go when the conversation runs in another process (hubsock.Route): deliver(text), close().
+        self.route: Any = None
         self.inbox = InjectQueue(hub, self)
 
     def info(self) -> dict[str, Any]:
@@ -298,16 +341,25 @@ class Call:
 
 class InjectQueue:
     """Deliveries into the owner's conversation, one at a time and in order, off the event loop. For a call the
-    user started, the "[Voice call started]" notice goes first, so turns wait until it is delivered."""
+    user started, the "[Voice call started]" notice goes first, so turns wait until it is delivered. Once the call
+    is over, its route (if any) hears so after the last delivery."""
+
+    END = None
 
     def __init__(self, hub: "CallHub", call: Call) -> None:
         self.hub = hub
         self.call = call
-        self.items: deque[str] = deque()
+        self.items: deque[Optional[str]] = deque()
         self.lock = threading.Lock()
         self.running = False
+        # Everything the call had to deliver is done (a route attached after this hears the end at once).
+        self.finished = False
 
-    def put(self, text: str) -> None:
+    def close(self) -> None:
+        """After what is queued: the call is over; tell its route, if it has one by then."""
+        self.put(InjectQueue.END)
+
+    def put(self, text: Optional[str]) -> None:
         with self.lock:
             self.items.append(text)
             if self.running:
@@ -327,8 +379,18 @@ class InjectQueue:
                     self.running = False
                     return
                 text = self.items.popleft()
+            if text is InjectQueue.END:
+                with self.hub.lock:
+                    self.finished = True
+                    route = self.call.route
+                try:
+                    if route is not None:
+                        route.close(self.call.outcome or "ended")
+                except Exception:  # noqa: BLE001
+                    logger.debug("hermes_voice: closing a call's route failed", exc_info=True)
+                continue
             try:
-                delivery = self.hub.injector.deliver(self.call.owner, text)
+                delivery = self.hub.deliver(self.call, text)
             except Exception as error:  # noqa: BLE001
                 logger.warning("hermes_voice: injection failed", exc_info=True)
                 delivery = inject.Delivery(False, detail=type(error).__name__)
@@ -537,6 +599,7 @@ class CallHub:
             notice = inject.outcome_notice(outcome, detail)
             if notice:
                 call.inbox.put(notice)
+        call.inbox.close()
         self._soon(self._close_out, call, was, outcome)
         return True
 
@@ -578,30 +641,52 @@ class CallHub:
 
     # ── the tools ────────────────────────────────────────────────────────────────────────────────────────
 
-    def start_call(self, origin: hermes.Origin, text: str, mode: str = "async") -> dict[str, Any]:
-        """Speak `text` on this conversation's call, ringing the phone first when it has none (tool thread)."""
+    def start_call(self, origin: hermes.Origin, text: str, mode: str = "async",
+                   signals: Optional[Signals] = None) -> dict[str, Any]:
+        """Speak `text` on this conversation's call, ringing the phone first when it has none (tool thread). A sync
+        call waits for the reply here."""
+        begun = self.begin_call(origin, text, mode)
+        if begun.waiter is None or begun.call is None:
+            return begun.result
+        return self.wait_reply(begun.call, begun.waiter, signals or Signals())
+
+    def speak(self, origin: hermes.Origin, text: str) -> dict[str, Any]:
+        """Speak into the call this conversation has; never rings."""
+        return self.begin_call(origin, text, "async", ring=False).result
+
+    def begin_call(self, origin: hermes.Origin, text: str, mode: str = "async", ring: bool = True,
+                   route: Optional[Callable[[Call], Any]] = None) -> Begun:
+        """Queue `text` on this conversation's call, claiming the call slot and ringing the phone first when it has
+        none (with `ring`). A sync call gets a waiter for the reply (``wait_reply``). `route` makes the route for a
+        call this starts for a conversation in another process (``hubsock.py``)."""
         settings = self.settings()
         text, clip_note = clip(text, settings.max_chars)
         with self.lock:
             call = self.slot
             if call is not None and not call.owner.matches(origin):
-                return _refusal(mode, "busy", (
+                return Begun(_refusal(mode, "busy", (
                     f"The user is on a call with {_quote(call.owner.title) or 'another conversation'}. Reply in "
-                    "text; you can call once that call is over."))
+                    "text; you can call once that call is over.")))
             if call is not None:
                 call.owner.rekey(origin.session_id, origin.runtime_sid)
         rang = False
         if call is None:
+            if not ring:
+                return Begun({"call_id": None, "status": "no_call",
+                              "note": "This conversation has no voice call; start_call rings the user."})
             decision = self.policy.check(origin)
             if not decision.allowed:
-                return _refusal(mode, "not_allowed", decision.note)
+                return Begun(_refusal(mode, "not_allowed", decision.note))
             with self.lock:
                 if self.slot is not None:  # another call won the slot meanwhile
                     if not self.slot.owner.matches(origin):
-                        return _refusal(mode, "busy", "The user is on another call. Reply in text.")
+                        return Begun(_refusal(mode, "busy", "The user is on another call. Reply in text."))
                     call = self.slot
                 else:
-                    call = Call(self, new_call_id(), Owner.from_origin(origin), "agent", "ringing")
+                    call = Call(self, new_call_id(), Owner.from_origin(origin, remote=route is not None), "agent",
+                                "ringing")
+                    if route is not None:
+                        call.route = route(call)
                     self.slot = call
                     timer = threading.Timer(settings.ring_timeout_s, self._ring_expired, args=(call,))
                     timer.daemon = True
@@ -611,25 +696,26 @@ class CallHub:
             if rang:
                 self.policy.record_ring(origin, call.call_id)
                 logger.info("hermes_voice: ringing for %s (call %s)", origin.session_id, call.call_id[:8])
-        line, waiter = self.enqueue_line(call, text, mode, clip_note, wait=mode == "sync")
+        _, waiter = self.enqueue_line(call, text, mode, clip_note, wait=mode == "sync")
         if rang:
             if mode == "sync":
                 self._push(call, mode)
             else:
                 hermes.spawn_thread(self._push, call, mode, name=f"hermes-voice-push-{call.call_id[:8]}")
-        if waiter is None:
-            with self.lock:
-                status = "speaking" if call.state == "live" else "ringing" if call.state == "ringing" else "ended"
-            note = {
-                "ringing": "The phone is ringing; your line is spoken once the user answers.",
-                "speaking": "Your line is being spoken.",
-                "ended": "The call ended before your line could be spoken.",
-            }[status]
-            note += " What the user says arrives as [Voice] messages; answer them with start_call."
-            return {"call_id": call.call_id, "status": status, "note": f"{note}{clip_note}"}
-        return self._wait(call, waiter, settings)
+        if waiter is not None:
+            return Begun({"call_id": call.call_id, "status": "waiting"}, call, waiter)
+        with self.lock:
+            status = "speaking" if call.state == "live" else "ringing" if call.state == "ringing" else "ended"
+        note = {
+            "ringing": "The phone is ringing; your line is spoken once the user answers.",
+            "speaking": "Your line is being spoken.",
+            "ended": "The call ended before your line could be spoken.",
+        }[status]
+        note += " What the user says arrives as [Voice] messages; answer them with start_call."
+        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{clip_note}"}, call)
 
-    def end_call(self, origin: hermes.Origin, text: str = "") -> dict[str, Any]:
+    def end_call(self, origin: hermes.Origin, text: str = "", signals: Optional[Signals] = None) -> dict[str, Any]:
+        signals = signals or Signals()
         with self.lock:
             call = self.slot
             if call is None or not call.owner.matches(origin):
@@ -642,7 +728,7 @@ class CallHub:
             line, _ = self.enqueue_line(call, text, "sync", clip_note)
             deadline = time.monotonic() + GOODBYE_WAIT
             while not line.done.wait(0.2):
-                if hermes.is_interrupted() or time.monotonic() > deadline:
+                if signals.interrupted() or time.monotonic() > deadline:
                     self.cancel_line(call, line)
                     line.done.wait(NOTICE_TIMEOUT + 1)
                     break
@@ -687,18 +773,27 @@ class CallHub:
         if line.task is not None and not line.task.done():
             line.task.cancel()
 
-    def _wait(self, call: Call, waiter: Waiter, settings: Settings) -> dict[str, Any]:
-        """A sync start_call: wait (as a human wait, so Hermes' tool deadline doesn't apply) for the reply."""
+    def wait_reply(self, call: Call, waiter: Waiter, signals: Signals,
+                   cap_s: Optional[float] = None) -> dict[str, Any]:
+        """A sync start_call: wait (as a human wait, so Hermes' tool deadline doesn't apply) for the reply. `cap_s`
+        bounds the whole wait (a tool in a messaging chat: approvals.timeout + 60 s)."""
+        settings = self.settings()
         deadline = time.monotonic() + settings.ring_timeout_s + PLAYBACK_WAIT_LIMIT + settings.sync_reply_timeout_s
-        beat = hermes.heartbeat("voice call")
+        capped = cap_s is not None and cap_s > 0 and time.monotonic() + cap_s < deadline
+        if capped:
+            deadline = time.monotonic() + float(cap_s or 0)
+        beat = signals.beater()
         line = waiter.line
-        with hermes.human_wait():
+        interrupted = False
+        with signals.window():
             while True:
-                interrupted = hermes.is_interrupted()
+                interrupted = signals.interrupted()
                 # A message for the conversation is parked until this tool returns: let it through.
-                yielded = not interrupted and hermes.take_yield()
+                yielded = not interrupted and signals.take_yield()
                 with self.lock:
-                    result = self._sync_result(call, waiter, interrupted, time.monotonic() > deadline, yielded)
+                    late = time.monotonic() > deadline
+                    result = self._sync_result(call, waiter, interrupted, late, yielded,
+                                               cap_s if capped else None)
                     if result is not None:
                         if call.waiter is waiter:
                             call.waiter = None
@@ -710,8 +805,16 @@ class CallHub:
             self.cancel_line(call, line)
         return result
 
+    def abandon(self, call: Call, waiter: Waiter) -> None:
+        """A sync wait nobody will collect (its process went away): turns go back to the conversation."""
+        with self.lock:
+            waiter.superseded = True
+            if call.waiter is waiter:
+                call.waiter = None
+            self.changed.notify_all()
+
     def _sync_result(self, call: Call, waiter: Waiter, interrupted: bool, late: bool,
-                     yielded: bool = False) -> Optional[dict[str, Any]]:
+                     yielded: bool = False, cap_s: Optional[float] = None) -> Optional[dict[str, Any]]:
         line = waiter.line
         if waiter.turn is not None:
             turn = waiter.turn
@@ -735,6 +838,11 @@ class CallHub:
             return {"call_id": call.call_id, "status": "yielded",
                     "note": f"Stopped waiting: a message for you came in (it follows this result). The call stays "
                             f"open and your line {spoken}; what the user says next arrives as a [Voice] message."}
+        if late and cap_s is not None:
+            return _sync(call, "", None, "answered", (
+                f"Stopped waiting after {cap_s:.0f} s: from a messaging chat a spoken reply is waited for at most "
+                "approvals.timeout + 60 s (Hermes' limit on waiting for a person inside one tool call). The call "
+                "stays open; the user's reply will arrive as a [Voice] message."))
         if late:
             return _sync(call, "", None, "answered",
                          "The user hasn't answered yet; their reply will arrive as a [Voice] message.")
@@ -1021,6 +1129,24 @@ class CallHub:
                 call.hang_up_turn = True
         call.inbox.put(text)
 
+    def deliver(self, call: Call, text: str) -> inject.Delivery:
+        """Put `text` into the call owner's conversation (InjectQueue thread). A conversation in another process
+        gets it there, through the call's route. What that process can't deliver while the conversation is idle
+        is tried here too, but only into a session this process has open (turns that run in compute-host
+        children belong to dashboard sessions); a messaging chat is never reopened here."""
+        route = call.route
+        if route is None and not call.owner.remote:
+            return self.injector.deliver(call.owner, text)
+        delivery = route.deliver(text) if route is not None else inject.Delivery(
+            False, detail="the conversation's process isn't connected", fallback=True)
+        if delivery.ok or not delivery.fallback or is_messaging(call.owner.source):
+            return delivery
+        live = getattr(self.injector, "deliver_live", None)
+        local = live(call.owner, text) if callable(live) else self.injector.deliver(call.owner, text)
+        if local.ok:
+            return local
+        return inject.Delivery(False, delivery.via, delivery.status, delivery.detail)
+
     def delivered(self, call: Call, text: str, delivery: inject.Delivery) -> None:
         self.deliveries.append((call.call_id, text, delivery))
         if not delivery.ok:
@@ -1108,6 +1234,12 @@ def _outcome_note(outcome: str, detail: str) -> str:
         "ended_by_user": "The user hung up. Reply in text.",
         "ended_by_agent": "The call was ended with end_call.",
     }.get(outcome, detail)
+
+
+def _surface_of(origin: hermes.Origin) -> str:
+    """Where the conversation runs: its messaging platform, else its session source."""
+    platform = (origin.platform or "").strip().lower()
+    return platform if is_messaging(platform) else (origin.source or platform or "").strip().lower()
 
 
 def _quote(title: str) -> str:
@@ -1300,6 +1432,42 @@ def install_hub(hub: Optional[CallHub]) -> None:
 
 def mark_routes_mounted() -> None:
     sys.__dict__[_ROUTES_KEY] = True
+    serve_socket_when_ready()
+
+
+_SOCKET_KEY = "_hermes_voice_hub_socket"
+
+
+def serve_socket_when_ready() -> None:
+    """Open the hub's socket for the other Hermes processes (``hubsock.py``) once this process serves the
+    dashboard: the routes are mounted at import, before the web server binds, and other processes import them too
+    without serving. Once per process; ``HERMES_VOICE_HUB_SOCKET=0`` turns it off (the unit tests do)."""
+    if os.environ.get("HERMES_VOICE_HUB_SOCKET", "").strip() == "0":
+        return
+    with _HUB_LOCK:
+        if sys.__dict__.get(_SOCKET_KEY) is not None:
+            return
+        sys.__dict__[_SOCKET_KEY] = "waiting"
+    try:
+        hermes.spawn_thread(_open_socket, name="hermes-voice-hubsock")
+    except RuntimeError:
+        sys.__dict__.pop(_SOCKET_KEY, None)
+
+
+def _open_socket() -> None:
+    deadline = time.monotonic() + SOCKET_WAIT_LIMIT
+    while not hermes.dashboard_serving():
+        if time.monotonic() > deadline:
+            sys.__dict__.pop(_SOCKET_KEY, None)
+            return  # imported, never served (an Ink TUI showing an image imports the web server)
+        time.sleep(0.5)
+    from . import hubsock
+    try:
+        server = hubsock.serve(get_hub())
+    except Exception:  # noqa: BLE001 - calls from this process still work
+        logger.warning("hermes_voice: could not open the hub socket for other processes", exc_info=True)
+        server = None
+    sys.__dict__[_SOCKET_KEY] = server
 
 
 def routes_mounted() -> bool:

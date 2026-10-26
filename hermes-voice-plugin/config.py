@@ -34,9 +34,11 @@ class QuietHours:
 
 @dataclass(frozen=True)
 class PolicyConfig:
-    # Session sources (HERMES_SESSION_SOURCE) whose conversations may ring the phone.
-    allowed_sources: tuple[str, ...] = ("desktop", "dashboard", "tui")
-    # The owner's own direct messages on a messaging platform (by the platform's user id).
+    # Session sources (HERMES_SESSION_SOURCE, or the plugin's session surface) whose conversations may ring the
+    # phone: the owner's own local clients ("local": a CLI / TUI session whose turns run in the gateway).
+    allowed_sources: tuple[str, ...] = ("desktop", "dashboard", "tui", "cli", "local")
+    # The owner's own direct messages on a messaging platform. The owner is whoever owner_ids names (a user id,
+    # or "<platform>:<user id>"); with no owner_ids, whoever the gateway's allowlist names or pairing approved.
     allow_owner_dms: bool = True
     owner_ids: tuple[str, ...] = ()
     allow_cron: bool = False

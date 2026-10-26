@@ -4,7 +4,7 @@
 
 and ``HERMES_PYTHON`` / ``HERMES_AGENT_DIR`` when Hermes isn't at ``~/.hermes/hermes-agent``. ``HERMES_VOICE_IT_TMP``
 picks the folder the sandbox goes in (default: the system temp folder); a failing run leaves it there with
-``hermes.log`` and ``home/.hermes/logs``."""
+``hermes.log`` and ``hermes/logs``. ``HERMES_VOICE_IT_PORTS=<low>-<high>`` keeps the test servers' ports in a range."""
 
 from __future__ import annotations
 

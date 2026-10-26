@@ -132,3 +132,60 @@ def test_the_ring_log_records_decisions_and_outcomes(core, fake, make_hub, tmp_p
 )
 def test_only_the_users_own_messages_count_as_a_go_ahead(core, message, own):
     assert core.policy.users_own_message(message) is own
+
+
+# ── messaging DMs: who the owner is ────────────────────────────────────────────────────────────────────────
+
+
+def test_owner_ids_may_name_the_platform(core, tmp_path):
+    policy = _policy(core, tmp_path, lambda: 0.0, owner_ids=("telegram:42", "@alice:matrix.org"))
+
+    def dm(platform, user, **fields):
+        return policy.check(_origin(core, platform=platform, chat_type="dm", user_id=user, **fields))
+
+    assert dm("telegram", "42").allowed
+    assert dm("discord", "42").reason == "not_owner"  # 42 is someone else there
+    assert dm("matrix", "@alice:matrix.org").allowed  # a colon in an id is not a platform
+    # With owner_ids set, they alone decide: the gateway's view doesn't widen them.
+    assert dm("telegram", "7", is_owner=True).reason == "not_owner"
+
+
+def test_without_owner_ids_the_gateway_decides_who_the_owner_is(core, tmp_path):
+    policy = _policy(core, tmp_path, lambda: 0.0)
+    assert policy.check(_origin(core, platform="telegram", chat_type="dm", user_id="42", is_owner=True)).allowed
+    assert policy.check(_origin(core, platform="telegram", chat_type="dm", user_id="42")).reason == "not_owner"
+    assert policy.check(_origin(core, platform="telegram", chat_type="dm", is_owner=True)).reason == "not_owner"
+
+
+def test_the_owner_is_whoever_the_gateway_allowlists_by_name_or_paired(core, fake, monkeypatch):
+    import sys
+    import types
+
+    pairing = types.ModuleType("gateway.pairing")
+    approved = {("signal", "+4611")}
+    pairing._allowlist_env_for_platform = lambda platform: f"{platform.upper()}_ALLOWED_USERS"
+    pairing._read_allowlist_env = lambda name: fake.secrets.get(name, "")
+    pairing._user_ids_match = lambda platform, left, right: left.lstrip("+") == right.lstrip("+")
+    pairing.PairingStore = lambda: types.SimpleNamespace(
+        is_approved=lambda platform, user: (platform, user) in approved)
+    monkeypatch.setitem(sys.modules, "gateway.pairing", pairing)
+    monkeypatch.setattr(sys.modules["gateway"], "pairing", pairing, raising=False)
+    fake.secrets.update({"TELEGRAM_ALLOWED_USERS": "42, 43", "DISCORD_ALLOWED_USERS": "*",
+                         "GATEWAY_ALLOWED_USERS": "99"})
+    owner = core.policy.gateway_owner
+    assert owner("telegram", "42") and owner("telegram", "43") and owner("telegram", "99")
+    assert not owner("telegram", "7")
+    assert not owner("discord", "7")  # a wildcard lets anyone write: nobody is the owner by it
+    assert owner("signal", "+4611") and owner("signal", "4611") is False  # paired (the store matches exactly)
+    assert not owner("desktop", "42") and not owner("telegram", "")
+
+
+def test_a_go_ahead_reported_by_another_process_counts(core, tmp_path):
+    now = [_at(23)]
+    quiet = core.config.QuietHours(start=22 * 60, end=7 * 60, action="confirm")
+    policy = _policy(core, tmp_path, lambda: now[0], quiet_hours=quiet)
+    assert policy.check(_origin(core)).reason == "quiet_hours_confirm"
+    now[0] += 10
+    assert not policy.check(_origin(core, user_turn_at=now[0] + 60)).allowed  # a time still to come: ignored
+    now[0] += 10
+    assert policy.check(_origin(core, user_turn_at=now[0] - 5)).allowed

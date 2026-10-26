@@ -279,10 +279,16 @@ def detached_transport() -> Iterator[None]:
 def dashboard_serving() -> bool:
     """This process runs the dashboard's web server (``start_server`` set ``app.state.bound_host``), rather than
     only importing it: other processes import ``hermes_cli.web_server`` too (a TUI resume that shows an attached
-    image does), which mounts the plugin's routes without ever serving them."""
+    image does), which mounts the plugin's routes without ever serving them. A messaging gateway that serves the
+    same app behind its own API listener (``gateway/run_api.py``: ``app.state.gateway_runner``) isn't it either:
+    the phone connects to ``hermes serve``, and the gateway's conversations reach it over the hub's socket."""
     web = sys.modules.get("hermes_cli.web_server")
     state = getattr(getattr(web, "app", None), "state", None) if web is not None else None
     try:
+        if getattr(state, "gateway_runner", None) is not None:
+            return False
+        if getattr(sys.modules.get("gateway.run_api"), "_ACTIVE_RUNNER", None) is not None:
+            return False
         return bool(getattr(state, "bound_host", None))
     except Exception:  # noqa: BLE001
         return False
@@ -362,6 +368,12 @@ class Origin:
     user_id: str = ""
     is_cron: bool = False
     is_subagent: bool = False
+    # Set for conversations in other processes (``remote.py``): Hermes' route key for the conversation (a
+    # messaging chat keeps it through compression), whether a messaging DM comes from someone the gateway was
+    # told to serve (its allowlist or pairing), and when the user last wrote there (quiet-hours confirmation).
+    session_key: str = ""
+    is_owner: bool = False
+    user_turn_at: float = 0.0
 
 
 def origin(session_id: Any) -> Origin:
@@ -386,3 +398,116 @@ def origin(session_id: Any) -> Origin:
         is_cron=session_env("HERMES_CRON_SESSION") == "1" or bool(os.environ.get("HERMES_KANBAN_TASK")),
         is_subagent=is_subagent,
     )
+
+
+# ── other Hermes processes (CLI, Ink TUI, messaging gateway, cron, compute-host children) ──────────────────
+
+
+def current_session_key() -> str:
+    """Hermes' route key for the conversation this tool or hook runs for (``get_current_session_key``: the gateway's
+    ``agent:<profile>:<platform>:...`` key, the CLI's session id), or "" (never Hermes' fallback ``default``)."""
+    try:
+        from tools.approval_context import get_current_session_key
+    except ImportError:
+        key = session_env("HERMES_SESSION_KEY")
+    else:
+        try:
+            key = str(get_current_session_key("") or "")
+        except Exception:  # noqa: BLE001
+            key = ""
+    key = key.strip()
+    return "" if key == "default" else key[:256]
+
+
+def turn_agent() -> Any:
+    """The top-level agent whose turn runs in this context: the agent Hermes binds for the turn, or the top of a
+    delegated subagent's parent chain. None outside a turn."""
+    try:
+        from agent.subagent_lifecycle import get_active_subagent_parent
+    except ImportError:
+        return None
+    try:
+        agent = get_active_subagent_parent()
+    except Exception:  # noqa: BLE001
+        return None
+    if agent is None:
+        return None
+    return subagent_parent() or agent
+
+
+def human_wait_ceiling() -> Optional[float]:
+    """How long one human wait may hold a tool past Hermes' tool deadline: ``approvals.timeout`` + 60 s (None
+    outside Hermes)."""
+    try:
+        from tools.approval_human_wait import human_wait_ceiling as ceiling
+    except ImportError:
+        return None
+    try:
+        value = float(ceiling())
+    except Exception:  # noqa: BLE001
+        return None
+    return value if value > 0 else None
+
+
+def gateway_injection_allowed() -> bool:
+    """``plugins.entries.hermes_voice.allow_gateway_injection: true``: Hermes lets this plugin start a turn in a
+    messaging (or Ink TUI / desktop) session with ``ctx.inject_message``."""
+    entry = ((load_config().get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
+    return isinstance(entry, dict) and entry.get("allow_gateway_injection") is True
+
+
+def gateway_allowed_users(platform: str) -> list[str]:
+    """The user ids the messaging gateway's allowlists name for ``platform`` (``<PLATFORM>_ALLOWED_USERS`` and
+    ``GATEWAY_ALLOWED_USERS``), read the way the gateway reads them (the profile's secret scope). Wildcards are
+    left out."""
+    names: list[str] = []
+    try:
+        from gateway import pairing
+        env_name = pairing._allowlist_env_for_platform(platform)
+    except Exception:  # noqa: BLE001 - not a gateway-capable Hermes
+        pairing, env_name = None, None
+    for name in (env_name, "GATEWAY_ALLOWED_USERS"):
+        if not name:
+            continue
+        raw = ""
+        reader = getattr(pairing, "_read_allowlist_env", None) if pairing is not None else None
+        try:
+            raw = str(reader(name) if callable(reader) else (get_secret(name) or ""))
+        except Exception:  # noqa: BLE001 - an unreadable allowlist names nobody
+            raw = ""
+        names.extend(part.strip() for part in raw.split(",") if part.strip() and part.strip() != "*")
+    return names
+
+
+def gateway_paired(platform: str, user_id: str) -> bool:
+    """The user paired with this Hermes on ``platform`` (a code the owner approved)."""
+    try:
+        from gateway.pairing import PairingStore
+        return bool(PairingStore().is_approved(platform, user_id))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def same_user(platform: str, left: str, right: str) -> bool:
+    """Two user ids for one person on ``platform`` (the gateway's own aliasing, e.g. WhatsApp phone / JID)."""
+    try:
+        from gateway.pairing import _user_ids_match
+        return bool(_user_ids_match(platform, left, right))
+    except Exception:  # noqa: BLE001
+        return bool(left) and left.strip() == right.strip()
+
+
+def hub_folders() -> list[Path]:
+    """Where to look for the dashboard hub's socket: this profile's folder, then the Hermes root's (a dashboard
+    serves every profile from its own home)."""
+    folders = [state_dir()]
+    try:
+        from hermes_constants import get_default_hermes_root
+        folders.append(Path(get_default_hermes_root()) / "hermes-voice")
+    except Exception:  # noqa: BLE001
+        pass
+    unique: list[Path] = []
+    for folder in folders:
+        if folder not in unique:
+            unique.append(folder)
+    return unique

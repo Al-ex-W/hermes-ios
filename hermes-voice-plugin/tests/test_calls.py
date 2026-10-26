@@ -485,26 +485,26 @@ def test_an_interrupted_sync_call_stops_speaking_and_returns(core, fake, make_hu
 # ── visibility and registration ────────────────────────────────────────────────────────────────────────────
 
 
-def test_the_tools_show_only_where_calls_work(core, fake, monkeypatch):
-    assert core.tools.available() is True
-    fake.host.turn_isolation = True
-    assert core.tools.available() is False
-    fake.host.turn_isolation = False
-    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
-    assert core.tools.available() is False
-    monkeypatch.delenv("HERMES_COMPUTE_HOST_CHILD")
-    monkeypatch.setitem(sys.modules, "tui_gateway.server", None)
-    assert core.tools.available() is False
-    monkeypatch.undo()
-    fake.install(monkeypatch)
-    monkeypatch.setitem(sys.__dict__, "_hermes_voice_routes_mounted", False)
-    assert core.tools.available() is False
-    monkeypatch.setitem(sys.__dict__, "_hermes_voice_routes_mounted", True)
-    assert core.tools.available() is True
+def test_the_tools_are_shown_in_every_process_and_say_when_calls_cant_be_placed(core, fake, monkeypatch):
+    """Calls work from any session (other processes go through the dashboard's hub socket), so the tools are never
+    hidden; where no dashboard serves the phone, start_call answers not_available instead."""
+    assert core.tools.available() is True and core.tools.reachable() is True
+    for change in (lambda: setattr(fake.host, "turn_isolation", True),
+                   lambda: monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1"),
+                   lambda: monkeypatch.setitem(sys.modules, "tui_gateway.server", None),
+                   lambda: monkeypatch.setitem(sys.__dict__, "_hermes_voice_routes_mounted", False)):
+        change()
+        assert core.tools.available() is True
     # The routes are mounted whenever hermes_cli.web_server is imported (a TUI resume that shows an image
     # imports it): only a process whose web server runs (start_server set bound_host) serves the phone.
+    monkeypatch.setitem(sys.__dict__, "_hermes_voice_routes_mounted", True)
     fake.bound_host = None
-    assert core.tools.available() is False and core.hub.routes_mounted() is False
+    assert core.hub.routes_mounted() is False and core.tools.reachable() is False
+    for mode, key in (("async", "status"), ("sync", "outcome")):
+        result = json.loads(core.tools.start_call({"text": "Hi", "mode": mode}, session_id="s1"))
+        assert result[key] == "not_available" and result["error"] == "not_available", result
+        assert "hermes serve" in result["note"]
+    assert json.loads(core.tools.end_call({}, session_id="s1"))["call_id"] is None
 
 
 def test_register_adds_tools_skill_and_hooks(core, fake, make_hub):
@@ -528,7 +528,7 @@ def test_register_adds_tools_skill_and_hooks(core, fake, make_hub):
             self.skills[name] = path
 
         def register_hook(self, name, callback):
-            self.hooks[name] = callback
+            self.hooks.setdefault(name, []).append(callback)  # Hermes keeps every callback of a hook
 
     ctx = Ctx()
     plugin.register(ctx)
@@ -541,14 +541,16 @@ def test_register_adds_tools_skill_and_hooks(core, fake, make_hub):
     assert "[Voice]" in ctx.tools["start_call"]["description"]
     assert set(ctx.skills) == {"voice-calls"}
     assert ctx.skills["voice-calls"].read_text().startswith("---\nname: voice-calls\n")
-    assert set(ctx.hooks) == {"pre_llm_call", "on_session_end"}
+    assert set(ctx.hooks) == {"pre_llm_call", "post_llm_call", "on_session_end"}  # post_llm_call: alert pushes
 
     hub = make_hub()
     origin = core.hermes.Origin(session_id="a")
     hub.slot = core.hub.Call(hub, uuid.uuid4().hex, core.hub.Owner.from_origin(origin), "agent", "live")
-    assert ctx.hooks["pre_llm_call"](session_id="b", parent_session_id="a", turn_id="t", model="m") is None
+    assert [hook(session_id="b", parent_session_id="a", turn_id="t", model="m")
+            for hook in ctx.hooks["pre_llm_call"]] == [None]
     assert hub.slot.owner.session_id == "b" and "b" in hub.busy
-    ctx.hooks["on_session_end"](session_id="b", completed=True)
+    for hook in ctx.hooks["on_session_end"]:
+        hook(session_id="b", completed=True)
     assert "b" not in hub.busy
     hub.slot = None
 
