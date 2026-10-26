@@ -11,19 +11,29 @@ struct HermesVoiceApp: App {
                 .environmentObject(delegate.model)
                 .environmentObject(delegate.model.calls)
                 .environmentObject(delegate.model.push)
+                .environmentObject(delegate.model.notifications)
                 .task { await delegate.model.restore() }
         }
     }
 }
 
-/// Owns the app model from launch: a VoIP push can start the app in the background, with no window, and PushKit
-/// must be registered before `didFinishLaunching` returns for that push to be delivered.
+/// Owns the app model from launch: a VoIP push or a notification action can start the app in the background, with
+/// no window, and PushKit and the notification delegate must be set before `didFinishLaunching` returns for them to
+/// be delivered.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     @MainActor private(set) lazy var model = AppModel()
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         MainActor.assumeIsolated { model.startPush() }
         return true
+    }
+
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        MainActor.assumeIsolated { model.push.didRegisterForAlerts(deviceToken: deviceToken) }
+    }
+
+    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        MainActor.assumeIsolated { model.push.didFailToRegisterForAlerts(error) }
     }
 }
 
@@ -43,6 +53,7 @@ struct RootView: View {
             }
         }
         .tint(Theme.primary)
+        .hermesAppearance()
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { model.didBecomeActive() }
         }
@@ -60,6 +71,7 @@ struct RootView: View {
 /// The signed-in app: the session sidebar beside the screen it opens on iPad, stacked on iPhone.
 struct AppShell: View {
     @StateObject private var sidebar: SidebarModel
+    @EnvironmentObject private var model: AppModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
     @State private var compactColumn = NavigationSplitViewColumn.sidebar
@@ -89,6 +101,11 @@ struct AppShell: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await sidebar.refresh() } }
         }
+        // A tapped notification opens its session (also one that launched the app).
+        .onReceive(model.notifications.$openRequest.compactMap { $0 }.receive(on: DispatchQueue.main)) { target in
+            model.notifications.openRequest = nil
+            sidebar.open(sessionID: target.id, profile: target.profile)
+        }
     }
 }
 
@@ -102,7 +119,11 @@ private struct DetailColumn: View {
         if let chat = openChat {
             NavigationStack { ChatScreen(chat: chat, sidebar: sidebar) }
                 .id(chat.id)
-                .onAppear { sidebar.show(chat) }
+                .onAppear {
+                    sidebar.show(chat)
+                    model.notifications.showing(chat)
+                }
+                .onDisappear { model.notifications.hid(chat) }
         } else {
             switch sidebar.selection {
             case .session?:

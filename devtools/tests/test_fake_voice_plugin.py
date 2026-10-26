@@ -163,7 +163,7 @@ def test_a_user_initiated_call_announces_itself_and_every_turn_is_injected():
     (call_id, idle, ready, greeting, announced, live, answer, answered, ended, close_code, goodbye, after, rows,
      problems) = asyncio.run(scenario())
     assert idle == {"calls": 0, "tts": "fake", "h2": False, "apns_configured": False, "scribe_configured": False,
-                    "active_call": None}
+                    "active_call": None, "devices": []}
     assert ready == {"type": "ready", "call_id": call_id, "state": "live"}
     assert greeting["text"] == HELLO_TEXT and greeting["sample_rate"] == SAMPLE_RATE
     assert greeting["format"] == "pcm_s16le"

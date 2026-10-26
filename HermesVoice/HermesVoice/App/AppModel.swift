@@ -11,8 +11,10 @@ final class AppModel: ObservableObject {
     }
 
     let calls = CallController()
-    /// VoIP pushes, so Hermes can ring this phone (`start_call`).
+    /// VoIP pushes, so Hermes can ring this phone (`start_call`), and the alert token beside them.
     let push = PushRegistration()
+    /// Background alerts (approval, question, turn done): their actions, taps and foreground banners.
+    let notifications = AlertNotifications()
     private(set) var client: DashboardClient?
     private(set) var connection: GatewayConnection?
     /// Approvals, questions and passwords Hermes is waiting on, for every chat.
@@ -26,6 +28,7 @@ final class AppModel: ObservableObject {
 
     init() {
         push.onToken = { [weak self] _ in self?.sendPushToken() }
+        notifications.attach(to: self)
         push.onIncoming = { [weak self] call, completion in
             guard let self else { return completion() }
             guard let call else { return self.calls.reportUnusablePush(completion: completion) }
@@ -36,9 +39,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// At launch, before any VoIP push can be delivered.
+    /// At launch, before any VoIP push or notification action can be delivered.
     func startPush() {
         push.start()
+        notifications.start()
     }
 
     func restore() async {

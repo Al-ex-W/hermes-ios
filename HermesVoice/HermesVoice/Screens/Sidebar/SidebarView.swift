@@ -8,6 +8,7 @@ struct SidebarView: View {
     @EnvironmentObject private var calls: CallController
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var showSettings = false
+    @State private var showProfiles = false
     @State private var renaming: SessionInfo?
     @State private var renameText = ""
     @State private var deleting: SessionInfo?
@@ -65,6 +66,21 @@ struct SidebarView: View {
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack { SettingsView() }
+        }
+        // A session opened from elsewhere (a tapped notification) shows above any open sheet.
+        .onChange(of: sidebar.selection) {
+            showSettings = false
+            showProfiles = false
+        }
+        .sheet(isPresented: $showProfiles) {
+            NavigationStack {
+                ProfilesPage()
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") { showProfiles = false }
+                        }
+                    }
+            }
         }
         .alert("Rename session", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }),
                presenting: renaming) { session in
@@ -231,6 +247,7 @@ struct SidebarView: View {
         }
     }
 
+    /// The title menu (`profile-dropdown-switcher.tsx`): the profile the list shows, then the Profiles page.
     @ViewBuilder private var profileSwitcher: some View {
         if sidebar.profiles.count > 1 {
             Picker("Profile", selection: sidebar.binding(\.profileScope)) {
@@ -238,6 +255,11 @@ struct SidebarView: View {
                 ForEach(sidebar.profiles) { profile in
                     Text(profile.label).tag(profile.name)
                 }
+            }
+        }
+        Section {
+            Button { showProfiles = true } label: {
+                Label("Manage profiles…", systemImage: Theme.Icon.settings)
             }
         }
     }

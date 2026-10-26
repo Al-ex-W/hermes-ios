@@ -41,6 +41,12 @@ enum VoicePluginAPI {
         ])
     }
 
+    /// `POST /devices` with a whole body: the VoIP token, and the alert token with the alerts this phone takes
+    /// (`PushRegistration.deviceBody`).
+    static func registerDevice(_ client: DashboardClient, body: JSON) async throws {
+        _ = try await call(client, "POST", "/devices", body: body)
+    }
+
     /// `POST /scribe-token`: a single-use ElevenLabs Scribe token, minted by the plugin with its API key.
     static func scribeToken(_ client: DashboardClient) async throws -> String {
         let result = try await call(client, "POST", "/scribe-token", body: [:])

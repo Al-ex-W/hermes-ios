@@ -129,6 +129,21 @@ push with `xcrun simctl openurl booted "hermesvoice://ring?call_id=<hex>&session
 inside the app; answer from the call panel). The module docstring has a curl recipe; `--call-ring-timeout` and
 `--call-drop-retention` shorten the timers.
 
+Devices may also register an APNs `alert_token` with `alerts: {approval, clarify, turn_done}` (bad shapes get
+`422`); `GET /status` lists them, and `GET …/debug/alerts?session_id=…&kind=approval|clarify|turn_done` returns the
+`{aps, hermes}` notification the plugin would push, the alert tokens it would go to, and the history.
+
+### Settings screens (M3)
+
+The Settings, Profiles and Providers screens have their routes here too, each honouring `?profile=`: the config
+schema, `GET`/`PUT /api/config`, the `/api/model/*` routes, the memory provider config, `/api/env` (masked values
+only; `POST /api/providers/validate` rejects keys starting with `bad`), provider sign-in by device code (approved
+after `--oauth-approve-after` seconds; a user code starting with `DENY` is denied), profile
+create/rename/delete/default/export/import and SOUL.md, `/api/status`, and the `vault.*` and `billing.*` RPCs (any
+master password unlocks except `wrong`). The module docstring lists every route. API keys, vault secrets and
+passwords are never logged. Unlike Hermes, `PUT /api/config` refuses a value whose type doesn't match its schema
+field, with `400`. Custom endpoints (`/api/providers/custom-endpoints`) aren't served yet.
+
 ### Detached sessions
 
 When the last socket of a session closes, the session keeps running with nobody attached, and its turn

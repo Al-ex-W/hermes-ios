@@ -1,8 +1,12 @@
 import Foundation
+import os
 import PushKit
 
-/// The VoIP push registration that lets Hermes ring this phone: PushKit at launch, and the token sent to the
-/// Hermes Voice plugin (`POST /api/plugins/hermes_voice/devices`) once signed in.
+private let pushLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "HermesVoice", category: "PushRegistration")
+
+/// The push registration with the Hermes Voice plugin (`POST /api/plugins/hermes_voice/devices`, once signed in):
+/// the VoIP token that lets Hermes ring this phone (PushKit at launch) and, beside it, the APNs alert token with
+/// the background alerts the user opted into (AlertNotifications).
 @MainActor
 final class PushRegistration: NSObject, ObservableObject {
     /// Where the token stands with Hermes.
@@ -15,13 +19,23 @@ final class PushRegistration: NSObject, ObservableObject {
 
     /// The VoIP token as hex, once PushKit has one.
     @Published private(set) var token: String?
+    /// The APNs alert token as hex (`registerForRemoteNotifications`), once iOS has one.
+    @Published private(set) var alertToken: String?
     @Published private(set) var upload: Upload = .notSent
+    /// The alerts the plugin may push: the user's opt-ins while iOS lets the app notify, else none. Nil until
+    /// AlertNotifications has read them, and a registration then leaves the plugin's stored ones as they are.
+    private(set) var alerts: NotificationPreferences?
     /// A new token arrived.
     var onToken: ((String) -> Void)?
+    /// A new alert token arrived.
+    var onAlertToken: ((String) -> Void)?
     /// A VoIP push arrived (nil when it carries no usable call). The handler must report a call to CallKit before
     /// it returns, and call the completion once that is done.
     var onIncoming: ((CallPush?, @escaping () -> Void) -> Void)?
     private var registry: PKPushRegistry?
+    /// Registrations go out one at a time, the latest state each; a change meanwhile sends again after.
+    private var nextSend: DashboardClient?
+    private var sending: Task<Void, Never>?
 
     /// Registers for VoIP pushes. Called at launch, so a push that launched the app is delivered.
     func start() {
@@ -32,17 +46,71 @@ final class PushRegistration: NSObject, ObservableObject {
         self.registry = registry
     }
 
-    /// Sends the token to the plugin on `client`'s dashboard.
+    /// Sends the tokens and opt-ins to the plugin on `client`'s dashboard (nothing before PushKit has a VoIP token:
+    /// the plugin keeps devices by it).
     func send(to client: DashboardClient) async {
+        guard token != nil else { return }
+        nextSend = client
+        if let sending { return await sending.value }
+        let task = Task { @MainActor in
+            while let client = self.nextSend {
+                self.nextSend = nil
+                await self.register(with: client)
+            }
+            self.sending = nil
+        }
+        sending = task
+        await task.value
+    }
+
+    private func register(with client: DashboardClient) async {
         guard let token else { return }
         upload = .sending
         do {
-            try await VoicePluginAPI.registerDevice(client, voipToken: token, environment: Self.environment,
-                                                    bundleID: Bundle.main.bundleIdentifier ?? "")
+            try await VoicePluginAPI.registerDevice(client, body: Self.deviceBody(
+                voipToken: token, environment: Self.environment, bundleID: Bundle.main.bundleIdentifier ?? "",
+                alertToken: alertToken, alerts: alerts
+            ))
             if self.token == token { upload = .sent(Date()) }
         } catch {
             if self.token == token { upload = .failed(error.localizedDescription) }
         }
+    }
+
+    /// The `POST /devices` body: the VoIP token the plugin keeps the phone by, the alert token once iOS gave one, and
+    /// the alerts it may push (`{approval, clarify, turn_done}`) once known. A key left out leaves the plugin's
+    /// stored value: an alert token from an earlier launch still reaches this phone.
+    nonisolated static func deviceBody(voipToken: String, environment: String, bundleID: String, alertToken: String?,
+                                       alerts: NotificationPreferences?) -> JSON {
+        var body: JSON = ["voip_token": voipToken, "environment": environment, "bundle_id": bundleID]
+        if let alertToken { body["alert_token"] = alertToken }
+        if let alerts { body["alerts"] = alerts.alerts }
+        return body
+    }
+
+    /// The alerts to register; true when they changed (and need sending).
+    @discardableResult
+    func setAlerts(_ alerts: NotificationPreferences) -> Bool {
+        guard alerts != self.alerts else { return false }
+        self.alerts = alerts
+        return true
+    }
+
+    /// `didRegisterForRemoteNotificationsWithDeviceToken`.
+    func didRegisterForAlerts(deviceToken: Data) {
+        let token = Self.hex(deviceToken)
+        guard token != alertToken else { return }
+        alertToken = token
+        onAlertToken?(token)
+    }
+
+    /// `didFailToRegisterForRemoteNotificationsWithError`: no alert token (the VoIP one still rings).
+    func didFailToRegisterForAlerts(_ error: Error) {
+        pushLog.error("No APNs alert token: \(error.localizedDescription, privacy: .public)")
+    }
+
+    nonisolated static func hex(_ token: Data) -> String {
+        token.map { String(format: "%02x", $0) }.joined()
     }
 
     #if DEBUG
@@ -82,7 +150,7 @@ final class PushRegistration: NSObject, ObservableObject {
 extension PushRegistration: PKPushRegistryDelegate {
     nonisolated func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
         guard type == .voIP else { return }
-        let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
+        let token = Self.hex(pushCredentials.token)
         MainActor.assumeIsolated {
             guard token != self.token else { return }
             self.token = token
