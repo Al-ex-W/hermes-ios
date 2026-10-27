@@ -73,13 +73,14 @@ struct PluginDetailScreen: View {
                             Text(String(sha.prefix(8))).font(Theme.TextStyle.code.font)
                         }
                     }
-                    if plugin.settingsCount > 0 {
-                        FormNote("Its \(plugin.settingsCount) setting\(plugin.settingsCount == 1 ? "" : "s") are edited in the desktop app's Settings ▸ Plugins.")
-                    }
                 } header: {
                     FormNote("Details")
                 }
                 .hermesFormRows()
+
+                if !plugin.settings.isEmpty {
+                    PluginSettingsSection(store: store, plugin: plugin, profileLabel: profileLabel)
+                }
 
                 if plugin.updateAvailable {
                     Section {

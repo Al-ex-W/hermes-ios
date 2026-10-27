@@ -474,6 +474,7 @@ def test_plugins_manage_lists_toggles_installs_updates_and_removes():
     assert linear["portable"] and linear["update_available"] and linear["catalog_tier"] == "verified"
     assert linear["servers"] == [{"name": "linear-sync", "state": "connected", "sentence": "Connected — 2 tools"}]
     assert [f["key"] for f in linear["settings_schema"]] == ["team", "interval_minutes", "api_key"]
+    assert linear["settings_schema"][1]["value"] == 15, "an unsaved setting reads as its default"
     assert linear["settings_schema"][2] == {"key": "api_key", "type": "secret", "label": "Linear API key",
                                             "description": "Personal API key", "required": True,
                                             "env": "LINEAR_SYNC_API_KEY", "has_value": False}

@@ -19,11 +19,16 @@ final class PluginsStore: ObservableObject {
 
     let api: PluginsAPI?
     let catalogAPI: PluginCatalogAPI
+    /// Stores one secret setting in the scoped profile's `.env` (`PUT /api/env`): secrets never ride the
+    /// `plugins.manage settings` RPC, and the phone keeps no copy.
+    let writeSecret: ((_ env: String, _ value: String) async throws -> Void)?
     private var loaded = false
 
-    init(api: PluginsAPI?, catalogAPI: PluginCatalogAPI) {
+    init(api: PluginsAPI?, catalogAPI: PluginCatalogAPI,
+         writeSecret: ((_ env: String, _ value: String) async throws -> Void)? = nil) {
         self.api = api
         self.catalogAPI = catalogAPI
+        self.writeSecret = writeSecret
     }
 
     func loadOnce() async {
@@ -133,6 +138,33 @@ final class PluginsStore: ObservableObject {
         }
     }
 
+    /// Saves a plugin's settings form (`saveAgentPluginSettings`): secrets first through the credential route,
+    /// then the values over `plugins.manage settings`. A secret-only save still makes the (empty) settings call,
+    /// which is what tells the plugin its settings changed. Answers whether everything landed.
+    func saveSettings(_ plugin: AgentPlugin, _ changes: PluginSettingsChanges) async -> Bool {
+        guard let api, busy == nil, !changes.isEmpty else { return false }
+        busy = plugin.id
+        defer { busy = nil }
+        do {
+            if !changes.secrets.isEmpty {
+                guard let writeSecret else { throw DashboardError.rpc("Secrets can't be saved from here.") }
+                for (env, value) in changes.secrets.sorted(by: { $0.key < $1.key }) { try await writeSecret(env, value) }
+            }
+            let refreshed = try await api.saveSettings(key: plugin.key ?? plugin.name, values: changes.values)
+            if let refreshed, let index = plugins?.firstIndex(where: { $0.id == plugin.id }) {
+                plugins?[index] = refreshed
+            } else {
+                await reloadPlugins()
+            }
+            notice = "\(plugin.name) settings saved."
+            return true
+        } catch {
+            guard !error.isCancellation else { return false }
+            failure = "Could not save \(plugin.name)'s settings. \(error.dashboardMessage)"
+            return false
+        }
+    }
+
     func remove(_ plugin: AgentPlugin) async -> Bool {
         guard let api, busy == nil else { return false }
         busy = plugin.id
@@ -165,7 +197,10 @@ struct PluginsTab: View {
     init(context: CapabilitiesContext, query: Binding<String>) {
         self.context = context
         _query = query
-        _store = StateObject(wrappedValue: PluginsStore(api: context.plugins, catalogAPI: context.pluginCatalog))
+        let client = context.client, profile = context.profile
+        _store = StateObject(wrappedValue: PluginsStore(api: context.plugins, catalogAPI: context.pluginCatalog) { env, value in
+            try await client.setEnv(env, value: value, profile: profile)
+        })
     }
 
     var body: some View {
@@ -219,7 +254,8 @@ struct PluginsTab: View {
 
     @ViewBuilder private func content(_ plugins: [AgentPlugin]) -> some View {
         let installed = PluginCuration.filter(plugins, query: query)
-        let available = PluginCuration.available(store.catalog ?? [], installed: plugins, query: query)
+        let available = PluginCuration.available(store.catalog ?? [], installed: plugins, query: query,
+                                                 catalogDescribesScope: context.profile == nil)
         Section {
             if installed.isEmpty {
                 if CapabilitySearch.normalize(query).isEmpty {
@@ -261,7 +297,7 @@ struct PluginsTab: View {
         } header: {
             FormNote("Available to install")
         } footer: {
-            FormNote("From the Hermes catalog: reviewed packages pinned to a commit.")
+            FormNote("From the Hermes catalog: reviewed packages pinned to a commit. Packages that only change the desktop app aren't listed here.")
         }
         .hermesFormRows()
     }

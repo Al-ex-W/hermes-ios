@@ -6055,7 +6055,8 @@ class CapabilityFeatures:
             if spec["type"] == "secret":
                 field_row.update(env=spec["env"], has_value=bool(profile.env.get(spec["env"])))
             else:
-                field_row.update(value=record["settings"].get(spec["key"]), default=spec.get("default"))
+                # plugins_settings.py plugin_settings_fields: the saved value, else the schema's default.
+                field_row.update(value=record["settings"].get(spec["key"], spec.get("default")), default=spec.get("default"))
                 if spec.get("choices"):
                     field_row["choices"] = list(spec["choices"])
             fields.append(field_row)

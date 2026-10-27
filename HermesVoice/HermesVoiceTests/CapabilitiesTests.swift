@@ -519,10 +519,25 @@ final class CapabilitiesTests: XCTestCase {
         XCTAssertEqual(catalog[1].tools, ["gpu_status"])
         XCTAssertEqual(catalog[1].requiresEnv, ["NV_KEY"])
         XCTAssertEqual(catalog[2].title, "Done")
-        XCTAssertEqual(PluginCuration.available(catalog, installed: [mine], query: "").map(\.name), ["nvidia"],
-                       "installed entries, by flag or by catalog name, aren't offered")
+        XCTAssertEqual(PluginCuration.available(catalog, installed: [mine], query: "", catalogDescribesScope: true).map(\.name),
+                       ["nvidia"], "installed entries, by flag or by catalog name, aren't offered")
+        XCTAssertEqual(PluginCuration.available(catalog, installed: [mine], query: "").map(\.name), ["nvidia", "done"],
+                       "another profile: the catalog's flag is the dashboard profile's, so only the scoped list counts")
         XCTAssertEqual(PluginCuration.available(catalog, installed: [], query: "gpu_status").map(\.name), ["nvidia"],
                        "search reads the tools a plugin registers")
+
+        let kinds = PluginCatalogEntry.list([
+            ["name": "accent-picker", "repo": "r", "category": "desktop",
+             "capabilities": ["provides_tools": [], "provides_hooks": [], "provides_middleware": [], "requires_env": []]],
+            ["name": "done-bell", "repo": "r", "category": "desktop", "capabilities": ["provides_hooks": ["post_turn"]]],
+            ["name": "kokoro-tts", "repo": "r", "category": "voice", "capabilities": ["provides_tools": ["speak"]]],
+            ["name": "web-search", "repo": "r", "category": "web"],
+            ["name": "no-category", "repo": "r"],
+        ] as [Any])
+        XCTAssertFalse(kinds[0].hasAgentHalf)
+        XCTAssertTrue(kinds[1].hasAgentHalf)
+        XCTAssertEqual(PluginCuration.available(kinds, installed: [], query: "").map(\.name), ["done-bell", "web-search", "no-category"],
+                       "renderer-only desktop packages and voice packages aren't offered on the phone")
     }
 
     func testPluginResultsDecode() throws {
@@ -595,12 +610,95 @@ final class CapabilitiesTests: XCTestCase {
         try await api.remove(name: "p")
         XCTAssertEqual(gateway.calls.last?.params, ["action": "remove", "profile": "work", "name": "p"])
 
+        gateway.reply = { _ in ["ok": true, "name": "p", "written": ["mode"], "plugin": ["name": "p", "key": "p"]] }
+        let saved = try await api.saveSettings(key: "p", values: ["mode": "fast", "limit": 3])
+        XCTAssertEqual(saved?.key, "p")
+        XCTAssertEqual(gateway.calls.last?.params, ["action": "settings", "profile": "work", "key": "p",
+                                                    "values": ["mode": "fast", "limit": 3]])
+
         _ = try await PluginsAPI(gateway: gateway, profile: nil).list()
         XCTAssertEqual(gateway.calls.last?.params, ["action": "list"], "the launch profile sends no scope")
 
         XCTAssertTrue(PluginsAPI.isCommit("0123456789ABCDEF0123456789abcdef01234567"))
         XCTAssertFalse(PluginsAPI.isCommit("main"))
         XCTAssertFalse(PluginsAPI.isCommit("0123456"))
+    }
+
+    func testPluginSettingsDecodeDraftAndCoerce() throws {
+        let plugin = try XCTUnwrap(PluginsAPI.plugins(try value("""
+        {"plugins": [{"name": "meshy", "key": "meshy", "settings_schema": [
+          {"key": "style", "type": "enum", "label": "Style", "choices": ["clay", "pbr"], "value": "pbr", "required": true},
+          {"key": "steps", "type": "number", "label": "Steps", "value": 30, "default": 30},
+          {"key": "scale", "type": "number", "label": "Scale", "value": 1.5},
+          {"key": "preview", "type": "boolean", "label": "Preview", "value": true},
+          {"key": "tags", "type": "json", "label": "Tags", "value": ["a"]},
+          {"key": "note", "type": "string", "label": "Note", "value": null},
+          {"key": "api_key", "type": "secret", "label": "API key", "env": "MESHY_API_KEY", "has_value": true},
+          {"key": "odd", "type": "teleport"},
+          {"type": "string"}]}]}
+        """)).first)
+        XCTAssertEqual(plugin.settings.map(\.key), ["style", "steps", "scale", "preview", "tags", "note", "api_key", "odd"])
+        XCTAssertEqual(plugin.settingsCount, 8)
+        let fields = Dictionary(uniqueKeysWithValues: plugin.settings.map { ($0.key, $0) })
+        XCTAssertEqual(fields["odd"]?.kind, .string, "an unknown type renders as text")
+        XCTAssertEqual(fields["api_key"]?.kind, .secret)
+        XCTAssertNil(fields["api_key"]?.value, "a secret's value never arrives")
+        XCTAssertTrue(fields["api_key"]?.hasValue == true)
+
+        var draft = PluginSettingsChanges.initialDraft(plugin.settings)
+        XCTAssertEqual(draft["style"], "pbr")
+        XCTAssertEqual(draft["steps"], "30")
+        XCTAssertEqual(draft["scale"], "1.5")
+        XCTAssertEqual(draft["preview"], "true")
+        XCTAssertEqual(draft["note"], "")
+        XCTAssertEqual(draft["api_key"], "", "a stored secret starts blank")
+        XCTAssertEqual(try PluginSettingsChanges.collect(plugin.settings, draft: draft), PluginSettingsChanges(),
+                       "nothing changed, nothing sent")
+
+        draft["steps"] = " 40 "
+        draft["scale"] = "0.25"
+        draft["preview"] = "false"
+        draft["tags"] = #"["a", "b"]"#
+        draft["api_key"] = "  sk-test  "
+        let changes = try PluginSettingsChanges.collect(plugin.settings, draft: draft)
+        XCTAssertEqual(changes.values, ["steps": .int(40), "scale": .double(0.25), "preview": .bool(false),
+                                        "tags": .array([.string("a"), .string("b")])])
+        XCTAssertEqual(changes.secrets, ["MESHY_API_KEY": "sk-test"], "secrets go by their .env name, never as values")
+
+        draft["steps"] = "lots"
+        XCTAssertThrowsError(try PluginSettingsChanges.collect(plugin.settings, draft: draft)) { error in
+            XCTAssertEqual(error.localizedDescription, "Steps: expected a number")
+        }
+        draft["steps"] = "40"
+        draft["tags"] = "\"just text\""
+        XCTAssertThrowsError(try PluginSettingsChanges.collect(plugin.settings, draft: draft)) { error in
+            XCTAssertEqual(error.localizedDescription, "Tags: expected a JSON list or object")
+        }
+        draft["tags"] = "[]"
+        draft["style"] = "neon"
+        XCTAssertThrowsError(try PluginSettingsChanges.collect(plugin.settings, draft: draft)) { error in
+            XCTAssertEqual(error.localizedDescription, "Style: not one of clay, pbr")
+        }
+    }
+
+    @MainActor
+    func testPluginSettingsSaveSendsSecretsToTheEnvRouteOnly() async throws {
+        let gateway = RecordingGateway()
+        var secrets: [String: String] = [:]
+        let store = PluginsStore(api: PluginsAPI(gateway: gateway, profile: "work"),
+                                 catalogAPI: PluginCatalogAPI(transport: RecordingCapabilitiesTransport())) { env, value in
+            secrets[env] = value
+        }
+        gateway.reply = { _ in ["plugins": [["name": "meshy", "key": "meshy"]]] }
+        await store.reloadPlugins()
+        let plugin = try XCTUnwrap(store.plugins?.first)
+        gateway.reply = { _ in ["ok": true, "plugin": ["name": "meshy", "key": "meshy", "version": "2"]] }
+        let saved = await store.saveSettings(plugin, PluginSettingsChanges(values: [:], secrets: ["MESHY_API_KEY": "sk-1"]))
+        XCTAssertTrue(saved)
+        XCTAssertEqual(secrets, ["MESHY_API_KEY": "sk-1"])
+        XCTAssertEqual(gateway.calls.last?.params, ["action": "settings", "profile": "work", "key": "meshy", "values": [:]],
+                       "a secret-only save still makes the (empty) settings call; the secret never rides it")
+        XCTAssertEqual(store.plugins?.first?.version, "2", "the refreshed row replaces the old one")
     }
 
     // MARK: Search, filters and the strip rule
