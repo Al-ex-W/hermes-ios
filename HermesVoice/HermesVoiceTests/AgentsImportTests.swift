@@ -424,6 +424,18 @@ final class AgentsImportTests: XCTestCase {
         XCTAssertEqual(gateway.calls("subagent.list").filter { $0.params["session_id"]?.stringValue == "rt-x" }.count,
                        AgentsStore.maxFailures + 1)
         XCTAssertEqual(store.focusSession, other.runtimeSessionID)
+
+        // A focused chat that isn't attached has no finished rows to show; it doesn't borrow another session's.
+        let detached = FakeChat(runtime: nil, stored: "stored-2", profile: nil)
+        store.focus(detached)
+        XCTAssertNil(store.focusSession)
+        let revision = store.focusRevision
+        detached.runtimeSessionID = "rt-2"
+        store.focus(detached)
+        XCTAssertEqual(store.focusSession, "rt-2")
+        XCTAssertEqual(store.focusRevision, revision + 1, "attaching moves the focus")
+        store.focus(detached)
+        XCTAssertEqual(store.focusRevision, revision + 1)
     }
 
     func testStoreReportsARefusedStop() async throws {

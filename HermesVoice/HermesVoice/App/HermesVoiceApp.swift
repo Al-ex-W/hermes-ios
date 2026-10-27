@@ -84,6 +84,9 @@ struct AppShell: View {
     @State private var compactColumn = NavigationSplitViewColumn.sidebar
     /// Whether the sidebar is on screen; nil until it first shows.
     @State private var sidebarShown: Bool?
+    /// The workspace panel (the desktop's right sidebar) beside the chat, a sheet on iPhone. It stays open from chat
+    /// to chat, as the desktop's does.
+    @State private var workspaceOpen = false
     private let client: DashboardClient
     private let connection: GatewayConnection
 
@@ -95,18 +98,31 @@ struct AppShell: View {
     }
 
     var body: some View {
-        NavigationSplitView(preferredCompactColumn: $compactColumn) {
-            SidebarView(sidebar: sidebar, agents: agents)
-                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
-                .onAppear {
-                    let returning = sidebarShown == false
-                    sidebarShown = true
-                    if returning { backToList() }
-                }
-                .onDisappear { sidebarShown = false }
-        } detail: {
-            DetailColumn(sidebar: sidebar, client: client, connection: connection)
+        HStack(spacing: 0) {
+            NavigationSplitView(preferredCompactColumn: $compactColumn) {
+                SidebarView(sidebar: sidebar, agents: agents)
+                    .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
+                    .onAppear {
+                        let returning = sidebarShown == false
+                        sidebarShown = true
+                        if returning { backToList() }
+                    }
+                    .onDisappear { sidebarShown = false }
+            } detail: {
+                DetailColumn(sidebar: sidebar, client: client, connection: connection, workspaceOpen: $workspaceOpen)
+            }
+            // iPad: the workspace panel is a column of its own beside the split view, for the chat on screen.
+            if sizeClass != .compact, workspaceOpen, let chat = sidebar.openChat {
+                Divider().ignoresSafeArea()
+                WorkspaceSidePanel(chat: chat, sidebar: sidebar, client: client, connection: connection,
+                                   folder: sidebar.folder(of: chat), open: $workspaceOpen)
+                    .id(chat.id)
+                    .frame(width: WorkspaceSidePanel.width)
+                    .ignoresSafeArea(.container, edges: .vertical)
+                    .transition(.move(edge: .trailing))
+            }
         }
+        .animation(.easeInOut(duration: 0.25), value: workspaceOpen)
         .environmentObject(agents)
         .onChange(of: sidebar.selection) { _, selection in
             if selection != nil {
@@ -152,14 +168,13 @@ private struct DetailColumn: View {
     let connection: GatewayConnection
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var agents: AgentsStore
-    /// The workspace panel (the desktop's right sidebar) beside the chat. It stays open from chat to chat, as the
-    /// desktop's does.
-    @State private var workspaceOpen = false
+    /// The workspace panel's open state, kept by the shell.
+    @Binding var workspaceOpen: Bool
 
     var body: some View {
         // One branch for every chat, so a draft that becomes its listed session keeps its screen.
         if let chat = openChat {
-            ChatColumn(chat: chat, sidebar: sidebar, client: client, connection: connection, folder: folder(of: chat),
+            ChatColumn(chat: chat, sidebar: sidebar, client: client, connection: connection, folder: sidebar.folder(of: chat),
                        workspaceOpen: $workspaceOpen)
                 .id(chat.id)
                 .onAppear {
@@ -167,6 +182,8 @@ private struct DetailColumn: View {
                     agents.focus(chat)
                     model.notifications.showing(chat)
                 }
+                // The chat attaches after it shows (and again after a reconnect): the spawn tree's focus follows.
+                .onReceive(chat.$runtimeID.removeDuplicates().receive(on: DispatchQueue.main)) { _ in agents.focus(chat) }
                 .onDisappear { model.notifications.hid(chat) }
         } else {
             switch sidebar.selection {
@@ -218,12 +235,6 @@ private struct DetailColumn: View {
 
     /// The sidebar's profile, or `SidebarOptions.allProfiles`.
     private var scope: String { sidebar.options.profileScope }
-
-    /// The chat's folder on the host: its session row's, or the folder a new chat starts in.
-    private func folder(of chat: ChatModel) -> String? {
-        if let id = chat.storedID, let cwd = sidebar.row(id)?.cwd, !cwd.isEmpty { return cwd }
-        return chat.isNewChat ? chat.workingFolder : nil
-    }
 
     /// A session a screen links to opens in this column, as a tapped sidebar row would.
     private var openSession: (String, String?) -> Void {

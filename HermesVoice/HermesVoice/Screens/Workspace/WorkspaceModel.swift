@@ -23,7 +23,7 @@ struct WorkspaceContext {
     var submitToChat: ((String) -> Void)?
     /// Opens a fresh chat in a folder (a new worktree); nil browses the worktree here instead.
     var startSession: ((String) -> Void)?
-    /// Closes the panel; nil hides the close button (an inspector the host closes itself).
+    /// Closes the panel; nil hides the close button (beside the chat, its header button closes it).
     var close: (() -> Void)?
 
     init(client: DashboardClient, gateway: GatewayClient? = nil, profile: String? = nil, cwd: String? = nil,

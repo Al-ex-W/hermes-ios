@@ -45,6 +45,8 @@ final class AgentsStore: ObservableObject {
     /// Trees on screen (`startPolling` minus `stopPolling`).
     private var viewers = 0
     private weak var focused: (any AgentsSessionSource)?
+    /// The focused chat's live session when last focused, so a re-attach moves the focus too.
+    private var focusedRuntime: String?
     /// Chats the store was told about, for titles and profiles.
     private var known: [WeakSource] = []
     private var failures: [String: Int] = [:]
@@ -75,11 +77,14 @@ final class AgentsStore: ObservableObject {
 
     // MARK: Sessions
 
-    /// The user is in `source`'s chat: its finished subagents show in the tree. Call when a chat shows.
+    /// The user is in `source`'s chat: its finished subagents show in the tree. Call when a chat shows, and again
+    /// when its live session changes (it attaches after showing), so the tree and the bottom bar's count follow.
     func focus(_ source: (any AgentsSessionSource)?) {
         if let source { note(source) }
-        guard focused !== source else { return }
+        let runtime = source?.runtimeSessionID
+        guard focused !== source || focusedRuntime != runtime else { return }
         focused = source
+        focusedRuntime = runtime
         focusRevision += 1
     }
 
@@ -89,10 +94,10 @@ final class AgentsStore: ObservableObject {
         if !known.contains(where: { $0.source === source }) { known.append(WeakSource(source: source)) }
     }
 
-    /// The runtime session whose finished rows show: the focused chat's, else (nothing focused yet) the session
-    /// with the newest subagent activity.
+    /// The runtime session whose finished rows show: the focused chat's (none while it isn't attached, as the
+    /// desktop's active session id), else (nothing focused yet) the session with the newest subagent activity.
     var focusSession: String? {
-        if let runtime = focused?.runtimeSessionID { return runtime }
+        if let focused { return focused.runtimeSessionID }
         return roster.bySession.compactMap { session, agents in agents.map(\.updatedAt).max().map { (session, $0) } }
             .max { $0.1 < $1.1 }?.0
     }

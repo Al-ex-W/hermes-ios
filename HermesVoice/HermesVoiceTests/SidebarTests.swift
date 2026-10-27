@@ -47,6 +47,33 @@ final class SidebarTests: XCTestCase {
         XCTAssertNil(SessionInfo(row: ["title": "no id"]))
     }
 
+    /// A session opened from outside the lists (a notification, Artifacts, an agent's child session) takes its stored
+    /// row's folder, so the workspace panel opens on its project.
+    func testAnUnlistedSessionKeepsItsStoredFolder() throws {
+        let opened = SessionInfo(id: "s9", profile: "research")
+        let stored = try XCTUnwrap(SessionInfo(row: try json("""
+        {"id": "s9", "title": "Q3 latency report", "profile": "research", "cwd": "/srv/atlas",
+         "git_repo_root": "/srv/atlas", "git_branch": "main", "message_count": 6}
+        """)))
+        let row = SidebarModel.unlisted(opened, stored: stored)
+        XCTAssertEqual(row.id, "s9")
+        XCTAssertEqual(row.title, "Q3 latency report")
+        XCTAssertEqual(row.cwd, "/srv/atlas")
+        XCTAssertEqual(row.gitRepoRoot, "/srv/atlas")
+        XCTAssertEqual(row.gitBranch, "main")
+        XCTAssertEqual(row.messageCount, 6)
+        XCTAssertEqual(row.profile, "research")
+
+        // Untitled in the store: the title it was opened with stays; a resolved id doesn't replace the opened one.
+        let named = SessionInfo(id: "s9", title: "From the call", profile: nil)
+        let untitled = try XCTUnwrap(SessionInfo(row: ["id": "s9-full", "title": "", "profile": "default"]))
+        let kept = SidebarModel.unlisted(named, stored: untitled)
+        XCTAssertEqual(kept.id, "s9")
+        XCTAssertEqual(kept.title, "From the call")
+        XCTAssertEqual(kept.profile, "default")
+        XCTAssertNil(kept.cwd)
+    }
+
     func testSidebarResponseDropsHiddenRowsAndReadsFailures() throws {
         let response = try json("""
         {"recents": {"sessions": [{"id": "a", "last_active": 2}, {"id": "b", "hidden": true}],

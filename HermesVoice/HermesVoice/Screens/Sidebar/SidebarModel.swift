@@ -117,8 +117,9 @@ final class SidebarModel: ObservableObject {
     /// outside the list (a toolbar button, a notification) is picked only once that push started: picked first, it
     /// starts in the hidden detail column and the push cancels the loading it started on appearing.
     var revealDetail: (() -> Bool)?
-    /// The shell is stacked (iPhone), so the detail column is pushed over the list.
-    var compact = false
+    /// The shell is stacked (iPhone), so the detail column is pushed over the list. Set from the shell's size class:
+    /// the sidebar column's own is compact on iPad too. Published, so the bottom bar's open states follow it.
+    @Published var compact = false
 
     /// Stored ids whose turn is running, and those waiting on an answer.
     @Published private(set) var workingIDs: Set<String> = []
@@ -130,11 +131,13 @@ final class SidebarModel: ObservableObject {
     private var listeners: [UUID] = []
     private var subscriptions: Set<AnyCancellable> = []
 
-    /// The chat on screen, set by the detail column.
-    private var openChat: ChatModel?
+    /// The chat on screen, set by the detail column. Published for the shell's workspace panel beside it (iPad).
+    @Published private(set) var openChat: ChatModel?
     /// The draft, the open chat and the one in a call: their busy state and runtime ids feed the rows.
     private var watched: [ChatModel] = []
     private var watchedSubscriptions: [AnyCancellable] = []
+    /// Each watched chat's turn starts, for the workspace's Last turn base.
+    private var turnSubscriptions: [AnyCancellable] = []
     /// `session.active_list`: status per stored id, and runtime id → stored id.
     private var liveStatus: [String: LiveSessionStatus] = [:]
     private var liveRuntime: [String: String] = [:]
@@ -544,7 +547,10 @@ final class SidebarModel: ObservableObject {
             draft = chat
             selection = .draft
         } else if let id = chat.storedID {
-            if row(id) == nil { opened[id] = SessionInfo(id: id, title: chat.title, profile: chat.profile) }
+            if row(id) == nil {
+                opened[id] = SessionInfo(id: id, title: chat.title, profile: chat.profile)
+                nameUnlisted(id, profile: chat.profile)
+            }
             selection = .session(id)
         }
         watch()
@@ -564,15 +570,41 @@ final class SidebarModel: ObservableObject {
         watch()
     }
 
-    /// A session opened from outside the lists has no title yet: its stored row (`GET /api/sessions/:id`) gives it.
+    /// A session opened from outside the lists has no title or folder yet: its stored row (`GET /api/sessions/:id`)
+    /// gives them, so the chat is named and the workspace panel finds the session's project.
     private func nameUnlisted(_ id: String, profile: String?) {
         let client = client
         Task { [weak self] in
             guard let stored = try? await client.storedSession(id, profile: profile),
-                  let title = stored.title, !title.isEmpty, let self, self.opened[id] != nil else { return }
-            self.opened[id]?.title = title
-            self.app?.existingChat(id)?.renamed(title)
+                  let self, let opened = self.opened[id] else { return }
+            let row = Self.unlisted(opened, stored: stored)
+            guard row != opened else { return }
+            // `opened` isn't published; the detail column reads the folder from it.
+            self.objectWillChange.send()
+            self.opened[id] = row
+            if let title = row.title, !title.isEmpty, title != opened.title { self.app?.existingChat(id)?.renamed(title) }
         }
+    }
+
+    /// An unlisted session's row once its stored row is read: the stored row's fields, under the id it was opened
+    /// with, keeping the opened title and profile where the stored row has none.
+    nonisolated static func unlisted(_ opened: SessionInfo, stored: SessionInfo) -> SessionInfo {
+        var row = SessionInfo(id: opened.id, title: stored.title.flatMap { $0.isEmpty ? nil : $0 } ?? opened.title,
+                              preview: stored.preview ?? opened.preview, source: stored.source ?? opened.source,
+                              profile: opened.profile ?? stored.profile, startedAt: stored.startedAt ?? opened.startedAt,
+                              lastActive: stored.lastActive ?? opened.lastActive)
+        row.model = stored.model ?? opened.model
+        row.messageCount = stored.messageCount
+        row.inputTokens = stored.inputTokens
+        row.outputTokens = stored.outputTokens
+        row.costUSD = stored.costUSD
+        row.archived = stored.archived
+        row.pinned = stored.pinned
+        row.cwd = stored.cwd ?? opened.cwd
+        row.gitRepoRoot = stored.gitRepoRoot ?? opened.gitRepoRoot
+        row.gitBranch = stored.gitBranch ?? opened.gitBranch
+        row.lineageIDs = stored.lineageIDs
+        return row
     }
 
     /// Opens the Command Center over what the detail column shows; again, it goes back there (the desktop's
@@ -912,7 +944,33 @@ final class SidebarModel: ObservableObject {
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] in self?.recomputeLive() }
         }
+        // A turn going busy records HEAD for Last turn whether or not the workspace panel is open (the desktop
+        // records every session's turn start). A chat already busy when first watched has started its turn.
+        turnSubscriptions = chats.map { chat in
+            chat.$busy.removeDuplicates().dropFirst().filter { $0 }
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self, weak chat] _ in
+                    if let self, let chat { self.turnStarted(chat) }
+                }
+        }
         recomputeLive()
+    }
+
+    /// Records the HEAD a chat's turn starts from in its folder's repository.
+    private func turnStarted(_ chat: ChatModel) {
+        guard let folder = folder(of: chat) else { return }
+        let client = client, profile = chat.profile
+        Task {
+            guard let root = try? await client.workspaceGitRoot(folder, profile: profile) else { return }
+            await WorkspaceTurnBase.shared.capture(client: client, repo: root)
+        }
+    }
+
+    /// A chat's folder on the host: its session row's (listed, or as an unlisted one was read), or the folder a new
+    /// chat starts in. Nil shows "No project open" in the workspace panel.
+    func folder(of chat: ChatModel) -> String? {
+        if let id = chat.storedID, let cwd = row(id)?.cwd, !cwd.isEmpty { return cwd }
+        return chat.isNewChat ? chat.workingFolder : nil
     }
 
     private func recomputeLive() {

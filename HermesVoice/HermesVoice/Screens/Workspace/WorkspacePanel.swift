@@ -3,7 +3,7 @@ import SwiftUI
 import UIKit
 
 /// The workspace panel: the desktop's right sidebar (Files and Review) for the session's folder on the host. The
-/// chat opens it as an inspector on iPad and a sheet on iPhone. The desktop's Terminal tab runs a shell on the
+/// chat opens it as a column beside it on iPad and a sheet on iPhone. The desktop's Terminal tab runs a shell on the
 /// desktop's own machine; it isn't ported, and its tab says so.
 ///
 /// The panel keeps its state for its identity: give it a new `.id` when the client or profile changes.
@@ -140,19 +140,13 @@ final class WorkspacePanelModel: ObservableObject {
         await review.refreshShip()
     }
 
-    /// A turn started: record HEAD for Last turn. A turn settled: re-read what it changed.
+    /// A turn settled: re-read what it changed. (The HEAD a turn starts from is recorded by the sidebar for every
+    /// chat it watches, so Last turn has its base even when the panel was closed at the start.)
     func turnBusyChanged(_ busy: Bool) async {
-        guard let folder = workingFolder else { return }
-        if busy {
-            var repo = await review.resolveRepo()
-            if repo == nil { repo = (try? await client.workspaceGitRoot(folder, profile: context.profile)) ?? nil }
-            guard let repo else { return }
-            await WorkspaceTurnBase.shared.capture(client: client, repo: repo)
-        } else {
-            await review.refresh()
-            await files.refreshChanges()
-            await refreshShipIfStale()
-        }
+        guard !busy, workingFolder != nil else { return }
+        await review.refresh()
+        await files.refreshChanges()
+        await refreshShipIfStale()
     }
 
     // MARK: Hand-offs to the chat
