@@ -75,6 +75,7 @@ plugins:
                                            # add oneshot (`chat -q`, `-z`) or tool (`--source tool`) to let those ring
           allow_owner_dms: true
           owner_ids: []                    # e.g. ["telegram:123456"]; empty: the gateway's allowlist / pairing
+          allowed_profiles: []             # other profiles whose processes may ring through this dashboard
           allow_cron: false
           allow_subagents: false
           allow_groups: false
@@ -87,7 +88,8 @@ plugins:
           clarify: true
           turn_done: true
           grace_s: 5                       # how long nothing has the conversation open before an alert
-          previews: true                   # false: no conversation text (or title) goes through APNs
+          previews: true                   # false: no conversation text or title goes through APNs (alerts
+                                           # and the call push alike)
       allow_gateway_injection: true        # not under settings: Hermes' own switch (see "Calls from any session")
 ```
 
@@ -100,6 +102,10 @@ platform allowlist (`TELEGRAM_ALLOWED_USERS` …) or `GATEWAY_ALLOWED_USERS`, or
 allow-all switch, a `*` wildcard, a group-only allowlist or a Discord role grant makes nobody the owner. Group
 chats, scheduled jobs and subagents stay off unless their `allow_*` setting is on. The rate limits and quiet hours
 count every ring on the host, whichever process it came from.
+
+**Other profiles.** A profile with no dashboard of its own finds the root profile's hub socket. Its processes ring
+only when `allowed_profiles` lists the profile, and then their DMs count as the owner's only through `owner_ids`:
+this dashboard can't vouch for another profile's allowlist or pairings.
 
 **Runs nobody sits at.** `hermes chat -q` and `hermes -z` (source `oneshot`) and third-party integrations
 (`hermes chat --source tool`, source `tool`) run as the CLI, but no one is there to talk to, and what they read
@@ -138,7 +144,10 @@ end calls through it (`hubsock.py` has the protocol), and take the call's turns 
   says so when it hits; the reply then arrives as a `[Voice]` message.
 
 A call whose process goes away (and doesn't come back within 30 s) is hung up. A messaging gateway that serves the
-dashboard app behind its own listener doesn't count as the dashboard: the phone connects to `hermes serve`.
+dashboard app behind its own listener doesn't count as the dashboard: the phone connects to `hermes serve`. While
+another dashboard in the same home holds `hub.sock` (a second `hermes serve`, or one still shutting down), this one
+keeps trying and takes it over once the other stops (`GET /status` says `hub_socket: "taken"` meanwhile).
+Disabling the plugin closes the socket; enabling it again reopens it.
 
 ## Alert pushes
 
@@ -149,8 +158,11 @@ nothing has that conversation open (no app, Desktop window or dashboard chat att
   server requests (those of turns under `dashboard.turn_isolation` too). A request alerts once, after it waited
   `grace_s` with no client attached; a client that attaches restarts the wait.
 - **A turn done**, when no client had the conversation open as the turn ended nor `grace_s` later, it didn't go on
-  with another turn, and it isn't on a call with the phone. An interrupted turn, and a `[SILENT]` reply, say
-  nothing; a failed turn says it failed. A turn run in a compute-host child says only "Hermes finished.".
+  with another turn, and it isn't on a call with the phone. A turn the user left mid-way (the app went to the
+  background, say) alerts; one they watched end doesn't. The watcher sees the turn end itself (Hermes doesn't run
+  `on_session_end` on every way out of a turn) and reads how it ended from the turn's `message.complete`
+  (relayed from a compute-host child too): its reply, or that it failed. An interrupted or muted turn, and a
+  `[SILENT]` reply, say nothing.
 
 Messaging and CLI conversations don't alert: they ask on their own surface, and the phone answers through the
 dashboard. Each alert goes to every registered phone with an alert token that didn't turn the kind off; the host
@@ -168,12 +180,16 @@ a collapse id, at most 4 KB:
 ```
 
 `request_id` comes with approvals and questions, `choices` (the subset the request offers) with approvals,
-`questions` with questions: empty when they don't fit in 4 KB or previews are off, and the app then opens the
-conversation to answer. The body of an approval is what needs approving (never the command); with
+`questions` with questions: empty when they don't fit in 4 KB, previews are off, or Hermes' secret redaction would
+change a choice, and the app then opens the conversation to answer. Every title, body and question goes through
+Hermes' redaction (`redact_sensitive_text`, forced on) first; where it can't run, the generic line goes instead. The body of an approval is what needs approving (never the command); with
 `previews: false` the title is "Hermes" and the body a generic line. The app answers with the gateway's `request.answer {id: request_id, result}` (`{choice}` for an
 approval, `{answers: {qid: answer}}` for a question), from any socket. An APNs `410` or bad-token answer forgets
-only the alert token: the phone still rings. Alerts aren't retried. The log names the kind, how many phones and
-APNs' reason, never a token or the payload.
+only the alert token: the phone still rings. A push APNs couldn't take for a passing reason (unreachable, `429`,
+`5xx`) is tried again after 1, 2, 4 and 8 s while its request is open. During `policy.quiet_hours`, and past a
+budget (one sounding turn_done per conversation every 5 minutes, 20 sounding alerts an hour), alerts go silently:
+no `sound`, `"interruption-level": "passive"`. The log names the kind, how many phones and APNs' reason, never a
+token or the payload.
 
 ## Phone protocol
 
@@ -194,7 +210,8 @@ plugin accepts the socket before refusing it, so the phone sees the code. VoIP p
   own ring timeout ran out) as `no_answer`; `error` (the phone gave up on the call) as `lost`.
 - A hello for a call that is over gets `cancel {reason}` (never answered) or `ended {outcome}`, then close 1000; a
   push hello for a call the plugin doesn't know gets `cancel {reason: "unknown_call"}`.
-- `GET /status` → `{calls, tts: "elevenlabs" | "fake", h2, apns_configured, scribe_configured, active_call, alerts}`,
+- `GET /status` → `{calls, tts: "elevenlabs" | "fake", h2, apns_configured, scribe_configured, active_call,
+  hub_socket: "open" | "waiting" | "taken" | "paused" | "failed" | "off", alerts}`,
   where `active_call` is `{call_id, session_id, title, state, initiated_by: "push" | "user"}` or null (the app's
   call button joins a call Hermes holds for the same chat) and `alerts` is `{enabled, kinds, watching, devices,
   sent}`. HTTP errors are `{detail}`.
@@ -211,7 +228,7 @@ uv run pytest -q
 The tests stub every Hermes module the plugin imports, run the plugin's router on a real server (an OS-assigned
 port) and drive it with a fake phone over a real WebSocket, plus a mock APNs and a mock ElevenLabs.
 
-`tests/integration/` runs the plugin inside a real `hermes serve --isolated` (opt-in, about three minutes):
+`tests/integration/` runs the plugin inside a real `hermes serve --isolated` (opt-in, about eight minutes):
 
 ```bash
 HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
@@ -220,10 +237,14 @@ HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
 - `test_real_hermes.py`: dashboard conversations driven over `/api/ws` call the phone (sync, async, redirect while
   a turn runs, declined, rung out, `busy`, unreachable, the socket's auth).
 - `test_calls_any_session.py`: `hermes chat -Q -q` in the same home (its turn runs in the gateway Hermes starts) calls
-  through `hub.sock`: a sync call returns the reply to that process; an async one's reply becomes a stored user
-  turn of the gateway session, answered into the same call.
+  through `hub.sock`: refused under the default policy (a one-shot), then, opted in, a sync call returns the reply
+  to that process; an async one's reply becomes a stored user turn of the gateway session, answered into the same
+  call; a voice turn the provider refuses (no `on_session_end`) doesn't swallow the next one.
+- `test_isolated_calls.py`, under `turn_isolation`: an idle voice turn is started by the dashboard (which then shows
+  it running), and a prompt typed meanwhile reaches the model instead of failing as "session busy".
 - `test_alerts_real_hermes.py`, with turns in the dashboard and under `turn_isolation`: approval and question
-  alerts once the client leaves, answered with `request.answer` from the alert's ids; and through the real APNs
+  alerts once the client leaves, answered with `request.answer` from the alert's ids; a turn the provider fails
+  alerts that it failed; and through the real APNs
   sender against a mock APNs, one approval alert per phone that takes them (ES256 provider token, headers, topic,
   payload), none for a phone that turned approvals off.
 

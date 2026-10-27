@@ -7,6 +7,9 @@ host's own method table, the way the desktop client would (pattern from Hermes C
 2. ``session.steer``: ``queued`` (or ``redirected``) = done. ``rejected``, or 4010 while not running -> 3.
 3. ``prompt.submit`` (without ``queued``: an idle session starts a new turn now).
 
+A session whose turns run in a compute-host child (``dashboard.turn_isolation``) gets ``prompt.submit`` with
+``queued`` only: the dashboard's own copy of its agent never runs a turn, so a redirect or steer there is lost.
+
 The target is the owner's live runtime session (``server._find_live_session_by_key``), else the stored id is
 reopened with ``session.resume`` (which follows a compression rotation to its tip). A stale runtime id (4001 /
 4007) is resolved again once.
@@ -193,7 +196,17 @@ class TuiInjector:
         return sid, ""
 
     def _chain(self, table: dict, sid: str, text: str) -> Optional[Delivery]:
-        """Redirect, else steer, else submit. None when the runtime id went stale (resolve it again)."""
+        """Redirect, else steer, else submit. None when the runtime id went stale (resolve it again). A session
+        whose turns run in a compute-host child gets a queued submit only: the dashboard's copy of its agent never
+        runs a turn, so a redirect or steer applied to it would never be read (the child steers its own running
+        turn itself); queued, the submit starts a turn now when idle and waits for the running one otherwise."""
+        if hermes.uses_compute_host(hermes.live_record(sid)):
+            response = _call(table, SUBMIT, {"session_id": sid, "text": text, "queued": True})
+            if _stale(response):
+                return None
+            if _ok(response):
+                return Delivery(True, "submit", _status(response) or "streaming")
+            return Delivery(False, "submit", "", _message(response))
         response = _call(table, REDIRECT, {"session_id": sid, "text": text})
         if _stale(response):
             return None

@@ -341,6 +341,22 @@ def session_title(runtime_sid: str, record: Optional[dict]) -> str:
     return ""
 
 
+def uses_compute_host(record: Optional[dict]) -> bool:
+    """The live session's turns run in a compute-host child (``dashboard.turn_isolation``): the dashboard holds the
+    session, but the agent that runs its turns is the child's. Its own copy of the agent (if any) never runs a turn,
+    so a redirect or steer the dashboard applies here would never be read."""
+    if not isinstance(record, dict):
+        return False
+    server = tui_server()
+    check = getattr(server, "_session_uses_compute_host", None) if server is not None else None
+    if callable(check):
+        try:
+            return bool(check(record))
+        except Exception:  # noqa: BLE001
+            pass
+    return bool(record.get("_compute_host_active")) and turn_isolation()
+
+
 def turn_isolation() -> bool:
     """``dashboard.turn_isolation``: turns run in compute-host children, where the call hub isn't."""
     server = tui_server()

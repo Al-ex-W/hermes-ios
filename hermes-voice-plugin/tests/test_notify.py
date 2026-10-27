@@ -364,6 +364,236 @@ def test_a_compute_host_turn_alerts_when_it_ends(core, env):
     assert len(env.mock.requests) == 2
 
 
+class Replay:
+    """The host's event ring (``tui_gateway.event_replay``): what each conversation's turns emitted."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.events: dict[str, list[dict]] = {}
+        module = types.ModuleType("tui_gateway.event_replay")
+        module.events_since = lambda sid, seq: [dict(e) for e in self.events.get(sid, []) if e["seq"] > seq]
+        module.latest_seq = lambda sid: max((e["seq"] for e in self.events.get(sid, [])), default=0)
+        monkeypatch.setitem(sys.modules, "tui_gateway.event_replay", module)
+
+    def emit(self, sid: str, kind: str, payload: dict) -> None:
+        ring = self.events.setdefault(sid, [])
+        ring.append({"seq": len(ring) + 1, "type": kind, "session_id": sid, "payload": payload})
+
+    def complete(self, sid: str, text: str, status: str = "complete") -> None:
+        self.emit(sid, "message.delta", {"text": text[:5]})
+        self.emit(sid, "message.complete", {"text": text, "status": status})
+
+
+def _turn(env, sid: str, start: float, end: float, replay: Replay = None, text: str = "", status: str = "complete",
+          **after) -> None:
+    """A turn the watcher sees running at `start` and idle at `end` (no on_session_end: an early return)."""
+    record = env.host.record(sid)
+    record["running"] = True
+    at(env, start)
+    if replay is not None:
+        replay.complete(sid, text, status)
+    record.update(running=False, **after)
+    at(env, end)
+
+
+def test_a_failed_turn_alerts_without_on_session_end(core, env, monkeypatch):
+    """Hermes skips on_session_end on its early returns (a provider 4xx, retries used up): the watcher sees the
+    conversation go idle, and the turn's message.complete says it failed."""
+    replay = Replay(monkeypatch)
+    sid = env.host.add("s1")
+    _turn(env, sid, 100.0, 101.0, replay, "Your request was not processed.", "error")
+    assert [at(env, 105.9), at(env, 106.0)] == [0, 1]
+    assert env.mock.payloads()[0]["aps"]["alert"]["body"] == "Hermes stopped: the turn failed."
+    _turn(env, sid, 400.0, 401.0, replay, "**Shipped** it.")  # a completed one carries its reply, hook or not
+    assert at(env, 406.0) == 1 and env.mock.payloads()[1]["aps"]["alert"]["body"] == "Shipped it."
+    for status in ("interrupted",):
+        _turn(env, sid, 700.0, 701.0, replay, "", status)
+        assert at(env, 720.0) == 0
+    _turn(env, sid, 800.0, 801.0, replay, "[SILENT]")
+    assert at(env, 820.0) == 0 and len(env.mock.requests) == 2
+
+
+def test_a_failed_turn_the_host_kept_alerts_without_events(core, env):
+    sid = env.host.add("s1")
+    _turn(env, sid, 100.0, 101.0, inflight_turn={"status": "error", "error": "HTTP 400"})
+    assert at(env, 106.0) == 1
+    assert env.mock.payloads()[0]["aps"]["alert"]["body"] == "Hermes stopped: the turn failed."
+
+
+def test_a_compute_host_turn_alerts_with_its_relayed_reply(core, env, monkeypatch):
+    replay = Replay(monkeypatch)
+    sid = env.host.add("s1", running=True, _compute_host_turn_id="turn-x")
+    at(env, 100.0)
+    replay.complete(sid, "All done, deployed.")
+    record = env.host.record(sid)
+    record.pop("_compute_host_turn_id")
+    record["running"] = False
+    assert [at(env, 101.0), at(env, 106.0)] == [0, 1]
+    assert env.mock.payloads()[0]["aps"]["alert"]["body"] == "All done, deployed."
+    record.update(_compute_host_turn_id="turn-y", running=True)
+    at(env, 200.0)
+    replay.complete(sid, "", "error")  # the child's turn failed: the relayed status says so
+    record.pop("_compute_host_turn_id")
+    record["running"] = False
+    at(env, 201.0)
+    assert at(env, 206.0) == 1 and env.mock.payloads()[1]["aps"]["alert"]["body"] == "Hermes stopped: the turn failed."
+
+
+def test_the_hook_and_the_watcher_tell_one_turn_once(core, env, monkeypatch):
+    replay = Replay(monkeypatch)
+    sid = env.host.add("s1")
+    record = env.host.record(sid)
+    record["running"] = True
+    at(env, 100.0)
+    env.alerts.note_reply("s1", "From the hook.")
+    replay.complete(sid, "From the event.")
+    env.alerts.turn_ended("s1", "t1", completed=True)  # still running: Hermes clears it just after
+    at(env, 100.5)
+    record["running"] = False
+    # One alert, timed from the hook (the turn's end), with the reply from the turn's own event.
+    assert [at(env, 101.0), at(env, 104.9), at(env, 105.0), at(env, 200.0)] == [0, 0, 1, 0]
+    assert env.mock.payloads()[0]["aps"]["alert"]["body"] == "From the event."
+
+
+def test_two_turn_ends_within_one_grace_alert_once(core, env, monkeypatch):
+    replay = Replay(monkeypatch)
+    sid = env.host.add("s1")
+    _turn(env, sid, 100.0, 101.0, replay, "First.")
+    _turn(env, sid, 102.0, 103.0, replay, "Second.")
+    assert [at(env, 106.0), at(env, 107.9), at(env, 108.0), at(env, 200.0)] == [0, 0, 1, 0]
+    assert [p["aps"]["alert"]["body"] for p in env.mock.payloads()] == ["Second."]
+
+
+def test_a_turn_watched_to_its_end_says_nothing_even_once_the_client_leaves(core, env, monkeypatch):
+    replay = Replay(monkeypatch)
+    sid = env.host.add("s1")
+    env.host.attach(sid)
+    _turn(env, sid, 100.0, 101.0, replay, "Seen on screen.")
+    env.host.detach(sid)  # the phone locks during the grace
+    assert [at(env, 106.0), at(env, 200.0)] == [0, 0] and env.mock.requests == []
+    # One the user left mid-turn (the app went to the background) alerts once it ends.
+    env.host.attach(sid)
+    record = env.host.record(sid)
+    record["running"] = True
+    at(env, 300.0)
+    env.host.detach(sid)
+    at(env, 310.0)
+    replay.complete(sid, "Finished while you were away.")
+    record["running"] = False
+    at(env, 320.0)
+    assert at(env, 325.0) == 1
+
+
+def test_a_muted_wake_and_a_turn_without_its_end_event_say_nothing(core, env, monkeypatch):
+    Replay(monkeypatch)
+    sid = env.host.add("s1")
+    env.alerts.turn_ended("s1", "t1", completed=True, muted=True)
+    assert [at(env, 100.0), at(env, 110.0)] == [0, 0]
+    _turn(env, sid, 200.0, 201.0)  # no message.complete (a manual compaction): nothing to tell
+    assert at(env, 210.0) == 0 and env.mock.requests == []
+
+
+# ── what may go through APNs, and how loud ─────────────────────────────────────────────────────────────────
+
+
+def test_credentials_are_redacted_and_a_masked_choice_drops_the_questions(core, env):
+    key = "sk-ant-api03-" + "A" * 40
+    payload = core.notify.turn_alert("done", f"Done. Your new key is {key} - keep it safe.", title=f"Keys {key}",
+                                     session_id="s1", profile="default", previews=True)
+    assert key not in json.dumps(payload) and "sk-ant...AAAA" in payload["aps"]["alert"]["body"]
+    token = "ghp_" + "b" * 36
+    params = {"questions": [{"qid": "q1", "question": f"Use {token}?", "choices": [token, "no"]}]}
+    clarify = core.notify.request_alert("clarify", params, request_id=CLARIFY_ID, title="T", session_id="s1",
+                                        profile="default", previews=True)
+    assert token not in json.dumps(clarify) and clarify["hermes"]["questions"] == []
+    approval = core.notify.request_alert("approval", {"description": f"push with {token}"}, request_id=APPROVAL_ID,
+                                         title="T", session_id="s1", profile="default", previews=True)
+    assert token not in json.dumps(approval)
+
+
+def test_without_hermes_redaction_only_generic_lines_go(core, env, monkeypatch):
+    monkeypatch.setitem(sys.modules, "agent.redact", None)
+    payload = core.notify.turn_alert("done", "Here is the key.", title="Chat", session_id="s1", profile="default",
+                                     previews=True)
+    assert payload["aps"]["alert"] == {"title": "Hermes", "body": "Hermes finished."}
+    clarify = core.notify.request_alert("clarify", {"questions": QUESTIONS}, request_id=CLARIFY_ID, title="T",
+                                        session_id="s1", profile="default", previews=True)
+    assert clarify["hermes"]["questions"] == [] and clarify["aps"]["alert"]["body"] == "Hermes has a question for you."
+
+
+def test_quiet_hours_and_the_budget_make_alerts_silent(core, env, monkeypatch):
+    replay = Replay(monkeypatch)
+    quiet = [True]
+    env.alerts.quiet_hours = lambda: quiet[0]
+    sid = env.host.add("s1")
+    env.host.approval(sid)
+    at(env, 100.0)
+    assert at(env, 105.0) == 1
+    aps = env.mock.payloads()[0]["aps"]
+    assert "sound" not in aps and aps["interruption-level"] == "passive"
+    env.host.answer(sid, APPROVAL_ID)
+    quiet[0] = False
+    _turn(env, sid, 200.0, 201.0, replay, "One.")
+    at(env, 206.0)
+    _turn(env, sid, 300.0, 301.0, replay, "Two.")  # within 5 minutes of the last sounding one
+    at(env, 306.0)
+    _turn(env, sid, 600.0, 601.0, replay, "Three.")
+    at(env, 606.0)
+    loud = ["sound" in p["aps"] for p in env.mock.payloads()[1:]]
+    assert loud == [True, False, True]
+    many = core.notify.Alerts(pusher=lambda: env.apns, settings=lambda: env.settings[0], clock=lambda: env.now[0],
+                              quiet_hours=lambda: False)
+    for index in range(core.notify.SOUNDED_PER_HOUR):
+        many._sounded("approval", f"s{index}", 1000.0, quiet=False)
+    assert many._quiet("approval", "s-new", 1001.0, False) is True
+    assert many._quiet("approval", "s-new", 4700.0, False) is False
+
+
+def test_an_alert_apns_couldnt_take_is_tried_again(core, env):
+    env.mock.script = [(503, "ServiceUnavailable"), (429, "TooManyRequests")]
+    sid = env.host.add("s1")
+    env.host.approval(sid)
+    at(env, 100.0)
+    assert [at(env, 105.0), at(env, 105.5), at(env, 106.0), at(env, 107.9), at(env, 108.0), at(env, 200.0)] == \
+        [0, 0, 0, 0, 1, 0]
+    assert len(env.mock.requests) == 3  # 503, then 429 a second later, then sent two seconds after that
+    # A refusal that won't pass (a bad payload, a phone APNs doesn't know) is not tried again.
+    env.mock.script = [(400, "BadTopic")]
+    env.host.answer(sid, APPROVAL_ID)
+    env.host.approval(sid, rid="srq-dddddddddddd")
+    at(env, 300.0)
+    assert [at(env, 305.0), at(env, 320.0)] == [0, 0] and len(env.mock.requests) == 4
+
+
+def test_a_turn_done_apns_couldnt_take_is_tried_again(core, env, monkeypatch):
+    replay = Replay(monkeypatch)
+    env.mock.script = [(500, "InternalServerError")]
+    sid = env.host.add("s1")
+    _turn(env, sid, 100.0, 101.0, replay, "Done.")
+    assert [at(env, 106.0), at(env, 106.5), at(env, 107.0)] == [0, 0, 1]
+    assert len(env.mock.requests) == 2
+
+
+def test_a_send_that_blows_up_is_tried_again(core, env):
+    calls = []
+
+    class Flaky:
+        store = env.store
+
+        def push_alert(self, kind, payload, collapse_id=""):
+            calls.append(kind)
+            if len(calls) == 1:
+                raise httpx.ConnectTimeout("APNs unreachable")
+            return core.push.PushResult(True, "", 1)
+
+    alerts = core.notify.Alerts(pusher=lambda: Flaky(), settings=lambda: env.settings[0], clock=lambda: env.now[0],
+                                quiet_hours=lambda: False)
+    env.alerts = alerts
+    sid = env.host.add("s1")
+    env.host.approval(sid)
+    at(env, 100.0)
+    assert [at(env, 105.0), at(env, 106.0), at(env, 110.0)] == [0, 1, 0] and calls == ["approval", "approval"]
+
+
 # ── APNs details ───────────────────────────────────────────────────────────────────────────────────────────
 
 

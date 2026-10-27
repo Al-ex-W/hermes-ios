@@ -398,6 +398,133 @@ def test_what_the_process_cant_deliver_is_tried_here_only_for_open_dashboard_ses
         assert delivery.ok and hub.injector.texts() == ["[Voice] hi"]
 
 
+def test_a_subscriber_that_goes_away_mid_call_ends_it_after_the_grace(mods, core, fake, open_socket, monkeypatch):
+    """The conversation's process dies with the call live: no one holds the call's turns any more, so after
+    SUBSCRIBER_GRACE the call ends and the phone hears so (the grace starts again when a subscriber leaves)."""
+    monkeypatch.setattr(mods.hubsock, "SUBSCRIBER_GRACE", 0.6)
+    pusher = FakePusher()
+    hub, server = open_socket(pusher=pusher)
+    folder = fake.home / "hermes-voice"
+
+    async def scenario():
+        async with serving(core) as port:
+            ringer = mods.remote.Client.connect([folder])
+            started = await asyncio.to_thread(ringer.request, "ring", {"origin": _origin(), "text": "Hi"})
+            sub = mods.remote.Client.connect([folder])
+            await asyncio.to_thread(sub.request, "subscribe_turns", {"call_id": started["call_id"],
+                                                                     "origin": _origin()})
+            phone = await _pick_up(port, fake, pusher)
+            await phone.expect("speech_end")
+            call = hub.slot
+            await asyncio.sleep(1.0)  # past the first grace: the subscriber holds the call
+            assert call.state == "live"
+            sub.close()  # the process went away
+            ringer.close()
+            ended = await phone.expect("ended", timeout=5)
+            return call, ended
+
+    call, ended = asyncio.run(scenario())
+    assert (call.outcome, call.detail) == ("ended_by_agent", "the conversation's Hermes process went away")
+    assert ended == {"type": "ended", "outcome": "ended_by_agent"}
+
+
+def test_in_a_short_folder_the_socket_is_bound_in_place_and_only_its_own_server_removes_it(mods, fake, make_hub):
+    """~/.hermes/hermes-voice is short: the socket is bound at hub.sock itself (no link). A dashboard that is
+    closing must not remove its successor's socket, which took the same path in the meantime."""
+    import shutil
+    import tempfile
+    root = tempfile.mkdtemp(prefix="hv-", dir="/tmp")
+    folder = Path(root) / "hermes-voice"
+    try:
+        folder.mkdir()
+        dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # what a dashboard killed with SIGKILL leaves
+        dead.bind(str(folder / "hub.sock"))
+        dead.close()
+        first = mods.hubsock.HubServer(make_hub(), folder).start()
+        assert not (folder / "hub.sock").is_symlink() and first.bound == str(folder / "hub.sock")
+        assert mods.remote.Client.connect([folder]).request("status")["calls"] == 0  # the stale one replaced
+        first.sock.close()  # it starts closing: no longer listening...
+        second = mods.hubsock.HubServer(make_hub(), folder).start()  # ...and the next dashboard takes over
+        first.close()  # ...then the first one finishes closing
+        assert (folder / "hub.sock").exists() and (folder / "hub.token").read_text().strip() == second.token
+        assert mods.remote.Client.connect([folder]).request("status")["calls"] == 0
+        second.close()
+        assert not (folder / "hub.sock").exists() and not (folder / "hub.token").exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.fixture
+def socket_key(core, monkeypatch):
+    """The process's hub socket, opened the way the dashboard opens it (serve_socket_when_ready)."""
+    import sys
+    monkeypatch.delenv("HERMES_VOICE_HUB_SOCKET", raising=False)
+    monkeypatch.setattr(core.hub, "SOCKET_RETRY_S", 0.1)
+    sys.__dict__.pop(core.hub._SOCKET_KEY, None)
+    yield core.hub._SOCKET_KEY
+    core.hub.pause_socket()
+    sys.__dict__.pop(core.hub._SOCKET_KEY, None)
+
+
+def test_the_dashboard_takes_the_socket_over_once_another_one_lets_it_go(mods, core, fake, make_hub, socket_key):
+    folder = fake.home / "hermes-voice"
+    make_hub()
+    other = mods.hubsock.HubServer(make_hub(), folder).start()  # another dashboard in the same home
+    core.hub.serve_socket_when_ready()
+    asyncio.run(until(lambda: core.hub.socket_state() == "taken"))
+    assert core.hub.get_hub().status()["hub_socket"] == "taken"
+    other.close()
+    asyncio.run(until(lambda: core.hub.socket_state() == "open", timeout=5))
+    assert mods.remote.Client.connect([folder]).request("status")["hub_socket"] == "open"
+    # The plugin unloads: no process rings through it any more; loading it again opens the socket again.
+    core.hub.pause_socket()
+    assert core.hub.socket_state() == "paused"
+    with pytest.raises(mods.remote.NotAvailable):
+        mods.remote.Client.connect([folder])
+    core.hub.resume_socket()
+    asyncio.run(until(lambda: core.hub.socket_state() == "open", timeout=5))
+    assert mods.remote.Client.connect([folder]).request("status")["calls"] == 0
+
+
+def test_another_profiles_process_rings_only_when_allowed_and_never_vouches_for_the_owner(mods, core, fake,
+                                                                                      open_socket):
+    """A profile without a dashboard of its own finds the root profile's hub. Its allowlist and pairings say
+    nothing about this profile's owner."""
+    pusher = FakePusher()
+    folder = fake.home / "hermes-voice"
+    hub, server = open_socket(pusher=pusher)
+    client = mods.remote.Client.connect([folder])
+    refused = client.request("ring", {"origin": _origin(profile="family"), "text": "Hi"})
+    assert refused["status"] == "not_allowed" and "allowed_profiles" in refused["note"] and pusher.payloads == []
+    server.close()
+    entries = [json.loads(line) for line in (fake.home / "hermes-voice" / "rings.jsonl").read_text().splitlines()]
+    assert (entries[-1]["reason"], entries[-1]["source"]) == ("profile", "family")
+
+    allowed = core.config.PolicyConfig(allowed_profiles=("family",))
+    hub, server = open_socket(pusher=pusher, settings=core.config.Settings(fake_tts=True, policy=allowed))
+    client = mods.remote.Client.connect([folder])
+    not_owner = client.request("ring", {"origin": _origin(profile="family"), "text": "Hi"})
+    assert not_owner["status"] == "not_allowed" and pusher.payloads == []  # is_owner from it doesn't count
+    server.close()
+    named = core.config.PolicyConfig(allowed_profiles=("family",), owner_ids=("telegram:42",))
+    hub, server = open_socket(pusher=pusher, settings=core.config.Settings(fake_tts=True, policy=named))
+    client = mods.remote.Client.connect([folder])
+    rang = client.request("ring", {"origin": _origin(profile="family"), "text": "Hi"})
+    assert rang["status"] == "ringing" and len(pusher.payloads) == 1 and pusher.payloads[0]["profile"] == "family"
+    client.close()
+
+
+def test_without_previews_the_voip_push_carries_no_title(core, fake, make_hub, monkeypatch):
+    fake.config = {"plugins": {"entries": {"hermes_voice": {"settings": {"alerts": {"previews": False}}}}}}
+    monkeypatch.setattr(core.notify, "_settings_cache", (0.0, None))
+    pusher = FakePusher()
+    make_hub(pusher=pusher)
+    fake.host.add("s1", title="Divorce lawyer")
+    result = json.loads(core.tools.start_call({"text": "Hi"}, session_id="s1"))
+    asyncio.run(until(lambda: pusher.payloads))
+    assert result["status"] == "ringing" and pusher.payloads[0]["title"] == "Hermes"
+
+
 # ── helpers ────────────────────────────────────────────────────────────────────────────────────────────────
 
 

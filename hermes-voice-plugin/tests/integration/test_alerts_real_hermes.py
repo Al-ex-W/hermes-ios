@@ -108,7 +108,8 @@ def _alive(pid: int) -> bool:
 
 class Model:
     """``do the dangerous thing`` -> ``terminal rm -rf <a folder in the sandbox>`` (an approval); ``ask me`` ->
-    ``clarify`` with one question; after a tool result -> a short reply."""
+    ``clarify`` with one question; ``fail now`` -> the provider refuses the request; after a tool result -> a short
+    reply."""
 
     def __init__(self) -> None:
         self.target = ""
@@ -125,6 +126,8 @@ class Model:
 
         if last.get("role") == "user":
             text = hs.message_text(last)
+            if "fail now" in text:
+                return hs.Fail(delay=1.0)  # a provider 400: the turn ends on an early return
             if "dangerous" in text:
                 return call("terminal", {"command": f"rm -rf {self.target}"})
             if "ask me" in text:
@@ -260,9 +263,8 @@ def test_an_approval_alerts_once_the_client_leaves_and_is_answered_from_the_aler
     assert "rm -rf" not in json.dumps(payload)
     assert answer == {"status": "ok"}
     assert done["payload"]["aps"]["category"] == "HERMES_TURN_DONE"
-    # A compute-host turn's reply stays in the child: its alert says it finished.
-    assert done["payload"]["aps"]["alert"]["body"] == ("Hermes finished." if sandbox.isolated
-                                                       else "All done, deployed.")
+    # A compute-host turn's message.complete is relayed through the dashboard: its alert has the reply too.
+    assert done["payload"]["aps"]["alert"]["body"] == "All done, deployed."
     assert done["payload"]["hermes"] == {"kind": "turn_done", "session_id": stored, "profile": "default"}
     assert not (sandbox.root / "target").exists()  # approved once, and it ran
 
@@ -304,6 +306,31 @@ def test_a_question_alerts_with_its_questions_and_is_answered_from_the_alert(her
     assert answer == {"status": "ok"}
     assert done["payload"]["hermes"]["kind"] == "turn_done"
     model.wait_for("staging")  # the answer reached the model as the clarify result
+
+
+def test_a_turn_the_provider_fails_alerts_that_it_failed(hermes):
+    """A provider 400 ends the turn on an early return, which fires no on_session_end: the watcher sees the
+    conversation go idle and its message.complete say "error" (relayed from the child under turn_isolation)."""
+    sandbox, _ = hermes
+
+    async def scenario():
+        dashboard = await signed_in(sandbox)
+        try:
+            gateway = await Gateway.answering(dashboard)
+            created = await gateway.call("session.create", {"source": "desktop", "title": "Alerts F"})
+            sid, stored = created["session_id"], created["stored_session_id"]
+            await gateway.call("prompt.submit", {"session_id": sid, "text": "fail now"})
+            await gateway.close()  # nobody watches the turn end
+            done = await alert_for(dashboard, "turn_done", stored)
+            messages = await dashboard.messages(stored)
+            return done, messages
+        finally:
+            await dashboard.close()
+
+    done, messages = asyncio.run(scenario())
+    assert done["payload"]["aps"]["alert"]["body"] == "Hermes stopped: the turn failed."
+    assert done["payload"]["aps"]["category"] == "HERMES_TURN_DONE"
+    assert any(m.get("role") == "user" and "fail now" in json.dumps(m.get("content")) for m in messages), messages
 
 
 # Two phones: A takes every alert; B turned approval alerts off (POST /devices {"alerts": {"approval": false}}).
