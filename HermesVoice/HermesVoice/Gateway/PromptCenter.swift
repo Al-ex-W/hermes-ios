@@ -127,6 +127,17 @@ final class PromptCenter: ObservableObject, ServerRequestHandling {
         await answer(id, ValueResult(value: value))
     }
 
+    /// The request was answered outside its card (from a notification), or Hermes no longer waits for it: the card
+    /// goes, unless an answer from it is on the way. `id` is the server-request id, or an approval's queue entry.
+    func answeredOutside(_ id: String) {
+        prompts.removeAll { prompt in
+            guard !prompt.answering else { return false }
+            if prompt.id == id { return true }
+            if case let .approval(approval) = prompt.kind { return approval.requestID == id }
+            return false
+        }
+    }
+
     private func answer<Result: Encodable>(_ id: String, _ result: Result) async {
         let value: JSONValue
         do {

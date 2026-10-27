@@ -11,8 +11,10 @@ final class AppModel: ObservableObject {
     }
 
     let calls = CallController()
-    /// VoIP pushes, so Hermes can ring this phone (`start_call`).
+    /// VoIP pushes, so Hermes can ring this phone (`start_call`), and the alert token beside them.
     let push = PushRegistration()
+    /// Background alerts (approval, question, turn done): their actions, taps and foreground banners.
+    let notifications = AlertNotifications()
     private(set) var client: DashboardClient?
     private(set) var connection: GatewayConnection?
     /// Approvals, questions and passwords Hermes is waiting on, for every chat.
@@ -26,6 +28,7 @@ final class AppModel: ObservableObject {
 
     init() {
         push.onToken = { [weak self] _ in self?.sendPushToken() }
+        notifications.attach(to: self)
         push.onIncoming = { [weak self] call, completion in
             guard let self else { return completion() }
             guard let call else { return self.calls.reportUnusablePush(completion: completion) }
@@ -36,9 +39,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// At launch, before any VoIP push can be delivered.
+    /// At launch, before any VoIP push or notification action can be delivered.
     func startPush() {
         push.start()
+        notifications.start()
     }
 
     func restore() async {
@@ -71,11 +75,21 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Hangs up, closes the gateway connection for good, and logs out of the dashboard.
+    /// Hangs up, closes the gateway connection for good, and logs out of the dashboard. The plugin is first told to
+    /// send this phone no more alerts (while the cookie still works), so a signed-out lock screen shows no commands
+    /// or questions; the next sign-in registers the opt-ins again.
     func signOut() {
         calls.end()
         connection?.disconnect()
-        client?.signOut()
+        if let leaving = client {
+            push.setAlerts(.none)
+            let push = push
+            Task {
+                await Self.waiting(atMost: 5) { await push.send(to: leaving) }
+                leaving.signOut()
+            }
+        }
+        notifications.signedOut()
         connection = nil
         prompts = nil
         client = nil
@@ -137,6 +151,29 @@ final class AppModel: ObservableObject {
     func startCall(in chat: ChatModel) async {
         guard let client else { return }
         await calls.start(chat: chat, client: client, settings: callSettings)
+    }
+
+    /// Runs `work`, giving up on waiting for it after `seconds` (it keeps running).
+    static func waiting(atMost seconds: Double, for work: @escaping @MainActor () async -> Void) async {
+        final class Once {
+            var continuation: CheckedContinuation<Void, Never>?
+            func resume() {
+                continuation?.resume()
+                continuation = nil
+            }
+        }
+        let once = Once()
+        await withCheckedContinuation { continuation in
+            once.continuation = continuation
+            Task { @MainActor in
+                await work()
+                once.resume()
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                once.resume()
+            }
+        }
     }
 
     /// Tells the Hermes Voice plugin where to ring this phone.

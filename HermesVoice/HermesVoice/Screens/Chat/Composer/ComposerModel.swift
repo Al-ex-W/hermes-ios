@@ -113,6 +113,11 @@ final class ComposerModel: ObservableObject {
         if let observable = sender.chat as? any ObservableObject {
             observation = Self.watch(observable) { [weak self] in self?.chatChanged() }
         }
+        // A key, account or endpoint added in Settings > Providers, or a new default model: the model menu follows.
+        NotificationCenter.default.publisher(for: .hermesModelOptionsDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in Task { await self?.refreshModel() } }
+            .store(in: &cancellables)
     }
 
     deinit {

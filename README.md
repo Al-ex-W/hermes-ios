@@ -246,6 +246,25 @@ settings any more):
 - The Simulator has no VoIP pushes, CallKit audio or microphone: there calls ring inside the app only, Hermes can
   be heard, and you answer by typing. Debug builds take `hermesvoice://ring?call_id=…&session_id=…` as a push.
 
+## Settings, profiles and notifications
+
+**Settings** (the gear in the sidebar) follows the desktop app's pages: Model, Chat, Appearance, Workspace, Safety,
+Browser, Passwords & Logins, Memory & Context, Advanced, Notifications, Billing, Providers, Profiles, Tools & Keys,
+Sessions and About, with a search over every field. The config pages are built from the dashboard's
+`/api/config/schema`, and each change is saved on its own (`PUT /api/config` with only that key). The desktop's
+Voice page, keyboard shortcuts, window layout, pet, local models and uninstall are left out; its Gateways page is
+this app's **Connection** page, and **Calls** is this app's own.
+
+- **Profiles** opens from the sidebar's title menu (**Manage profiles…**) or from Settings: create, clone, rename,
+  delete, set the default, export or import (paths on the host), and edit SOUL.md.
+- **Providers** signs in to provider accounts (device codes) and adds API keys and custom endpoints. A key you type
+  is sent only to your own dashboard (`/api/env`); the app neither keeps nor logs it.
+- **Notifications** chooses which alerts Hermes may push to this iPhone: an approval waiting, a question waiting,
+  a turn finished. The app registers its APNs alert token and these choices with the `hermes_voice` plugin
+  (`POST /api/plugins/hermes_voice/devices`). Approvals can be answered from the notification (Run, Allow for
+  session, Reject), a single question with a typed reply, and tapping a notification opens its chat. The plugin
+  must support alert pushes for these to arrive; with an older plugin only the registration happens.
+
 ## Building the app
 
 ```bash
