@@ -113,7 +113,10 @@ struct PluginSettingsSection: View {
 
     private func hint(_ field: PluginSetting) -> String? {
         var parts: [String] = []
-        if !field.description.isEmpty { parts.append(field.description) }
+        if !field.description.isEmpty {
+            let description = field.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            parts.append(".!?".contains(description.last ?? ".") ? description : description + ".")
+        }
         if field.kind == .secret, let env = field.env { parts.append("Stored as \(env) in the profile's .env.") }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }

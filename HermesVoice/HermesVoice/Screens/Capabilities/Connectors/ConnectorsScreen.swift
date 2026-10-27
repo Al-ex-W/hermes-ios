@@ -201,12 +201,23 @@ private struct ConnectorsDirectory: View {
             if page.showsSegments || page.segment != segment || page.hiddenMatches > 0 {
                 Section {
                     if page.showsSegments {
-                        Picker("Group", selection: $segment) {
-                            ForEach(page.segments, id: \.segment) { item in
-                                Text("\(item.segment.title) \(item.count)").tag(item.segment)
+                        // Up to three segments fit side by side on a phone; with more (managed apps and the
+                        // host's), the groups are a menu so no label is cut.
+                        if page.segments.count > 3 {
+                            Picker("Show", selection: $segment) {
+                                ForEach(page.segments, id: \.segment) { item in
+                                    Text("\(item.segment.title) \(item.count)").tag(item.segment)
+                                }
                             }
+                            .pickerStyle(.menu)
+                        } else {
+                            Picker("Group", selection: $segment) {
+                                ForEach(page.segments, id: \.segment) { item in
+                                    Text("\(item.segment.title) \(item.count)").tag(item.segment)
+                                }
+                            }
+                            .pickerStyle(.segmented)
                         }
-                        .pickerStyle(.segmented)
                     }
                     if page.segment != segment {
                         FormNote("No match in \(segment.title), so every match is shown.")
