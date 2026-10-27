@@ -936,6 +936,7 @@ struct FallbackModelsEditor: View {
 struct DelegationRouteRow: View {
     @EnvironmentObject private var store: SettingsStore
     @EnvironmentObject private var catalog: ModelCatalog
+    @EnvironmentObject private var routing: DelegationRoutingModel
     var error: String?
     var saving = false
     @State private var picking = false
@@ -988,19 +989,28 @@ struct DelegationRouteRow: View {
         let route = ModelRoute(provider: saved.provider, model: saved.model)
         let direct = Self.directEndpointActive(saved)
         let inherits = !direct && route.model.isEmpty
-        SettingsRow(title: SettingsCatalog.label(for: "delegation.model"),
-                    description: direct
-                        ? "Subagents call a direct endpoint (\(Self.host(saved.baseURL))). Picking a model here stops that."
-                        : "The model subagents run on. Same as the main model unless you pick one.",
-                    error: error ?? store.errors["delegation.provider"], saving: saving) {
-            Button { picking = true } label: {
-                Text(direct ? (saved.model.isEmpty ? "Direct endpoint" : "\(saved.model) · Direct endpoint")
-                            : inherits ? "Main model" : catalog.describe(route))
-                    .foregroundStyle(Theme.Text.tertiary)
-                    .lineLimit(1)
+        // A routing mode other than Default picks each subagent's model itself (`SubagentModelGate`).
+        let gated = routing.routing.flatMap { $0.ownsSubagentModel ? $0 : nil }
+        Group {
+            SettingsRow(title: SettingsCatalog.label(for: "delegation.model"),
+                        description: gated.map { "Not used in this mode. \($0.inactiveReason)" }
+                            ?? (direct ? "Subagents call a direct endpoint (\(Self.host(saved.baseURL))). Picking a model here stops that."
+                                       : "The model subagents run on. Same as the main model unless you pick one."),
+                        error: error ?? store.errors["delegation.provider"], saving: saving) {
+                Button { picking = true } label: {
+                    Text(direct ? (saved.model.isEmpty ? "Direct endpoint" : "\(saved.model) · Direct endpoint")
+                                : inherits ? "Main model" : catalog.describe(route))
+                        .foregroundStyle(gated == nil ? Theme.Text.tertiary : Theme.Text.quaternary)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.borderless)
+                .fixedSize()
+                .disabled(gated != nil)
             }
-            .buttonStyle(.borderless)
-            .fixedSize()
+            if gated != nil {
+                Button("Switch to Default") { Task { await routing.choose("default") } }
+                    .disabled(routing.busy)
+            }
         }
         .modelRoutePicker(isPresented: $picking, catalog: catalog, title: "Subagent Model",
                           current: inherits || direct ? nil : route, clearLabel: "Same as main model") { picked in

@@ -618,3 +618,49 @@ def test_alert_registration_and_the_alerts_a_backgrounded_app_would_get():
     assert cleared.json() == {"ok": True}
     assert [(d["voip_token"], d["alert_token"]) for d in after_clear] == [(VOIP, None)]
     assert after_clear[0]["alerts"] == {"approval": False, "clarify": False, "turn_done": False}
+
+
+def test_shared_metrics_consent_is_kept_per_profile():
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                gateway = await Gateway.connect(base, http)
+                before = await gateway.call("shared_metrics.status", {})
+                shared = await gateway.call("shared_metrics.set", {"enabled": True, "send": True, "profile": "research"})
+                research = await gateway.call("shared_metrics.status", {"profile": "research"})
+                default = await gateway.call("shared_metrics.status", {})
+                forced = await gateway.call("shared_metrics.set", {"enabled": False, "send": True, "profile": "research"})
+                bad = await failure(gateway, "shared_metrics.set", {"enabled": "yes"})
+                problems = contract_problems(gateway)
+                await gateway.close()
+        return before, shared, research, default, forced, bad, problems
+
+    before, shared, research, default, forced, bad, problems = asyncio.run(scenario())
+    assert problems == []
+    assert before == {"enabled": False, "send": False, "decided": False}
+    assert shared == research == {"enabled": True, "send": True, "decided": True}
+    assert default == before, "another profile's answer"
+    assert forced == {"enabled": False, "send": False, "decided": True}, "send is off without enabled"
+    assert bad.code == 4002
+
+
+def test_delegation_routing_and_backend_choice():
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                before = (await http.get("/api/delegation/routing")).json()
+                chosen = (await http.put("/api/delegation/backend", json={"backend": "model_map"})).json()
+                after = (await http.get("/api/delegation/routing")).json()
+                research = (await http.get("/api/delegation/routing", params={"profile": "research"})).json()
+                unknown = await http.put("/api/delegation/backend", json={"backend": "nope"})
+                config = (await http.get("/api/config")).json()
+        return before, chosen, after, research, unknown, config
+
+    before, chosen, after, research, unknown, config = asyncio.run(scenario())
+    assert before["configured"] == "default" and before["blocked_reason"] is None
+    assert [b["name"] for b in before["backends"]] == ["default", "model_map", "profile_routes"]
+    assert before["model_map"] == {"options": [], "default": None}
+    assert chosen == {"ok": True, "backend": "model_map"} and after["configured"] == "model_map"
+    assert research["configured"] == "default", "another profile's routing"
+    assert unknown.status_code == 400
+    assert config["delegation"]["backend"] == "model_map"

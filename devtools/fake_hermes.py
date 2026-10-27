@@ -58,6 +58,7 @@ config.yaml, .env, SOUL.md, logins and vault; unknown -> 404, invalid name -> 40
                                   type does not match its schema field (400), which the real server would save
   GET  /api/model/info|options|auxiliary|moa|recommended-default, POST /api/model/set, PUT /api/model/moa
   GET  /api/memory, GET/PUT /api/memory/providers/<name>/config?surface=declared (a declared "fake-recall")
+  GET  /api/delegation/routing, PUT /api/delegation/backend (Default, Model routes, Profile routes)
   GET/PUT/DELETE /api/env, POST /api/env/reveal, POST /api/providers/validate (the fake never calls a provider:
                                   a key starting "bad" is rejected, one containing "offline" can't be checked)
   GET  /api/providers/oauth, POST .../{id}/start (device code, approved after --oauth-approve-after seconds),
@@ -65,7 +66,8 @@ config.yaml, .env, SOUL.md, logins and vault; unknown -> 404, invalid name -> 40
   /api/profiles (+ POST create, PATCH rename, DELETE, /active, /{name}/soul, /{name}/export, /import, ...)
   GET  /api/status                the public liveness probe: versions and gateway state
 RPCs vault.* (a local vault plus a fake 1Password; unlock with any master password but "wrong") and billing.*
-(a Nous Portal account; money routes need billing.step_up first). Values typed into these routes (API keys,
+(a Nous Portal account; money routes need billing.step_up first), and shared_metrics.status / .set (the
+profile's telemetry.shared_metrics consent). Values typed into these routes (API keys,
 passwords, vault secrets) are never logged.
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
@@ -2258,8 +2260,9 @@ class FakeProfile:
         return self.name == "default"
 
     def loaded(self) -> dict[str, Any]:
-        """load_config(): the defaults with the file over them (a file's MoA preset map replaces the defaults')."""
-        merged = deep_merge(DEFAULT_CONFIG, self.config)
+        """load_config(): the defaults with the file over them (a file's MoA preset map replaces the defaults').
+        A fresh copy: a route that edits the record and saves it must never change the defaults themselves."""
+        merged = deep_merge(copy.deepcopy(DEFAULT_CONFIG), self.config)
         moa = self.config.get("moa")
         if isinstance(moa, dict) and isinstance(moa.get("presets"), dict):
             merged["moa"]["presets"] = copy.deepcopy(moa["presets"])
@@ -2531,6 +2534,8 @@ class SettingsFeatures:
             Route("/api/model/moa", r(self.get_moa), methods=["GET"]),
             Route("/api/model/moa", r(self.put_moa), methods=["PUT"]),
             Route("/api/model/set", r(self.set_model_assignment), methods=["POST"]),
+            Route("/api/delegation/routing", r(self.delegation_routing), methods=["GET"]),
+            Route("/api/delegation/backend", r(self.select_delegation_backend), methods=["PUT"]),
             Route("/api/memory", r(self.memory_status), methods=["GET"]),
             Route("/api/memory/providers/{name}/config", r(self.memory_provider_config), methods=["GET"]),
             Route("/api/memory/providers/{name}/config", r(self.put_memory_provider_config), methods=["PUT"]),
@@ -2814,6 +2819,43 @@ class SettingsFeatures:
 
         model, provider = profile.main_model()
         return {"tasks": [row(slot) for slot in AUX_TASK_SLOTS], "main": {"provider": provider, "model": model}}
+
+    # The fake host has the Advanced Delegation plugin installed and on: its two backends can run.
+    DELEGATION_BACKENDS = (
+        ("default", "Default", "Every subagent runs on the subagent model.", True),
+        ("model_map", "Model routes", "Name a few models. The agent picks one for each subagent.", False),
+        ("profile_routes", "Profile routes", "Subagents run as one of your profiles.", False),
+    )
+
+    def delegation_routing(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """delegation.py GET /api/delegation/routing: the saved backend, the registered ones, both route blocks."""
+        profile = self.scoped(request)
+        delegation = profile.loaded().get("delegation") or {}
+        configured = str(delegation.get("backend") or "default").strip().lower() or "default"
+        names = [name for name, *_ in self.DELEGATION_BACKENDS]
+        blocks = delegation.get("backends") if isinstance(delegation.get("backends"), dict) else {}
+        model_map = blocks.get("model_map") if isinstance(blocks.get("model_map"), dict) else {}
+        routes = blocks.get("profile_routes") if isinstance(blocks.get("profile_routes"), dict) else {}
+        return {"configured": configured,
+                "blocked_reason": None if configured in names else f"No delegation backend named {configured!r}.",
+                "backends": [{"name": n, "label": label, "description": text, "available": True, "reason": "",
+                              "builtin": builtin} for n, label, text, builtin in self.DELEGATION_BACKENDS],
+                "model_map": {"options": [o for o in model_map.get("options") or [] if isinstance(o, dict)],
+                              "default": model_map.get("default") or None},
+                "profile_routes": {"profiles": [p for p in routes.get("profiles") or [] if isinstance(p, dict)],
+                                   "default": routes.get("default") or None},
+                "profiles": sorted(self.profiles)}
+
+    def select_delegation_backend(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """delegation.py PUT /api/delegation/backend {backend}: only a registered backend (400 otherwise)."""
+        profile = self.scoped(request, body)
+        name = str(body.get("backend") or "").strip().lower() or "default"
+        if name not in [n for n, *_ in self.DELEGATION_BACKENDS]:
+            raise HttpError(400, f"Unknown delegation backend: {name}")
+        config = profile.loaded()
+        config.setdefault("delegation", {})["backend"] = name
+        profile.save(config)
+        return {"ok": True, "backend": name}
 
     def get_moa(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         return normalize_moa(self.scoped(request).loaded().get("moa"))
@@ -3437,7 +3479,31 @@ class SettingsFeatures:
             "billing.auto_reload": lambda: self.billing_auto_reload(params),
             "billing.keep_going_on_credits": lambda: self.billing_keep_going(params),
             "billing.step_up": lambda: self.billing_step_up(conn, params),
+            "shared_metrics.status": lambda: self.shared_metrics_status(params),
+            "shared_metrics.set": lambda: self.shared_metrics_set(params),
         }
+
+    @staticmethod
+    def consent_state(profile: FakeProfile) -> dict[str, Any]:
+        """shared_metrics_consent.py consent_state over the profile's raw telemetry.shared_metrics."""
+        section = ((profile.config.get("telemetry") or {}).get("shared_metrics") or {})
+        enabled = section.get("enabled") is True
+        return {"enabled": enabled, "send": enabled and section.get("send") is True,
+                "decided": "enabled" in section or "send" in section}
+
+    def shared_metrics_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self.consent_state(self.rpc_profile(params))
+
+    def shared_metrics_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        """shared_metrics.set {enabled, send?}: send is forced off without enabled."""
+        profile = self.rpc_profile(params)
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            raise RpcError(4002, "enabled must be a boolean")
+        send = bool(params.get("send")) and enabled
+        profile.config.setdefault("telemetry", {})["shared_metrics"] = {"enabled": enabled, "send": send}
+        log(f"shared_metrics.set profile={profile.name} enabled={enabled} send={send}")
+        return self.consent_state(profile)
 
     def rpc_profile(self, params: dict[str, Any]) -> FakeProfile:
         name = str(params.get("profile") or "").strip()

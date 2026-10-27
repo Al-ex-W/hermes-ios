@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Where Settings navigates: a page (its subpage list, or its content when it has one), or a subpage with the
 /// row to scroll to.
@@ -93,15 +94,23 @@ private struct SettingsRoot: View {
     @StateObject private var context: SettingsContext
     @StateObject private var store: SettingsStore
     @StateObject private var catalog: ModelCatalog
+    @StateObject private var routing: DelegationRoutingModel
     @ObservedObject var scopes: ProfileScopeModel
     @Binding var selection: String
     @State private var query = ""
     @State private var credentials: [SettingsSearchEntry] = []
+    @State private var exported: URL?
+    @State private var importing = false
+    /// An imported record waiting for a yes (it clears every enabled toolset).
+    @State private var pendingImport: JSONValue?
+    @State private var confirmingReset = false
+    @State private var configFailure: String?
 
     init(context: SettingsContext, scopes: ProfileScopeModel, selection: Binding<String>) {
         _context = StateObject(wrappedValue: context)
         _store = StateObject(wrappedValue: SettingsStore(transport: context.api))
         _catalog = StateObject(wrappedValue: ModelCatalog(api: context.api))
+        _routing = StateObject(wrappedValue: DelegationRoutingModel(api: context.api))
         self.scopes = scopes
         _selection = selection
     }
@@ -147,6 +156,33 @@ private struct SettingsRoot: View {
             context.scopeNote = SettingsContext.scopeNote(profile: context.profile, profiles: scopes.profiles,
                                                           dashboardProfile: scopes.dashboardProfile)
         }
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) { configMenu }
+        }
+        .sheet(item: Binding(get: { exported.map(SharedFile.init) }, set: { if $0 == nil { finishExport() } })) { file in
+            ShareSheet(items: [file.url])
+                .presentationDetents([.medium, .large])
+        }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
+            Task { await importConfig(result) }
+        }
+        .confirmationDialog("Reset all settings to Hermes defaults?", isPresented: $confirmingReset, titleVisibility: .visible) {
+            Button("Reset to defaults", role: .destructive) { Task { await resetConfig() } }
+        } message: {
+            Text(context.scopeNote ?? "Keys, accounts and chats stay.")
+        }
+        .alert("Remove all enabled toolsets?", isPresented: Binding(get: { pendingImport != nil }, set: { if !$0 { pendingImport = nil } }),
+               presenting: pendingImport) { record in
+            Button("Cancel", role: .cancel) {}
+            Button("Import", role: .destructive) { Task { await save(record) } }
+        } message: { _ in
+            Text("The imported config enables no toolsets: memory, terminal, web search, delegation and most other tools stay off until you re-enable them.")
+        }
+        .alert("Settings", isPresented: Binding(get: { configFailure != nil }, set: { if !$0 { configFailure = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(configFailure ?? "")
+        }
         .hermesForm()
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
@@ -161,8 +197,79 @@ private struct SettingsRoot: View {
             .environmentObject(context)
             .environmentObject(store)
             .environmentObject(catalog)
+            .environmentObject(routing)
         }
         .task { await store.load() }
+    }
+
+    // MARK: Export, import, reset (the desktop's settings footer)
+
+    private var configMenu: some View {
+        Menu {
+            Button { Task { await exportConfig() } } label: { Label("Export config", systemImage: "square.and.arrow.up") }
+            Button { importing = true } label: { Label("Import config", systemImage: "square.and.arrow.down") }
+            Button(role: .destructive) { confirmingReset = true } label: {
+                Label("Reset to defaults", systemImage: "arrow.counterclockwise")
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .accessibilityLabel("Config actions")
+    }
+
+    /// The scoped profile's record as `hermes-config.json`, handed to the share sheet and deleted after it.
+    private func exportConfig() async {
+        do {
+            let record = try await context.api.config()
+            let data = try JSONSerialization.data(withJSONObject: record.anyValue, options: [.prettyPrinted, .sortedKeys])
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("hermes-config.json")
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            exported = url
+        } catch {
+            configFailure = "Couldn't export the config: \(error.localizedDescription)"
+        }
+    }
+
+    private func finishExport() {
+        if let exported { try? FileManager.default.removeItem(at: exported) }
+        exported = nil
+    }
+
+    /// Saves an imported JSON record (a sparse `PUT /api/config` deep-merges it), asking first when it would
+    /// clear every enabled toolset.
+    private func importConfig(_ result: Result<URL, Error>) async {
+        do {
+            let url = try result.get()
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let record = try JSONValue(jsonData: Data(contentsOf: url))
+            guard record.objectValue != nil else { throw DashboardError.rpc("The file isn't a Hermes config (a JSON object).") }
+            if let toolsets = record["toolsets"], SettingsStore.clearsToolsets(from: store.value("toolsets"), to: toolsets) {
+                pendingImport = record
+                return
+            }
+            await save(record)
+        } catch {
+            configFailure = "Couldn't import the config: \(error.localizedDescription)"
+        }
+    }
+
+    private func resetConfig() async {
+        do {
+            await save(try await context.api.defaults())
+        } catch {
+            configFailure = "Couldn't reset the settings: \(error.localizedDescription)"
+        }
+    }
+
+    private func save(_ record: JSONValue) async {
+        do {
+            try await context.api.save(record)
+            await store.load()
+            NotificationCenter.default.post(name: .hermesModelOptionsDidChange, object: nil)
+        } catch {
+            configFailure = error.localizedDescription
+        }
     }
 
     @ViewBuilder private var results: some View {
@@ -340,6 +447,8 @@ struct ConfigSubpageView: View {
     private var form: some View {
         let fields = store.fields(in: section, subpage: subpage)
         let embedded = section.page == .model && ["main", "auxiliary", "moa"].contains(subpageID)
+        // Safety > Privacy also carries the shared-metrics consent (`showSharedMetrics`).
+        let sharedMetrics = section.page == .safety && subpageID == "privacy"
         return Form {
             SettingsScopeNote()
             if section.page == .model {
@@ -347,6 +456,7 @@ struct ConfigSubpageView: View {
                 case "main"?: MainModelSection()
                 case "auxiliary"?: AuxiliaryModelsSection()
                 case "moa"?: MoaSection()
+                case "delegation"?: DelegationRoutingSection()
                 default: EmptyView()
                 }
             }
@@ -364,13 +474,14 @@ struct ConfigSubpageView: View {
                     if let hint = restartHint(fields.map(\.key)) { FormNote(hint, color: Theme.Text.secondary) }
                 }
                 .hermesFormRows()
-            } else if !embedded {
+            } else if !embedded && !sharedMetrics {
                 Section {
                     ContentUnavailableView("Nothing to change here", systemImage: section.page.icon,
                                            description: Text("This Hermes host has none of these settings."))
                 }
                 .listRowBackground(Color.clear)
             }
+            if sharedMetrics { SharedMetricsRow() }
         }
         .hermesForm()
         .settingsAnchor(anchor)

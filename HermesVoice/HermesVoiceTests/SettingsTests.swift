@@ -579,6 +579,26 @@ final class SettingsTests: XCTestCase {
         XCTAssertNil(MoaSection.deleting("fast", from: withoutDefault), "the last preset stays")
     }
 
+    func testDelegationRoutingGatesTheSubagentModel() throws {
+        let routing = DelegationRouting(try json("""
+        {"configured": "model_map", "blocked_reason": null,
+         "backends": [{"name": "default", "label": "Default", "available": true},
+                      {"name": "model_map", "label": "Model routes", "available": true},
+                      {"name": "profile_routes", "label": "Profile routes", "available": false, "reason": "off"}],
+         "model_map": {"options": [{"name": "cheap", "model": "m-mini", "provider": "openrouter"}], "default": "cheap"},
+         "profile_routes": {"profiles": [], "default": null}, "profiles": ["default"]}
+        """))
+        XCTAssertTrue(routing.ownsSubagentModel)
+        XCTAssertEqual(routing.modes, ["default", "model_map"], "a backend that can't run isn't offered")
+        XCTAssertEqual(routing.modelRoutes, [.init(name: "cheap", detail: "m-mini · openrouter")])
+        XCTAssertEqual(routing.inactiveReason, "Model routes pick each subagent's model. Subagents that pick no route use “cheap”.")
+
+        let blocked = DelegationRouting(try json(#"{"configured": "swarm", "blocked_reason": "Not installed.", "backends": []}"#))
+        XCTAssertEqual(blocked.modes, ["default", "swarm"], "the saved mode always shows")
+        XCTAssertEqual(blocked.blockedReason, "Not installed.")
+        XCTAssertFalse(DelegationRouting(try json(#"{"configured": "default"}"#)).ownsSubagentModel)
+    }
+
     func testFallbackEntriesKeepRoutingAndReadLegacyStrings() {
         let rows = FallbackModelsEditor.entries(.array([
             ["provider": "openrouter", "model": "a", "base_url": "http://x"],

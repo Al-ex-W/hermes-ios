@@ -272,6 +272,13 @@ final class ConfigAPI: ConfigTransport {
         return record
     }
 
+    /// `GET /api/config/defaults`: Hermes' defaults, for "Reset to defaults".
+    func defaults() async throws -> JSONValue {
+        let record = try await get("/api/config/defaults")
+        guard record.objectValue != nil else { throw DashboardError.rpc("The dashboard sent no defaults.") }
+        return record
+    }
+
     func save(_ patch: JSONValue) async throws {
         let result = try await send("PUT", "/api/config", ["config": patch])
         if result["ok"]?.boolValue == false {
