@@ -12,6 +12,7 @@ extension SidebarDestination {
         case .messaging: return "Messaging"
         case .artifacts: return "Artifacts"
         case .scheduledJobs: return "Scheduled jobs"
+        case .commandCenter: return "Command Center"
         }
     }
 
@@ -22,15 +23,15 @@ extension SidebarDestination {
         case .messaging: return Theme.Icon.messaging
         case .artifacts: return Theme.Icon.artifacts
         case .scheduledJobs: return Theme.Icon.scheduledJobs
+        case .commandCenter: return Theme.Icon.commandCenter
         }
     }
 
-    /// The milestone that brings the screen.
+    /// The milestone that brings a screen this app doesn't have yet; nil once it's here.
     var milestone: String? {
         switch self {
-        case .capabilities, .artifacts, .scheduledJobs: return "M4"
         case .messaging: return "M5"
-        case .draft, .session: return nil
+        case .draft, .session, .capabilities, .artifacts, .scheduledJobs, .commandCenter: return nil
         }
     }
 }

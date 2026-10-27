@@ -9,6 +9,10 @@ import Foundation
 /// A call the user starts goes live once the plugin is ready. A call Hermes rings (a VoIP push) rings until the
 /// user answers, declines, or `ringTimeout` passes; the plugin speaks only after `answered`, which goes out once the
 /// call's audio runs. A line is acknowledged as `played` only if all of it reached the speaker.
+///
+/// A pushed call whose session this app can't open (a messaging chat or a CLI session the dashboard doesn't list)
+/// runs without a chat: the plugin knows the call by its id, so it rings, speaks and takes turns the same way, and
+/// the call shows under the push's title.
 @MainActor
 final class VoiceCall: ObservableObject, Identifiable {
     enum State: Equatable { case ringing, connecting, live, ended(String?) }
@@ -78,7 +82,8 @@ final class VoiceCall: ObservableObject, Identifiable {
     /// 32 lowercase hex characters: the plugin's call id, and the CallKit UUID with the dashes taken out.
     let callID: String
     let uuid: UUID
-    let chat: ChatModel
+    /// The chat the call belongs to; nil for a pushed call whose session the app can't open.
+    let chat: ChatModel?
     let settings: CallSettings
     let initiatedBy: CallInitiator
     /// The push that rang, for a call Hermes started.
@@ -142,7 +147,7 @@ final class VoiceCall: ObservableObject, Identifiable {
     private var linkNote: String? { didSet { refreshNote() } }
     private var speechNote: String? { didSet { refreshNote() } }
 
-    init(chat: ChatModel, settings: CallSettings, initiatedBy: CallInitiator, callID: String = CallID.make(),
+    init(chat: ChatModel?, settings: CallSettings, initiatedBy: CallInitiator, callID: String = CallID.make(),
          push: CallPush? = nil, environment: Environment) {
         self.chat = chat
         self.settings = settings
@@ -163,12 +168,15 @@ final class VoiceCall: ObservableObject, Identifiable {
         return false
     }
 
+    /// What the call is shown as: its chat's title, else the push's.
+    var title: String { chat?.title ?? push?.title ?? "Hermes" }
+
     /// Opens the link to the plugin: at once for a call that rings, so the plugin hears `ringing`. `ringingSince`:
     /// when the push arrived, which the ring timeout counts from.
     func begin(ringingSince: Date = Date()) {
         guard !began, !isEnded else { return }
         began = true
-        chat.setInUse(useKey, true)
+        chat?.setInUse(useKey, true)
         if !answered { startRingTimer(since: ringingSince) }
         Task { await connect() }
     }
@@ -275,6 +283,11 @@ final class VoiceCall: ObservableObject, Identifiable {
     /// Resumes the chat on the gateway first, so the hello carries its stored session id. A call that rang knows its
     /// session from the push and goes on without it; one the user starts needs it.
     private func connect() async {
+        // A call without a chat has nothing to attach: the plugin knows it by its id.
+        guard let chat else {
+            if isEnded && !declinePending { return }
+            return openLink()
+        }
         let knowsSession = push?.sessionID != nil
         let attempts = knowsSession ? 2 : 3
         for attempt in 0..<attempts {
@@ -297,8 +310,8 @@ final class VoiceCall: ObservableObject, Identifiable {
 
     private func openLink() {
         link?.close(after: [])
-        let hello = PhoneHello(callID: callID, sessionID: chat.storedID ?? push?.sessionID,
-                               title: push?.title ?? chat.title, initiatedBy: initiatedBy)
+        let hello = PhoneHello(callID: callID, sessionID: chat?.storedID ?? push?.sessionID,
+                               title: push?.title ?? chat?.title, initiatedBy: initiatedBy)
         let link = environment.makeLink(hello)
         // Only the current link counts: a replaced one can't trigger reconnects or play speech.
         link.onEvent = { [weak self, weak link] event in
@@ -515,7 +528,7 @@ final class VoiceCall: ObservableObject, Identifiable {
         audioNote = nil
         linkNote = nil
         speechNote = nil
-        if began { chat.setInUse(useKey, false) }
+        if began { chat?.setInUse(useKey, false) }
         if cause != .local { onEnded?(cause) }
     }
 

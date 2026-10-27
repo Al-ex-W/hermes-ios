@@ -160,8 +160,7 @@ final class DashboardClient {
             let (data, response) = try await session.data(for: request)
             let http = response as? HTTPURLResponse
             let code = http?.statusCode ?? 0
-            let redirectedAway = http?.url.map { $0.host != base.host || $0.path.contains("login") } ?? false
-            if code == 401 || code == 403 || redirectedAway {
+            if code == 401 || code == 403 || isSignInRedirect(http, for: request) {
                 if attempt == 0 { try await signIn(); continue }
                 throw DashboardError.signedOut
             }
@@ -169,6 +168,23 @@ final class DashboardClient {
             return data.isEmpty ? JSON() : try JSONSerialization.jsonObject(with: data)
         }
         throw DashboardError.signedOut
+    }
+
+    /// The answer came from the sign-in page instead of the route asked for: URLSession followed a redirect to
+    /// another host, or to the dashboard's own `/login` (or `/auth/…`) page. An answer from the requested path is
+    /// never one, even when a user-chosen name in it reads "login" (an MCP server called `login-helper`).
+    func isSignInRedirect(_ response: HTTPURLResponse?, for request: URLRequest) -> Bool {
+        Self.isSignInRedirect(final: response?.url, requested: request.url, base: base)
+    }
+
+    static func isSignInRedirect(final: URL?, requested: URL?, base: URL) -> Bool {
+        guard let final, let requested else { return false }
+        if final.host?.lowercased() != requested.host?.lowercased() { return true }
+        guard final.path != requested.path else { return false }
+        var path = final.path
+        let prefix = base.path.trimmingSuffix("/")
+        if !prefix.isEmpty, path.hasPrefix(prefix + "/") { path.removeFirst(prefix.count) }
+        return path == "/login" || path.hasPrefix("/login/") || path.hasPrefix("/auth/")
     }
 
     func webSocketTicket() async throws -> String {
@@ -180,10 +196,10 @@ final class DashboardClient {
     /// `limit` rows of the stored transcript, `offset` rows back from the newest, oldest first. `profile` picks
     /// the store; nil reads the dashboard's own.
     func messageRows(sessionID: String, profile: String? = nil, limit: Int = 200, offset: Int = 0) async throws -> [JSONValue] {
-        let encoded = sessionID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sessionID
+        let segment = try Self.segment(sessionID)
         var query = ["limit": "\(limit)", "offset": "\(offset)", "order": "latest", "include_compacted": "true", "inline_images": "false"]
         if let profile { query["profile"] = profile }
-        let result = try await request("GET", "/api/sessions/\(encoded)/messages", query: query) as? JSON
+        let result = try await request("GET", "/api/sessions/\(segment)/messages", query: query) as? JSON
         var rows = ((result?["messages"] ?? result?["data"]) as? [Any] ?? []).map(JSONValue.init(any:))
         if let first = rows.first?["id"]?.intValue, let last = rows.last?["id"]?.intValue, first > last { rows.reverse() }
         return rows

@@ -24,6 +24,9 @@ struct SidebarView: View {
 
     private var searching: Bool { !sidebar.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
+    /// The Command Center shows beside the sidebar (iPad), so its button reads as on.
+    private var commandCenterOpen: Bool { sizeClass != .compact && sidebar.selection == .commandCenter }
+
     var body: some View {
         List(selection: $sidebar.selection) {
             navigation
@@ -37,7 +40,7 @@ struct SidebarView: View {
         .scrollContentBackground(.hidden)
         .background(Theme.sidebar)
         .environment(\.defaultMinListRowHeight, 28)
-        .searchable(text: $sidebar.query, placement: .sidebar, prompt: "Search sessions")
+        .modifier(SidebarSearch(query: $sidebar.query, compact: sizeClass == .compact))
         .task(id: sidebar.query) {
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
@@ -49,9 +52,15 @@ struct SidebarView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarTitleMenu { profileSwitcher }
         .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
+            ToolbarItemGroup(placement: .topBarLeading) {
                 Button { showSettings = true } label: { Image(systemName: Theme.Icon.settings) }
                     .accessibilityLabel("Settings")
+                // The desktop's statusbar Command Center button: it opens in the detail column (pushed on iPhone),
+                // and on iPad pressing it again goes back to what was open.
+                Button { sidebar.toggleCommandCenter() } label: {
+                    Image(systemName: commandCenterOpen ? "command.square.fill" : Theme.Icon.commandCenter)
+                }
+                .accessibilityLabel(commandCenterOpen ? "Close Command Center" : "Open Command Center")
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 SidebarFilterMenu(sidebar: sidebar)
@@ -61,8 +70,15 @@ struct SidebarView: View {
         }
         .safeAreaInset(edge: .bottom) {
             if let call = calls.active {
-                ActiveCallBanner(call: call) { sidebar.open(call.chat) }
-                    .padding(.bottom, Theme.Spacing.md)
+                if let chat = call.chat {
+                    ActiveCallBanner(call: call) { sidebar.open(chat) }
+                        .padding(.bottom, Theme.Spacing.md)
+                } else {
+                    // A call whose session the app can't open has no chat to show it in: its controls show here.
+                    CallPanel(call: call)
+                        .padding(.horizontal, Theme.Spacing.lg)
+                        .padding(.bottom, Theme.Spacing.md)
+                }
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -450,5 +466,61 @@ private extension View {
         listRowInsets(EdgeInsets(top: 0, leading: Theme.Spacing.lg, bottom: 0, trailing: Theme.Spacing.lg))
             .listRowSeparator(.hidden)
             .listRowBackground(background)
+    }
+}
+
+/// The session search. Beside the iPad's split view it is the system search field; on iPhone, where the collapsed
+/// split view's search drawer doesn't take focus when tapped, it is a field of its own pinned above the list (the
+/// desktop's plain search field): tapping it focuses it and raises the keyboard, Cancel clears and closes it.
+private struct SidebarSearch: ViewModifier {
+    @Binding var query: String
+    let compact: Bool
+    @FocusState private var focused: Bool
+
+    func body(content: Content) -> some View {
+        if compact {
+            content.safeAreaInset(edge: .top, spacing: 0) { field }
+        } else {
+            content.searchable(text: $query, placement: .sidebar, prompt: "Search sessions")
+        }
+    }
+
+    private var field: some View {
+        HStack(spacing: Theme.Spacing.md) {
+            HStack(spacing: Theme.Spacing.sm) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(Theme.Text.tertiary)
+                    .accessibilityHidden(true)
+                TextField("Search sessions", text: $query)
+                    .focused($focused)
+                    .submitLabel(.search)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                if !query.isEmpty {
+                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Theme.Text.tertiary)
+                        .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, Theme.Spacing.md)
+            .padding(.vertical, Theme.Spacing.sm + 1)
+            .background(Theme.Fill.quaternary, in: RoundedRectangle(cornerRadius: Theme.Radius.icon))
+            .hermesOutline(radius: Theme.Radius.icon)
+            // The whole field focuses, not just the text: the glyph and padding are part of the target.
+            .contentShape(Rectangle())
+            .onTapGesture { focused = true }
+            if focused {
+                Button("Cancel") {
+                    query = ""
+                    focused = false
+                }
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.default, value: focused)
+        .padding(.horizontal, Theme.Spacing.sidebarInset)
+        .padding(.vertical, Theme.Spacing.sm)
+        .background(Theme.sidebar)
     }
 }

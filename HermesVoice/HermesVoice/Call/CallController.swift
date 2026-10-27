@@ -5,17 +5,19 @@ import CallKit
 /// shows in the Dynamic Island / Lock Screen, keeps running in the background, and gets the system's call audio session.
 @MainActor
 final class CallController: NSObject, ObservableObject {
-    @Published private(set) var active: VoiceCall?
+    @Published private(set) var active: VoiceCall? { didSet { updateInCall() } }
     /// A call is being set up (permissions, plugin check) and isn't `active` yet.
-    @Published private(set) var starting = false
+    @Published private(set) var starting = false { didSet { updateInCall() } }
     @Published var lastError: String?
+    /// A call rings, is being set up or runs: the app keeps its gateway connection meanwhile, even in the background.
+    @Published private(set) var inCall = false
 
     private let provider: CXProvider
     private let controller = CXCallController()
     /// `end` was asked for while a call was still starting.
     private var startCancelled = false
     /// A pushed call CallKit shows while its chat is still being opened (signing in after a cold launch).
-    private var ringing: Ringing?
+    private var ringing: Ringing? { didSet { updateInCall() } }
     /// How long a pushed call may take to get its chat before it stops ringing; VoiceCall's own ring timeout matches.
     private let ringTimeout: TimeInterval = 45
 
@@ -41,6 +43,11 @@ final class CallController: NSObject, ObservableObject {
 
     /// The call that rings, waiting for the user to answer.
     var isRinging: Bool { ringingUUID != nil }
+
+    private func updateInCall() {
+        let now = active != nil || ringing != nil || starting
+        if now != inCall { inCall = now }
+    }
 
     // MARK: Calls the user starts
 
@@ -164,8 +171,9 @@ final class CallController: NSObject, ObservableObject {
                 return
             }
             guard let state = ringing, state.uuid == uuid else { return }
-            ringing = nil
+            // Adopted before the ring state goes, so `inCall` never dips (the gateway stays up in the background).
             adopt(call)
+            ringing = nil
             call.begin(ringingSince: state.since)
             if state.answered { call.answer() }
             if state.ended {
@@ -336,7 +344,7 @@ extension CallController: CXProviderDelegate {
             guard let call = active, call.uuid == action.callUUID else { return action.fail() }
             do {
                 try CallAudio.configureSession()
-                provider.reportCall(with: action.callUUID, updated: Self.update(title: call.chat.title))
+                provider.reportCall(with: action.callUUID, updated: Self.update(title: call.title))
                 provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
                 action.fulfill()
             } catch {

@@ -664,3 +664,29 @@ def test_delegation_routing_and_backend_choice():
     assert research["configured"] == "default", "another profile's routing"
     assert unknown.status_code == 400
     assert config["delegation"]["backend"] == "model_map"
+
+
+def test_device_registrations_can_be_held_in_flight():
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                bad = (await http.post(f"{PREFIX}/debug/hold-devices", json={"hold": "yes"})).status_code
+                held = (await http.post(f"{PREFIX}/debug/hold-devices", json={"hold": True})).json()
+                device = {"voip_token": VOIP, "alert_token": ALERT, "environment": "sandbox",
+                          "bundle_id": "com.example.hermesvoice", "alerts": {"clarify": False}}
+                waiting = asyncio.ensure_future(http.post(f"{PREFIX}/devices", json=device))
+                for _ in range(100):
+                    if fake.voice_plugin.devices_held:
+                        break
+                    await asyncio.sleep(0.01)
+                before = dict(fake.voice_plugin.devices)
+                released = (await http.post(f"{PREFIX}/debug/hold-devices", json={"hold": False})).json()
+                stored = (await waiting).json()
+                after = fake.voice_plugin.devices[VOIP]["alerts"]
+        return bad, held, before, released, stored, after
+
+    bad, held, before, released, stored, after = asyncio.run(scenario())
+    assert bad == 422 and held == {"ok": True, "hold": True, "waiting": 0}
+    assert before == {}, "a held registration isn't stored yet"
+    assert released == {"ok": True, "hold": False, "waiting": 1}
+    assert stored == {"ok": True} and after == {"clarify": False}

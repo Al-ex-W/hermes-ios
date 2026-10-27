@@ -88,7 +88,8 @@ struct ChatScreen: View {
             recover: { recovery, _ in recover(recovery) },
             openMedia: { ref in openMedia(ref) },
             edit: { message in chat.composer.editMessage(message) },
-            restore: { message in Task { await chat.rewind(message, to: ChatModel.promptText(message)) } },
+            restore: { message in Task { await chat.rewind(message, to: ChatModel.promptText(message), kind: .restore) } },
+            stop: { Task { await chat.composer.stop() } },
             regenerate: { reply in Task { await chat.regenerate(reply) } },
             branch: { reply in Task { await chat.branch(from: reply) } },
             openSession: { id in open(.session(SessionSummary(id: id, title: "Agent session", lastActive: nil, profile: chat.profile))) }
@@ -199,7 +200,7 @@ private struct TranscriptScroll: View {
                     if chat.transcript.items.isEmpty, chat.isNewChat, !chat.busy {
                         emptyState
                     }
-                    TranscriptList(items: chat.transcript.rows, display: chat.display)
+                    TranscriptList(items: chat.transcript.rows, display: chat.display, stopID: chat.runningPromptID)
                     activity
                     Color.clear.frame(height: 1).id(Self.bottom)
                 }

@@ -78,6 +78,9 @@ Use a short grace to test what happens when the app was backgrounded for too lon
   hidden: false, …}], total, …}`. A draft only appears once it has a prompt.
 - `GET /api/sessions/{id}/messages` returns `{session_id, profile, messages: [{id, role, content,
   display_kind, tool_calls, …}], pagination}`. A draft with no prompt yet gets 404.
+- `GET /api/sessions/{id}?profile=` returns the stored row from that profile's store (the dashboard's own without
+  `?profile=`), stamped with `profile` and `is_default_profile`. A session in another profile's store, or a draft,
+  gets 404.
 - Any unauthenticated `/api/*` call gets Hermes' 401 envelope `{error: "unauthenticated", …}`. A `POST`
   whose `Origin` doesn't match its `Host` gets 403.
 - `WS /api/ws?ticket=…` sends `gateway.ready {skin, change_events, heartbeat: true, replay_epoch}` first. A bad
@@ -132,6 +135,8 @@ inside the app; answer from the call panel). The module docstring has a curl rec
 Devices may also register an APNs `alert_token` with `alerts: {approval, clarify, turn_done}` (bad shapes get
 `422`); `GET /status` lists them, and `GET …/debug/alerts?session_id=…&kind=approval|clarify|turn_done` returns the
 `{aps, hermes}` notification the plugin would push, the alert tokens it would go to, and the history.
+`POST …/debug/hold-devices {hold: true}` keeps each later registration waiting (`{hold: false}` lets them go;
+the answer says how many wait), so a test can change the alerts while one is in flight.
 
 ### Settings screens (M3)
 
@@ -143,6 +148,72 @@ create/rename/delete/default/export/import and SOUL.md, `/api/status`, and the `
 master password unlocks except `wrong`). The module docstring lists every route. API keys, vault secrets and
 passwords are never logged. Unlike Hermes, `PUT /api/config` refuses a value whose type doesn't match its schema
 field, with `400`. Custom endpoints (`/api/providers/custom-endpoints`) aren't served yet.
+
+### Capabilities, cron, command center and artifacts (M4)
+
+The M4 screens have their routes here too, each honouring `?profile=` with its own state per profile. The shapes
+come from `hermes_cli/web_routers/{skills,tools,mcp,cron,ops,status,analytics,actions,files}.py` and
+`plugins.manage` in `tui_gateway/methods_tools.py`; each handler names its source.
+
+- **Skills**: `GET /api/skills`, `PUT /api/skills/toggle`, `GET`/`PUT /api/skills/content`, `POST /api/skills`
+  (the same name, category and frontmatter checks as Hermes), plus the hub: the official catalog
+  (`/api/skills/hub/official`), `search` (the official catalog and two community skills; an empty `q` answers
+  empty), `preview`, `scan` (the install-time security scan: verdict, policy and findings; the community
+  `shell-helpers` has a finding and is blocked), `install`, `uninstall` and `update`. `DELETE /api/learning/node
+  {id}` archives a learned skill; a built-in, hub or external skill is refused with 400 and Hermes' message.
+- **Toolsets**: `GET /api/tools/toolsets` (the voice toolsets `tts` and `stt` are listed; the app strips them),
+  `PUT /{name}`, `/config` (providers with `ready` / `needs_keys` / `needs_auth` / `needs_setup`), `/models`,
+  `/model`, `/provider` (web picks a backend per capability), `/env` (declared keys only, into `.env`),
+  `/post-setup`, `GET`/`PUT /api/tools/terminal/backend(s)` (writes `terminal.backend`), and
+  `GET /api/tools/computer-use/status` (a Linux host without cua-driver).
+- **MCP**: `GET`/`POST`/`PUT /api/mcp/servers`, `DELETE /{name}`, `PUT /{name}/enabled`, `POST /{name}/test`
+  (an `auth: oauth` server needs a token first; a URL or command with `offline` in it fails to connect),
+  `POST /{name}/auth` + `GET`/`DELETE /api/mcp/oauth/flows/{id}`, and `GET`/`POST /api/mcp/catalog(/install)`.
+  The servers live in the profile's config (`mcp_servers` in `GET /api/config`), like in Hermes. The RPC
+  `reload.mcp {confirm: true}` answers `reloaded` (without `confirm`, `confirm_required`), as the app calls it
+  after each change so running chats pick it up. An OAuth flow
+  approves itself after `--mcp-oauth-approve-after` seconds (default 2, `0` = never). It also completes through
+  its `authorization_url`, which is the fake's own consent page (Approve / Deny), or through the debug trigger
+  `POST /api/mcp/oauth/flows/{id}/debug {outcome: "approve" | "deny"}`.
+- **Managed apps**: the gateway RPCs `connectors.list` / `catalog` / `accounts` (+ `.remove`) / `policy.get` /
+  `policy.set` / `connect` / `operation.status` / `operation.wake` and `connection.respond`, as the account owner. A
+  profile only sees its apps once it is signed in to Nous (Settings ▸ Providers ▸ Nous Portal); before that
+  `connectors.policy.get` answers `NEEDS_NOUS_AUTH` in the error's `data.reason`. The default profile then has a
+  working GitHub account, an expired Google Drive one and Notion turned off for the member; the organisation turns
+  Salesforce off. A connect opens the fake's `/fake-connect/authorize` page (Approve / Deny) and approves itself
+  after `--mcp-oauth-approve-after` seconds.
+- **Plugins**: the gateway RPC `plugins.manage` with `list`, `toggle`, `install` (a `catalog_name` or a git
+  repo), `update` (one update asks for consent first), `remove` and `settings`. An enabled plugin can add a
+  toolset or an MCP server (`source: "plugin"`, read-only). `GET /api/dashboard/plugins/catalog` lists the
+  curated catalog with each entry's installed state, as the Plugins tab's "Available to install" reads it.
+- **Cron**: jobs CRUD, `runs`, `pause`, `resume`, `trigger`, `delivery-targets`, `blueprints` and
+  `blueprints/instantiate`, with the schedule parser of `cron/jobs.py` (`30m`, `every 2h`, `in 45m`,
+  `weekdays at 9am`, five-field cron, ISO time). A triggered agent job leaves a `source: cron` chat that the run
+  row points at. `POST /api/cron/fire` takes `Authorization: Bearer <--cron-fire-token>`.
+- **Command center**: `GET /api/health` (public), `/api/system/stats`, `/api/logs` (file, level, component and
+  search filters), `/api/analytics/usage` and `/models`, `/api/curator` (+ `paused`, `run`), and the maintenance
+  actions `POST /api/ops/doctor`, `security-audit`, `backup` (+ `GET /api/ops/backup/download?archive=` once it's
+  done), `debug-share`, `GET /api/ops/checkpoints` + `POST …/prune`, `POST /api/gateway/restart`, and
+  `GET /api/hermes/update/check` + `POST /api/hermes/update`, and `POST /api/memory/reset {target}` (deletes the
+  built-in MEMORY.md and USER.md that `GET /api/memory` sizes). Curator runs, checkpoint prunes and memory resets
+  need an explicit `?profile=` (400 otherwise), as on a multi-profile Hermes.
+- **Actions**: every background action is tailed with `GET /api/actions/{name}/status`. Each poll shows more of
+  its log, and the `--action-polls`-th poll (default 3) finishes it with its exit code. An action nobody polls
+  finishes after `--action-seconds` (default 6, `0` = only by polls). What it changes (a new skill or server, the
+  archive, pruned checkpoints, the update) happens when it finishes.
+- **Artifacts**: the screen reads chats, so `--seed full` adds chats whose messages carry an image (`MEDIA:`),
+  files (a PDF and a CSV, also in a `write_file` result) and links. `GET /api/fs/read-data-url`,
+  `/api/fs/read-text` (`{binary, byteSize, language, mimeType, path, text, truncated}`) and `/api/fs/download`
+  serve those files, and `GET /api/media/proxy` serves the one remote image (from memory; the fake never goes
+  online).
+- **Live sessions**: the RPC `session.active_list` lists the sessions live in the fake (`{sessions: [{id,
+  session_key, title, status, …}]}`), which the app's push router checks after `GET /api/sessions/{id}`.
+
+`--seed` picks the data: `full` (the default) is `demo` plus the artifact chats and one chat per past cron run.
+`demo` seeds both profiles with skills, MCP servers, plugins, cron jobs (one paused, one failing), checkpoints
+and 90 days of usage, without new chats. `minimal` has none of it, to see the empty states. `/api/audio/*` is
+never served. Keys and tokens typed into these routes go to the profile's `.env` or config only and are never
+logged.
 
 ### Detached sessions
 
@@ -178,7 +249,8 @@ cd hermes-voice-mcp
 uv run pytest -q ../devtools/tests
 ```
 
-The tests start the fake in-process and cover sign-in and streaming, reconnect plus replay (also truncated),
+The tests start the fake in-process. `test_fake_hermes_m4.py` covers the M4 routes and `plugins.manage`; the
+others cover sign-in and streaming, reconnect plus replay (also truncated),
 reaping and `session.activate` after a reap, resuming a reaped draft, approvals across a reconnect,
 `approval.respond`, 4404 declines, clients that can't answer, clarify locks, secrets, interrupt and timeout
 cancels, and the speak demo against an in-process voice server. One test checks every result, event and request

@@ -828,6 +828,46 @@ struct Transcript {
         nextPrompts.append(UserMessage(id: id, text: projected.text, attachments: projected.refs, timestamp: now()))
     }
 
+    /// The stored ids of the prompts and replies shown, oldest first (what a rewind asks Hermes to rebind).
+    var durableRowIDs: [Int] {
+        var seen: Set<Int> = []
+        return items.compactMap { item -> Int? in
+            switch item {
+            case let .user(message): return message.rowID
+            case let .assistant(text): return text.rowID
+            default: return nil
+            }
+        }.filter { seen.insert($0).inserted }
+    }
+
+    /// Hermes stored the prompt shown as row `id` under `rowID` (`prompt.submit`'s `user_row_id`).
+    mutating func bindRowID(_ rowID: Int, to id: String) {
+        guard let index = items.firstIndex(where: { $0.id == id }), case var .user(message) = items[index],
+              message.rowID != rowID else { return }
+        message.rowID = rowID
+        items[index] = .user(message)
+    }
+
+    /// A rewind rewrote the stored transcript, giving the rows it kept new ids (`survivor_row_id_map`): the shown
+    /// prompts and replies take them, and one mapped to nil forgets its id. Ids the map doesn't name stay.
+    mutating func rebindRowIDs(_ map: [Int: Int?]) {
+        guard !map.isEmpty else { return }
+        items = items.map { item in
+            switch item {
+            case var .user(message):
+                guard let old = message.rowID, let new = map[old] else { return item }
+                message.rowID = new
+                return .user(message)
+            case var .assistant(text):
+                guard let old = text.rowID, let new = map[old] else { return item }
+                text.rowID = new
+                return .assistant(text)
+            default:
+                return item
+            }
+        }
+    }
+
     /// Drops the row `id` and everything after it (a rewind re-runs the conversation from there). No turn runs
     /// once it is cut.
     mutating func truncate(from id: String) {

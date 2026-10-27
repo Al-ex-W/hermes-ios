@@ -259,6 +259,16 @@ final class StatusStackModel: ObservableObject {
         }
     }
 
+    /// An edit or restore abandoned the timeline the background processes belong to (the desktop's
+    /// `resetSessionBackground`): the running ones are killed and every row goes.
+    func resetBackground() {
+        let running = processes.filter { $0.state == .running }
+        dismissed.formUnion(processes.map(\.id))
+        processes = []
+        guard !running.isEmpty else { return }
+        Task { for process in running { await kill(process) } }
+    }
+
     /// Drops a finished process's row and keeps it dropped across refreshes.
     func dismiss(_ process: Process) {
         dismissed.insert(process.id)

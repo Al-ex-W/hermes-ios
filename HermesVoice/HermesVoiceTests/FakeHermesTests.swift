@@ -87,6 +87,39 @@ final class FakeHermesTests: XCTestCase {
         XCTAssertTrue(listed.contains { $0.id == reported })
     }
 
+    /// A pushed call finds its session through the dashboard's real lookups: the stored row
+    /// (`GET /api/sessions/:id`), then the live list (`session.active_list`); an unknown id runs standalone.
+    func testPushedCallRouterFindsStoredAndLiveSessions() async throws {
+        let chat = await newChat()
+        await reply(chat, "route me")
+        let stored = try XCTUnwrap(chat.storedID)
+        await waitUntil { chat.title != "New chat" }
+
+        let row = try await client.storedSession(stored, profile: nil)
+        XCTAssertEqual(row?.id, stored)
+        XCTAssertEqual(row?.profile, "default")
+        let missing = try await client.storedSession("20200101_000000_abcdef", profile: nil)
+        XCTAssertNil(missing, "an id the store doesn't hold is not found, not an error")
+
+        let router = PushedCallRouter.live(client: client, connection: connection) { _ in nil }
+        let push = { (id: String) in CallPush(callID: String(repeating: "a", count: 32), sessionID: id, profile: nil,
+                                              mode: "async", title: "Ring") }
+        guard case let .chat(summary) = await router.route(push(stored)) else {
+            return XCTFail("a stored session opens its chat")
+        }
+        XCTAssertEqual(summary.id, stored)
+        XCTAssertEqual(summary.title, chat.title)
+
+        // A runtime id is found in the live list and opens the stored session behind it.
+        let runtime = try XCTUnwrap(chat.runtimeID)
+        guard case let .chat(live) = await router.route(push(runtime)) else {
+            return XCTFail("a live runtime id opens its chat")
+        }
+        XCTAssertEqual(live.id, stored)
+        let unknown = await router.route(push("local-telegram-123"))
+        XCTAssertEqual(unknown, .standalone)
+    }
+
     func testPromptsAreAnswered() async throws {
         let chat = await newChat()
 

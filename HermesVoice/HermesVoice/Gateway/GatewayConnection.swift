@@ -90,6 +90,8 @@ final class WebSocketTransport: GatewayTransport {
 struct GatewayRPCError: LocalizedError, Equatable {
     let code: Int
     let message: String
+    /// The error's `data` (the connector RPCs put their `reason` there).
+    var data: JSONValue?
 
     var errorDescription: String? { message }
 }
@@ -211,8 +213,11 @@ protocol ServerRequestHandling: AnyObject {
 /// what it missed is replayed from `session.events.since`, deduplicated by `seq`, before live frames resume. A
 /// session Hermes is still settling (4009) is re-attached again shortly after.
 /// Calls have deadlines; a lost answer drops the socket and listeners hear `.disconnected`.
+/// While the app is in the background it can be paused (`pauseForBackground`): the socket closes, so Hermes counts
+/// this phone as gone and sends its alerts as pushes, while tracked sessions and their watermarks stay for
+/// `resumeFromBackground` to re-attach and replay.
 @MainActor
-final class GatewayConnection: GatewayCalling {
+final class GatewayConnection: GatewayCalling, GatewayPausing {
     enum State: Equatable { case disconnected, connecting, connected }
 
     struct Options {
@@ -303,6 +308,9 @@ final class GatewayConnection: GatewayCalling {
     private var pings = 0
     /// Set by disconnect(): the connection never reconnects (signed out).
     private var closed = false
+    /// Paused for the background: no socket, no reconnects; `connect()` waits for `resumeFromBackground()`.
+    private(set) var paused = false
+    private var resumeWaiters: [CheckedContinuation<Void, Error>] = []
 
     init(options: Options = Options(), dial: @escaping () async throws -> GatewayTransport) {
         self.options = options
@@ -352,8 +360,17 @@ final class GatewayConnection: GatewayCalling {
     /// Connects (single flight) and finishes the handshake, re-attaching tracked sessions.
     func connect() async throws {
         guard !closed else { throw DashboardError.disconnected }
+        // In the background nothing dials: the caller goes on once the app is back in front.
+        if paused { try await untilResumed() }
         if isConnected { return }
-        if let connecting { return try await connecting.value }
+        if let connecting {
+            do {
+                return try await connecting.value
+            } catch where paused && !closed {
+                // Cut short by the pause: carry on once resumed.
+                return try await connect()
+            }
+        }
         // A socket that ended without its failure being seen yet: drop it so its calls and listeners hear about it.
         if let stale = socket { drop(stale) }
         let attempt = Task { @MainActor in
@@ -364,9 +381,45 @@ final class GatewayConnection: GatewayCalling {
         do {
             try await attempt.value
         } catch {
+            if paused && !closed { return try await connect() }
             scheduleReconnect()
             throw error
         }
+    }
+
+    private func untilResumed() async throws {
+        while paused {
+            try await withCheckedThrowingContinuation { resumeWaiters.append($0) }
+        }
+    }
+
+    // MARK: Background
+
+    /// The app went to the background with no call: closes the socket (Hermes then sees no client on the sessions
+    /// and alerts this phone by push), stops reconnecting and heartbeats, and holds every `connect()` until
+    /// `resumeFromBackground()`. Tracked sessions, watermarks and the replay epoch are kept. Calls whose frames
+    /// went out fail as on any drop; ones not yet written fail as not sent.
+    func pauseForBackground() {
+        guard !closed, !paused else { return }
+        paused = true
+        reconnect?.cancel()
+        reconnect = nil
+        reconnectAttempt = 0
+        if let socket { drop(socket) }
+    }
+
+    /// Back in front (or a call needs the gateway): lets waiting calls go on, and redials at once when sessions are
+    /// tracked, re-attaching them and replaying what they missed (`session.events.since`, or a refetch when their
+    /// runtime was reaped meanwhile).
+    func resumeFromBackground() {
+        guard paused else { return }
+        paused = false
+        let waiters = resumeWaiters
+        resumeWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        pruneTracked()
+        guard !closed, !tracked.isEmpty else { return }
+        Task { try? await connect() }
     }
 
     /// Closes for good (sign-out): fails every waiting call and refuses to reconnect.
@@ -390,11 +443,16 @@ final class GatewayConnection: GatewayCalling {
             entry.deadline?.cancel()
             entry.continuation.resume(throwing: DashboardError.disconnected)
         }
+        paused = false
+        let waiters = resumeWaiters
+        resumeWaiters.removeAll()
+        for waiter in waiters { waiter.resume(throwing: DashboardError.disconnected) }
     }
 
     /// Checks the connection now (the app is back in the foreground): a dead socket is dropped within
     /// `probeTimeout`, and a dropped one with sessions to keep is redialled at once.
     func probe() {
+        guard !paused else { return }
         if state == .disconnected {
             pruneTracked()
             guard !closed, !tracked.isEmpty else { return }
@@ -410,7 +468,7 @@ final class GatewayConnection: GatewayCalling {
 
     private func open() async throws {
         let socket = try await dial()
-        guard !closed else {
+        guard !closed, !paused else {
             socket.close()
             throw DashboardError.disconnected
         }
@@ -756,7 +814,7 @@ final class GatewayConnection: GatewayCalling {
     /// Redials after a drop while sessions are tracked, with backoff.
     private func scheduleReconnect() {
         pruneTracked()
-        guard !closed, reconnect == nil, state == .disconnected, !tracked.isEmpty, !options.reconnectDelays.isEmpty else { return }
+        guard !closed, !paused, reconnect == nil, state == .disconnected, !tracked.isEmpty, !options.reconnectDelays.isEmpty else { return }
         let delays = options.reconnectDelays
         let delay = delays[min(reconnectAttempt, delays.count - 1)]
         reconnectAttempt += 1
@@ -831,7 +889,8 @@ final class GatewayConnection: GatewayCalling {
         if let error = object["error"] {
             entry.continuation.resume(throwing: GatewayRPCError(
                 code: error["code"]?.intValue ?? 0,
-                message: error["message"]?.stringValue ?? "Hermes returned an error."
+                message: error["message"]?.stringValue ?? "Hermes returned an error.",
+                data: error["data"].flatMap { $0.isNull ? nil : $0 }
             ))
             return
         }

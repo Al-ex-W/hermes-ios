@@ -215,6 +215,8 @@ enum Theme {
         static let messaging = "bubble.left"
         static let artifacts = "doc.on.doc"
         static let scheduledJobs = "clock"
+        /// The statusbar's Command Center button (Tabler `Command`).
+        static let commandCenter = "command"
         static let search = "magnifyingglass"
         static let filter = "line.3.horizontal.decrease"
         static let settings = "gearshape"

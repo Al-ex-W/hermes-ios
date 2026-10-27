@@ -73,6 +73,11 @@ final class ComposerModel: ObservableObject {
     @Published private(set) var editingMessage: UserMessage?
     /// Re-runs the conversation from a prompt with new text; true when it went out. Set by the chat.
     var rewind: ((UserMessage, String) async -> Bool)?
+    /// How many prompts follow one in the chat (an edit there drops their turns too). Set by the chat.
+    var promptsAfter: ((UserMessage) -> Int)?
+    /// An edit of an older prompt waiting for the user to agree that the turns after it go (the desktop asks
+    /// "Restore to this checkpoint?" before such a cut).
+    @Published var deepEditConfirmation: UserMessage?
 
     let sender: SendController
     let profile: String?
@@ -227,7 +232,17 @@ final class ComposerModel: ObservableObject {
         attachments = []
     }
 
+    /// The user agreed to drop the turns after the edited prompt: the edit goes out. `message` is the prompt the
+    /// question was about, captured when the button was tapped: the dialog has already cleared
+    /// `deepEditConfirmation` by the time this runs.
+    func confirmDeepEdit(_ message: UserMessage?) async {
+        deepEditConfirmation = nil
+        guard let message, editingMessage?.id == message.id else { return }
+        await sendEdit(of: message, confirmed: true)
+    }
+
     func cancelMessageEdit() {
+        deepEditConfirmation = nil
         guard editingMessage != nil else { return }
         editingMessage = nil
         restoreMessageStash()
@@ -240,10 +255,21 @@ final class ComposerModel: ObservableObject {
         attachments = stash?.attachments ?? []
     }
 
-    /// Sends the edit as a rewind; refused, the edit stays in the composer.
-    private func sendEdit(of message: UserMessage) async {
+    /// Sends the edit as a rewind; refused, the edit stays in the composer. Unchanged text sends nothing and just
+    /// closes the edit, and an edit that would drop later turns asks first (`deepEditConfirmation`), as on the
+    /// desktop.
+    private func sendEdit(of message: UserMessage, confirmed: Bool = false) async {
         let text = draft
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let rewind else { return }
+        if Transcript.normalized(text) == Transcript.normalized(ChatModel.promptText(message)) {
+            cancelMessageEdit()
+            return
+        }
+        if !confirmed, (promptsAfter?(message) ?? 0) > 0 {
+            deepEditConfirmation = message
+            return
+        }
+        deepEditConfirmation = nil
         editingMessage = nil
         restoreMessageStash()
         guard await rewind(message, text) == false else { return }
