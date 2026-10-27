@@ -11,6 +11,8 @@ struct ModelRoute: Hashable {
 @MainActor
 final class ModelCatalog: ObservableObject {
     @Published private(set) var providers: [ModelOptionProvider] = []
+    /// The models that offer Ultrafast, by provider slug.
+    @Published private(set) var ultrafast: Set<ModelRoute> = []
     @Published private(set) var loaded = false
     @Published private(set) var error: String?
 
@@ -22,7 +24,9 @@ final class ModelCatalog: ObservableObject {
 
     func load(refresh: Bool = false) async {
         do {
-            providers = try await api.modelOptions(refresh: refresh).providers
+            let options = try await api.modelOptions(refresh: refresh)
+            providers = options.result.providers
+            ultrafast = options.ultrafast
             error = nil
         } catch {
             guard !error.isCancellation else { return }
@@ -46,6 +50,12 @@ final class ModelCatalog: ObservableObject {
 
     func capabilities(_ route: ModelRoute) -> ModelCapabilities? {
         provider(route.provider)?.capabilities?[route.model]
+    }
+
+    /// The model offers the Ultrafast tier (`capabilities[model].ultrafast`).
+    func offersUltrafast(_ route: ModelRoute) -> Bool {
+        guard let slug = provider(route.provider)?.slug else { return false }
+        return ultrafast.contains(ModelRoute(provider: slug, model: route.model))
     }
 
     /// "model · Provider", or the model alone when the provider is unknown.
@@ -242,7 +252,16 @@ struct MainModelSection: View {
 
     /// Fast is on for the tiers the composer reads as priority (`composerServiceTier`).
     static func fastOn(_ value: JSONValue?) -> Bool {
-        ["fast", "priority", "on"].contains((value?.displayText ?? "").trimmingCharacters(in: .whitespaces).lowercased())
+        speed(value) == "fast"
+    }
+
+    /// `agent.service_tier` as the Speed choice shows it (`speedValue`): fast, ultrafast, or normal (Standard).
+    static func speed(_ value: JSONValue?) -> String {
+        switch (value?.displayText ?? "").trimmingCharacters(in: .whitespaces).lowercased() {
+        case "fast", "priority", "on": return "fast"
+        case "ultrafast", "ultra": return "ultrafast"
+        default: return "normal"
+        }
     }
 
     var body: some View {
@@ -276,10 +295,25 @@ struct MainModelSection: View {
                 }
                 .id("model.reasoning")
             }
-            if caps?.fast ?? false {
+            let speed = Self.speed(store.value("agent.service_tier"))
+            // Standard, Fast and Ultrafast where the model offers Ultrafast (or it is the saved tier, so it shows as
+            // itself rather than as Off); a Fast switch otherwise.
+            if catalog.offersUltrafast(main) || speed == "ultrafast" {
+                SettingsRow(title: "Speed", error: store.errors["agent.service_tier"],
+                            saving: store.saving.contains("agent.service_tier")) {
+                    Picker("Speed", selection: Binding(get: { speed }, set: { store.set("agent.service_tier", .string($0)) })) {
+                        Text("Standard").tag("normal")
+                        if caps?.fast ?? false || speed == "fast" { Text("Fast").tag("fast") }
+                        Text("Ultrafast").tag("ultrafast")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+                .id("model.fast")
+            } else if caps?.fast ?? false {
                 SettingsRow(title: "Fast", description: "Priority processing for new chats.",
                             error: store.errors["agent.service_tier"], saving: store.saving.contains("agent.service_tier")) {
-                    Toggle("Fast", isOn: Binding(get: { Self.fastOn(store.value("agent.service_tier")) },
+                    Toggle("Fast", isOn: Binding(get: { speed == "fast" },
                                                  set: { store.set("agent.service_tier", .string($0 ? "fast" : "normal")) }))
                         .labelsHidden()
                 }
@@ -343,16 +377,18 @@ struct MainModelSection: View {
 
 // MARK: - Auxiliary models
 
-/// Settings > Model > Auxiliary models: each side task's model, "Use main model" by default
-/// (`/api/model/auxiliary`, assigned with `POST /api/model/set` scope auxiliary).
+/// Settings > Model > Auxiliary models: each side task's model and reasoning effort, the main model by default
+/// (`/api/model/auxiliary`, assigned with `POST /api/model/set` scope auxiliary). A plugin task registered with
+/// `inherit_from` follows its base task instead until it is pinned.
 struct AuxiliaryModelsSection: View {
     @EnvironmentObject private var catalog: ModelCatalog
     @State private var tasks: [ConfigAPI.AuxiliaryTask] = []
-    @State private var main = ModelRoute(provider: "", model: "")
     @State private var loading = true
     @State private var busy = false
     @State private var failure: String?
     @State private var editing: ConfigAPI.AuxiliaryTask?
+    @State private var pendingConfirm: (assignment: ConfigAPI.ModelAssignment, message: String)?
+    @State private var confirmingReset = false
 
     /// `en_aux_tasks.ts`: built-in tasks have client-side copy; plugin tasks bring their own.
     static let builtinCopy: [String: (label: String, hint: String)] = [
@@ -369,6 +405,9 @@ struct AuxiliaryModelsSection: View {
         "curator": ("Curator", "Skill-usage review"),
     ]
 
+    /// The editor's "inherit" effort choice (no `reasoning_effort` on the slot).
+    static let inheritEffort = "__inherit__"
+
     var body: some View {
         Section {
             if loading {
@@ -381,7 +420,7 @@ struct AuxiliaryModelsSection: View {
                         HStack {
                             Text(Self.title(task)).foregroundStyle(Theme.Text.primary)
                             Spacer()
-                            Text(task.followsMain ? "Main model" : catalog.describe(ModelRoute(provider: task.provider, model: task.model)))
+                            Text(Self.summary(task, in: tasks, catalog: catalog))
                                 .foregroundStyle(Theme.Text.tertiary).lineLimit(1)
                         }
                         if let hint = copy?.hint ?? task.hint {
@@ -392,8 +431,8 @@ struct AuxiliaryModelsSection: View {
                 .disabled(busy)
             }
             if !tasks.isEmpty {
-                Button("Reset all to main model", role: .destructive) { Task { await resetAll() } }
-                    .disabled(busy || main.model.isEmpty)
+                Button("Reset all to main model", role: .destructive) { confirmingReset = true }
+                    .disabled(busy || tasks.allSatisfy { $0.isAuto && $0.reasoningEffort == nil })
             }
         } header: {
             FormNote("Side tasks")
@@ -403,12 +442,28 @@ struct AuxiliaryModelsSection: View {
         }
         .hermesFormRows()
         .id("model.auxiliary")
-        .modelRoutePicker(isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } }),
-                          catalog: catalog, title: editing.map(Self.title) ?? "",
-                          current: editing.flatMap { $0.followsMain ? nil : ModelRoute(provider: $0.provider, model: $0.model) },
-                          clearLabel: "Use main model") { [editing] route in
-            guard let task = editing?.task else { return }
-            Task { await assign(task, route) }
+        .sheet(item: $editing) { task in
+            AuxiliaryTaskEditor(task: task, title: Self.title(task),
+                                baseLabel: task.inheritFrom.map { Self.baseTitle($0, in: tasks) }) { route, effort in
+                Task { await assign(Self.assignment(task: task.task, route: route, effort: effort, catalog: catalog)) }
+            }
+            .environmentObject(catalog)
+        }
+        .confirmationDialog("Reset every side task to the main model?", isPresented: $confirmingReset, titleVisibility: .visible) {
+            Button("Reset all", role: .destructive) { Task { await resetAll() } }
+        } message: {
+            Text("Their own models and reasoning settings are cleared.")
+        }
+        .alert("Use this model?", isPresented: Binding(get: { pendingConfirm != nil }, set: { if !$0 { pendingConfirm = nil } }),
+               presenting: pendingConfirm) { pending in
+            Button("Cancel", role: .cancel) {}
+            Button("Use it") {
+                var confirmed = pending.assignment
+                confirmed.confirmExpensiveModel = true
+                Task { await assign(confirmed) }
+            }
+        } message: { pending in
+            Text(pending.message)
         }
         .task { await reload() }
     }
@@ -417,11 +472,53 @@ struct AuxiliaryModelsSection: View {
         builtinCopy[task.task]?.label ?? task.label ?? task.task
     }
 
+    /// A task's label by key (an inheriting task's base).
+    static func baseTitle(_ key: String, in tasks: [ConfigAPI.AuxiliaryTask]) -> String {
+        tasks.first { $0.task == key }.map(title) ?? builtinCopy[key]?.label ?? key
+    }
+
+    /// The row's route line (`AuxTaskRouteSummary`): the pinned route, "Main model", or for an unpinned
+    /// inheriting task "Follows <Base> · <the route it resolves to>"; then the task's own reasoning effort.
+    static func summary(_ task: ConfigAPI.AuxiliaryTask, in tasks: [ConfigAPI.AuxiliaryTask], catalog: ModelCatalog) -> String {
+        var line: String
+        if let route = task.route {
+            line = route.model.isEmpty ? "\(catalog.providerName(route.provider)) · provider default" : catalog.describe(route)
+        } else if let base = task.inheritFrom {
+            let effective = task.effective.flatMap { $0.provider.isEmpty || $0.provider.lowercased() == "auto" ? nil : $0 }
+            let resolved = effective.map { $0.model.isEmpty ? catalog.providerName($0.provider) : catalog.describe($0) } ?? "Main model"
+            line = "Follows \(baseTitle(base, in: tasks)) · \(resolved)"
+        } else {
+            line = "Main model"
+        }
+        if let effort = task.reasoningEffort {
+            line += effort == "none" ? " · Reasoning off" : " · \(SettingsText.prettyName(effort))"
+        }
+        return line
+    }
+
+    /// The `POST /api/model/set` body for an edit: a route pins the task (with a user-defined provider's endpoint),
+    /// none puts it back on auto (the main model, or its base); the effort is always sent (inherit clears it).
+    static func assignment(task: String, route: ModelRoute?, effort: String, catalog: ModelCatalog) -> ConfigAPI.ModelAssignment {
+        let target = route ?? ModelRoute(provider: "auto", model: "")
+        return ConfigAPI.ModelAssignment(
+            scope: .auxiliary, provider: target.provider, model: target.model, task: task,
+            baseURL: route.flatMap { catalog.provider($0.provider)?.apiUrl },
+            reasoningEffort: effort == inheritEffort ? .null : .string(effort)
+        )
+    }
+
+    /// "Reset all": one auto assignment per task shown here. The server's `__reset__` would also reset the tasks
+    /// this app hides (voice chat), which the user can't see from the phone.
+    static func resetAssignments(_ tasks: [ConfigAPI.AuxiliaryTask]) -> [ConfigAPI.ModelAssignment] {
+        tasks.filter { !SettingsCatalog.strippedAuxiliaryTasks.contains($0.task) }.map { task in
+            ConfigAPI.ModelAssignment(scope: .auxiliary, provider: "auto", model: "", task: task.task, reasoningEffort: .null)
+        }
+    }
+
     private func reload() async {
         do {
             let result = try await catalog.api.auxiliaryModels()
             tasks = result.tasks.filter { !SettingsCatalog.strippedAuxiliaryTasks.contains($0.task) }
-            main = ModelRoute(provider: result.mainProvider, model: result.mainModel)
             failure = nil
         } catch {
             if !error.isCancellation { failure = error.localizedDescription }
@@ -430,16 +527,19 @@ struct AuxiliaryModelsSection: View {
         if !catalog.loaded { await catalog.load() }
     }
 
-    private func assign(_ task: String, _ route: ModelRoute?) async {
+    /// Sends an assignment; a pricing or data-use warning is shown first and the assignment resent once confirmed,
+    /// as the main model's row does.
+    private func assign(_ assignment: ConfigAPI.ModelAssignment) async {
         busy = true
+        failure = nil
         defer { busy = false }
-        // "Use main model" stores provider auto with no model, as the desktop's per-row reset does.
-        let target = route ?? ModelRoute(provider: "auto", model: "")
         do {
-            _ = try await catalog.api.assignModel(.init(
-                scope: .auxiliary, provider: target.provider, model: target.model, task: task,
-                baseURL: route.flatMap { catalog.provider($0.provider)?.apiUrl }, confirmExpensiveModel: true
-            ))
+            let result = try await catalog.api.assignModel(assignment)
+            if let confirm = result.confirmMessage {
+                pendingConfirm = (assignment, confirm)
+                return
+            }
+            if !result.ok { failure = "Hermes didn't change the model." }
             await reload()
         } catch {
             failure = error.localizedDescription
@@ -448,21 +548,103 @@ struct AuxiliaryModelsSection: View {
 
     private func resetAll() async {
         busy = true
+        failure = nil
         defer { busy = false }
         do {
-            _ = try await catalog.api.assignModel(.init(scope: .auxiliary, provider: main.provider, model: main.model,
-                                                       task: "__reset__"))
-            await reload()
+            for assignment in Self.resetAssignments(tasks) {
+                _ = try await catalog.api.assignModel(assignment)
+            }
         } catch {
             failure = error.localizedDescription
         }
+        await reload()
+    }
+}
+
+/// One side task's model and reasoning effort (the desktop row's Change editor), saved together.
+private struct AuxiliaryTaskEditor: View {
+    @EnvironmentObject private var catalog: ModelCatalog
+    @Environment(\.dismiss) private var dismiss
+    let task: ConfigAPI.AuxiliaryTask
+    let title: String
+    /// The base task's label, for a plugin task that inherits one.
+    let baseLabel: String?
+    let save: (ModelRoute?, String) -> Void
+    @State private var route: ModelRoute?
+    @State private var effort: String
+    @State private var picking = false
+
+    init(task: ConfigAPI.AuxiliaryTask, title: String, baseLabel: String?, save: @escaping (ModelRoute?, String) -> Void) {
+        self.task = task
+        self.title = title
+        self.baseLabel = baseLabel
+        self.save = save
+        _route = State(initialValue: task.route)
+        _effort = State(initialValue: task.reasoningEffort ?? AuxiliaryModelsSection.inheritEffort)
+    }
+
+    private var followLabel: String { baseLabel.map { "Follow \($0)" } ?? "Use main model" }
+    private var initialEffort: String { task.reasoningEffort ?? AuxiliaryModelsSection.inheritEffort }
+    private var changed: Bool { route != task.route || effort != initialEffort }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Button { picking = true } label: {
+                        HStack {
+                            Text("Model").foregroundStyle(Theme.Text.primary)
+                            Spacer()
+                            Text(route.map(catalog.describe) ?? (baseLabel.map { "Follows \($0)" } ?? "Main model"))
+                                .foregroundStyle(Theme.Text.tertiary).lineLimit(1)
+                            Image(systemName: "chevron.right").foregroundStyle(Theme.Text.quaternary)
+                        }
+                    }
+                    Picker("Reasoning", selection: $effort) {
+                        Text("Same as main model").tag(AuxiliaryModelsSection.inheritEffort)
+                        let levels = ["none"] + SettingsCatalog.reasoningEfforts
+                        ForEach(levels.contains(effort) || effort == AuxiliaryModelsSection.inheritEffort ? levels : levels + [effort],
+                                id: \.self) { level in
+                            Text(level == "none" ? "Off" : SettingsText.prettyName(level)).tag(level)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                } footer: {
+                    if let base = baseLabel, route == nil {
+                        FormNote("Follows \(base) until you pick a model for it.")
+                    } else {
+                        FormNote(task.hint ?? AuxiliaryModelsSection.builtinCopy[task.task]?.hint ?? "")
+                    }
+                }
+                .hermesFormRows()
+            }
+            .hermesForm()
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        dismiss()
+                        save(route, effort)
+                    }
+                    .disabled(!changed)
+                }
+            }
+            .modelRoutePicker(isPresented: $picking, catalog: catalog, title: title, current: route,
+                              clearLabel: followLabel) { picked in
+                route = picked
+            }
+        }
+        .task { if !catalog.loaded { await catalog.load() } }
     }
 }
 
 // MARK: - Mixture of Agents
 
-/// Settings > Model > Mixture of Agents: the presets' reference models and aggregator (`/api/model/moa`). The
-/// whole MoA record is sent back on save, so members this page doesn't edit survive.
+/// Settings > Model > Mixture of Agents: the named presets (enabled, default, added and deleted), each preset's
+/// reference models and aggregator (`/api/model/moa`). The whole MoA record is sent back on save, so members this
+/// page doesn't edit survive; the submitted preset map is what the server keeps.
 struct MoaSection: View {
     @EnvironmentObject private var catalog: ModelCatalog
     @State private var moa: JSONValue?
@@ -471,6 +653,9 @@ struct MoaSection: View {
     @State private var failure: String?
     @State private var addingReference = false
     @State private var pickingAggregator = false
+    @State private var namingPreset = false
+    @State private var newPresetName = ""
+    @State private var deletingPreset = false
 
     private var presetNames: [String] { (moa?["presets"]?.objectValue?.keys).map { Array($0).sorted() } ?? [] }
     private var defaultPreset: String { moa?["default_preset"]?.stringValue ?? "" }
@@ -479,6 +664,29 @@ struct MoaSection: View {
 
     static func route(_ slot: JSONValue?) -> ModelRoute {
         ModelRoute(provider: slot?["provider"]?.stringValue ?? "", model: slot?["model"]?.stringValue ?? "")
+    }
+
+    /// The record without preset `name`: the default moves to the first preset left and an active pick of it is
+    /// cleared (the desktop's Delete preset). Nil when it is the only preset.
+    static func deleting(_ name: String, from moa: JSONValue) -> JSONValue? {
+        guard var presets = moa["presets"]?.objectValue, presets.count > 1, presets[name] != nil else { return nil }
+        presets[name] = nil
+        var next = moa.setting("presets", .object(presets))
+        if moa["default_preset"]?.stringValue == name, let fallback = presets.keys.sorted().first {
+            next = next.setting("default_preset", .string(fallback))
+        }
+        if moa["active_preset"]?.stringValue == name { next = next.setting("active_preset", "") }
+        return next
+    }
+
+    /// The record with a new preset `name`, a copy of `source` (the desktop's Add preset). Nil for an empty or
+    /// taken name.
+    static func adding(_ name: String, copyOf source: String, to moa: JSONValue) -> JSONValue? {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, var presets = moa["presets"]?.objectValue, presets[name] == nil,
+              let copy = presets[source] else { return nil }
+        presets[name] = copy
+        return moa.setting("presets", .object(presets))
     }
 
     var body: some View {
@@ -498,20 +706,58 @@ struct MoaSection: View {
         .task { await reload() }
     }
 
-    @ViewBuilder private var presetSection: some View {
-        if presetNames.count > 1 {
-            Section {
+    private var presetSection: some View {
+        Section {
+            if presetNames.count > 1 {
                 Picker("Preset", selection: Binding(get: { presetName }, set: { selected = $0 })) {
                     ForEach(presetNames, id: \.self) { Text($0).tag($0) }
                 }
-                if presetName != defaultPreset {
-                    Button("Make default") { update { $0 = $0.setting("default_preset", .string(presetName)) } }
-                        .disabled(saving)
-                }
-            } footer: {
-                FormNote("Default preset: \(defaultPreset)")
+            } else {
+                LabeledContent("Preset") { Text(presetName).foregroundStyle(Theme.Text.tertiary) }
             }
-            .hermesFormRows()
+            Toggle("Enabled", isOn: Binding(get: { preset?["enabled"]?.boolValue ?? true }, set: { on in
+                updatePreset { $0.setting("enabled", .bool(on)) }
+            }))
+            .disabled(saving)
+            if presetName != defaultPreset {
+                Button("Make default") { update { $0 = $0.setting("default_preset", .string(presetName)) } }
+                    .disabled(saving)
+            }
+            Button { newPresetName = ""; namingPreset = true } label: {
+                Label("Add preset", systemImage: "plus")
+            }
+            .disabled(saving)
+            if presetNames.count > 1 {
+                Button("Delete preset", role: .destructive) { deletingPreset = true }
+                    .disabled(saving)
+            }
+        } header: {
+            FormNote("Presets")
+        } footer: {
+            FormNote("Each enabled preset shows as a model of the Mixture of Agents provider. Default preset: \(defaultPreset)")
+        }
+        .hermesFormRows()
+        .alert("Add preset", isPresented: $namingPreset) {
+            TextField("new preset", text: $newPresetName)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Cancel", role: .cancel) {}
+            Button("Add") {
+                let name = newPresetName.trimmingCharacters(in: .whitespacesAndNewlines), source = presetName
+                update { moa in if let next = Self.adding(name, copyOf: source, to: moa) { moa = next } }
+                if presetNames.contains(name) { selected = name }
+            }
+            .disabled(newPresetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      || presetNames.contains(newPresetName.trimmingCharacters(in: .whitespacesAndNewlines)))
+        } message: {
+            Text("A copy of “\(presetName)” under a new name.")
+        }
+        .confirmationDialog("Delete preset “\(presetName)”?", isPresented: $deletingPreset, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                let name = presetName
+                update { moa in if let next = Self.deleting(name, from: moa) { moa = next } }
+                selected = presetNames.first { $0 != name } ?? ""
+            }
         }
     }
 
@@ -527,8 +773,11 @@ struct MoaSection: View {
                     }))
                     .labelsHidden()
                 }
+                // A preset keeps at least one reference model (the server refuses an empty one).
                 .swipeActions {
-                    Button("Remove", role: .destructive) { updateSlots { $0.remove(at: index) } }
+                    if slots.count > 1 {
+                        Button("Remove", role: .destructive) { updateSlots { $0.remove(at: index) } }
+                    }
                 }
             }
             Button { addingReference = true } label: {
@@ -543,7 +792,8 @@ struct MoaSection: View {
             FormNote("Reference models")
         } footer: {
             if let failure { FormNote(failure, color: Theme.destructive) }
-            else { FormNote("Each reference model answers on its own; swipe to remove one.") }
+            else { FormNote(slots.count > 1 ? "Each reference model answers on its own; swipe to remove one."
+                                             : "Each reference model answers on its own. A preset keeps at least one.") }
         }
         .hermesFormRows()
     }
@@ -602,6 +852,7 @@ struct MoaSection: View {
     private func update(_ change: (inout JSONValue) -> Void) {
         guard var next = moa, let previous = moa else { return }
         change(&next)
+        guard next != previous else { return }
         moa = next
         saving = true
         failure = nil
@@ -680,7 +931,8 @@ struct FallbackModelsEditor: View {
 }
 
 /// `delegation.model` with `delegation.provider`: the subagents' route, empty for "same as the main model"
-/// (`DelegationRouteRow`). Both keys are saved together.
+/// (`DelegationRouteRow`). Both keys are saved together, and a route picked here leaves a direct endpoint
+/// (`delegation.base_url`, set on the desktop or the CLI), which Hermes would otherwise keep calling.
 struct DelegationRouteRow: View {
     @EnvironmentObject private var store: SettingsStore
     @EnvironmentObject private var catalog: ModelCatalog
@@ -688,26 +940,77 @@ struct DelegationRouteRow: View {
     var saving = false
     @State private var picking = false
 
+    /// The saved route (`SavedRoute` in `delegation-route-draft.ts`).
+    struct Saved: Equatable {
+        var provider: String
+        var model: String
+        var baseURL: String
+    }
+
+    /// A direct URL + key + wire protocol; leaving it clears all three (`DIRECT_ENDPOINT_KEYS`).
+    static let directEndpointKeys = ["delegation.base_url", "delegation.api_key", "delegation.api_mode"]
+    /// Native SDK routes ignore a direct URL (`tools/delegate_tool_config.py`).
+    static let nativeSDKProviders: Set<String> = ["bedrock", "vertex", "google", "google-genai"]
+
+    /// Hermes calls `delegation.base_url` directly (`directEndpointActive`).
+    static func directEndpointActive(_ saved: Saved) -> Bool {
+        !saved.baseURL.trimmingCharacters(in: .whitespaces).isEmpty
+            && !nativeSDKProviders.contains(saved.provider.trimmingCharacters(in: .whitespaces).lowercased())
+    }
+
+    /// The editor mode of a saved route (`savedMode`): a direct endpoint, a provider, a model alone, or inherit.
+    static func mode(_ saved: Saved) -> String {
+        if directEndpointActive(saved) { return "direct" }
+        if !saved.provider.isEmpty { return "provider:\(saved.provider)" }
+        return saved.model.isEmpty ? "inherit" : "model-only"
+    }
+
+    /// What picking `picked` (nil: same as the main model) saves (`draftOutcome` + `applyDelegationRoute`): the
+    /// provider and model, and the direct endpoint's keys cleared when it was active or the mode changes.
+    static func entries(saved: Saved, picked: ModelRoute?) -> [SettingsStore.Entry] {
+        var entries = [SettingsStore.Entry(key: "delegation.provider", value: .string(picked?.provider ?? "")),
+                       SettingsStore.Entry(key: "delegation.model", value: .string(picked?.model ?? ""))]
+        let next = picked.map { "provider:\($0.provider)" } ?? "inherit"
+        if directEndpointActive(saved) || next != mode(saved) {
+            entries += directEndpointKeys.map { SettingsStore.Entry(key: $0, value: .string("")) }
+        }
+        return entries
+    }
+
+    private var saved: Saved {
+        Saved(provider: store.value("delegation.provider")?.displayText ?? "",
+              model: store.value("delegation.model")?.displayText ?? "",
+              baseURL: store.value("delegation.base_url")?.displayText ?? "")
+    }
+
     var body: some View {
-        let route = ModelRoute(provider: store.value("delegation.provider")?.displayText ?? "",
-                               model: store.value("delegation.model")?.displayText ?? "")
-        let inherits = route.model.isEmpty
+        let saved = saved
+        let route = ModelRoute(provider: saved.provider, model: saved.model)
+        let direct = Self.directEndpointActive(saved)
+        let inherits = !direct && route.model.isEmpty
         SettingsRow(title: SettingsCatalog.label(for: "delegation.model"),
-                    description: "The model subagents run on. Same as the main model unless you pick one.",
+                    description: direct
+                        ? "Subagents call a direct endpoint (\(Self.host(saved.baseURL))). Picking a model here stops that."
+                        : "The model subagents run on. Same as the main model unless you pick one.",
                     error: error ?? store.errors["delegation.provider"], saving: saving) {
             Button { picking = true } label: {
-                Text(inherits ? "Main model" : catalog.describe(route))
+                Text(direct ? (saved.model.isEmpty ? "Direct endpoint" : "\(saved.model) · Direct endpoint")
+                            : inherits ? "Main model" : catalog.describe(route))
                     .foregroundStyle(Theme.Text.tertiary)
                     .lineLimit(1)
             }
             .buttonStyle(.borderless)
             .fixedSize()
         }
-        .modelRoutePicker(isPresented: $picking, catalog: catalog, title: "Subagent Model", current: inherits ? nil : route,
-                          clearLabel: "Same as main model") { picked in
-            store.set([SettingsStore.Entry(key: "delegation.provider", value: .string(picked?.provider ?? "")),
-                       SettingsStore.Entry(key: "delegation.model", value: .string(picked?.model ?? ""))])
+        .modelRoutePicker(isPresented: $picking, catalog: catalog, title: "Subagent Model",
+                          current: inherits || direct ? nil : route, clearLabel: "Same as main model") { picked in
+            store.set(Self.entries(saved: saved, picked: picked))
         }
         .task { if !catalog.loaded { await catalog.load() } }
+    }
+
+    /// The endpoint's host, for the row's note (never its key).
+    static func host(_ url: String) -> String {
+        URL(string: url.trimmingCharacters(in: .whitespaces))?.host ?? url
     }
 }

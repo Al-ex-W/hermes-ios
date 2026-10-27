@@ -487,6 +487,98 @@ final class SettingsTests: XCTestCase {
         XCTAssertFalse(confirm.ok)
     }
 
+    func testSpeedReadsUltrafastAsItsOwnTier() throws {
+        XCTAssertEqual(MainModelSection.speed(.string("ultrafast")), "ultrafast")
+        XCTAssertEqual(MainModelSection.speed(.string("Priority")), "fast")
+        XCTAssertEqual(MainModelSection.speed(.string("auto")), "normal")
+        XCTAssertEqual(MainModelSection.speed(nil), "normal")
+        XCTAssertFalse(MainModelSection.fastOn(.string("ultrafast")), "a saved ultrafast isn't shown as Fast")
+        let options = try json("""
+        {"providers": [{"slug": "openai-codex", "name": "Codex", "capabilities": {
+            "gpt-a": {"fast": true, "reasoning": true, "ultrafast": true}, "gpt-b": {"fast": true, "reasoning": true}}}]}
+        """)
+        XCTAssertEqual(ConfigAPI.ultrafastRoutes(options), [ModelRoute(provider: "openai-codex", model: "gpt-a")])
+    }
+
+    func testSubagentRouteLeavesADirectEndpoint() {
+        func keys(_ saved: DelegationRouteRow.Saved, _ picked: ModelRoute?) -> [String: JSONValue] {
+            Dictionary(uniqueKeysWithValues: DelegationRouteRow.entries(saved: saved, picked: picked).map { ($0.key, $0.value) })
+        }
+        let cleared: [String: JSONValue] = ["delegation.base_url": "", "delegation.api_key": "", "delegation.api_mode": ""]
+        // A direct endpoint set on the desktop: any pick here (a route, or the main model) leaves it.
+        let direct = DelegationRouteRow.Saved(provider: "custom", model: "local-m", baseURL: "http://lab:8000/v1")
+        XCTAssertTrue(DelegationRouteRow.directEndpointActive(direct))
+        XCTAssertEqual(keys(direct, ModelRoute(provider: "openrouter", model: "x")),
+                       cleared.merging(["delegation.provider": "openrouter", "delegation.model": "x"]) { $1 })
+        XCTAssertEqual(keys(direct, nil), cleared.merging(["delegation.provider": "", "delegation.model": ""]) { $1 })
+        // Another model of the same provider keeps the request settings.
+        let routed = DelegationRouteRow.Saved(provider: "openrouter", model: "a", baseURL: "")
+        XCTAssertEqual(keys(routed, ModelRoute(provider: "openrouter", model: "b")),
+                       ["delegation.provider": "openrouter", "delegation.model": "b"])
+        // A mode change (another provider, or back to the main model) drops the endpoint keys too.
+        XCTAssertEqual(keys(routed, nil).count, 5)
+        XCTAssertEqual(keys(DelegationRouteRow.Saved(provider: "", model: "", baseURL: ""), ModelRoute(provider: "openrouter", model: "a")).count, 5)
+        // A native SDK provider ignores a URL: it isn't a direct endpoint.
+        XCTAssertFalse(DelegationRouteRow.directEndpointActive(.init(provider: "Bedrock", model: "m", baseURL: "http://x")))
+    }
+
+    @MainActor
+    func testAuxiliaryEditsAndResetLeaveHiddenTasksAlone() throws {
+        let rows = try json("""
+        {"tasks": [
+          {"task": "vision", "provider": "openrouter", "model": "v", "reasoning_effort": "low"},
+          {"task": "voice_chat", "provider": "openrouter", "model": "talk"},
+          {"task": "lint", "provider": "auto", "model": "", "label": "Lint", "inherit_from": "review",
+           "effective": {"provider": "anthropic", "model": "claude", "base_url": ""}},
+          {"task": "review", "provider": "auto", "model": ""}
+        ]}
+        """)
+        let tasks = (rows["tasks"]?.arrayValue ?? []).map(ConfigAPI.AuxiliaryTask.init)
+        XCTAssertEqual(tasks[2].effective, ModelRoute(provider: "anthropic", model: "claude"))
+        XCTAssertNil(tasks[2].route)
+        let catalog = ModelCatalog(api: ConfigAPI(client: try DashboardClient(settings: ConnectionSettings(
+            dashboardURL: "http://127.0.0.1:9", username: "test", password: "test"))))
+        XCTAssertEqual(AuxiliaryModelsSection.summary(tasks[2], in: tasks, catalog: catalog), "Follows Review · claude · anthropic")
+        XCTAssertEqual(AuxiliaryModelsSection.summary(tasks[0], in: tasks, catalog: catalog), "v · openrouter · Low")
+        XCTAssertEqual(AuxiliaryModelsSection.summary(tasks[3], in: tasks, catalog: catalog), "Main model")
+
+        // Reset all: one auto assignment per task shown, never the stripped voice task, effort cleared.
+        let reset = AuxiliaryModelsSection.resetAssignments(tasks)
+        XCTAssertEqual(reset.compactMap(\.task), ["vision", "lint", "review"])
+        XCTAssertEqual(reset[0].body, ["scope": "auxiliary", "provider": "auto", "model": "", "task": "vision",
+                                       "reasoning_effort": .null])
+        // An edit sends its effort (inherit clears it) and never pre-confirms an expensive model.
+        let pinned = AuxiliaryModelsSection.assignment(task: "vision", route: ModelRoute(provider: "openrouter", model: "w"),
+                                                       effort: "none", catalog: catalog)
+        XCTAssertEqual(pinned.body, ["scope": "auxiliary", "provider": "openrouter", "model": "w", "task": "vision",
+                                     "reasoning_effort": "none"])
+        let follow = AuxiliaryModelsSection.assignment(task: "lint", route: nil, effort: AuxiliaryModelsSection.inheritEffort,
+                                                       catalog: catalog)
+        XCTAssertEqual(follow.body, ["scope": "auxiliary", "provider": "auto", "model": "", "task": "lint",
+                                     "reasoning_effort": .null])
+    }
+
+    func testMoaPresetsAddAndDelete() throws {
+        let moa = try json("""
+        {"default_preset": "default", "active_preset": "fast", "presets": {
+          "default": {"enabled": true, "reference_models": [{"provider": "a", "model": "1"}], "aggregator": {"provider": "a", "model": "2"}},
+          "fast": {"enabled": false, "reference_models": [{"provider": "b", "model": "1"}], "aggregator": {"provider": "b", "model": "2"}}
+        }}
+        """)
+        let added = try XCTUnwrap(MoaSection.adding(" deep ", copyOf: "fast", to: moa))
+        XCTAssertEqual(added["presets"]?["deep"], moa["presets"]?["fast"])
+        XCTAssertNil(MoaSection.adding("fast", copyOf: "default", to: moa), "a taken name")
+        XCTAssertNil(MoaSection.adding("  ", copyOf: "default", to: moa))
+
+        let withoutDefault = try XCTUnwrap(MoaSection.deleting("default", from: moa))
+        XCTAssertEqual(withoutDefault["default_preset"], "fast")
+        XCTAssertEqual(withoutDefault["active_preset"], "fast")
+        let withoutActive = try XCTUnwrap(MoaSection.deleting("fast", from: moa))
+        XCTAssertEqual(withoutActive["active_preset"], "")
+        XCTAssertEqual(withoutActive["default_preset"], "default")
+        XCTAssertNil(MoaSection.deleting("fast", from: withoutDefault), "the last preset stays")
+    }
+
     func testFallbackEntriesKeepRoutingAndReadLegacyStrings() {
         let rows = FallbackModelsEditor.entries(.array([
             ["provider": "openrouter", "model": "a", "base_url": "http://x"],

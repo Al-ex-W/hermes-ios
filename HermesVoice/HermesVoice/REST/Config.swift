@@ -302,11 +302,25 @@ final class ConfigAPI: ConfigTransport {
         ModelInfo(try await get("/api/model/info"))
     }
 
-    /// `GET /api/model/options`: the same shape as the `model.options` RPC.
-    func modelOptions(refresh: Bool = false) async throws -> ModelOptionsResult {
+    /// `GET /api/model/options`: the same shape as the `model.options` RPC, and the models that offer Ultrafast
+    /// (`capabilities[model].ultrafast`, which the pinned contract's `ModelCapabilities` doesn't carry yet).
+    func modelOptions(refresh: Bool = false) async throws -> (result: ModelOptionsResult, ultrafast: Set<ModelRoute>) {
         var query = ["explicit_only": "1"]
         if refresh { query["refresh"] = "1" }
-        return try await get("/api/model/options", query).decode(ModelOptionsResult.self)
+        let json = try await get("/api/model/options", query)
+        return (try json.decode(ModelOptionsResult.self), Self.ultrafastRoutes(json))
+    }
+
+    /// The `{provider slug, model}` pairs whose capabilities say `ultrafast: true` (`inventory.py::_apply_capabilities`).
+    static func ultrafastRoutes(_ options: JSONValue) -> Set<ModelRoute> {
+        var routes: Set<ModelRoute> = []
+        for row in options["providers"]?.arrayValue ?? [] {
+            guard let slug = row["slug"]?.stringValue else { continue }
+            for (model, caps) in row["capabilities"]?.objectValue ?? [:] where caps["ultrafast"]?.boolValue == true {
+                routes.insert(ModelRoute(provider: slug, model: model))
+            }
+        }
+        return routes
     }
 
     /// `POST /api/model/set` (`ModelAssignmentRequest`).
@@ -365,10 +379,17 @@ final class ConfigAPI: ConfigTransport {
         var reasoningEffort: String?
         var label: String?
         var hint: String?
+        /// A plugin task that follows this base task until it is pinned itself.
         var inheritFrom: String?
+        /// An inheriting task's route right now (the base's while it isn't pinned).
+        var effective: ModelRoute?
 
         var id: String { task }
-        var followsMain: Bool { (provider.isEmpty || provider == "auto") && model.isEmpty }
+        /// Not pinned: provider auto (or none) follows the main model, or an inheriting task's base
+        /// (`_layer_over_inherited`). The desktop reads it the same way, whatever the stored model.
+        var isAuto: Bool { provider.isEmpty || provider.lowercased() == "auto" }
+        /// The pinned route, nil while auto.
+        var route: ModelRoute? { isAuto ? nil : ModelRoute(provider: provider, model: model) }
 
         init(_ json: JSONValue) {
             task = json["task"]?.stringValue ?? ""
@@ -379,6 +400,10 @@ final class ConfigAPI: ConfigTransport {
             label = json["label"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
             hint = json["hint"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
             inheritFrom = json["inherit_from"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+            if let effective = json["effective"], effective.objectValue != nil {
+                self.effective = ModelRoute(provider: effective["provider"]?.stringValue ?? "",
+                                            model: effective["model"]?.stringValue ?? "")
+            }
         }
     }
 
