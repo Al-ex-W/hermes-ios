@@ -20,6 +20,7 @@ struct KeysSettingsView: View {
     var body: some View {
         let entries = catalog.entries(categories: categories)
         Form {
+            SettingsScopeNote()
             Section {
                 if loaded && entries.isEmpty {
                     Text("Nothing to set up here.").foregroundStyle(Theme.Text.tertiary)
@@ -50,7 +51,7 @@ struct KeysSettingsView: View {
 
     private func reload() async {
         do {
-            catalog = try await context.client.envVars()
+            catalog = try await context.client.envVars(profile: context.profile)
             failure = nil
         } catch {
             if !error.isCancellation { failure = error.localizedDescription }
@@ -71,6 +72,7 @@ private struct CredentialRow: View {
     @State private var draft = ""
     @State private var busy = false
     @State private var failure: String?
+    @State private var confirmingRemove = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
@@ -109,7 +111,7 @@ private struct CredentialRow: View {
                     Button(info.isSet ? "Replace" : "Save") { Task { await save() } }
                         .disabled(busy || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     if info.isSet {
-                        Button("Remove", role: .destructive) { Task { await remove() } }.disabled(busy)
+                        Button("Remove", role: .destructive) { confirmingRemove = true }.disabled(busy)
                     }
                     Spacer()
                     if let url = info.url.flatMap(URL.init(string:)) {
@@ -125,6 +127,12 @@ private struct CredentialRow: View {
             }
         }
         .padding(.vertical, Theme.Spacing.xxs)
+        // As every credential removal on the desktop and the Providers > API keys page: there's no undo.
+        .confirmationDialog("Remove \(info.key)?", isPresented: $confirmingRemove, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { Task { await remove() } }
+        } message: {
+            Text("Hermes deletes it from this profile's .env on the host, with every copy of it in the config.")
+        }
     }
 
     private func save() async {
@@ -133,7 +141,7 @@ private struct CredentialRow: View {
         busy = true
         defer { busy = false }
         do {
-            try await context.client.setEnv(info.key, value: value)
+            try await context.client.setEnv(info.key, value: value, profile: context.profile)
             changed(true, CredentialMask.localPreview(value.trimmingCharacters(in: .whitespacesAndNewlines)))
             draft = ""
             failure = nil
@@ -146,7 +154,7 @@ private struct CredentialRow: View {
         busy = true
         defer { busy = false }
         do {
-            try await context.client.deleteEnv(info.key)
+            try await context.client.deleteEnv(info.key, profile: context.profile)
             changed(false, nil)
             failure = nil
         } catch {

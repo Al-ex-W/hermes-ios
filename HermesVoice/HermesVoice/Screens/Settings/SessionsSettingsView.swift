@@ -39,6 +39,7 @@ struct SessionsSettingsView: View {
     var body: some View {
         Form {
             if subpage == "default-directory" {
+                SettingsScopeNote()
                 folderSection
             } else {
                 retentionSection
@@ -49,7 +50,7 @@ struct SessionsSettingsView: View {
         .settingsAnchor(anchor, ready: store.phase == .loaded)
         .refreshable { await reload() }
         .task {
-            folder = DefaultProjectFolder.dir(base: context.client.base, profile: nil) ?? ""
+            folder = DefaultProjectFolder.dir(base: context.client.base, profile: context.profile) ?? ""
             if subpage != "default-directory" { await reload() }
         }
         .confirmationDialog("Delete \(deleting?.displayTitle ?? "")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
@@ -121,16 +122,18 @@ struct SessionsSettingsView: View {
         } header: {
             FormNote("Default project folder")
         } footer: {
-            FormNote("A folder on the Hermes host that new chats from this iPhone start in. Empty uses "
-                + (fallback.map { "the host's working directory (\($0))." } ?? "the host's working directory."))
+            FormNote("A folder on the Hermes host that new chats from this iPhone start in"
+                + (context.profile.map { " when the sidebar shows the “\($0)” profile" } ?? "")
+                + ". Empty uses " + (fallback.map { "the host's working directory (\($0))." } ?? "the host's working directory."))
         }
         .hermesFormRows()
         .id("sessions.default-directory")
     }
 
     private func saveFolder() {
-        DefaultProjectFolder.set(folder, base: context.client.base, profile: nil)
-        folder = DefaultProjectFolder.dir(base: context.client.base, profile: nil) ?? ""
+        // The key new chats read (ChatModel: the chat's profile, the sidebar's), so the folder is the one they use.
+        DefaultProjectFolder.set(folder, base: context.client.base, profile: context.profile)
+        folder = DefaultProjectFolder.dir(base: context.client.base, profile: context.profile) ?? ""
     }
 
     private func reload() async {

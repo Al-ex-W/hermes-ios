@@ -22,6 +22,7 @@ struct VaultSettingsView: View {
 
     var body: some View {
         Form {
+            SettingsScopeNote()
             if context.gateway == nil {
                 Section { FormNote("Not connected to Hermes.") }
             } else if showsSources {
@@ -150,9 +151,9 @@ struct VaultSettingsView: View {
         guard let gateway = context.gateway else { return }
         do {
             if showsSources {
-                sources = try await gateway.vaultSources().sources ?? []
+                sources = try await gateway.vaultSources(.init(profile: context.profile)).sources ?? []
             } else {
-                items = try await gateway.vaultList().items ?? []
+                items = try await gateway.vaultList(.init(profile: context.profile)).items ?? []
             }
             failure = nil
         } catch {
@@ -175,21 +176,29 @@ struct VaultSettingsView: View {
     }
 
     private func remove(_ item: VaultItem) async {
-        await run { _ = try await $0.vaultRemove(.init(id: item.id)) }
+        let profile = context.profile
+        await run { _ = try await $0.vaultRemove(.init(profile: profile, id: item.id)) }
     }
 
     private func setEnabled(_ source: VaultSource, _ enabled: Bool) async {
-        await run { _ = try await $0.vaultSourceSet(.init(name: source.name, enabled: enabled)) }
+        let profile = context.profile
+        await run {
+            _ = try await $0.vaultSourceSet(.init(profile: profile, name: source.name, enabled: enabled))
+        }
     }
 
     private func unlock(_ source: VaultSource) async {
         let secret = password
         password = ""
-        await run { _ = try await $0.vaultUnlock(.init(name: source.name, password: secret)) }
+        let profile = context.profile
+        await run {
+            _ = try await $0.vaultUnlock(.init(profile: profile, name: source.name, password: secret))
+        }
     }
 
     private func lock(_ source: VaultSource) async {
-        await run { _ = try await $0.vaultLock(.init(name: source.name)) }
+        let profile = context.profile
+        await run { _ = try await $0.vaultLock(.init(profile: profile, name: source.name)) }
     }
 }
 
@@ -344,7 +353,7 @@ struct VaultAddForm: View {
         defer { saving = false }
         let origin = draft.origin.trimmingCharacters(in: .whitespaces)
         do {
-            _ = try await gateway.vaultAdd(.init(kind: VaultKind(rawValue: draft.kind),
+            _ = try await gateway.vaultAdd(.init(profile: context.profile, kind: VaultKind(rawValue: draft.kind),
                                                  label: draft.label.trimmingCharacters(in: .whitespaces),
                                                  origin: origin, secret: draft.secret))
             draft = Draft()

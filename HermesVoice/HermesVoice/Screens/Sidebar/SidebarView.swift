@@ -66,7 +66,9 @@ struct SidebarView: View {
             }
         }
         .sheet(isPresented: $showSettings) {
-            NavigationStack { SettingsView() }
+            NavigationStack {
+                SettingsView(profile: sidebar.options.profileScope == SidebarOptions.allProfiles ? nil : sidebar.options.profileScope)
+            }
         }
         // A session opened from elsewhere (a tapped notification) shows above any open sheet. Only that: the
         // selection also changes when a sent draft settles into its listed row, which must not close a sheet.

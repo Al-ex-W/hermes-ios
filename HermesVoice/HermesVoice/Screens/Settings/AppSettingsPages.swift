@@ -73,6 +73,7 @@ struct AppearanceSettingsView: View {
     var body: some View {
         Form {
             if subpage == "chat-display" {
+                SettingsScopeNote()
                 Section {
                     if store.phase == .loaded, store.field("display.show_reasoning") != nil {
                         ConfigFieldRow(key: "display.show_reasoning").id("display.show_reasoning")

@@ -3,10 +3,12 @@ import SwiftUI
 /// Settings › Providers, for the signed-in dashboard (an entry point that needs no client of its own).
 struct ProvidersPage: View {
     @EnvironmentObject private var model: AppModel
+    /// The profile it starts on (Settings' "Applies to"); nil is the dashboard's own.
+    var scope: String?
 
     var body: some View {
         if let client = model.client {
-            ProvidersScreen(client: client)
+            ProvidersScreen(client: client, scope: scope)
         } else {
             ContentUnavailableView("Not signed in", systemImage: "key", description: Text("Sign in to the Hermes dashboard first."))
                 .navigationTitle("Providers")
@@ -21,6 +23,11 @@ struct ProvidersScreen: View {
     @StateObject private var scopes = ProfileScopeModel()
     /// The profile the page edits; nil is the dashboard's own.
     @State private var scope: String?
+
+    init(client: DashboardClient, scope: String? = nil) {
+        self.client = client
+        _scope = State(initialValue: scope)
+    }
     @State private var accounts: [OAuthAccount]?
     @State private var loadError: String?
     @State private var showOthers = false

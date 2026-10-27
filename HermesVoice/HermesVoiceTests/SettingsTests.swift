@@ -644,6 +644,31 @@ final class SettingsTests: XCTestCase {
         XCTAssertNil(DefaultProjectFolder.dir(base: home, profile: nil, defaults: defaults))
     }
 
+    @MainActor
+    func testSettingsEditTheScopedProfileAndSayWhichOne() throws {
+        var root = ProfileInfo(name: "default", isDefault: true)
+        root.displayName = nil
+        var work = ProfileInfo(name: "work", displayName: "Work")
+        work.botTitle = nil
+        let profiles = [root, work]
+        // One profile: no note, whatever is edited.
+        XCTAssertNil(SettingsContext.scopeNote(profile: "work", profiles: [work], dashboardProfile: "default"))
+        // The default (root) profile, picked or followed: no note.
+        XCTAssertNil(SettingsContext.scopeNote(profile: nil, profiles: profiles, dashboardProfile: "default"))
+        XCTAssertNil(SettingsContext.scopeNote(profile: "default", profiles: profiles, dashboardProfile: "default"))
+        // Another profile (the sidebar's, or picked): named as its chip names it.
+        XCTAssertEqual(SettingsContext.scopeNote(profile: "work", profiles: profiles, dashboardProfile: "default"),
+                       "Changes on this page apply to the “Work” profile.")
+        XCTAssertEqual(SettingsContext.scopeNote(profile: nil, profiles: profiles, dashboardProfile: "work"),
+                       "Changes on this page apply to the “Work” profile.")
+
+        // The pages' requests carry the profile.
+        let client = try DashboardClient(settings: ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "test",
+                                                                      password: "test"))
+        XCTAssertEqual(SettingsContext(client: client, gateway: nil, profile: "work").api.profile, "work")
+        XCTAssertNil(SettingsContext(client: client, gateway: nil).api.profile)
+    }
+
     func testStatusAndModelInfoDecoding() throws {
         let status = ConfigAPI.Status(try json(#"{"version": "0.9.1", "release_date": "2026-10-01", "config_version": 41, "latest_config_version": 42, "gateway_running": true, "gateway_state": "running", "active_sessions": 2}"#))
         XCTAssertEqual(status.version, "0.9.1")

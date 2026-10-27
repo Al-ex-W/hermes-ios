@@ -11,17 +11,35 @@ enum SettingsRoute: Hashable {
     }
 }
 
-/// What the settings pages talk to: the dashboard's REST routes and the gateway's RPCs.
+/// What the settings pages talk to: the dashboard's REST routes and the gateway's RPCs, for the profile the
+/// pages edit (the shared "Applies to" scope).
 @MainActor
 final class SettingsContext: ObservableObject {
     let client: DashboardClient
     let gateway: GatewayClient?
     let api: ConfigAPI
+    /// The profile the config, key, vault and memory pages edit, sent as `?profile=` / `profile`; nil is the
+    /// dashboard's own.
+    let profile: String?
+    /// "Changes on this page apply to the … profile." while the pages edit a profile other than the default one.
+    @Published var scopeNote: String?
 
-    init(client: DashboardClient, gateway: GatewayClient?) {
+    init(client: DashboardClient, gateway: GatewayClient?, profile: String? = nil) {
         self.client = client
         self.gateway = gateway
-        api = ConfigAPI(client: client)
+        self.profile = profile
+        api = ConfigAPI(client: client, profile: profile)
+    }
+
+    /// The scope note (`SettingsProfileScope`): shown with two or more profiles while the pages edit one that isn't
+    /// the default (root) profile, naming it as its chip does.
+    static func scopeNote(profile: String?, profiles: [ProfileInfo], dashboardProfile: String) -> String? {
+        guard profiles.count > 1 else { return nil }
+        let name = profile ?? dashboardProfile
+        let root = profiles.first(where: \.isDefault)?.name ?? "default"
+        guard name.lowercased() != root.lowercased() else { return nil }
+        let label = profiles.first { $0.name.lowercased() == name.lowercased() }.map(ProfileScopeSection.label) ?? name
+        return "Changes on this page apply to the “\(label)” profile."
     }
 }
 
@@ -30,11 +48,14 @@ final class SettingsContext: ObservableObject {
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
+    /// The profile new chats start in (the sidebar's), which the pages edit until another is picked; nil is the
+    /// dashboard's own.
+    var profile: String?
 
     var body: some View {
         Group {
             if let client = model.client {
-                SettingsRoot(context: SettingsContext(client: client, gateway: model.connection?.client))
+                SettingsScope(client: client, gateway: model.connection?.client, inUse: profile)
             } else {
                 ContentUnavailableView("Signed out", systemImage: "network.slash",
                                        description: Text("Sign in to the Hermes dashboard to change its settings."))
@@ -48,17 +69,41 @@ struct SettingsView: View {
     }
 }
 
+/// The shared "Applies to" scope (`SettingsProfileScope`): the profile the config-backed pages edit, following
+/// the sidebar's profile until another is picked. Picking one rebuilds the pages for it.
+private struct SettingsScope: View {
+    let client: DashboardClient
+    let gateway: GatewayClient?
+    let inUse: String?
+    @StateObject private var scopes = ProfileScopeModel()
+    /// A profile picked here; nil follows `inUse`.
+    @State private var picked: String?
+
+    var body: some View {
+        let profile = picked ?? inUse
+        SettingsRoot(context: SettingsContext(client: client, gateway: gateway, profile: profile), scopes: scopes,
+                     selection: Binding(get: { profile ?? scopes.dashboardProfile },
+                                        set: { picked = $0 == (inUse ?? scopes.dashboardProfile) ? nil : $0 }))
+            .id(profile ?? "")
+            .task { await scopes.load(client) }
+    }
+}
+
 private struct SettingsRoot: View {
     @StateObject private var context: SettingsContext
     @StateObject private var store: SettingsStore
     @StateObject private var catalog: ModelCatalog
+    @ObservedObject var scopes: ProfileScopeModel
+    @Binding var selection: String
     @State private var query = ""
     @State private var credentials: [SettingsSearchEntry] = []
 
-    init(context: SettingsContext) {
+    init(context: SettingsContext, scopes: ProfileScopeModel, selection: Binding<String>) {
         _context = StateObject(wrappedValue: context)
         _store = StateObject(wrappedValue: SettingsStore(transport: context.api))
         _catalog = StateObject(wrappedValue: ModelCatalog(api: context.api))
+        self.scopes = scopes
+        _selection = selection
     }
 
     private var searching: Bool { !query.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -68,6 +113,18 @@ private struct SettingsRoot: View {
             if searching {
                 results
             } else {
+                if scopes.profiles.count > 1 {
+                    Section {
+                        Picker("Applies to", selection: $selection) {
+                            ForEach(scopes.profiles) { profile in
+                                Text(ProfileScopeSection.label(profile)).tag(profile.name)
+                            }
+                        }
+                    } footer: {
+                        FormNote(context.scopeNote ?? "Model, chat, workspace, safety, memory, keys and passwords are kept per profile.")
+                    }
+                    .hermesFormRows()
+                }
                 ForEach(Array(SettingsPageID.groups.enumerated()), id: \.offset) { _, group in
                     Section {
                         ForEach(group) { page in
@@ -83,8 +140,12 @@ private struct SettingsRoot: View {
         .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search settings")
         .task(id: searching) {
             // Credential rows join the index the first time a search starts.
-            guard searching, credentials.isEmpty, let catalog = try? await context.client.envVars() else { return }
+            guard searching, credentials.isEmpty, let catalog = try? await context.client.envVars(profile: context.profile) else { return }
             credentials = SettingsSearch.credentialEntries(catalog)
+        }
+        .onChange(of: [scopes.profiles.map(\.name), [scopes.dashboardProfile]], initial: true) {
+            context.scopeNote = SettingsContext.scopeNote(profile: context.profile, profiles: scopes.profiles,
+                                                          dashboardProfile: scopes.dashboardProfile)
         }
         .hermesForm()
         .navigationTitle("Settings")
@@ -155,8 +216,25 @@ struct SettingsPageView: View {
     }
 }
 
+/// The scope note on a page that edits the scoped profile (nothing while it edits the default one).
+struct SettingsScopeNote: View {
+    @EnvironmentObject private var context: SettingsContext
+
+    var body: some View {
+        if let note = context.scopeNote {
+            Section {
+                Label { Text(note) } icon: { Image(systemName: "person.crop.circle") }
+                    .hermesText(.caption)
+                    .foregroundStyle(Theme.primary)
+            }
+            .hermesFormRows()
+        }
+    }
+}
+
 /// The content of one page or subpage.
 struct SettingsContentView: View {
+    @EnvironmentObject private var context: SettingsContext
     let page: SettingsPageID
     let subpage: String?
     let anchor: String?
@@ -182,7 +260,7 @@ struct SettingsContentView: View {
         case .vault: VaultSettingsView(subpage: subpage)
         case .notifications: NotificationsSettingsView(anchor: anchor)
         case .billing: BillingSettingsView()
-        case .providers: ProvidersPage()
+        case .providers: ProvidersPage(scope: context.profile)
         case .profiles: ProfilesPage()
         case .connection: ConnectionSettingsView()
         case .calls: CallsSettingsView()
@@ -263,6 +341,7 @@ struct ConfigSubpageView: View {
         let fields = store.fields(in: section, subpage: subpage)
         let embedded = section.page == .model && ["main", "auxiliary", "moa"].contains(subpageID)
         return Form {
+            SettingsScopeNote()
             if section.page == .model {
                 switch subpageID {
                 case "main"?: MainModelSection()
