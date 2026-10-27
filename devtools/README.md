@@ -215,6 +215,75 @@ and 90 days of usage, without new chats. `minimal` has none of it, to see the em
 never served. Keys and tokens typed into these routes go to the profile's `.env` or config only and are never
 logged.
 
+### Files, git review, messaging, agents, import, star map and kanban (M5)
+
+The M5 screens have their routes here too. The shapes come from `hermes_cli/web_routers/{files,git,messaging,ops,
+chat_workspaces,status}.py`, `hermes_cli/{web_git,web_server_files,web_server_messaging,foreign_sessions_browser,
+webhook}.py`, `gateway/pairing.py`, `agent/learning_graph.py`, `tui_gateway/methods_{subagents,session_foreign}.py`
+and the kanban plugin (`plugins/kanban/dashboard/plugin_api.py` over `hermes_cli/kanban_db*.py`); each handler names
+its source. Everything lives in the "M5" section of `fake_hermes.py` (`class WorkspaceFeatures`).
+
+- **Files panel**: `GET /api/fs/list?path=` (`{entries: [{name, path, isDirectory}]}`, build and VCS folders and
+  credential files left out; a missing path or a file answers `{entries: [], error: ENOENT|ENOTDIR}`),
+  `POST /api/fs/write-text {path, content}`, `GET /api/fs/git-root`, `GET /api/fs/default-cwd?profile=` (the
+  profile's `terminal.cwd`, else the home folder), and the managed files `GET`/`DELETE /api/files`,
+  `/api/files/read`, `/download`, `/upload` (a base64 data URL), `/upload-stream` (multipart) and `/mkdir`. The
+  host is `/home/demo` (notes, the Atlas and Beacon projects, a markdown doc and two PNGs); writes land in the same
+  files the M4 `read-text`/`read-data-url`/`download` routes and the chat's `@file:` refs read.
+- **Git review**: `/api/git/status`, `gh-auth`, `worktrees`, `branches`, `base-branches`, `review/list` (scopes
+  `uncommitted`, `branch`, `lastTurn`), `review/diff`, `file-diff`, `review/commit-context`, `review/rev-parse`,
+  `review/ship-info`, `review/pr-list`, and the mutations `review/stage`, `unstage`, `revert`, `commit` (+ push),
+  `push`, `create-pr`, `worktree/add`, `worktree/remove` and `branch/switch`, with git's and gh's own error text as
+  `400 {detail}`. The repositories are a model over the fake files (HEAD, index and working tree), not real repos.
+  With `--seed full`/`demo`, Atlas (`main`, one local commit not pushed) has a staged, an unstaged, a both, an added,
+  a deleted and two untracked files, a linked worktree `.worktrees/token-refresh` on the PR branch
+  `hermes/token-refresh` (PR #42), a local-only branch, a remote-only branch and PRs (one from a fork, which never
+  counts for a branch); Beacon is clean on `release/1.4`, one commit behind. `--seed minimal` keeps one clean commit
+  per repo and gh signed out. `--gh ready|signed-out|missing` overrides gh. `worktree/add` on a folder that is no
+  repo yet runs `git init` with an empty root commit, like Hermes. The git routes ignore `?profile=`, as Hermes does.
+- **Chat workspaces**: `GET /api/chat/workspaces?profile=&scan=` (projects, repos, default folder, home).
+- **Messaging**: `GET /api/messaging/platforms?profile=`, `PUT /api/messaging/platforms/{id}` (the platform's own
+  keys only, Telegram's token and allowlist checks, never a redacted preview), `POST …/{id}/test` (auth posture:
+  `allowlist`, `pairing`, `open` or `deny_all`). States: `connected`, `pending_restart` (until a gateway restart
+  finishes), `gateway_stopped`, `not_configured`, `disabled`, and `fatal` for a token starting with `bad`. The
+  default profile has Telegram connected with a home channel and Discord rejecting its token.
+- **Onboarding**: Telegram (`/api/messaging/telegram/onboarding/start`, `/{id}`, `/{id}/apply`, `DELETE /{id}`) and
+  WhatsApp (`…/whatsapp/onboarding/…`, `starting` → `waiting` with a QR payload → `connected`). A pairing completes on
+  its `--onboarding-polls`-th status poll (default 3), or at once with the fake-only
+  `POST /api/messaging/debug/onboarding/{id}/complete`. Apply writes the profile's `.env`, enables the platform and
+  restarts the gateway (best effort, `restart_busy` while a turn runs).
+- **Pairing**: `GET /api/pairing`, `POST /api/pairing/approve {platform, request_id | code, profile}`, `revoke`,
+  `clear-pending`. Codes are never returned; five wrong codes lock a platform out (429). The fake-only
+  `POST /api/pairing/debug/request {platform, user_id, user_name?}` adds a pending request and returns its code.
+- **Webhooks**: `GET /api/webhooks`, `POST /api/webhooks/enable`, `POST /api/webhooks` (the secret is shown once),
+  `PUT /api/webhooks/{name}/enabled`, `DELETE /api/webhooks/{name}?profile=` (the profile must be named).
+- **Gateway**: `POST /api/gateway/start` and `POST /api/gateway/stop?interrupt=` (409 while a turn runs) are
+  actions (`gateway-start`, `gateway-stop`) tailed with `/api/actions/{name}/status`. Each profile has its own
+  gateway; `/api/status` reports it (`gateway_running`, `gateway_state`, `gateway_platforms`).
+- **Agents**: the chat trigger word `fleet` runs one `delegate_task` with three subagents (one spawns a grandchild,
+  one fails) over about `--fleet-seconds` (default 8). `subagent.list`, `subagent.interrupt`, `subagent.tail` and
+  `subagent.steer` act on them.
+- **Session import**: `session.foreign.list` / `preview` / `import` over five Claude Code and Codex logs (one
+  unreadable); an import becomes a `claude-code` / `codex-cli` chat in the profile, once per profile.
+- **Star map**: `GET /api/learning/graph?profile=` (learned skills, MEMORY.md / USER.md entries, related and
+  memory→skill edges, clusters, stats), `GET`/`PUT /api/learning/node` and `DELETE /api/learning/node` (a memory
+  entry here, a skill is archived by the M4 handler). Memory node ids carry a fingerprint; a stale one is 400.
+- **Kanban**: `GET /api/dashboard/plugins` lists the bundled kanban plugin (and `hermes_voice` where it's enabled);
+  `--no-kanban`, or a profile that disabled the kanban plugin through `plugins.manage`, drops it and answers
+  `/api/plugins/kanban/*` with `404 Plugin not found`. The plugin routes: `board`, `workflow`, `tasks` (+ `/{id}`
+  GET/PATCH/DELETE, `/bulk`, `/comments`, `/attachments` (multipart), `/log`, `/reclaim`, `/reassign`,
+  `/estimate`, `/specify`, `/decompose`, `/home-subscribe/{platform}`), `attachments/{id}`, `links`, `estimate`,
+  `diagnostics`, `workers/active`, `runs/{id}` (+ `/terminate`), `config`, `home-channels`, `stats`, `assignees`,
+  `dispatch`, `model-options`, `projects`, `boards` (+ create, `PATCH`/`DELETE /{slug}`, `/export`, `/import`,
+  `/switch`), `profiles` (+ `PATCH`, `/describe-auto`) and `orchestration`. Boards are shared by every profile; the
+  orchestration knobs live in the profile's config. `WS /api/plugins/kanban/events?ticket=&board=&since=` (the same
+  single-use ticket `/api/ws` takes) sends `{events, cursor}` every 0.3 s for every change made through the API;
+  without `since` it starts at the tail. `dispatch` gives ready cards a fake worker that finishes after
+  `--kanban-run-seconds` (default 20); the seeded running card finishes after two minutes.
+
+Bot tokens, webhook secrets and app passwords typed into these routes land in the profile's `.env` or config and
+are never logged. `/api/audio/*` is never served.
+
 ### Detached sessions
 
 When the last socket of a session closes, the session keeps running with nobody attached, and its turn
@@ -249,7 +318,8 @@ cd hermes-voice-mcp
 uv run pytest -q ../devtools/tests
 ```
 
-The tests start the fake in-process. `test_fake_hermes_m4.py` covers the M4 routes and `plugins.manage`; the
+The tests start the fake in-process. `test_fake_hermes_m4.py` covers the M4 routes and `plugins.manage`;
+`test_fake_hermes_m5.py` covers the M5 routes, the kanban events socket and the M5 RPCs (on ports 9300-9309); the
 others cover sign-in and streaming, reconnect plus replay (also truncated),
 reaping and `session.activate` after a reap, resuming a reaped draft, approvals across a reconnect,
 `approval.respond`, 4404 declines, clients that can't answer, clarify locks, secrets, interrupt and timeout
