@@ -6,11 +6,15 @@ import UIKit
 struct ChatScreen: View {
     @ObservedObject var chat: ChatModel
     let sidebar: SidebarModel
+    /// The workspace panel beside (iPad) or over (iPhone) the chat; the header button toggles it.
+    @Binding var workspaceOpen: Bool
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var calls: CallController
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var preview: MediaPreview?
     @State private var mediaNote: String?
+    /// A desktop overlay the chat opened (the status stack's Agents button, `/journey`), pushed over it.
+    @State private var pushed: ChatOverlay?
 
     private var callHere: VoiceCall? {
         guard let call = calls.active, call.chat === chat else { return nil }
@@ -35,17 +39,25 @@ struct ChatScreen: View {
                         .disabled(calls.active != nil || calls.starting)
                         .accessibilityLabel("Start voice call")
                     }
+                    // The desktop's titlebar toggle for its right sidebar (Files and Review).
+                    Button { workspaceOpen.toggle() } label: {
+                        Image(systemName: Theme.Icon.workspace)
+                    }
+                    .accessibilityLabel(workspaceOpen ? "Hide files and review" : "Show files and review")
                     ChatSessionMenu(chat: chat, sidebar: sidebar, open: open)
                 }
+            }
+            .navigationDestination(item: $pushed) { overlay in
+                ChatOverlayScreen(overlay: overlay, chat: chat, sidebar: sidebar)
             }
             .environment(\.transcriptActions, actions)
             .onAppear {
                 chat.setInUse("view", true)
                 let compact = sizeClass == .compact
-                let shell = sidebar, app = model
+                let shell = sidebar, app = model, push = $pushed
                 chat.navigate = { [weak shell, weak app] route in
                     guard let shell, let app else { return }
-                    Self.open(route, sidebar: shell, app: app, compact: compact)
+                    Self.open(route, sidebar: shell, app: app, compact: compact, push: push)
                 }
             }
             .onDisappear { chat.setInUse("view", false) }
@@ -74,7 +86,7 @@ struct ChatScreen: View {
             if let prompts = model.prompts {
                 PromptStack(center: prompts, sessionIDs: chat.sessionIDs)
             }
-            StatusStackView(status: chat.status, composer: chat.composer, busy: chat.busy)
+            StatusStackView(status: chat.status, composer: chat.composer, busy: chat.busy) { pushed = .agents }
             ComposerView(composer: chat.composer, busy: chat.busy, status: chat.status, newChat: chat.isNewChat && !chat.hasContent)
         }
         .padding(.horizontal, Theme.Spacing.lg)
@@ -130,10 +142,11 @@ struct ChatScreen: View {
     }
 
     private func open(_ route: ChatModel.Route) {
-        Self.open(route, sidebar: sidebar, app: model, compact: sizeClass == .compact)
+        Self.open(route, sidebar: sidebar, app: model, compact: sizeClass == .compact, push: $pushed)
     }
 
-    private static func open(_ route: ChatModel.Route, sidebar: SidebarModel, app: AppModel, compact: Bool) {
+    private static func open(_ route: ChatModel.Route, sidebar: SidebarModel, app: AppModel, compact: Bool,
+                             push: Binding<ChatOverlay?>) {
         switch route {
         case .newChat:
             sidebar.newSession()
@@ -142,6 +155,37 @@ struct ChatScreen: View {
             if compact { sidebar.selection = nil }
         case let .session(summary):
             if let chat = app.chat(for: summary) { sidebar.open(chat) }
+        case .agents:
+            push.wrappedValue = .agents
+        case .memoryGraph:
+            push.wrappedValue = .memoryGraph
+        }
+    }
+}
+
+/// The desktop overlays a chat opens over itself; here they push onto the chat, and Back returns to it.
+enum ChatOverlay: Hashable {
+    case agents, memoryGraph
+}
+
+/// An overlay pushed from a chat: the subagent tree, or the memory graph of the chat's profile.
+private struct ChatOverlayScreen: View {
+    let overlay: ChatOverlay
+    let chat: ChatModel
+    let sidebar: SidebarModel
+    @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var agents: AgentsStore
+
+    var body: some View {
+        switch overlay {
+        case .agents:
+            AgentsScreen(context: .init(store: agents, openSession: { [sidebar] id, profile in
+                sidebar.open(sessionID: id, profile: profile)
+            }))
+        case .memoryGraph:
+            if let client = model.client {
+                StarmapScreen(context: .init(client: client, profileScope: chat.profile ?? SidebarOptions.allProfiles))
+            }
         }
     }
 }

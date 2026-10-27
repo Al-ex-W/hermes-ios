@@ -73,6 +73,36 @@ final class FakeHermesTests: XCTestCase {
         XCTAssertEqual(chat.lastReply, "Echo: hello there")
     }
 
+    /// Two M5 reads as Hermes answers them: a kanban worker's live stats, and a workspace download that names its
+    /// session (resolved in the requested profile, relative paths against the session's folder; 404 otherwise).
+    func testKanbanRunInspectAndSessionScopedDownloads() async throws {
+        // A dispatched card gets a worker whose run reports live stats.
+        let kanban = KanbanAPI(transport: client)
+        let created = try await kanban.createTask(KanbanNewTask(title: "Inspect this worker", assignee: "default"))
+        let taskID = try XCTUnwrap(created.task?.id)
+        try await kanban.dispatch()
+        let workers = try await kanban.activeWorkers()
+        let worker = try XCTUnwrap(workers.first { $0.taskID == taskID })
+        let live = try await kanban.inspectRun(worker.runID)
+        XCTAssertTrue(live.alive)
+        XCTAssertEqual(live.pid, worker.workerPID)
+        XCTAssertNotNil(live.memoryRSSBytes)
+        XCTAssertNotNil(live.threads)
+        let ended = try await kanban.inspectRun(2)
+        XCTAssertFalse(ended.alive)
+        XCTAssertEqual(ended.reason, "run already ended")
+
+        let sessions = try await storedSessions()
+        let q3 = try XCTUnwrap(sessions.first { $0.title == "Q3 latency report" })
+        let file = try await client.workspaceDownloadFile("README.md", profile: q3.profile, sessionID: q3.id)
+        defer { DashboardClient.removeTemporaryFile(file) }
+        XCTAssertTrue(String(decoding: try Data(contentsOf: file), as: UTF8.self).hasPrefix("# Atlas"))
+        do {
+            _ = try await client.workspaceDownloadFile("README.md", profile: "research", sessionID: q3.id)
+            XCTFail("the session isn't in that profile")
+        } catch DashboardError.http(404, _) {}
+    }
+
     func testNewChatIsStoredAndTitled() async throws {
         let chat = await newChat()
         var reported: String?

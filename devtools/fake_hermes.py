@@ -85,6 +85,21 @@ status,analytics,actions,files}.py and tui_gateway/methods_tools.py (plugins.man
   /api/fs/download, /api/media/proxy, and the RPCs plugins.manage, session.active_list (the live sessions),
   reload.mcp and the managed connectors (connectors.*, connection.respond; the consent page /fake-connect/authorize).
   /api/audio/* is never served.
+Files, git review, messaging, agents, session import, the star map and kanban (M5), from
+hermes_cli/web_routers/{files,git,messaging,ops,chat_workspaces,status}.py, hermes_cli/web_git.py, gateway/pairing.py,
+agent/learning_graph.py, tui_gateway/methods_{subagents,session_foreign}.py and plugins/kanban/dashboard/plugin_api.py
+(the section comment above ``class WorkspaceFeatures`` has the details):
+  /api/fs/{list,write-text,git-root,default-cwd}, /api/files (+ read, download, upload, upload-stream, mkdir, DELETE),
+  /api/git/{status,gh-auth,worktrees,branches,base-branches,file-diff} and /api/git/review/{list,diff,commit-context,
+  rev-parse,ship-info,pr-list,stage,unstage,revert,commit,push,create-pr}, /api/git/worktree/{add,remove},
+  /api/git/branch/switch over modelled repositories (Atlas with every kind of change, a linked worktree and PRs),
+  /api/chat/workspaces, /api/messaging/platforms (+ PUT, test), Telegram and WhatsApp QR onboarding (done on the
+  ``--onboarding-polls``-th poll or via POST /api/messaging/debug/onboarding/{id}/complete), /api/pairing (+ approve,
+  revoke, clear-pending, debug/request), /api/webhooks (+ enable, POST, DELETE, /{name}/enabled),
+  /api/gateway/{start,stop} (per profile; /api/status reports it), /api/learning/graph and /api/learning/node (GET,
+  PUT, DELETE), /api/dashboard/plugins, the kanban plugin under /api/plugins/kanban/ with its /events socket
+  (``--no-kanban`` turns it off), and the RPCs session.foreign.{list,preview,import} and
+  subagent.{interrupt,tail,steer} (the chat trigger ``fleet`` runs a subagent tree for them).
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
 the plugin would send ({aps, hermes}: approval or clarify waiting, turn done) and the alert tokens they go to.
@@ -101,10 +116,12 @@ import asyncio
 import base64
 import binascii
 import copy
+import difflib
 import hashlib
 import html
 import inspect
 import io
+import itertools
 import json
 import math
 import mimetypes
@@ -124,7 +141,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import httpx2  # the mcp SDK's streamable HTTP client takes an httpx2.AsyncClient
 import uvicorn
@@ -2715,8 +2732,8 @@ class SettingsFeatures:
         log("http GET /api/status -> 200")
         return JSONResponse({
             "version": FAKE_VERSION, "release_date": FAKE_RELEASE_DATE, "config_version": CONFIG_VERSION,
-            "latest_config_version": CONFIG_VERSION, "can_update_hermes": False, "gateway_running": True,
-            "gateway_state": "running", "gateway_platforms": {}, "gateway_exit_reason": None,
+            "latest_config_version": CONFIG_VERSION, "can_update_hermes": False,
+            **self.status_gateway(requested), "gateway_exit_reason": None,
             "gateway_updated_at": datetime.now(timezone.utc).isoformat(), "gateway_heartbeat_stale_s": None,
             "gateway_shared_with": None, "active_agents": active, "gateway_busy": active > 0,
             "gateway_drainable": True, "restart_drain_timeout": 60, "active_sessions": len(self.runtimes),
@@ -3399,7 +3416,9 @@ class SettingsFeatures:
                 "mcp_written": 0, "skills_disabled": 0, "hub_installs": [], "soul_set": soul is not None}
 
     def active_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
-        return {"active": self.sticky_profile, "current": "default"}
+        """profiles.py GET /api/profiles/active: ``current`` is get_active_profile_name(), "custom" for a dashboard
+        whose HERMES_HOME is outside ~/.hermes and its profiles/ folder (``--custom-home``)."""
+        return {"active": self.sticky_profile, "current": "custom" if self.custom_home else "default"}
 
     def set_active_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         canon = self.canonical_name(body_field(body, "name", str))
@@ -5248,8 +5267,9 @@ class CapabilityFeatures:
         return state
 
     def explicit_profile(self, request: Request, route: str) -> FakeProfile:
-        """_common.py destructive_profile: this backend serves several profiles, so an unnamed target is refused."""
-        if not (request.query_params.get("profile") or "").strip():
+        """_common.py destructive_profile: this backend serves several profiles, so an unnamed target is refused.
+        A ``--custom-home`` dashboard stands for a single-profile host, where an unnamed target is its own."""
+        if not (request.query_params.get("profile") or "").strip() and not self.custom_home:
             raise HttpError(400, MULTIPLEX_DETAIL.format(route=route))
         return self.scoped(request)
 
@@ -7245,14 +7265,23 @@ class CapabilityFeatures:
 
     # ── files the Artifacts screen opens (files.py) ───────────────────────────────────────────────
 
-    def fs_target(self, request: Request) -> tuple[str, bytes]:
-        """files.py _fs_download_path + _fs_regular_file over the fake host's files."""
+    def fs_target(self, request: Request, *, session: bool = False) -> tuple[str, bytes]:
+        """files.py _fs_download_path + _fs_regular_file over the fake host's files. With ``session`` (download and
+        read-data-url), a ``session_id`` must name a stored session of the requested profile (404 "Session not found"
+        when blank or unknown, as get_session_detail), and a relative path resolves against that session's folder."""
         raw = request.query_params.get("path")
         if raw is None:
             raise HttpError(422, [{"type": "missing", "loc": ["query", "path"], "msg": "Field required"}])
-        self.scoped(request)
+        profile = self.scoped(request)
         path = raw[7:] if raw.startswith("file://") else raw
         path = DEMO_HOME + path[1:] if path.startswith("~/") else path
+        sid = request.query_params.get("session_id") if session else None
+        if sid is not None:
+            stored = self.sessions.get(sid.strip()) if sid.strip() else None
+            if stored is None or not stored.persisted or stored.profile != profile.name:
+                raise HttpError(404, "Session not found")
+            if not path.startswith("/") and stored.cwd.startswith("/"):
+                path = posixpath.join(stored.cwd, path)
         if not path.startswith("/"):
             raise HttpError(400, "Invalid path")
         path = posixpath.normpath(path)
@@ -7268,8 +7297,8 @@ class CapabilityFeatures:
         return path, data
 
     def fs_read_data_url(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
-        """files.py GET /api/fs/read-data-url?path=: ``{dataUrl}`` (413 over 25 MB)."""
-        path, data = self.fs_target(request)
+        """files.py GET /api/fs/read-data-url?path=&session_id=: ``{dataUrl}`` (413 over 25 MB)."""
+        path, data = self.fs_target(request, session=True)
         if len(data) > FS_DATA_URL_MAX:
             raise HttpError(413, "File too large")
         kind = FS_MEDIA_TYPES.get(posixpath.splitext(path)[1].lower(), "application/octet-stream")
@@ -7292,8 +7321,8 @@ class CapabilityFeatures:
                 "truncated": len(data) > FS_TEXT_PREVIEW_MAX}
 
     def fs_download(self, request: Request, body: dict[str, Any]) -> Response:
-        """files.py GET /api/fs/download?path=: the file as an attachment."""
-        path, data = self.fs_target(request)
+        """files.py GET /api/fs/download?path=&session_id=: the file as an attachment."""
+        path, data = self.fs_target(request, session=True)
         kind = FS_MEDIA_TYPES.get(posixpath.splitext(path)[1].lower(), "application/octet-stream")
         return Response(data, media_type=kind,
                         headers={"content-disposition": f'attachment; filename="{posixpath.basename(path)}"'})
@@ -7350,7 +7379,3876 @@ def normalize_repeat(repeat: Any) -> int | None:
     return repeat if repeat > 0 else None
 
 
-class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# M5: the workspace (files panel + git review), messaging (platforms, Telegram/WhatsApp onboarding, pairing,
+# webhooks, gateway start/stop), agents (a subagent fleet), session import, the learning graph (star map) and the
+# kanban plugin. Shapes from hermes_cli/web_routers/{files,git,messaging,ops,chat_workspaces,status}.py,
+# hermes_cli/{web_git,web_server_files,web_server_messaging,foreign_sessions_browser,webhook}.py, gateway/pairing.py,
+# agent/{learning_graph,learning_mutations}.py, tui_gateway/{methods_subagents,methods_session_foreign}.py and
+# plugins/kanban/dashboard/plugin_api.py over hermes_cli/kanban_db*.py. All in memory: the git repositories are a
+# model over the fake host's files (HEAD, index and worktree snapshots), never a real repository.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+# files.py _FS_READDIR_HIDDEN, _SENSITIVE_MANAGED_FILE_BASENAMES, _SENSITIVE_MANAGED_DIR_NAMES.
+FS_READDIR_HIDDEN = frozenset({".git", ".hg", ".svn", ".cache", ".next", ".turbo", ".venv", "__pycache__", "build",
+                               "dist", "node_modules", "target", "venv"})
+SENSITIVE_FILE_NAMES = frozenset({"auth.json", "auth.lock", "credentials", "config.yaml", ".anthropic_oauth.json",
+                                  "google_token.json", "google_oauth_pending.json", "google_oauth.json",
+                                  "webhook_subscriptions.json", "bws_cache.json", "bws_cache.enc.json",
+                                  ".git-credentials"})
+SENSITIVE_DIR_NAMES = frozenset({"mcp-tokens", "pairing"})
+FS_WRITE_TEXT_MAX = 8 * 1024 * 1024  # files.py _FS_TEXT_WRITE_MAX_BYTES
+MANAGED_FILE_MAX = 100 * 1024 * 1024  # web_server.py _MANAGED_FILE_MAX_BYTES
+# web_server_files.py _managed_response_meta for a non-hosted install: home is the default, nothing is locked.
+MANAGED_META = {"root": None, "locked_root": None, "can_change_path": True}
+
+# web_git.py constants and the fake repositories' remote.
+GIT_IGNORED = frozenset({".git", ".worktrees", "__pycache__", "node_modules", ".DS_Store", ".venv"})
+COMMIT_CONTEXT_MAX = 120_000  # _COMMIT_CONTEXT_DIFF_MAX_CHARS
+COMMIT_CONTEXT_UNTRACKED_MAX = 80
+UNTRACKED_SCAN_CAP = 500
+GH_ERR_TAIL = 400  # _GH_ERR_TAIL_CHARS
+GITHUB_OWNER = "acme"
+NOT_A_REPO = "fatal: not a git repository (or any of the parent directories): .git"
+BRANCH_SANITIZERS = ((r"\s+", "-"), (r"[^\w./-]", ""), (r"-{2,}", "-"), (r"/{2,}", "/"), (r"\.{2,}", "."),
+                     (r"^[-./]+|[-./]+$", ""))
+ATLAS_AUTH_PATCHED = AUTH_PY.replace("    now = now or time.time()\n", "    if now is None:\n        now = time.time()\n")
+ATLAS_TOKENS_PY = ('"""Refresh tokens shortly before they expire."""\n\nfrom atlas.auth import TOKEN_TTL, issue_token\n\n'
+                   'REFRESH_WINDOW = 60\n\n\ndef needs_refresh(token, now):\n    return token["exp"] - now < REFRESH_WINDOW\n')
+ATLAS_CLOCK_PY = "import time\n\n\ndef now():\n    return time.time()\n"
+ATLAS_ARCHITECTURE_MD = ("# Atlas architecture\n\nAtlas issues short-lived tokens and stores users.\n\n## Modules\n\n"
+                         "- `auth.py` issues tokens (15 minute TTL).\n- `storage.py` loads and saves users.\n\n"
+                         "## Request flow\n\n1. The client signs in.\n2. `issue_token` returns a token.\n"
+                         "3. The client refreshes it before `exp`.\n")
+ATLAS_TOKEN_FLOW_MD = ("# Token flow\n\n```\nclient -> /login -> issue_token -> {sub, exp}\nclient -> /refresh "
+                       "-> needs_refresh? -> issue_token\n```\n\nRefresh when fewer than 60 seconds remain.\n")
+M5_TEXT_FILES = {"projects/atlas/docs/architecture.md": ATLAS_ARCHITECTURE_MD}
+M5_IMAGE_FILES = {"projects/beacon/docs/screenshot.png": (160, 100, (0x0D, 0x11, 0x17)),
+                  "projects/beacon/assets/logo.png": (48, 48, (0xC2, 0x41, 0x0C))}
+
+# Messaging (web_server_messaging.py _messaging_platform_catalog over the platform plugins' dashboard cards, a
+# slice): (id, name, description, docs_url, env_vars, required_env).
+MESSAGING_PLATFORMS = (
+    ("telegram", "Telegram", "Run Hermes from Telegram DMs, groups, and topics.",
+     "https://core.telegram.org/bots/features#botfather",
+     ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS", "TELEGRAM_PROXY"), ("TELEGRAM_BOT_TOKEN",)),
+    ("discord", "Discord", "Connect Hermes to Discord DMs, channels, and threads.",
+     "https://discord.com/developers/applications", ("DISCORD_BOT_TOKEN", "DISCORD_ALLOWED_USERS"),
+     ("DISCORD_BOT_TOKEN",)),
+    ("slack", "Slack", "Use Hermes from Slack via Socket Mode. Add allowed Slack member IDs so connected bots can "
+     "respond.", "https://api.slack.com/apps", ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"),
+     ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")),
+    ("whatsapp", "WhatsApp", "Use Hermes through the bundled WhatsApp bridge with QR-based auth.",
+     "https://github.com/tulir/whatsmeow",
+     ("WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_DM_POLICY", "WHATSAPP_ALLOWED_USERS"), ("WHATSAPP_ENABLED",)),
+    ("signal", "Signal", "Connect through a signal-cli REST bridge.",
+     "https://github.com/bbernhard/signal-cli-rest-api", ("SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT", "SIGNAL_ALLOWED_USERS"),
+     ("SIGNAL_HTTP_URL", "SIGNAL_ACCOUNT")),
+    ("api_server", "API server", "Expose Hermes as an OpenAI-compatible HTTP API for tools like Open WebUI.",
+     "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/",
+     ("API_SERVER_ENABLED", "API_SERVER_KEY", "API_SERVER_PORT", "API_SERVER_HOST", "API_SERVER_MODEL_NAME"), ()),
+    ("webhook", "Webhooks", "Receive events from GitHub, GitLab, and other webhook sources.",
+     "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks/",
+     ("WEBHOOK_ENABLED", "WEBHOOK_PORT", "WEBHOOK_SECRET"), ()),
+)
+MESSAGING_BY_ID = {row[0]: row for row in MESSAGING_PLATFORMS}
+# config_defaults.py OPTIONAL_ENV_VARS (messaging) + messaging.py _MESSAGING_ENV_FALLBACKS: key -> (description,
+# prompt, url, password, advanced).
+MESSAGING_ENV = {
+    "TELEGRAM_BOT_TOKEN": ("Complete Telegram bot token created by @BotFather (numeric bot ID followed by a colon and "
+                           "secret)", "Telegram bot token", "https://t.me/BotFather", True, False),
+    "TELEGRAM_ALLOWED_USERS": ("Optional comma-separated numeric Telegram user IDs allowed immediately; leave blank to "
+                               "approve new users through DM pairing", "Allowed Telegram user IDs (comma-separated)",
+                               "https://t.me/userinfobot", False, False),
+    "TELEGRAM_PROXY": ("Proxy URL for Telegram connections (overrides HTTPS_PROXY). Supports http://, https://, "
+                       "socks5://", "Telegram proxy URL (optional)", None, False, False),
+    "DISCORD_BOT_TOKEN": ("Discord bot token from Developer Portal", "Discord bot token",
+                          "https://discord.com/developers/applications", True, False),
+    "DISCORD_ALLOWED_USERS": ("Comma-separated Discord user IDs allowed to use the bot",
+                              "Allowed Discord user IDs (comma-separated)", None, False, False),
+    "SLACK_BOT_TOKEN": ("Slack bot token (xoxb-). Get from OAuth & Permissions after installing your app.",
+                        "Slack Bot Token (xoxb-...)", "https://api.slack.com/apps", True, False),
+    "SLACK_APP_TOKEN": ("Slack app-level token (xapp-) for Socket Mode.", "Slack App Token (xapp-...)",
+                        "https://api.slack.com/apps", True, False),
+    "SLACK_ALLOWED_USERS": ("Comma-separated Slack member IDs allowed to use Hermes, e.g. U01ABC2DEF3.",
+                            "Allowed Slack member IDs", "https://api.slack.com/apps", False, False),
+    "WHATSAPP_ENABLED": ("Enable the WhatsApp gateway adapter", "Enable WhatsApp", None, False, True),
+    "WHATSAPP_MODE": ("WhatsApp bridge mode", "WhatsApp mode", None, False, True),
+    "WHATSAPP_DM_POLICY": ("How WhatsApp direct messages are authorized", "WhatsApp DM policy", None, False, True),
+    "WHATSAPP_ALLOWED_USERS": ("Comma-separated WhatsApp users allowed to use the bot", "Allowed WhatsApp users", None,
+                               False, False),
+    "SIGNAL_HTTP_URL": ("signal-cli REST API base URL, e.g. http://127.0.0.1:8080", "Signal bridge URL",
+                        "https://github.com/bbernhard/signal-cli-rest-api", False, False),
+    "SIGNAL_ACCOUNT": ("Signal account phone number registered with the bridge", "Signal account", None, False, False),
+    "SIGNAL_ALLOWED_USERS": ("Comma-separated Signal users allowed to use the bot", "Allowed Signal users", None, False,
+                             False),
+    "API_SERVER_ENABLED": ("Enable the OpenAI-compatible API server", "Enable API server", None, False, False),
+    "API_SERVER_KEY": ("Bearer key clients must send to the API server", "API server key", None, True, False),
+    "API_SERVER_PORT": ("Port the API server listens on (default 8642)", "API server port", None, False, True),
+    "API_SERVER_HOST": ("Host the API server binds (default 127.0.0.1)", "API server host", None, False, True),
+    "API_SERVER_MODEL_NAME": ("Model name the API server reports", "API server model name", None, False, True),
+    "WEBHOOK_ENABLED": ("Enable the webhook receiver", "Enable webhooks", None, False, False),
+    "WEBHOOK_PORT": ("Port the webhook receiver listens on (default 8644)", "Webhook port", None, False, True),
+    "WEBHOOK_SECRET": ("Default HMAC secret for webhook routes", "Webhook secret", None, True, False),
+}
+TELEGRAM_TOKEN_RE = re.compile(r"\d+:[A-Za-z0-9_-]{30,}")  # plugins/platforms/telegram/dashboard_card.py
+ENV_VALUE_RULES = {
+    "TELEGRAM_BOT_TOKEN": (lambda v: bool(TELEGRAM_TOKEN_RE.fullmatch(v)),
+                           "Telegram bot token must be the complete token from @BotFather, such as 123456789:ABC…"),
+    "TELEGRAM_ALLOWED_USERS": (lambda v: all(re.fullmatch(r"\d+", u.strip()) for u in v.split(",") if u.strip()),
+                               "Telegram allowed users must be comma-separated numeric user IDs."),
+}
+ALLOWLIST_KEY = re.compile(r"_ALLOWED(?:_[A-Z]+)?$")  # messaging.py _ALLOWLIST_KEY_RE
+ONBOARDING_TTL = 600
+TELEGRAM_SESSION_NOT_FOUND = "Telegram setup session was not found. Start a new setup."
+WHATSAPP_SESSION_NOT_FOUND = "WhatsApp setup session was not found. Start a new setup."
+NO_GATEWAY_WARNING = ("No gateway is running — the task will sit in 'ready' until you start it. Run:\n"
+                      "    hermes gateway start\nThe gateway hosts an embedded dispatcher (tick interval 60s by "
+                      "default); your task will be picked up on the next tick after the gateway comes up.")
+WEBHOOK_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+PAIRING_LOCKOUT = 5  # gateway/pairing.py MAX_FAILED_ATTEMPTS
+PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+# Session import (hermes_cli/foreign_sessions.py): source -> (label, origin tool).
+FOREIGN_LABELS = {"claude": "Claude Code", "codex": "Codex CLI"}
+FOREIGN_TOOLS = {"claude": "claude-code", "codex": "codex-cli"}
+FOREIGN_HOST = "hermes-demo-host"
+# (source, path, age, cwd, turns); an empty turn list is a log the browser cannot parse ("unreadable").
+FOREIGN_SEEDS = (
+    ("claude", "~/.claude/projects/-home-demo-projects-atlas/3f2a9c1e.jsonl", 2 * HOUR, project_path("atlas"), [
+        ("user", "Why does test_token_at_epoch_zero fail on CI only?"),
+        ("assistant", "`issue_token` treats `now=0` as falsy, so it falls back to `time.time()`. CI runs the test "
+                      "with a frozen clock at the epoch."),
+        ("user", "Fix it and add a regression test."),
+        ("assistant", "Changed `now = now or time.time()` to an explicit `None` check and added "
+                      "`test_token_at_epoch_zero`. All 4 tests pass.")]),
+    ("codex", "~/.codex/sessions/2026/10/24/rollout-7b1d.jsonl", 3 * DAY, project_path("beacon"), [
+        ("user", "# Files\n- src/server.ts\n\n## My request:\nAdd a /health endpoint that reports the version."),
+        ("assistant", "Added `GET /health` returning `{status: 'ok', version}` and a test.")]),
+    ("claude", "~/.claude/projects/-home-demo/91c0d4aa.jsonl", 6 * DAY, DEMO_HOME, [
+        ("user", "Summarize my notes.md into three bullets."),
+        ("assistant", "- Try the new release flow.\n- Clean up old branches.\n- Read the storage RFC.")]),
+    ("codex", "~/.codex/sessions/2026/10/12/rollout-0c44.jsonl", 15 * DAY, None, []),
+    ("claude", "~/.claude/projects/-home-demo-projects-atlas/c7e81b02.jsonl", 20 * DAY, project_path("atlas"), [
+        ("user", "Draft a migration plan for storage v2."),
+        ("assistant", "1. Add batch writes behind a flag.\n2. Backfill.\n3. Flip the flag.\n4. Remove v1.")]),
+)
+
+# The learning graph (agent/learning_graph.py): declared related_skills between the seeded skills, and the built-in
+# memory entries (memories/MEMORY.md, USER.md) per profile.
+LEARNING_RELATED = {"release-notes": ["deploy-checklist"], "paper-summary": ["citation-check"]}
+MEMORY_SEEDS = {
+    "default": {"memory": ["User prefers short answers with the code first.",
+                           "Atlas uses pytest; run `pytest -q` before committing.",
+                           "The staging deploy for Beacon runs from the release/1.4 branch."],
+                "profile": ["Name: Demo User. Works on Atlas and Beacon, mostly in Python and TypeScript."]},
+    "research": {"memory": ["Prefers arXiv abstracts over PDFs; cite with arXiv ids."], "profile": []},
+}
+MEMORY_FILES = {"memory": "MEMORY.md", "profile": "USER.md"}
+
+# Kanban (hermes_cli/kanban_workflow.py DEFAULT_WORKFLOW, kanban_db.py).
+KANBAN_COLUMNS = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done")
+KANBAN_WORKFLOW = {
+    "columns": [{"key": key, "label": key.capitalize(), "icon": icon, "drag_target": key not in
+                 ("scheduled", "running", "review")} for key, icon in zip(KANBAN_COLUMNS, "◇◻⏱▶●⊘◎✓")],
+    "manual": {"triage": ["ready", "todo"], "todo": ["ready", "scheduled", "triage"],
+               "scheduled": ["ready", "todo", "triage"],
+               "ready": ["blocked", "done", "review", "scheduled", "todo", "triage"],
+               "running": ["blocked", "done", "ready", "review", "scheduled", "todo", "triage"],
+               "blocked": ["done", "ready", "scheduled", "todo", "triage"], "review": ["done", "ready", "todo", "triage"],
+               "done": ["ready", "todo", "triage"], "archived": ["ready", "todo", "triage"]},
+    "archived": "archived"}
+KANBAN_SLUG = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")  # kanban_db.py _BOARD_SLUG_RE
+KANBAN_WORKSPACES = frozenset({"scratch", "dir", "worktree"})
+KANBAN_ATTACHMENT_MAX = 25 * 1024 * 1024
+KANBAN_SUMMARY_PREVIEW = 200
+KANBAN_POLL_SECONDS = 0.3  # plugin_api.py _EVENT_POLL_SECONDS
+KANBAN_SEEDED_RUN_SECONDS = 120  # the seeded running card's worker; dispatched ones take --kanban-run-seconds
+KANBAN_RUNNING_DIRECT = "Cannot set status to 'running' directly; use the dispatcher/claim path"
+KANBAN_MANIFEST = {"name": "kanban", "label": "Kanban", "description": "Multi-agent collaboration board — drag-drop "
+                   "cards across columns, read comment threads, see which profile is running what", "icon": "Package",
+                   "version": "1.0.0", "tab": {"path": "/kanban", "position": "after:skills"}, "slots": [],
+                   "entry": "dist/index.js", "css": "dist/style.css", "has_api": True, "source": "bundled"}
+VOICE_MANIFEST = {"name": "hermes_voice", "label": "Hermes Voice", "description": "Phone calls with Hermes from the "
+                  "HermesVoice app", "icon": "Phone", "version": "0.6.0", "tab": {"path": "/hermes_voice",
+                  "position": "end", "hidden": True}, "slots": [], "entry": "dist/index.js", "css": None,
+                  "has_api": True, "source": "user"}
+
+# The subagent fleet behind the "fleet" chat trigger: (goal, toolsets, tools, outcome, nested child goal).
+FLEET_TASKS = (
+    ("Audit the token module for clock bugs", ["file"], ("search_files", "read_file", "read_file"), "completed",
+     None),
+    ("Map every caller of the storage layer", ["file", "terminal"], ("search_files", "terminal"), "completed",
+     "Read the storage tests"),
+    ("Check the release checklist against CI", ["terminal"], ("terminal", "terminal"), "failed", None),
+)
+
+
+def fs_absolute(raw: Any, cwd: str | None = None) -> str:
+    """web_server_files.py _fs_path: a required path (file: URLs and ~ allowed), NUL refused, made absolute (a relative
+    path resolves against ``cwd``, else the folder ``hermes serve`` runs in: the fake's home) and normalized."""
+    text = str(raw or "").strip()
+    if not text:
+        raise HttpError(400, "Path is required")
+    if "\0" in text:
+        raise HttpError(400, "Invalid path")
+    if text.lower().startswith("file:"):
+        parts = urlsplit(text)
+        if re.search(r"%2f", parts.path, re.IGNORECASE) or parts.netloc not in ("", "localhost"):
+            raise HttpError(400, "Invalid path")
+        text = unquote(parts.path)
+    if text == "~" or text.startswith("~/"):
+        text = DEMO_HOME + text[1:]
+    if not text.startswith("/"):
+        text = f"{cwd or DEMO_HOME}/{text}"
+    return posixpath.normpath(text) if text != "/" else "/"
+
+
+def is_sensitive(path: str) -> bool:
+    """files.py _is_sensitive_path: a credential basename, or any credential directory in the path."""
+    name = posixpath.basename(path).lower()
+    if name == ".env" or name.startswith(".env.") or name == ".envrc" or name in SENSITIVE_FILE_NAMES:
+        return True
+    return any(part.lower() in SENSITIVE_DIR_NAMES for part in path.split("/"))
+
+
+def query_flag(request: Request, name: str, default: bool = False) -> bool:
+    """A FastAPI ``bool`` query parameter (1/true/yes/on, 0/false/no/off); anything else is its 422."""
+    raw = request.query_params.get(name)
+    if raw is None or raw == "":
+        return default
+    lowered = raw.lower()
+    if lowered in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if lowered in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise HttpError(422, [{"type": "bool_parsing", "loc": ["query", name], "input": raw,
+                           "msg": "Input should be a valid boolean, unable to interpret input"}])
+
+
+def query_text(request: Request, name: str) -> str:
+    """A required ``str`` query parameter: FastAPI's 422 when it is missing."""
+    value = request.query_params.get(name)
+    if value is None:
+        raise HttpError(422, [{"type": "missing", "loc": ["query", name], "msg": "Field required"}])
+    return value
+
+
+def blob_id(data: bytes | None) -> str:
+    """git hash-object: the short blob id ``index`` lines carry (all zeros for a missing side)."""
+    if data is None:
+        return "0000000"
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()[:7]
+
+
+def looks_binary(data: bytes) -> bool:
+    return b"\0" in data[:8000]
+
+
+def text_lines(data: bytes | None) -> list[str]:
+    return [] if not data else data.decode("utf-8", errors="replace").splitlines(keepends=True)
+
+
+def line_stat(old: bytes | None, new: bytes | None) -> tuple[int, int]:
+    """``git diff --numstat`` for one file: (added, removed); a binary side counts 0, like ``-``."""
+    if (old and looks_binary(old)) or (new and looks_binary(new)):
+        return 0, 0
+    added = removed = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, text_lines(old), text_lines(new), autojunk=False
+                                                       ).get_opcodes():
+        if tag in ("replace", "delete"):
+            removed += i2 - i1
+        if tag in ("replace", "insert"):
+            added += j2 - j1
+    return added, removed
+
+
+def untracked_lines(data: bytes) -> int:
+    """web_git.py _untracked_insertions: line count of a new file; binary or over 1 MB counts 0."""
+    if len(data) > 1024 * 1024 or b"\0" in data:
+        return 0
+    lines = data.count(b"\n")
+    return lines + 1 if data and not data.endswith(b"\n") else lines
+
+
+def unified_file_diff(rel: str, old: bytes | None, new: bytes | None) -> str:
+    """One file's ``git diff`` text (``diff --git`` header, index line, hunks)."""
+    if old == new:
+        return ""
+    head = [f"diff --git a/{rel} b/{rel}"]
+    if old is None:
+        head += ["new file mode 100644", f"index 0000000..{blob_id(new)}"]
+    elif new is None:
+        head += ["deleted file mode 100644", f"index {blob_id(old)}..0000000"]
+    else:
+        head.append(f"index {blob_id(old)}..{blob_id(new)} 100644")
+    if (old and looks_binary(old)) or (new and looks_binary(new)):
+        a = "/dev/null" if old is None else f"a/{rel}"
+        b = "/dev/null" if new is None else f"b/{rel}"
+        return "\n".join(head + [f"Binary files {a} and {b} differ"]) + "\n"
+    lines = list(difflib.unified_diff(text_lines(old), text_lines(new),
+                                      "/dev/null" if old is None else f"a/{rel}",
+                                      "/dev/null" if new is None else f"b/{rel}", lineterm="\n", n=3))
+    out = []
+    for line in lines:
+        if line.startswith(("---", "+++")):
+            out.append(line.rstrip("\n").rstrip() + "\n")
+        elif line.endswith("\n"):
+            out.append(line)
+        else:
+            out.append(line + "\n\\ No newline at end of file\n")
+    return "\n".join(head) + "\n" + "".join(out)
+
+
+def sanitize_branch(name: Any) -> str:
+    """web_git.py _sanitize_branch."""
+    value = str(name or "")
+    for pattern, repl in BRANCH_SANITIZERS:
+        value = re.sub(pattern, repl, value)
+    return value
+
+
+def slugify(name: Any) -> str:
+    """web_git.py _slugify."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower())
+    slug = re.sub(r"^-+|-+$", "", slug)[:40].rstrip("-")
+    return slug or "work"
+
+
+@dataclass
+class GitCommit:
+    sha: str
+    subject: str
+    at: float
+    parent: str | None
+    tree: dict[str, bytes]
+    author: str = "Demo Dev"
+
+
+@dataclass
+class GitCheckout:
+    """One working tree (``git worktree list``): the main tree first, then the linked ones under .worktrees/. The
+    worktree's files are the fake host's files under ``path``; the index is its own snapshot."""
+
+    path: str
+    branch: str | None
+    head: str
+    index: dict[str, bytes]
+    locked: bool = False
+
+
+@dataclass
+class GitRepo:
+    """A repository: commits, local and remote-tracking refs, its checkouts and the GitHub pull requests ``gh`` sees."""
+
+    root: str
+    slug: str | None
+    commits: dict[str, GitCommit] = field(default_factory=dict)
+    branches: dict[str, str] = field(default_factory=dict)
+    upstreams: dict[str, str] = field(default_factory=dict)
+    remotes: dict[str, str] = field(default_factory=dict)
+    origin_head: str | None = None
+    checkouts: list[GitCheckout] = field(default_factory=list)
+    prs: list[dict[str, Any]] = field(default_factory=list)
+
+    def commit(self, subject: str, at: float, parent: str | None, tree: dict[str, bytes]) -> str:
+        seed = f"{parent}|{subject}|{at:.0f}|" + ",".join(f"{p}:{blob_id(d)}" for p, d in sorted(tree.items()))
+        sha = hashlib.sha1(seed.encode()).hexdigest()
+        self.commits[sha] = GitCommit(sha, subject, at, parent, dict(tree))
+        return sha
+
+    def ancestors(self, sha: str | None) -> list[str]:
+        out = []
+        while sha:
+            out.append(sha)
+            sha = self.commits[sha].parent
+        return out
+
+    def head_sha(self, checkout: GitCheckout) -> str:
+        return self.branches[checkout.branch] if checkout.branch else checkout.head
+
+    def tree(self, sha: str | None) -> dict[str, bytes]:
+        return self.commits[sha].tree if sha in self.commits else {}
+
+    def default_branch(self) -> str | None:
+        """web_git.py _default_branch_name: origin/HEAD, else a local or remote main/master."""
+        if self.origin_head:
+            return self.origin_head
+        return next((b for b in ("main", "master") if b in self.branches or f"origin/{b}" in self.remotes), None)
+
+    def resolve(self, ref: str | None) -> str | None:
+        """``git rev-parse``: HEAD-relative names need a checkout, so callers pass those resolved; branch, remote
+        branch, ``<ref>~N`` and full or unique abbreviated commit ids."""
+        match = re.fullmatch(r"(.+?)(?:~(\d*))?", (ref or "").strip())
+        if match is None:
+            return None
+        base, back = match.group(1), match.group(2)
+        if base == "origin/HEAD":
+            sha = self.remotes.get(f"origin/{self.origin_head}") if self.origin_head else None
+        else:
+            sha = self.branches.get(base) or self.remotes.get(base)
+        if sha is None and re.fullmatch(r"[0-9a-f]{4,40}", base):
+            found = [c for c in self.commits if c.startswith(base)]
+            sha = found[0] if len(found) == 1 else None
+        for _ in range(0 if back is None else int(back or 1)):
+            sha = self.commits[sha].parent if sha else None
+        return sha
+
+    def merge_base(self, a: str | None, b: str | None) -> str | None:
+        seen = set(self.ancestors(b))
+        return next((sha for sha in self.ancestors(a) if sha in seen), None)
+
+    def ahead_behind(self, local: str, upstream: str | None) -> tuple[int, int]:
+        if upstream is None:
+            return 0, 0
+        mine, theirs = self.ancestors(local), self.ancestors(upstream)
+        return len(set(mine) - set(theirs)), len(set(theirs) - set(mine))
+
+    def checkout_of(self, branch: str) -> GitCheckout | None:
+        return next((c for c in self.checkouts if c.branch == branch), None)
+
+
+@dataclass
+class KanbanBoard:
+    """One board (kanban.db + board.json): tasks, comments, the append-only task_events table, runs, attachments and
+    links. Boards are shared by every profile (kanban_db.py kanban_home)."""
+
+    slug: str
+    meta: dict[str, Any]
+    tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    comments: list[dict[str, Any]] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    runs: list[dict[str, Any]] = field(default_factory=list)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    blobs: dict[int, bytes] = field(default_factory=dict)
+    links: list[tuple[str, str]] = field(default_factory=list)
+    logs: dict[str, str] = field(default_factory=dict)
+    notify: dict[str, set[str]] = field(default_factory=dict)
+    finish_at: dict[str, float] = field(default_factory=dict)
+    next_event: int = 1
+
+    def latest_event(self) -> int:
+        return max((e["id"] for e in self.events), default=0)
+
+
+def kanban_task(task_id: str, title: str, status: str, created_at: float, **extra: Any) -> dict[str, Any]:
+    """kanban_db.py Task (asdict order)."""
+    task = {"id": task_id, "title": title, "body": None, "assignee": None, "status": status, "priority": 0,
+            "created_by": "dashboard", "created_at": int(created_at), "started_at": None, "completed_at": None,
+            "workspace_kind": "scratch", "workspace_path": None, "claim_lock": None, "claim_expires": None,
+            "tenant": None, "branch_name": None, "project_id": None, "result": None, "idempotency_key": None,
+            "consecutive_failures": 0, "worker_pid": None, "last_failure_error": None, "max_runtime_seconds": None,
+            "last_heartbeat_at": None, "current_run_id": None, "workflow_template_id": None,
+            "current_step_key": None, "skills": None, "model_override": None, "provider_override": None,
+            "reasoning_effort": None, "max_retries": None, "goal_mode": False, "goal_max_turns": None,
+            "session_id": None, "block_kind": None, "block_recurrences": 0, "completion_contract": None}
+    task.update(extra)
+    return task
+
+
+class WorkspaceFeatures:
+    """M5: the REST routes behind the files panel and the git review pane (/api/fs/*, /api/files*, /api/git/*,
+    /api/chat/workspaces), messaging (/api/messaging/*, /api/pairing*, /api/webhooks*, /api/gateway/start|stop),
+    the learning graph (/api/learning/graph, /api/learning/node), the dashboard plugin list and the kanban plugin
+    (/api/plugins/kanban/*, its /events socket), plus the RPCs session.foreign.* and subagent.interrupt|tail|steer.
+    Mixed into FakeHermes; uses the host files ChatFeatures keeps (``files``, ``dirs``, ``media``), SettingsFeatures'
+    profiles and ``rest``/``scoped``, and CapabilityFeatures' actions and per-profile skills."""
+
+    profiles: dict[str, FakeProfile]
+    sessions: dict[str, StoredSession]
+    runtimes: dict[str, Runtime]
+    seed_mode: str
+    files: dict[str, bytes]
+    dirs: set[str]
+    media: dict[str, bytes]
+    artifact_files: dict[str, bytes]
+    subagents: dict[str, dict[str, dict[str, Any]]]
+    projects: list[dict[str, Any]]
+    actions: dict[str, FakeAction]
+    tickets: dict[str, float]
+    rest: Callable[..., Callable[[Request], Awaitable[Response]]]
+    scoped: Callable[..., FakeProfile]
+    profile_named: Callable[[str], FakeProfile]
+    rpc_profile: Callable[[dict[str, Any]], FakeProfile]
+    caps: Callable[[FakeProfile], Caps]
+    spawn: Callable[..., FakeAction]
+    settle_actions: Callable[[], None]
+    explicit_profile: Callable[[Request, str], FakeProfile]
+    delete_learning_node: Callable[[Request, dict[str, Any]], dict[str, Any]]
+    authed: Callable[[Request], bool]
+    unauthorized: Callable[[Request], JSONResponse]
+    origin_problem: Callable[[Request], str | None]
+    emit: Callable[..., Awaitable[None]]
+    run_native_tool: Callable[..., Awaitable[str]]
+    new_key: Callable[[], str]
+    add_row: Callable[..., dict[str, Any]]
+    runtime: Callable[..., Runtime]
+
+    def _init_workspace(self, args: argparse.Namespace) -> None:
+        self.kanban_enabled = not getattr(args, "no_kanban", False)
+        self.onboarding_polls = max(1, int(getattr(args, "onboarding_polls", 3)))
+        self.kanban_run_seconds = float(getattr(args, "kanban_run_seconds", 20.0))
+        self.fleet_seconds = float(getattr(args, "fleet_seconds", 8.0))
+        self.custom_home = bool(getattr(args, "custom_home", False))
+        gh = getattr(args, "gh", "auto")
+        rich = self.seed_mode != "minimal"
+        self.gh_available = gh != "missing"
+        self.gh_authenticated = gh == "ready" or (gh == "auto" and rich)
+        self.mtimes: dict[str, float] = {}
+        self.repos: list[GitRepo] = []
+        self.gateway_state: dict[str, dict[str, Any]] = {}
+        self.platform_changes: dict[tuple[str, str], float] = {}
+        self.onboardings: dict[str, dict[str, Any]] = {}
+        self.pairing: dict[str, dict[str, Any]] = {}
+        self.webhooks: dict[str, dict[str, dict[str, Any]]] = {}
+        self.imported: dict[tuple[str, str], str] = {}
+        self.memories: dict[str, dict[str, list[str]]] = {}
+        self.fleet: dict[str, dict[str, Any]] = {}
+        self.kanban_boards: dict[str, KanbanBoard] = {}
+        self.kanban_current = "default"
+        self.started_m5 = time.time()
+        if rich:
+            for rel, text in M5_TEXT_FILES.items():
+                self.host_write(f"{DEMO_HOME}/{rel}", text.encode())
+            for rel, (width, height, rgb) in M5_IMAGE_FILES.items():
+                self.host_write(f"{DEMO_HOME}/{rel}", demo_png(width, height, rgb))
+        self.seed_repos(rich)
+        for name in self.profiles:
+            self.memories[name] = copy.deepcopy(MEMORY_SEEDS.get(name, {"memory": [], "profile": []})) if rich \
+                else {"memory": [], "profile": []}
+        self.kanban_boards["default"] = KanbanBoard("default", self.board_meta("default", created_at=time.time()))
+        if rich:
+            self.seed_messaging()
+            self.seed_kanban()
+
+    # ── plumbing ──────────────────────────────────────────────────────────────────────────────────
+
+    def workspace_routes(self) -> list[BaseRoute]:
+        r = self.rest
+        k = self.kanban_rest
+        return [
+            # files.py (the files panel; read-text, read-data-url and download are CapabilityFeatures')
+            Route("/api/fs/list", r(self.fs_list), methods=["GET"]),
+            Route("/api/fs/write-text", r(self.fs_write_text), methods=["POST"]),
+            Route("/api/fs/git-root", r(self.fs_git_root), methods=["GET"]),
+            Route("/api/fs/default-cwd", r(self.fs_default_cwd), methods=["GET"]),
+            Route("/api/files", r(self.managed_list), methods=["GET"]),
+            Route("/api/files", r(self.managed_delete), methods=["DELETE"]),
+            Route("/api/files/read", r(self.managed_read), methods=["GET"]),
+            Route("/api/files/download", r(self.managed_download), methods=["GET"]),
+            Route("/api/files/upload", r(self.managed_upload), methods=["POST"]),
+            Route("/api/files/upload-stream", self.raw_rest(self.managed_upload_stream), methods=["POST"]),
+            Route("/api/files/mkdir", r(self.managed_mkdir), methods=["POST"]),
+            # git.py over web_git.py
+            Route("/api/git/status", r(self.git_status), methods=["GET"]),
+            Route("/api/git/gh-auth", r(self.git_gh_auth), methods=["GET"]),
+            Route("/api/git/worktrees", r(self.git_worktrees), methods=["GET"]),
+            Route("/api/git/branches", r(self.git_branches), methods=["GET"]),
+            Route("/api/git/base-branches", r(self.git_base_branches), methods=["GET"]),
+            Route("/api/git/review/list", r(self.git_review_list), methods=["GET"]),
+            Route("/api/git/review/diff", r(self.git_review_diff), methods=["GET"]),
+            Route("/api/git/file-diff", r(self.git_file_diff), methods=["GET"]),
+            Route("/api/git/review/commit-context", r(self.git_commit_context), methods=["GET"]),
+            Route("/api/git/review/rev-parse", r(self.git_rev_parse), methods=["GET"]),
+            Route("/api/git/review/ship-info", r(self.git_ship_info), methods=["GET"]),
+            Route("/api/git/review/pr-list", r(self.git_pr_list), methods=["POST"]),
+            Route("/api/git/review/stage", r(self.git_stage), methods=["POST"]),
+            Route("/api/git/review/unstage", r(self.git_unstage), methods=["POST"]),
+            Route("/api/git/review/revert", r(self.git_revert), methods=["POST"]),
+            Route("/api/git/review/commit", r(self.git_commit), methods=["POST"]),
+            Route("/api/git/review/push", r(self.git_push), methods=["POST"]),
+            Route("/api/git/review/create-pr", r(self.git_create_pr), methods=["POST"]),
+            Route("/api/git/worktree/add", r(self.git_worktree_add), methods=["POST"]),
+            Route("/api/git/worktree/remove", r(self.git_worktree_remove), methods=["POST"]),
+            Route("/api/git/branch/switch", r(self.git_branch_switch), methods=["POST"]),
+            # chat_workspaces.py
+            Route("/api/chat/workspaces", r(self.chat_workspaces), methods=["GET"]),
+            # messaging.py
+            Route("/api/messaging/platforms", r(self.messaging_platforms), methods=["GET"]),
+            Route("/api/messaging/platforms/{platform_id}", r(self.update_messaging_platform), methods=["PUT"]),
+            Route("/api/messaging/platforms/{platform_id}/test", r(self.test_messaging_platform), methods=["POST"]),
+            Route("/api/messaging/telegram/onboarding/start", r(self.telegram_start), methods=["POST"]),
+            Route("/api/messaging/telegram/onboarding/{pairing_id}", r(self.telegram_status), methods=["GET"]),
+            Route("/api/messaging/telegram/onboarding/{pairing_id}", r(self.onboarding_cancel), methods=["DELETE"]),
+            Route("/api/messaging/telegram/onboarding/{pairing_id}/apply", r(self.telegram_apply), methods=["POST"]),
+            Route("/api/messaging/whatsapp/onboarding/start", r(self.whatsapp_start), methods=["POST"]),
+            Route("/api/messaging/whatsapp/onboarding/{pairing_id}", r(self.whatsapp_status), methods=["GET"]),
+            Route("/api/messaging/whatsapp/onboarding/{pairing_id}", r(self.onboarding_cancel), methods=["DELETE"]),
+            Route("/api/messaging/whatsapp/onboarding/{pairing_id}/apply", r(self.whatsapp_apply), methods=["POST"]),
+            Route("/api/messaging/debug/onboarding/{pairing_id}/complete", r(self.debug_complete_onboarding),
+                  methods=["POST"]),
+            # ops.py
+            Route("/api/pairing", r(self.pairing_list), methods=["GET"]),
+            Route("/api/pairing/approve", r(self.pairing_approve), methods=["POST"]),
+            Route("/api/pairing/revoke", r(self.pairing_revoke), methods=["POST"]),
+            Route("/api/pairing/clear-pending", r(self.pairing_clear), methods=["POST"]),
+            Route("/api/pairing/debug/request", r(self.debug_pairing_request), methods=["POST"]),
+            Route("/api/webhooks", r(self.webhooks_list), methods=["GET"]),
+            Route("/api/webhooks", r(self.webhook_create), methods=["POST"]),
+            Route("/api/webhooks/enable", r(self.webhooks_enable), methods=["POST"]),
+            Route("/api/webhooks/{name}", r(self.webhook_delete), methods=["DELETE"]),
+            Route("/api/webhooks/{name}/enabled", r(self.webhook_set_enabled), methods=["PUT"]),
+            Route("/api/gateway/start", r(self.gateway_start), methods=["POST"]),
+            Route("/api/gateway/stop", r(self.gateway_stop), methods=["POST"]),
+            # status.py (the learning graph; DELETE takes memory ids here, skills go to CapabilityFeatures)
+            Route("/api/learning/graph", r(self.learning_graph), methods=["GET"]),
+            Route("/api/learning/node", r(self.learning_node), methods=["GET"]),
+            Route("/api/learning/node", r(self.learning_edit), methods=["PUT"]),
+            Route("/api/learning/node", r(self.learning_delete), methods=["DELETE"]),
+            # dashboard_ui.py
+            Route("/api/dashboard/plugins", r(self.dashboard_plugins), methods=["GET"]),
+            Route("/api/dashboard/plugins/rescan", r(self.dashboard_plugins_rescan), methods=["GET"]),
+            # plugins/kanban/dashboard/plugin_api.py, mounted at /api/plugins/kanban/
+            Route("/api/plugins/kanban/board", k(self.kanban_board), methods=["GET"]),
+            Route("/api/plugins/kanban/workflow", k(lambda request, body: copy.deepcopy(KANBAN_WORKFLOW)),
+                  methods=["GET"]),
+            Route("/api/plugins/kanban/tasks", k(self.kanban_create_task), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/bulk", k(self.kanban_bulk), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/{task_id}", k(self.kanban_task_detail), methods=["GET"]),
+            Route("/api/plugins/kanban/tasks/{task_id}", k(self.kanban_update_task), methods=["PATCH"]),
+            Route("/api/plugins/kanban/tasks/{task_id}", k(self.kanban_delete_task), methods=["DELETE"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/comments", k(self.kanban_comment), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/attachments", k(self.kanban_attachments), methods=["GET"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/attachments", k(self.kanban_upload, raw=True),
+                  methods=["POST"]),
+            Route("/api/plugins/kanban/attachments/{attachment_id}", k(self.kanban_download), methods=["GET"]),
+            Route("/api/plugins/kanban/attachments/{attachment_id}", k(self.kanban_remove_attachment),
+                  methods=["DELETE"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/log", k(self.kanban_log), methods=["GET"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/reclaim", k(self.kanban_reclaim), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/reassign", k(self.kanban_reassign), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/estimate", k(self.kanban_estimate_task), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/specify", k(self.kanban_specify), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/decompose", k(self.kanban_decompose), methods=["POST"]),
+            Route("/api/plugins/kanban/tasks/{task_id}/home-subscribe/{platform}", k(self.kanban_subscribe),
+                  methods=["POST", "DELETE"]),
+            Route("/api/plugins/kanban/links", k(self.kanban_link), methods=["POST"]),
+            Route("/api/plugins/kanban/links", k(self.kanban_unlink), methods=["DELETE"]),
+            Route("/api/plugins/kanban/estimate", k(self.kanban_estimate_text), methods=["POST"]),
+            Route("/api/plugins/kanban/diagnostics", k(self.kanban_diagnostics), methods=["GET"]),
+            Route("/api/plugins/kanban/workers/active", k(self.kanban_workers), methods=["GET"]),
+            Route("/api/plugins/kanban/runs/{run_id}", k(self.kanban_run), methods=["GET"]),
+            Route("/api/plugins/kanban/runs/{run_id}/inspect", k(self.kanban_inspect_run), methods=["GET"]),
+            Route("/api/plugins/kanban/runs/{run_id}/terminate", k(self.kanban_terminate_run), methods=["POST"]),
+            Route("/api/plugins/kanban/config", k(self.kanban_config), methods=["GET"]),
+            Route("/api/plugins/kanban/home-channels", k(self.kanban_home_channels), methods=["GET"]),
+            Route("/api/plugins/kanban/stats", k(self.kanban_stats), methods=["GET"]),
+            Route("/api/plugins/kanban/assignees", k(self.kanban_assignees), methods=["GET"]),
+            Route("/api/plugins/kanban/dispatch", k(self.kanban_dispatch), methods=["POST"]),
+            Route("/api/plugins/kanban/model-options", k(self.kanban_model_options), methods=["GET"]),
+            Route("/api/plugins/kanban/projects", k(self.kanban_projects), methods=["GET"]),
+            Route("/api/plugins/kanban/boards", k(self.kanban_boards_list), methods=["GET"]),
+            Route("/api/plugins/kanban/boards", k(self.kanban_create_board), methods=["POST"]),
+            Route("/api/plugins/kanban/boards/import", k(self.kanban_import_board), methods=["POST"]),
+            Route("/api/plugins/kanban/boards/{slug}", k(self.kanban_update_board), methods=["PATCH"]),
+            Route("/api/plugins/kanban/boards/{slug}", k(self.kanban_delete_board), methods=["DELETE"]),
+            Route("/api/plugins/kanban/boards/{slug}/export", k(self.kanban_export_board), methods=["POST"]),
+            Route("/api/plugins/kanban/boards/{slug}/switch", k(self.kanban_switch_board), methods=["POST"]),
+            Route("/api/plugins/kanban/profiles", k(self.kanban_profiles), methods=["GET"]),
+            Route("/api/plugins/kanban/profiles/{name}", k(self.kanban_describe), methods=["PATCH"]),
+            Route("/api/plugins/kanban/profiles/{name}/describe-auto", k(self.kanban_describe_auto),
+                  methods=["POST"]),
+            Route("/api/plugins/kanban/orchestration", k(self.kanban_orchestration), methods=["GET"]),
+            Route("/api/plugins/kanban/orchestration", k(self.kanban_set_orchestration), methods=["PUT"]),
+            WebSocketRoute("/api/plugins/kanban/events", self.kanban_events),
+        ]
+
+    def workspace_methods(self, conn: Conn, params: dict[str, Any]) -> dict[str, Callable[[], Any]]:
+        return {"session.foreign.list": lambda: self.foreign_list(params),
+                "session.foreign.preview": lambda: self.foreign_preview(params),
+                "session.foreign.import": lambda: self.foreign_import(params),
+                "subagent.interrupt": lambda: self.subagent_interrupt(params),
+                "subagent.tail": lambda: self.subagent_tail(params),
+                "subagent.steer": lambda: self.subagent_steer(params)}
+
+    def workspace_demos(self) -> dict[str, Callable[[Runtime, StoredSession], Awaitable[str]]]:
+        """Chat trigger words this section adds (FakeHermes.chat_demos merges them after ChatFeatures')."""
+        return {"fleet": self.demo_fleet}
+
+    def raw_rest(self, handler: Callable[[Request], Awaitable[Any]]) -> Callable[[Request], Awaitable[Response]]:
+        """``rest`` for a multipart route: sign-in and origin checks and HttpError mapping, the body left unread."""
+        async def endpoint(request: Request) -> Response:
+            name = f"{request.method} {request.url.path}"
+            if not self.authed(request):
+                log(f"http {name} -> 401")
+                return self.unauthorized(request)
+            if problem := self.origin_problem(request):
+                log(f"http {name} -> 403", problem)
+                return JSONResponse({"detail": problem}, status_code=403)
+            try:
+                result = await handler(request)
+            except HttpError as exc:
+                log(f"http {name} -> {exc.status} {short(exc.detail, 160)}")
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status)
+            log(f"http {name} -> 200")
+            return result if isinstance(result, Response) else JSONResponse(result)
+        return endpoint
+
+    # ── the fake host's files ─────────────────────────────────────────────────────────────────────
+
+    def host_data(self, path: str) -> bytes | None:
+        """A file's bytes from whichever store holds it (the same order as CapabilityFeatures.fs_target)."""
+        for store in (self.media, self.files, self.artifact_files):
+            if path in store:
+                return store[path]
+        return None
+
+    def host_is_dir(self, path: str) -> bool:
+        """A folder: one the fake knows, or an ancestor of one (/, /home)."""
+        if path in self.dirs or path == "/":
+            return True
+        prefix = path.rstrip("/") + "/"
+        return any(d.startswith(prefix) for d in self.dirs)
+
+    def host_exists(self, path: str) -> bool:
+        return self.host_data(path) is not None or self.host_is_dir(path)
+
+    def host_children(self, directory: str) -> list[str]:
+        prefix = "/" if directory == "/" else directory.rstrip("/") + "/"
+        names = set()
+        for path in (*self.files, *self.media, *self.artifact_files, *self.dirs):
+            if path.startswith(prefix) and len(path) > len(prefix):
+                names.add(path[len(prefix):].split("/", 1)[0])
+        return sorted(prefix + name for name in names)
+
+    def host_files_under(self, directory: str) -> dict[str, bytes]:
+        prefix = directory.rstrip("/") + "/"
+        out: dict[str, bytes] = {}
+        for store in (self.artifact_files, self.files, self.media):
+            out.update({p: d for p, d in store.items() if p.startswith(prefix)})
+        return out
+
+    def host_mkdirs(self, path: str) -> None:
+        while path and path != "/" and path not in self.dirs:
+            self.dirs.add(path)
+            path = posixpath.dirname(path)
+
+    def host_write(self, path: str, data: bytes) -> None:
+        """Write a file (parents created); it then lives only in ``files``, so no other store shadows it."""
+        self.host_mkdirs(posixpath.dirname(path))
+        self.media.pop(path, None)
+        self.artifact_files.pop(path, None)
+        self.files[path] = data
+        self.mtimes[path] = time.time()
+
+    def host_remove(self, path: str) -> None:
+        """Remove a file, or a folder with everything under it."""
+        prefix = path.rstrip("/") + "/"
+        for store in (self.files, self.media, self.artifact_files):
+            for key in [k for k in store if k == path or k.startswith(prefix)]:
+                del store[key]
+        for key in [d for d in self.dirs if d == path or d.startswith(prefix)]:
+            self.dirs.discard(key)
+
+    def host_mtime(self, path: str) -> float:
+        if path in self.mtimes:
+            return self.mtimes[path]
+        return self.started_m5 - 3600 - int(hashlib.sha1(path.encode()).hexdigest()[:6], 16) % (30 * DAY)
+
+    def fs_scope(self, request: Request) -> FakeProfile:
+        """files.py ``profile`` query parameter: _profile_scope's 400/404 for a bad one."""
+        return self.scoped(request)
+
+    # ── /api/fs/* (files.py) ──────────────────────────────────────────────────────────────────────
+
+    def fs_list(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/fs/list?path=: ``{entries: [{name, path, isDirectory}]}`` without hidden build/VCS folders
+        or credential files, folders first; a missing path or a file is ``{entries: [], error: ENOENT|ENOTDIR}``."""
+        raw = query_text(request, "path")
+        self.fs_scope(request)
+        target = fs_absolute(raw)
+        if self.host_data(target) is not None:
+            return {"entries": [], "error": "ENOTDIR"}
+        if not self.host_is_dir(target):
+            return {"entries": [], "error": "ENOENT"}
+        entries = [{"name": posixpath.basename(p), "path": p, "isDirectory": self.host_is_dir(p)}
+                   for p in self.host_children(target)
+                   if posixpath.basename(p) not in FS_READDIR_HIDDEN and not is_sensitive(p)]
+        entries.sort(key=lambda e: (not e["isDirectory"], e["name"].lower(), e["name"]))
+        return {"entries": entries}
+
+    def fs_write_text(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py POST /api/fs/write-text {path, content}: the spot editor's save; the parent must exist, a folder
+        is refused, 8 MB at most. The content is never logged."""
+        raw, content = body_field(body, "path", str), body_field(body, "content", str)
+        self.fs_scope(request)
+        target = fs_absolute(raw)
+        data = content.encode("utf-8")
+        if len(data) > FS_WRITE_TEXT_MAX:
+            raise HttpError(413, "Content too large")
+        if self.host_is_dir(target):
+            raise HttpError(400, "Path points to a directory")
+        if not self.host_is_dir(posixpath.dirname(target)):
+            raise HttpError(400, "Parent directory does not exist")
+        self.host_write(target, data)
+        return {"ok": True, "path": target, "byteSize": len(data)}
+
+    def fs_git_root(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/fs/git-root?path=: the nearest folder holding ``.git`` (a linked worktree's own folder
+        too), walking up from the path (or its folder); ``{root: null}`` outside a repository."""
+        raw = query_text(request, "path")
+        self.fs_scope(request)
+        target = fs_absolute(raw)
+        _repo, checkout = self.git_locate(target)
+        return {"root": checkout.path if checkout else None}
+
+    def default_cwd(self, profile: FakeProfile) -> str:
+        """files.py _fs_default_cwd: the profile's terminal.cwd when it names a folder, else the home folder."""
+        raw = str((profile.loaded().get("terminal") or {}).get("cwd") or "").strip()
+        if raw in ("", ".", "auto", "cwd"):
+            return DEMO_HOME
+        path = fs_absolute(raw)
+        return path if self.host_is_dir(path) else DEMO_HOME
+
+    def fs_default_cwd(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/fs/default-cwd?profile=: ``{cwd, branch}`` (``git branch --show-current``, "" outside a
+        repository or detached)."""
+        cwd = self.default_cwd(self.fs_scope(request))
+        repo, checkout = self.git_locate(cwd)
+        return {"cwd": cwd, "branch": (checkout.branch or "") if checkout else ""}
+
+    # ── /api/files* (files.py managed files: the remote folder picker and file browser) ───────────
+
+    def managed_path(self, raw: Any, *, for_write: bool = False) -> str:
+        """web_server_files.py _resolve_managed_path without a locked root: home when empty, absolute only, no ``..``;
+        a read of a missing path is 404."""
+        text = str(raw or "").strip()
+        if "\0" in text:
+            raise HttpError(400, "Invalid path")
+        if not text:
+            return DEMO_HOME
+        if text == "~" or text.startswith("~/"):
+            text = DEMO_HOME + text[1:]
+        if not text.startswith("/"):
+            raise HttpError(400, "Path must be absolute")
+        if ".." in text.split("/"):
+            raise HttpError(400, "Path cannot contain '..'")
+        target = posixpath.normpath(text) if text != "/" else "/"
+        if not for_write and not self.host_exists(target):
+            raise HttpError(404, "Path not found")
+        return target
+
+    def managed_entry(self, path: str) -> dict[str, Any]:
+        """web_server_files.py _managed_file_entry."""
+        is_dir = self.host_is_dir(path) and self.host_data(path) is None
+        data = None if is_dir else self.host_data(path)
+        return {"name": posixpath.basename(path) or path, "path": path, "is_directory": is_dir,
+                "size": None if is_dir else len(data or b""), "mtime": self.host_mtime(path),
+                "mime_type": None if is_dir else (mimetypes.guess_type(path)[0] or "application/octet-stream")}
+
+    def managed_list(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/files?path=: the folder's entries (credential files left out), folders first."""
+        target = self.managed_path(request.query_params.get("path"))
+        if self.host_data(target) is not None:
+            raise HttpError(400, "Path is not a directory")
+        entries = [self.managed_entry(p) for p in self.host_children(target) if not is_sensitive(p)]
+        entries.sort(key=lambda e: (not e["is_directory"], str(e["name"]).lower()))
+        parent = None if target == "/" else posixpath.dirname(target)
+        return {"path": target, "parent": parent, "entries": entries, **MANAGED_META}
+
+    def managed_file(self, request: Request) -> tuple[str, bytes, str]:
+        """files.py _managed_readable_file + _managed_file_size."""
+        target = self.managed_path(query_text(request, "path"))
+        data = self.host_data(target)
+        if data is None:
+            raise HttpError(400, "Path is not a file")
+        if is_sensitive(target):
+            raise HttpError(403, "Access to sensitive files is not allowed")
+        if len(data) > MANAGED_FILE_MAX:
+            raise HttpError(413, "File is too large")
+        return target, data, mimetypes.guess_type(target)[0] or "application/octet-stream"
+
+    def managed_read(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/files/read?path=: the file as a data URL."""
+        target, data, mime = self.managed_file(request)
+        return {"name": posixpath.basename(target), "path": target, "size": len(data), "mime_type": mime,
+                "data_url": f"data:{mime};base64,{base64.b64encode(data).decode()}", **MANAGED_META}
+
+    def managed_download(self, request: Request, body: dict[str, Any]) -> Response:
+        """files.py GET /api/files/download?path=: an attachment."""
+        target, data, mime = self.managed_file(request)
+        return Response(data, media_type=mime, headers={
+            "content-disposition": f'attachment; filename="{posixpath.basename(target)}"'})
+
+    def managed_write_target(self, raw: Any, overwrite: bool) -> str:
+        """files.py _managed_write_target."""
+        target = self.managed_path(raw, for_write=True)
+        if self.host_is_dir(target) and self.host_data(target) is None:
+            raise HttpError(409, "A directory already exists at that path")
+        if self.host_data(target) is not None and not overwrite:
+            raise HttpError(409, "File already exists")
+        return target
+
+    def managed_written(self, target: str) -> dict[str, Any]:
+        return {"ok": True, "entry": self.managed_entry(target), "path": target, **MANAGED_META}
+
+    def managed_upload(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py POST /api/files/upload {path, data_url, overwrite=true}: a base64 data URL, written with its
+        parent folders."""
+        raw, data_url = body_field(body, "path", str), body_field(body, "data_url", str)
+        overwrite = body_field(body, "overwrite", bool, required=False, default=True)
+        target = self.managed_write_target(raw, overwrite)
+        text = data_url.strip()
+        if not text.startswith("data:") or "," not in text:
+            raise HttpError(400, "Upload payload must be a data URL")
+        header, encoded = text.split(",", 1)
+        if ";base64" not in header:
+            raise HttpError(400, "Upload payload must be base64 encoded")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise HttpError(400, "Upload payload is not valid base64") from None
+        if len(data) > MANAGED_FILE_MAX:
+            raise HttpError(413, "File is too large")
+        self.host_write(target, data)
+        return self.managed_written(target)
+
+    async def managed_upload_stream(self, request: Request) -> dict[str, Any]:
+        """files.py POST /api/files/upload-stream (multipart: file, path, overwrite=true)."""
+        form = await request.form()
+        upload, raw = form.get("file"), form.get("path")
+        if upload is None or isinstance(upload, str) or raw is None:
+            missing = "file" if upload is None or isinstance(upload, str) else "path"
+            raise HttpError(422, [{"type": "missing", "loc": ["body", missing], "msg": "Field required"}])
+        overwrite = str(form.get("overwrite", "true")).lower() not in ("false", "0", "no", "off")
+        target = self.managed_write_target(raw, overwrite)
+        data = await upload.read()
+        if len(data) > MANAGED_FILE_MAX:
+            raise HttpError(413, "File is too large")
+        self.host_write(target, data)
+        return self.managed_written(target)
+
+    def managed_mkdir(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py POST /api/files/mkdir {path}: ``mkdir -p``; a file in the way is 409."""
+        target = self.managed_path(body_field(body, "path", str), for_write=True)
+        if self.host_data(target) is not None:
+            raise HttpError(409, "A file already exists at that path")
+        self.host_mkdirs(target)
+        return self.managed_written(target)
+
+    def managed_delete(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py DELETE /api/files {path, recursive=false}: a file, an empty folder, or with ``recursive`` a whole
+        tree; a non-empty folder without it is 409."""
+        target = self.managed_path(body_field(body, "path", str))
+        recursive = body_field(body, "recursive", bool, required=False, default=False)
+        if target == "/":
+            raise HttpError(400, "Cannot delete the filesystem root")
+        if self.host_data(target) is None and self.host_children(target) and not recursive:
+            raise HttpError(409, f"Could not delete path: [Errno 66] Directory not empty: '{target}'")
+        self.host_remove(target)
+        for repo in self.repos:
+            repo.checkouts = [c for c in repo.checkouts if c is repo.checkouts[0] or self.host_is_dir(c.path)]
+        return {"ok": True, "path": target, **MANAGED_META}
+
+    # ── git: the seeded repositories ──────────────────────────────────────────────────────────────
+
+    def seed_repos(self, rich: bool) -> None:
+        """Atlas and Beacon as repositories over their folders. ``minimal``: one commit, clean trees, no remotes ahead
+        or behind, no pull requests. Otherwise Atlas has history, a local commit not pushed, staged / unstaged /
+        both / added / deleted / untracked files, a linked worktree on a PR branch, a local-only branch, a remote-only
+        branch and PRs (one from a fork); Beacon is clean but behind its upstream."""
+        now = time.time()
+        for _pid, slug, _name, _color, branch in DEMO_PROJECTS:
+            root = project_path(slug)
+            baseline = {p[len(root) + 1:]: d for p, d in self.host_files_under(root).items()}
+            repo = GitRepo(root=root, slug=f"{GITHUB_OWNER}/{slug}", origin_head="main")
+            self.repos.append(repo)
+            if not rich:
+                sha = repo.commit("Initial commit", now - 30 * DAY, None, baseline)
+                for name in {"main", branch}:
+                    repo.branches[name] = repo.remotes[f"origin/{name}"] = sha
+                    repo.upstreams[name] = f"origin/{name}"
+                repo.checkouts.append(GitCheckout(root, branch, sha, dict(baseline)))
+                continue
+            if slug == "atlas":
+                self.seed_atlas(repo, baseline, now)
+            else:
+                self.seed_beacon(repo, baseline, branch, now)
+
+    def seed_atlas(self, repo: GitRepo, baseline: dict[str, bytes], now: float) -> None:
+        def pick(*names: str) -> dict[str, bytes]:
+            return {n: baseline[n] for n in names if n in baseline}
+
+        c1 = repo.commit("Initial commit", now - 60 * DAY, None, pick("README.md", "pyproject.toml",
+                                                                      "src/atlas/__init__.py"))
+        c2 = repo.commit("Add token issuing", now - 40 * DAY, c1, {**repo.tree(c1), **pick(
+            "src/atlas/auth.py", "tests/test_auth.py", "AGENTS.md")})
+        c3 = repo.commit("Add storage module", now - 20 * DAY, c2, {**repo.tree(c2), **pick(
+            "src/atlas/storage.py", "tests/test_storage.py")})
+        released = {k: v for k, v in baseline.items() if k != "docs/architecture.md"}
+        c4 = repo.commit("Release 0.3.0", now - 9 * DAY, c3, released)
+        c5 = repo.commit("Docs: architecture overview", now - DAY, c4, baseline)
+        repo.branches["main"], repo.remotes["origin/main"], repo.upstreams["main"] = c5, c4, "origin/main"
+        refresh = AUTH_PY + "\n\ndef refresh(token, now):\n    return issue_token(token[\"user\"], now)\n"
+        t1 = repo.commit("Refresh tokens before they expire", now - 3 * DAY, c4, {
+            **released, "src/atlas/auth.py": refresh.encode(), "src/atlas/tokens.py": ATLAS_TOKENS_PY.encode()})
+        t2 = repo.commit("Test the refresh window", now - 2 * DAY, t1, {**repo.tree(t1), "tests/test_auth.py": (
+            DEMO_FILES["projects/atlas/tests/test_auth.py"] + "\n\ndef test_refresh_window():\n    ...\n").encode()})
+        repo.branches["hermes/token-refresh"] = t2
+        repo.remotes["origin/hermes/token-refresh"] = t1
+        repo.upstreams["hermes/token-refresh"] = "origin/hermes/token-refresh"
+        storage = DEMO_FILES["projects/atlas/src/atlas/storage.py"]
+        repo.branches["feature/storage-v2"] = repo.commit("Storage v2: batch writes", now - 12 * DAY, c3, {
+            **repo.tree(c3), "src/atlas/storage.py": (storage + "\n\ndef save_users(users):\n    ...\n").encode()})
+        repo.remotes["origin/feature/rate-limit"] = repo.commit("Rate limit /login", now - 5 * DAY, c4, {
+            **released, "src/atlas/ratelimit.py": b"LIMIT_PER_MINUTE = 10\n"})
+        # The main tree: one change of every kind.
+        main = GitCheckout(repo.root, "main", c5, dict(baseline))
+        main.index["CHANGELOG.md"] = CHANGELOG_NEW.encode()
+        self.host_write(f"{repo.root}/CHANGELOG.md", CHANGELOG_NEW.encode())
+        self.host_write(f"{repo.root}/src/atlas/auth.py", ATLAS_AUTH_PATCHED.encode())
+        staged_storage = storage + "\n\ndef delete_user(uid):\n    ...\n"
+        main.index["src/atlas/storage.py"] = staged_storage.encode()
+        self.host_write(f"{repo.root}/src/atlas/storage.py",
+                        (staged_storage + "\n\ndef list_users():\n    ...\n").encode())
+        main.index["src/atlas/clock.py"] = ATLAS_CLOCK_PY.encode()
+        self.host_write(f"{repo.root}/src/atlas/clock.py", ATLAS_CLOCK_PY.encode())
+        self.host_remove(f"{repo.root}/tests/test_storage.py")
+        self.host_write(f"{repo.root}/src/atlas/tokens.py", ATLAS_TOKENS_PY.encode())
+        self.host_write(f"{repo.root}/docs/token-flow.md", ATLAS_TOKEN_FLOW_MD.encode())
+        repo.checkouts.append(main)
+        # A linked worktree on the PR branch, with an unstaged README edit.
+        path = f"{repo.root}/.worktrees/token-refresh"
+        linked = GitCheckout(path, "hermes/token-refresh", t2, dict(repo.tree(t2)))
+        for rel, data in repo.tree(t2).items():
+            self.host_write(f"{path}/{rel}", data)
+        self.host_write(f"{path}/README.md", (DEMO_FILES["projects/atlas/README.md"] +
+                                              "\nTokens refresh 60 seconds before they expire.\n").encode())
+        repo.checkouts.append(linked)
+        url = f"https://github.com/{repo.slug}/pull/"
+        repo.prs = [
+            {"number": 38, "branch": "feature/storage-v2", "title": "Storage v2: batch writes", "state": "MERGED",
+             "draft": False, "cross": False, "url": f"{url}38"},
+            {"number": 42, "branch": "hermes/token-refresh", "title": "Refresh tokens before they expire",
+             "state": "OPEN", "draft": False, "cross": False, "url": f"{url}42"},
+            {"number": 44, "branch": "feature/rate-limit", "title": "Rate limit /login", "state": "OPEN",
+             "draft": True, "cross": False, "url": f"{url}44"},
+            {"number": 45, "branch": "main", "title": "Fix a typo in the README", "state": "OPEN", "draft": False,
+             "cross": True, "url": f"{url}45"}]
+
+    def seed_beacon(self, repo: GitRepo, baseline: dict[str, bytes], branch: str, now: float) -> None:
+        first = {k: v for k, v in baseline.items() if not k.startswith(("docs/", "assets/"))}
+        b1 = repo.commit("Initial server", now - 90 * DAY, None, first)
+        b2 = repo.commit("Release 1.4.0", now - 30 * DAY, b1, baseline)
+        package = DEMO_FILES["projects/beacon/package.json"].replace("1.4.0", "1.5.0-dev")
+        b3 = repo.commit("Bump dependencies", now - 2 * DAY, b2, {**baseline, "package.json": package.encode()})
+        server = DEMO_FILES["projects/beacon/src/server.ts"].replace("{}", "{ /* health check: 5 s timeout */ }")
+        b4 = repo.commit("Hotfix: health check timeout", now - DAY, b2, {**baseline, "src/server.ts": server.encode()})
+        repo.branches.update({"main": b2, branch: b2})
+        repo.remotes.update({"origin/main": b3, f"origin/{branch}": b4})
+        repo.upstreams.update({"main": "origin/main", branch: f"origin/{branch}"})
+        repo.checkouts.append(GitCheckout(repo.root, branch, b2, dict(baseline)))
+
+    # ── git: the model ────────────────────────────────────────────────────────────────────────────
+
+    def git_locate(self, path: str) -> tuple[GitRepo | None, GitCheckout | None]:
+        """The working tree a path lies in (the deepest one: a linked worktree inside the main tree's folder wins)."""
+        best: tuple[GitRepo | None, GitCheckout | None] = (None, None)
+        for repo in self.repos:
+            for checkout in repo.checkouts:
+                if (path == checkout.path or path.startswith(checkout.path + "/")) and self.host_is_dir(checkout.path) \
+                        and (best[1] is None or len(checkout.path) > len(best[1].path)):
+                    best = (repo, checkout)
+        return best
+
+    def git_cwd(self, raw: Any) -> str:
+        """git.py _git_path."""
+        return fs_absolute(raw)
+
+    def git_at(self, raw: Any) -> tuple[GitRepo, GitCheckout]:
+        """A mutation's repository: git's own refusal outside one (400 through _git_op)."""
+        cwd = self.git_cwd(raw)
+        if not self.host_is_dir(cwd):
+            raise HttpError(400, "git invocation failed")
+        repo, checkout = self.git_locate(cwd)
+        if repo is None or checkout is None:
+            raise HttpError(400, NOT_A_REPO)
+        return repo, checkout
+
+    def git_read(self, raw: Any) -> tuple[GitRepo | None, GitCheckout | None]:
+        """A read's repository: None (the empty answer) when the path is no folder or no repository."""
+        cwd = self.git_cwd(raw)
+        return self.git_locate(cwd) if self.host_is_dir(cwd) else (None, None)
+
+    def work_files(self, repo: GitRepo, checkout: GitCheckout) -> dict[str, bytes]:
+        """The working tree: the host files under the checkout, minus nested worktrees and ignored names."""
+        nested = [c.path + "/" for c in repo.checkouts if c is not checkout and c.path.startswith(checkout.path + "/")]
+        out = {}
+        for path, data in self.host_files_under(checkout.path).items():
+            rel = path[len(checkout.path) + 1:]
+            if any(path.startswith(n) for n in nested) or GIT_IGNORED.intersection(rel.split("/")):
+                continue
+            out[rel] = data
+        return out
+
+    def git_entries(self, repo: GitRepo, checkout: GitCheckout,
+                    work: dict[str, bytes] | None = None) -> list[tuple[str, str, str]]:
+        """``git status --porcelain=v2`` as web_git.py _walk_entries yields it: (tag, XY, path), by path."""
+        work = self.work_files(repo, checkout) if work is None else work
+        head, index = repo.tree(repo.head_sha(checkout)), checkout.index
+        out = []
+        for path in sorted(set(head) | set(index) | set(work)):
+            if path in index or path in head:
+                x = "A" if path not in head else "D" if path not in index else "M" if head[path] != index[path] else "."
+                y = "." if path not in index else "D" if path not in work else "M" if work[path] != index[path] else "."
+                if x != "." or y != ".":
+                    out.append(("1", x + y, path))
+                if path not in index and path in work:
+                    out.append(("?", "??", path))
+            else:
+                out.append(("?", "??", path))
+        return out
+
+    @staticmethod
+    def entry_staged(tag: str, xy: str) -> bool:
+        return tag in ("1", "2") and xy[0] not in (".", "?")
+
+    def git_classify(self, tag: str, xy: str, path: str) -> dict[str, Any]:
+        """web_git.py _classify."""
+        return {"path": path, "staged": self.entry_staged(tag, xy),
+                "unstaged": tag == "?" or (tag in ("1", "2") and xy[1] not in (".", "?")),
+                "untracked": tag == "?", "conflicted": tag == "u"}
+
+    @staticmethod
+    def numstat(old: dict[str, bytes], new: dict[str, bytes], paths: set[str] | None = None) -> dict[str, tuple[int, int]]:
+        """``git diff --numstat`` between two snapshots (only paths that differ; ``paths`` limits the set)."""
+        keys = (set(old) | set(new)) if paths is None else paths
+        return {p: line_stat(old.get(p), new.get(p)) for p in sorted(keys) if old.get(p) != new.get(p)}
+
+    def head_vs_work(self, repo: GitRepo, checkout: GitCheckout, work: dict[str, bytes]) -> dict[str, tuple[int, int]]:
+        """``git diff --numstat HEAD``: tracked paths only (the index or HEAD knows them)."""
+        head = repo.tree(repo.head_sha(checkout))
+        return self.numstat(head, work, set(head) | set(checkout.index))
+
+    def rel_target(self, checkout: GitCheckout, cwd: str, raw: Any) -> str | None:
+        """git.py ``_fs_path(file, cwd=cwd)`` made relative to the working tree; None outside it."""
+        target = fs_absolute(raw, cwd)
+        if not target.startswith(checkout.path + "/"):
+            return None
+        return target[len(checkout.path) + 1:]
+
+    @staticmethod
+    def under(paths: Any, rel: str) -> list[str]:
+        """A pathspec: the path itself, or everything under it when it names a folder (``.`` = everything)."""
+        if rel in ("", "."):
+            return sorted(paths)
+        return sorted(p for p in paths if p == rel or p.startswith(rel.rstrip("/") + "/"))
+
+    def single_diff(self, rel: str, old: dict[str, bytes], new: dict[str, bytes]) -> str:
+        """web_git.py _single_file_diff: one file; a folder with changes inside is refused."""
+        if rel in old or rel in new:
+            return unified_file_diff(rel, old.get(rel), new.get(rel))
+        if any(old.get(p) != new.get(p) for p in self.under(set(old) | set(new), rel)):
+            raise HttpError(400, "Expected a single file, not a directory")
+        return ""
+
+    def write_tree(self, checkout: GitCheckout, rel: str, data: bytes | None) -> None:
+        path = f"{checkout.path}/{rel}"
+        if data is None:
+            self.host_remove(path)
+        else:
+            self.host_write(path, data)
+
+    # ── /api/git/* (git.py, web_git.py) ───────────────────────────────────────────────────────────
+
+    def git_status(self, request: Request, body: dict[str, Any]) -> dict[str, Any] | None:
+        """web_git.py repo_status: the coding rail's compact status; null outside a repository."""
+        repo, checkout = self.git_read(query_text(request, "path"))
+        if repo is None or checkout is None:
+            return None
+        work = self.work_files(repo, checkout)
+        files = [self.git_classify(*entry) for entry in self.git_entries(repo, checkout, work)]
+        counts = self.head_vs_work(repo, checkout, work).values()
+        added = sum(a for a, _ in counts) + sum(untracked_lines(work[f["path"]]) for f in files[:UNTRACKED_SCAN_CAP]
+                                                if f["untracked"])
+        ahead, behind = (repo.ahead_behind(repo.branches[checkout.branch], repo.remotes.get(
+            repo.upstreams.get(checkout.branch, ""))) if checkout.branch else (0, 0))
+        return {"branch": checkout.branch, "defaultBranch": repo.default_branch(), "detached": checkout.branch is None,
+                "ahead": ahead, "behind": behind,
+                **{flag: sum(f[flag] for f in files) for flag in ("staged", "unstaged", "untracked", "conflicted")},
+                "changed": len(files), "added": added, "removed": sum(r for _, r in counts), "files": files[:200]}
+
+    def git_gh_auth(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """git.py GET /api/git/gh-auth?refresh=: whether the ``gh`` CLI is installed and signed in."""
+        query_flag(request, "refresh")
+        return {"available": self.gh_available, "authenticated": self.gh_available and self.gh_authenticated}
+
+    def git_worktrees(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py worktree_list: the main tree first."""
+        repo, _checkout = self.git_read(query_text(request, "path"))
+        trees = [{"path": c.path, "branch": c.branch, "isMain": i == 0, "detached": c.branch is None,
+                  "locked": c.locked} for i, c in enumerate(repo.checkouts if repo else [])]
+        return {"worktrees": trees}
+
+    def ref_names(self, repo: GitRepo, local: bool = True, remote: bool = False) -> list[str]:
+        """``for-each-ref --sort=-committerdate`` over refs/heads and/or refs/remotes (origin/HEAD left out)."""
+        refs = ([(n, s) for n, s in repo.branches.items()] if local else []) + \
+               ([(n, s) for n, s in repo.remotes.items()] if remote else [])
+        return [n for n, s in sorted(refs, key=lambda ns: (-repo.commits[ns[1]].at, ns[0]))]
+
+    def git_branches(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py branch_list: local heads (newest first), then remote branches with no local head."""
+        repo, _checkout = self.git_read(query_text(request, "path"))
+        if repo is None:
+            return {"branches": []}
+        locals_ = self.ref_names(repo)
+        where = {c.branch: c.path for c in repo.checkouts if c.branch}
+        trunk = repo.default_branch()
+        remotes = [n for n in self.ref_names(repo, local=False, remote=True) if n.split("/", 1)[-1] not in locals_]
+        return {"branches": [
+            *({"name": n, "checkedOut": n in where, "isDefault": n == trunk, "isRemote": False,
+               "worktreePath": where.get(n)} for n in locals_),
+            *({"name": n, "checkedOut": False, "isDefault": False, "isRemote": True, "worktreePath": None}
+              for n in remotes)]}
+
+    def git_base_branches(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py base_branch_list: local and remote refs; origin/HEAD's target is the default."""
+        repo, _checkout = self.git_read(query_text(request, "path"))
+        if repo is None:
+            return {"branches": []}
+        default = f"origin/{repo.origin_head}" if repo.origin_head else repo.default_branch()
+        return {"branches": [{"name": n, "isRemote": n.startswith("origin/"), "isDefault": n == default}
+                             for n in self.ref_names(repo, local=True, remote=True)]}
+
+    def branch_base(self, repo: GitRepo, checkout: GitCheckout) -> str | None:
+        """web_git.py _branch_base: merge-base of HEAD with origin/HEAD (or origin/main, main…)."""
+        head = repo.head_sha(checkout)
+        for ref in ("origin/HEAD", "origin/main", "origin/master", "main", "master"):
+            if (sha := repo.resolve(ref)) and (base := repo.merge_base(head, sha)):
+                return base
+        return None
+
+    def resolve_in(self, repo: GitRepo, checkout: GitCheckout, ref: str | None) -> str | None:
+        ref = (ref or "HEAD").strip()
+        if ref == "HEAD" or ref.startswith("HEAD~"):
+            ref = repo.head_sha(checkout) + ref[4:]
+        return repo.resolve(ref)
+
+    def git_review_list(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_list: scope ``uncommitted`` (status with staged + unstaged counts), ``branch`` (committed
+        since the merge-base) or ``lastTurn`` (since ``base``, untracked files included)."""
+        q = request.query_params
+        repo, checkout = self.git_read(query_text(request, "path"))
+        scope, base_ref = q.get("scope", "uncommitted"), q.get("base")
+        if repo is None or checkout is None:
+            return {"files": [], "base": None}
+        work = self.work_files(repo, checkout)
+        files: list[dict[str, Any]] = []
+        if scope in ("branch", "lastTurn"):
+            base = self.branch_base(repo, checkout) if scope == "branch" else base_ref
+            if not base:
+                return {"files": [], "base": None}
+            if scope == "branch":
+                stats = self.numstat(repo.tree(base), repo.tree(repo.head_sha(checkout)))
+            else:
+                sha = self.resolve_in(repo, checkout, base)
+                old = repo.tree(sha)
+                stats = self.numstat(old, work, set(old) | set(checkout.index)) if sha else {}
+            files = [{"path": p, "added": a, "removed": r, "status": "M", "staged": False} for p, (a, r) in
+                     stats.items()]
+            if scope == "lastTurn":
+                seen = {f["path"] for f in files}
+                files += [{"path": p, "added": 0, "removed": 0, "status": "?", "staged": False}
+                          for tag, _xy, p in self.git_entries(repo, checkout, work) if tag == "?" and p not in seen]
+        else:
+            base = None
+            head = repo.tree(repo.head_sha(checkout))
+            staged, unstaged = self.numstat(head, checkout.index), self.numstat(checkout.index, work,
+                                                                                set(checkout.index))
+            for tag, xy, path in self.git_entries(repo, checkout, work):
+                sa, sr = staged.get(path, (0, 0)) if tag != "?" else (0, 0)
+                ua, ur = unstaged.get(path, (0, 0)) if tag != "?" else (0, 0)
+                letter = tag.upper() if tag in ("?", "u") else ((xy[0] if xy[0] != "." else xy[1]) or "M").upper()
+                files.append({"path": path, "added": sa + ua, "removed": sr + ur, "status": letter,
+                              "staged": self.entry_staged(tag, xy)})
+        files.sort(key=lambda f: f["path"])
+        for f in files:
+            if f["status"] == "?" and f["added"] == 0 and f["removed"] == 0 and f["path"] in work:
+                f["added"] = untracked_lines(work[f["path"]])
+        return {"files": files, "base": base}
+
+    def git_review_diff(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_diff: one file's diff for a scope (staged, worktree, or an untracked file's all-add)."""
+        q = request.query_params
+        raw, file = query_text(request, "path"), query_text(request, "file")
+        cwd = self.git_cwd(raw)
+        fs_absolute(file, cwd)
+        repo, checkout = self.git_read(raw)
+        if repo is None or checkout is None:
+            return {"diff": ""}
+        rel = self.rel_target(checkout, cwd, file)
+        if rel is None:
+            return {"diff": ""}
+        scope, staged = q.get("scope", "uncommitted"), query_flag(request, "staged")
+        work = self.work_files(repo, checkout)
+        head = repo.tree(repo.head_sha(checkout))
+        if scope == "branch":
+            base = self.branch_base(repo, checkout)
+            return {"diff": self.single_diff(rel, repo.tree(base), head) if base else ""}
+        if scope == "lastTurn":
+            sha = self.resolve_in(repo, checkout, q.get("base")) if q.get("base") else None
+            if not sha:
+                return {"diff": ""}
+            old = repo.tree(sha)
+            tracked = {p: work.get(p) for p in set(old) | set(checkout.index) if p in work}
+            return {"diff": self.single_diff(rel, old, tracked)}
+        if staged:
+            return {"diff": self.single_diff(rel, head, checkout.index)}
+        tracked = {p: d for p, d in work.items() if p in checkout.index}
+        diff = self.single_diff(rel, {p: d for p, d in checkout.index.items()}, tracked)
+        if not diff.strip() and rel not in checkout.index and rel in work:
+            diff = unified_file_diff(rel, None, work[rel])
+        return {"diff": diff}
+
+    def git_file_diff(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py file_diff_vs_head: the working tree against HEAD; all-add only for an untracked file."""
+        raw, file = query_text(request, "path"), query_text(request, "file")
+        cwd = self.git_cwd(raw)
+        repo, checkout = self.git_read(raw)
+        if repo is None or checkout is None:
+            return {"diff": ""}
+        rel = self.rel_target(checkout, cwd, file)
+        if rel is None:
+            return {"diff": ""}
+        work = self.work_files(repo, checkout)
+        head = repo.tree(repo.head_sha(checkout))
+        tracked = {p: work.get(p) for p in set(head) | set(checkout.index) if p in work}
+        diff = self.single_diff(rel, head, tracked)
+        if not diff.strip() and rel not in head and rel not in checkout.index and rel in work:
+            diff = unified_file_diff(rel, None, work[rel])
+        return {"diff": diff}
+
+    def git_commit_context(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_commit_context: the diff that WILL commit (staged, else everything tracked against
+        HEAD) plus the untracked files, and the last ten subjects, for drafting a message."""
+        repo, checkout = self.git_read(query_text(request, "path"))
+        if repo is None or checkout is None:
+            return {"diff": "", "recent": ""}
+        work = self.work_files(repo, checkout)
+        entries = self.git_entries(repo, checkout, work)
+        head = repo.tree(repo.head_sha(checkout))
+        if any(self.entry_staged(tag, xy) for tag, xy, _p in entries):
+            old, new = head, checkout.index
+        else:
+            old, new = head, {p: work.get(p) for p in set(head) | set(checkout.index) if p in work}
+        diff = "".join(unified_file_diff(p, old.get(p), new.get(p)) for p in sorted(set(old) | set(new))
+                       if old.get(p) != new.get(p))
+        if len(diff) > COMMIT_CONTEXT_MAX:
+            diff = f"{diff[:COMMIT_CONTEXT_MAX]}\n# diff truncated: {len(diff) - COMMIT_CONTEXT_MAX} chars omitted\n"
+        untracked = [p for tag, _xy, p in entries if tag == "?"]
+        if untracked:
+            visible = untracked[:COMMIT_CONTEXT_UNTRACKED_MAX]
+            diff += "\n# New (untracked) files:\n" + "".join(f"#   {p}\n" for p in visible)
+            if len(untracked) > len(visible):
+                diff += f"#   ... {len(untracked) - len(visible)} more omitted\n"
+        recent = "\n".join(repo.commits[s].subject for s in repo.ancestors(repo.head_sha(checkout))[:10])
+        return {"diff": diff, "recent": recent}
+
+    def git_rev_parse(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_rev_parse: the full commit id of ``ref`` (HEAD by default), or null."""
+        repo, checkout = self.git_read(query_text(request, "path"))
+        if repo is None or checkout is None:
+            return {"sha": None}
+        return {"sha": self.resolve_in(repo, checkout, request.query_params.get("ref"))}
+
+    def pr_payload(self, pr: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py _pr_payload."""
+        return {"branch": pr["branch"], "draft": pr["draft"], "number": pr["number"], "state": pr["state"].lower(),
+                "title": pr["title"], "url": pr["url"]}
+
+    def gh_ready(self, repo: GitRepo) -> bool:
+        """``gh auth status`` succeeds and the repository has a GitHub remote."""
+        return self.gh_available and self.gh_authenticated and repo.slug is not None
+
+    def git_ship_info(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_ship_info: gh ready, and this branch's PR (``gh pr view``: the newest, any state)."""
+        repo, checkout = self.git_read(query_text(request, "path"))
+        if repo is None or checkout is None or not self.gh_ready(repo):
+            return {"ghReady": False, "pr": None}
+        pr = next((p for p in sorted(repo.prs, key=lambda p: -p["number"])
+                   if checkout.branch and p["branch"] == checkout.branch and not p["cross"]), None)
+        return {"ghReady": True, "pr": {"url": pr["url"], "state": pr["state"], "number": pr["number"]} if pr else None}
+
+    def git_pr_list(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_pr_list {path, branches, numbers}: the newest own-repo PR per branch (a fork's PR on the
+        same branch name never counts) and the PRs asked for by number."""
+        raw = body_field(body, "path", str)
+        branches = body_field(body, "branches", list, required=False, default=[])
+        numbers = body_field(body, "numbers", list, required=False, default=[])
+        not_ready = {"ghReady": False, "prs": []}
+        repo, _checkout = self.git_read(raw)
+        wanted = list(dict.fromkeys(str(b) for b in branches if b))[:300]
+        by_number = list(dict.fromkeys(int(n) for n in numbers if isinstance(n, int) and n))[:300]
+        if repo is None or (not wanted and not by_number) or not self.gh_ready(repo):
+            return not_ready
+        newest = sorted(repo.prs, key=lambda p: -p["number"])
+        prs = [self.pr_payload(pr) for b in wanted
+               if (pr := next((p for p in newest if p["branch"] == b and not p["cross"]), None))]
+        prs += [self.pr_payload(pr) for n in by_number if (pr := next((p for p in newest if p["number"] == n), None))]
+        return {"ghReady": True, "prs": prs}
+
+    def file_arg(self, body: dict[str, Any]) -> str | None:
+        file = body.get("file")
+        if file is not None and not isinstance(file, str):
+            raise body_error("file", "string_type")
+        return file or None
+
+    def git_stage(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_stage: ``git add -- <file>`` (``add -A`` without one)."""
+        repo, checkout = self.git_at(body_field(body, "path", str))
+        file = self.file_arg(body)
+        work = self.work_files(repo, checkout)
+        rel = "." if file is None else self.rel_target(checkout, self.git_cwd(body["path"]), file)
+        paths = self.under(set(work) | set(checkout.index), rel) if rel is not None else []
+        if not paths:
+            raise HttpError(400, f"fatal: pathspec '{file}' did not match any files")
+        for p in paths:
+            if p in work:
+                checkout.index[p] = work[p]
+            else:
+                checkout.index.pop(p, None)
+        return {"ok": True}
+
+    def git_unstage(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_unstage: ``git reset -q HEAD [-- <file>]``."""
+        repo, checkout = self.git_at(body_field(body, "path", str))
+        file = self.file_arg(body)
+        head = repo.tree(repo.head_sha(checkout))
+        rel = "." if file is None else self.rel_target(checkout, self.git_cwd(body["path"]), file)
+        for p in self.under(set(head) | set(checkout.index), rel) if rel is not None else []:
+            if p in head:
+                checkout.index[p] = head[p]
+            else:
+                checkout.index.pop(p, None)
+        return {"ok": True}
+
+    def git_revert(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_revert: ``git checkout HEAD -- <file|.>`` then ``git clean -fd -- <file|.>`` (a staged new
+        file is kept; untracked files go)."""
+        repo, checkout = self.git_at(body_field(body, "path", str))
+        file = self.file_arg(body)
+        head = repo.tree(repo.head_sha(checkout))
+        rel = "." if file is None else self.rel_target(checkout, self.git_cwd(body["path"]), file)
+        if rel is None:
+            return {"ok": True}
+        for p in self.under(head, rel):
+            checkout.index[p] = head[p]
+            self.write_tree(checkout, p, head[p])
+        work = self.work_files(repo, checkout)
+        for p in self.under(work, rel):
+            if p not in checkout.index:
+                self.write_tree(checkout, p, None)
+        return {"ok": True}
+
+    def git_commit(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_commit {path, message, push}: everything is staged first when nothing is."""
+        repo, checkout = self.git_at(body_field(body, "path", str))
+        message = body_field(body, "message", str)
+        push = body_field(body, "push", bool, required=False, default=False)
+        work = self.work_files(repo, checkout)
+        if not any(self.entry_staged(t, xy) for t, xy, _p in self.git_entries(repo, checkout, work)):
+            checkout.index = dict(work)
+        if not message.strip():
+            raise HttpError(400, "Aborting commit due to empty commit message.")
+        parent = repo.head_sha(checkout)
+        if repo.tree(parent) == checkout.index:
+            raise HttpError(400, "git commit failed")
+        sha = repo.commit(message.strip().splitlines()[0], time.time(), parent, checkout.index)
+        if checkout.branch:
+            repo.branches[checkout.branch] = sha
+        else:
+            checkout.head = sha
+        if push:
+            self.push(repo, checkout)
+        return {"ok": True}
+
+    def push(self, repo: GitRepo, checkout: GitCheckout) -> None:
+        """web_git.py _review_push: ``git push`` with an upstream, else ``git push -u origin <branch>``."""
+        if checkout.branch is None:
+            return
+        if not repo.slug:
+            raise HttpError(400, "fatal: 'origin' does not appear to be a git repository\nfatal: Could not read from "
+                                 "remote repository.\n\nPlease make sure you have the correct access rights\nand the "
+                                 "repository exists.")
+        branch, local = checkout.branch, repo.branches[checkout.branch]
+        remote = repo.upstreams.get(branch) or f"origin/{branch}"
+        theirs = repo.remotes.get(remote)
+        if theirs is not None and theirs not in repo.ancestors(local):
+            raise HttpError(400, f"To github.com:{repo.slug}.git\n ! [rejected]        {branch} -> {branch} "
+                                 "(non-fast-forward)\nerror: failed to push some refs to "
+                                 f"'github.com:{repo.slug}.git'\nhint: Updates were rejected because the tip of your "
+                                 "current branch is behind\nhint: its remote counterpart. If you want to integrate the "
+                                 "remote changes,\nhint: use 'git pull' before pushing again.")
+        repo.remotes[remote] = local
+        repo.upstreams[branch] = remote
+
+    def git_push(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        repo, checkout = self.git_at(body_field(body, "path", str))
+        self.push(repo, checkout)
+        return {"ok": True}
+
+    def git_create_pr(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py review_create_pr: push (errors ignored), then ``gh pr create --fill``; gh's own stderr says why
+        it failed."""
+        repo, checkout = self.git_at(body_field(body, "path", str))
+        try:
+            self.push(repo, checkout)
+        except HttpError:
+            pass
+
+        def failed(detail: str) -> HttpError:
+            return HttpError(400, f"gh pr create failed: {detail.strip()[-GH_ERR_TAIL:]}")
+        if not self.gh_available:
+            raise failed("is gh installed and authenticated?")
+        if not self.gh_authenticated:
+            raise failed("To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the "
+                         "GH_TOKEN environment variable with a GitHub API authentication token.")
+        if not repo.slug:
+            raise failed("none of the git remotes configured for this repository point to a known GitHub host.")
+        branch, base = checkout.branch, repo.default_branch() or "main"
+        if branch is None:
+            raise failed("could not determine the current branch: not on any branch")
+        if branch == base:
+            raise failed(f"could not create pull request: head branch \"{branch}\" is the same as base branch "
+                         f"\"{base}\", cannot create a pull request")
+        if f"origin/{branch}" not in repo.remotes:
+            raise failed("aborted: you must first push the current branch to a remote, or use the --head flag")
+        if (existing := next((p for p in repo.prs if p["branch"] == branch and not p["cross"] and
+                              p["state"] == "OPEN"), None)):
+            raise failed(f"a pull request for branch \"{branch}\" into branch \"{base}\" already exists:\n"
+                         f"{existing['url']}")
+        base_sha = repo.resolve(f"origin/{base}") or repo.resolve(base)
+        mine = [s for s in repo.ancestors(repo.branches[branch]) if s not in set(repo.ancestors(base_sha))]
+        if not mine:
+            raise failed(f"pull request create failed: GraphQL: No commits between {base} and {branch} "
+                         "(createPullRequest)")
+        number = max([p["number"] for p in repo.prs] or [0]) + 1
+        title = repo.commits[mine[-1]].subject if len(mine) == 1 else branch.split("/")[-1].replace("-", " ").title()
+        url = f"https://github.com/{repo.slug}/pull/{number}"
+        repo.prs.append({"number": number, "branch": branch, "title": title, "state": "OPEN", "draft": False,
+                         "cross": False, "url": url})
+        return {"url": url}
+
+    def unique_dir(self, base: str) -> str:
+        return next(c for c in itertools.chain([base], (f"{base}-{n}" for n in itertools.count(2)))
+                    if not self.host_exists(c))
+
+    def check_out(self, repo: GitRepo, path: str, branch: str) -> dict[str, Any]:
+        """``git worktree add <path> <branch>``: a branch already checked out elsewhere is refused."""
+        if (other := repo.checkout_of(branch)) is not None:
+            raise HttpError(400, f"fatal: '{branch}' is already used by worktree at '{other.path}'")
+        tree = repo.tree(repo.branches[branch])
+        self.host_mkdirs(path)
+        for rel, data in tree.items():
+            self.host_write(f"{path}/{rel}", data)
+        repo.checkouts.append(GitCheckout(path, branch, repo.branches[branch], dict(tree)))
+        return {"path": path, "branch": branch, "repoRoot": repo.root}
+
+    def ensure_repo(self, cwd: str) -> GitRepo:
+        """web_git.py _ensure_repo: a folder that is no repository yet gets ``git init`` and an empty root commit."""
+        if not self.host_is_dir(cwd):
+            raise HttpError(400, "git invocation failed")
+        repo, _checkout = self.git_locate(cwd)
+        if repo is not None:
+            return repo
+        repo = GitRepo(root=cwd, slug=None)
+        sha = repo.commit("Initial commit", time.time(), None, {})
+        repo.branches["main"] = sha
+        repo.checkouts.append(GitCheckout(cwd, "main", sha, {}))
+        self.repos.append(repo)
+        return repo
+
+    def git_worktree_add(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py worktree_add {path, name?, branch?, base?, existingBranch?}: a new branch (``hermes/<slug>``
+        unless named) in ``<repo>/.worktrees/<slug>``, or an existing local / remote branch checked out (the trunk
+        switches the main tree instead)."""
+        options = {k: body_field(body, k, str, required=False) for k in ("name", "branch", "base", "existingBranch")}
+        repo = self.ensure_repo(self.git_cwd(body_field(body, "path", str)))
+        root = repo.root
+        if options["existingBranch"]:
+            requested = sanitize_branch(options["existingBranch"])
+            if not requested:
+                raise HttpError(400, "Branch name is required.")
+            remote = requested in repo.remotes
+            existing = requested.split("/", 1)[1] if remote else requested
+            if not remote and existing == repo.default_branch():
+                self.switch(repo, repo.checkouts[0], existing)
+                return {"path": root, "branch": existing, "repoRoot": root}
+            target = self.unique_dir(f"{root}/.worktrees/{slugify(existing)}")
+            if remote:
+                if existing in repo.branches:
+                    raise HttpError(400, f"fatal: a branch named '{existing}' already exists")
+                repo.branches[existing] = repo.remotes[requested]
+                repo.upstreams[existing] = requested
+            elif existing not in repo.branches:
+                raise HttpError(400, f"fatal: invalid reference: {existing}")
+            return self.check_out(repo, target, existing)
+        slug = slugify(options["name"] or f"work-{secrets.token_hex(4)}")
+        branch = sanitize_branch(options["branch"] or "") or f"hermes/{slug}"
+        target = self.unique_dir(f"{root}/.worktrees/{slug}")
+        if branch in repo.branches:
+            return self.check_out(repo, target, branch)
+        start = repo.resolve(options["base"]) if options["base"] else repo.head_sha(repo.checkouts[0])
+        if start is None:
+            raise HttpError(400, f"fatal: invalid reference: {options['base']}")
+        repo.branches[branch] = start
+        return self.check_out(repo, target, branch)
+
+    def git_worktree_remove(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py worktree_remove {path, worktreePath, force}: ``git worktree remove [--force]``; the main tree, a
+        locked tree and (without force) a dirty one are refused."""
+        repo, _checkout = self.git_at(body_field(body, "path", str))
+        raw = body_field(body, "worktreePath", str)
+        force = body_field(body, "force", bool, required=False, default=False)
+        path = self.git_cwd(raw)
+        tree = next((c for c in repo.checkouts if c.path == path), None)
+        if tree is None:
+            raise HttpError(400, f"fatal: '{raw}' is not a working tree")
+        if tree is repo.checkouts[0]:
+            raise HttpError(400, f"fatal: '{path}' is a main working tree")
+        if tree.locked:
+            raise HttpError(400, "fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or "
+                                 "unlock first")
+        if not force and self.git_entries(repo, tree):
+            raise HttpError(400, f"fatal: '{path}' contains modified or untracked files, use --force to delete it")
+        self.host_remove(path)
+        repo.checkouts.remove(tree)
+        return {"removed": raw}
+
+    def switch(self, repo: GitRepo, checkout: GitCheckout, target: str) -> None:
+        """``git switch <target>``: a remote-only branch gets a tracking local one; local changes travel along unless
+        the switch would overwrite them."""
+        if target not in repo.branches:
+            if f"origin/{target}" not in repo.remotes:
+                raise HttpError(400, f"fatal: invalid reference: {target}")
+            repo.branches[target] = repo.remotes[f"origin/{target}"]
+            repo.upstreams[target] = f"origin/{target}"
+        if checkout.branch == target:
+            return
+        if (other := repo.checkout_of(target)) is not None:
+            raise HttpError(400, f"fatal: '{target}' is already used by worktree at '{other.path}'")
+        work = self.work_files(repo, checkout)
+        old, new = repo.tree(repo.head_sha(checkout)), repo.tree(repo.branches[target])
+        touched = [p for p in sorted(set(old) | set(new)) if old.get(p) != new.get(p)]
+        dirty = {p for p in set(old) | set(checkout.index) | set(work)
+                 if work.get(p) != old.get(p) or checkout.index.get(p) != old.get(p)}
+        clash = [p for p in touched if p in dirty and (p in old or p in new)]
+        if clash:
+            raise HttpError(400, "error: Your local changes to the following files would be overwritten by checkout:\n"
+                            + "".join(f"\t{p}\n" for p in clash)
+                            + "Please commit your changes or stash them before you switch branches.\nAborting")
+        for p in touched:
+            if new.get(p) is None:
+                checkout.index.pop(p, None)
+            else:
+                checkout.index[p] = new[p]
+            self.write_tree(checkout, p, new.get(p))
+        checkout.branch, checkout.head = target, repo.branches[target]
+
+    def git_branch_switch(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """web_git.py branch_switch {path, branch}."""
+        repo, checkout = self.git_at(body_field(body, "path", str))
+        target = sanitize_branch(body_field(body, "branch", str))
+        if not target:
+            raise HttpError(400, "Branch name is required.")
+        self.switch(repo, checkout, target)
+        return {"branch": target}
+
+    # ── /api/chat/workspaces (chat_workspaces.py) ─────────────────────────────────────────────────
+
+    def chat_workspaces(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """chat_workspaces.py GET /api/chat/workspaces?profile=&scan=: the projects, the repositories (session-derived
+        roots of this profile plus the scanned ones), the profile's default folder and whether scanning is on."""
+        profile = self.scoped(request)
+        query_flag(request, "scan")
+        policy = (profile.loaded().get("desktop") or {})
+        scan_enabled = policy.get("repo_scan_enabled", True) is not False
+        repos: dict[str, dict[str, Any]] = {}
+        for stored in self.sessions.values():
+            if stored.profile == profile.name and stored.persisted and stored.git_repo_root:
+                agg = repos.setdefault(stored.git_repo_root, {"root": stored.git_repo_root, "label": "",
+                                                              "sessions": 0, "last_active": 0.0})
+                agg["sessions"] += 1
+                agg["last_active"] = max(agg["last_active"], float(stored.last_active))
+        if scan_enabled:
+            for repo in self.repos:
+                repos.setdefault(repo.root, {"root": repo.root, "label": "", "sessions": 0, "last_active": 0.0})
+        out = sorted(repos.values(), key=lambda r: r["last_active"], reverse=True)
+        for row in out:
+            row["label"] = row["label"] or posixpath.basename(row["root"])
+        return {"projects": [dict(p) for p in self.projects], "repos": out, "default_cwd": self.default_cwd(profile),
+                "home": DEMO_HOME, "scan_enabled": scan_enabled}
+
+    # ── gateway lifecycle (ops.py start/stop; /api/status reads it) ───────────────────────────────
+
+    def gateway_record(self, name: str) -> dict[str, Any]:
+        """The profile's gateway: running unless stopped from here; a finished restart (CapabilityFeatures' or one
+        started after a messaging change) brings it back."""
+        state = self.gateway_state.setdefault(name, {"running": True, "changed": self.started_m5})
+        restart = self.actions.get("gateway-restart")
+        if restart is not None and restart.done and restart.exit_code == 0 and restart.started > state["changed"]:
+            state.update(running=True, changed=restart.started)
+        return state
+
+    def gateway_running(self, name: str) -> bool:
+        self.settle_actions()
+        return self.gateway_record(name)["running"]
+
+    def live_refusal(self, profile: FakeProfile, verb: str) -> str | None:
+        """web_server_gateway.py live_session_refusal (gateway_lifecycle_guards.py _work_lines)."""
+        live = [rt for rt in self.runtimes.values() if rt.running and
+                (stored := self.sessions.get(rt.key)) is not None and stored.profile == profile.name]
+        if not live:
+            return None
+        lines = [f"Refusing to {verb} the gateway: {len(live)} live session(s) would be interrupted."]
+        lines += [f"  • session {rt.key}: a turn is running" for rt in live]
+        lines += ["  Let them finish, or interrupt them deliberately:",
+                  f"    POST /api/gateway/{verb}?interrupt=true   # interrupts {len(live)} live session(s)"]
+        return "\n".join(lines)
+
+    def restart_after(self, profile: FakeProfile) -> dict[str, Any]:
+        """web_server_gateway.py _restart_gateway_after: a best-effort restart (a running one is reused); live
+        sessions refuse it with ``restart_busy``."""
+        if refusal := self.live_refusal(profile, "restart"):
+            return {"restart_started": False, "restart_error": refusal, "restart_busy": True}
+        current = self.actions.get("gateway-restart")
+        if current is None or current.done:
+            current = self.spawn("gateway-restart", [
+                "Interrupting 0 running turns…", f"Stopping gateway (pid {20_000 + secrets.randbelow(40_000)})…",
+                f"Gateway started (pid {20_000 + secrets.randbelow(40_000)})", "Gateway is healthy."])
+        return {"restart_started": True, "restart_action": "gateway-restart", "restart_pid": current.pid}
+
+    def gateway_start(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/gateway/start: ``hermes -p <profile> gateway start`` (gateway-start)."""
+        profile = self.scoped(request)
+        state = self.gateway_record(profile.name)
+        action = self.spawn("gateway-start", [f"Starting gateway for profile {profile.name}…",
+                                              f"Gateway started (pid {20_000 + secrets.randbelow(40_000)})",
+                                              "Gateway is healthy."],
+                            on_done=lambda: state.update(running=True, changed=time.time()))
+        return {"ok": True, "pid": action.pid, "name": "gateway-start"}
+
+    def gateway_stop(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/gateway/stop?interrupt=: refused (409) while sessions run, unless ``interrupt``."""
+        profile = self.scoped(request)
+        interrupt = query_flag(request, "interrupt")
+        if not interrupt and (refusal := self.live_refusal(profile, "stop")):
+            raise HttpError(409, refusal)
+        state = self.gateway_record(profile.name)
+        action = self.spawn("gateway-stop", [f"Stopping gateway for profile {profile.name}…",
+                                             *(["Interrupting live sessions…"] if interrupt else []),
+                                             "Gateway stopped."],
+                            on_done=lambda: state.update(running=False, changed=time.time()))
+        return {"ok": True, "pid": action.pid, "name": "gateway-stop"}
+
+    def status_gateway(self, requested: str) -> dict[str, Any]:
+        """The /api/status gateway fields for a profile (SettingsFeatures.get_status reads them)."""
+        name = requested if requested and requested.lower() != "current" and requested in self.profiles else "default"
+        running = self.gateway_running(name)
+        platforms = {p["id"]: {"state": p["state"], "error_code": p["error_code"],
+                               "error_message": p["error_message"], "updated_at": p["updated_at"]}
+                     for p in self.platform_payloads(self.profiles[name]) if p["enabled"] and running}
+        return {"gateway_running": running, "gateway_state": "running" if running else "stopped",
+                "gateway_platforms": platforms}
+
+    # ── messaging (messaging.py, web_server_messaging.py) ─────────────────────────────────────────
+
+    def seed_messaging(self) -> None:
+        """Default profile: Telegram connected (allowlist + paired users), Discord enabled with a token the platform
+        rejects, a home channel; two pending pairing requests; webhooks on with two routes. Research: nothing yet."""
+        default = self.profiles["default"]
+        default.env.update({"TELEGRAM_BOT_TOKEN": "7012345678:AAFakeDemoTokenForTheFakeHermesOnly00",
+                            "TELEGRAM_ALLOWED_USERS": "123456789", "DISCORD_BOT_TOKEN": "bad-demo-discord-token"})
+        default.config.setdefault("platforms", {}).update({
+            "telegram": {"enabled": True, "home_channel": {"platform": "telegram", "chat_id": "123456789",
+                                                           "name": "Demo DM", "thread_id": ""}},
+            "discord": {"enabled": True}, "webhook": {"enabled": True, "extra": {"port": 8644}}})
+        now = time.time()
+        self.pairing["default"] = {
+            "pending": [
+                {"platform": "telegram", "request_id": secrets.token_hex(8), "code": "K7Q2M9XA",
+                 "user_id": "555000111", "user_name": "Alex Example", "created": now - 7 * 60},
+                {"platform": "discord", "request_id": secrets.token_hex(8), "code": "P3W8R2NZ",
+                 "user_id": "998877665544", "user_name": "sam#0042", "created": now - 42 * 60}],
+            "approved": [{"platform": "telegram", "user_id": "123456789", "user_name": "Demo User",
+                          "approved_at": now - 20 * DAY}],
+            "failures": {}}
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 10 * DAY))
+        self.webhooks["default"] = {
+            "github-pr": {"description": "Review new pull requests on acme/atlas", "events": ["pull_request"],
+                          "secret": secrets.token_urlsafe(32), "prompt": "Review PR {{pull_request.html_url}} and "
+                          "post a short summary.", "skills": ["github-pr-review"], "deliver": "telegram",
+                          "created_at": stamp},
+            "uptime-alert": {"description": "Dashboard-created subscription: uptime-alert", "events": [],
+                             "secret": secrets.token_urlsafe(32), "prompt": "", "skills": [], "deliver": "log",
+                             "created_at": stamp, "enabled": False}}
+
+    def platform_payloads(self, profile: FakeProfile, only: str | None = None) -> list[dict[str, Any]]:
+        """messaging.py _messaging_platform_payload, judged from the profile's own .env and config.yaml."""
+        running = self.gateway_running(profile.name)
+        state = self.gateway_record(profile.name)
+        platforms_cfg = profile.config.get("platforms") if isinstance(profile.config.get("platforms"), dict) else {}
+        out = []
+        for pid, name, description, docs, env_keys, required in MESSAGING_PLATFORMS:
+            if only is not None and pid != only:
+                continue
+            env = profile.env
+            cfg = platforms_cfg.get(pid) if isinstance(platforms_cfg.get(pid), dict) else {}
+            # A platform without required keys (api_server, webhook) is configured once it is switched on, as the
+            # gateway's own _is_platform_connected judges it.
+            explicit = cfg.get("enabled")
+            configured = all(env.get(k) for k in required) if required else explicit is True
+            enabled = False if explicit is False else bool(explicit) or configured
+            home = cfg.get("home_channel") if isinstance(cfg.get("home_channel"), dict) else None
+            changed = self.platform_changes.get((profile.name, pid))
+            error_code = error_message = updated_at = None
+            if not enabled:
+                status = "disabled"
+            elif not configured:
+                status = "not_configured"
+            elif not running:
+                status = "gateway_stopped"
+            elif changed is not None and changed > state["changed"]:
+                status = "pending_restart"
+            elif any(str(env.get(k, "")).startswith("bad") for k in required):
+                status, error_code = "fatal", "unauthorized"
+                error_message = f"{name} rejected the bot token (401 Unauthorized). Paste a fresh token."
+                updated_at = iso_at(state["changed"])
+            else:
+                status, updated_at = "connected", iso_at(state["changed"])
+            env_vars = []
+            for key in env_keys:
+                value = str(env.get(key) or "")
+                description_, prompt, url, password, advanced = MESSAGING_ENV[key]
+                is_list = not password and ALLOWLIST_KEY.search(key) is not None
+                env_vars.append({"key": key, "required": key in required, "is_set": bool(value),
+                                 "redacted_value": credential_preview(value) if value else None,
+                                 "value": value if is_list else None, "description": description_, "prompt": prompt,
+                                 "help": "", "url": url, "is_password": password, "is_list": is_list,
+                                 "advanced": advanced})
+            payload = {"id": pid, "name": name, "description": description, "docs_url": docs, "enabled": enabled,
+                       "configured": configured, "gateway_running": running, "state": status,
+                       "error_code": error_code, "error_message": error_message, "updated_at": updated_at,
+                       "home_channel": home, "env_vars": env_vars, "ingress_url": None}
+            if pid == "whatsapp":
+                mode = str(env.get("WHATSAPP_MODE") or "").strip()
+                payload["whatsapp_setup"] = {"mode": mode if mode in ("bot", "self-chat") else "",
+                                             "allowed_users_set": bool(str(env.get("WHATSAPP_ALLOWED_USERS") or
+                                                                           "").strip()),
+                                             "home_channel_set": bool(home)}
+            out.append(payload)
+        return out
+
+    def messaging_platforms(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py GET /api/messaging/platforms?profile=."""
+        profile = self.scoped(request)
+        return {"env_path": f"{profile.path}/.env",
+                "gateway_start_command": f"hermes -p {profile.name} gateway start",
+                "platforms": self.platform_payloads(profile)}
+
+    def write_platform_enabled(self, profile: FakeProfile, pid: str, enabled: bool) -> None:
+        """web_server_messaging.py _write_platform_enabled: config.yaml platforms.<id>.enabled."""
+        platforms = profile.config.setdefault("platforms", {})
+        platforms.setdefault(pid, {})["enabled"] = enabled
+        self.platform_changes[(profile.name, pid)] = time.time()
+
+    def update_messaging_platform(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py PUT /api/messaging/platforms/{id} {enabled?, env, clear_env, profile?}: only the platform's
+        own keys, never a redacted preview, values checked by the platform's rules. Values are never logged."""
+        pid = request.path_params["platform_id"]
+        profile = self.scoped(request, body)
+        entry = MESSAGING_BY_ID.get(pid)
+        if entry is None:
+            raise HttpError(404, f"Unknown messaging platform: {pid}")
+        env = body_field(body, "env", dict, required=False, default={})
+        clear = body_field(body, "clear_env", list, required=False, default=[])
+        enabled = body_field(body, "enabled", bool, required=False)
+        allowed = set(entry[4])
+        updates = {}
+        for key in [*clear, *env]:
+            if key not in allowed:
+                raise HttpError(400, f"{key} is not configurable for {entry[1]}")
+        for key, value in env.items():
+            trimmed = str(value).strip()
+            if not trimmed:
+                continue
+            if is_credential_preview(trimmed):
+                raise HttpError(400, REDACTED_WRITE_DETAIL)
+            if (rule := ENV_VALUE_RULES.get(key)) and not rule[0](trimmed):
+                raise HttpError(400, rule[1])
+            updates[key] = trimmed
+        for key in clear:
+            profile.env.pop(key, None)
+        profile.env.update(updates)
+        if enabled is not None:
+            self.write_platform_enabled(profile, pid, enabled)
+        elif updates or clear:
+            self.platform_changes[(profile.name, pid)] = time.time()
+        log(f"messaging {pid} updated for profile {profile.name}: env_keys={sorted(env)} cleared={sorted(clear)}")
+        return {"ok": True, "platform": pid, "hot_served": False}
+
+    def test_messaging_platform(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py POST /api/messaging/platforms/{id}/test: the setup verdict, and for a connected platform its
+        auth posture (open / allowlist / pairing / deny_all)."""
+        pid = request.path_params["platform_id"]
+        profile = self.scoped(request)
+        if pid not in MESSAGING_BY_ID:
+            raise HttpError(404, f"Unknown messaging platform: {pid}")
+        payload = self.platform_payloads(profile, only=pid)[0]
+        name = payload["name"]
+
+        def result(ok: bool, message: str) -> dict[str, Any]:
+            return {"ok": ok, "state": payload["state"], "message": message}
+        if not payload["enabled"]:
+            return result(False, f"{name} is disabled. Enable it, then restart the gateway.")
+        if not payload["configured"]:
+            missing = [f["key"] for f in payload["env_vars"] if f["required"] and not f["is_set"]]
+            return result(False, f"Missing required setup: {', '.join(missing)}" if missing else
+                          "Platform setup is incomplete.")
+        if not payload["gateway_running"]:
+            return result(False, "Gateway is not running. Restart the gateway to connect this platform.")
+        if payload["state"] != "connected":
+            return result(False, payload["error_message"] or "Setup looks complete, but the gateway has not reported "
+                                                             "a connection yet. Restart the gateway.")
+        allowed_env = f"{pid.upper()}_ALLOWED_USERS"
+        if pid in ("api_server", "webhook"):
+            return result(True, f"{name} is connected.")
+        allowlist = str(profile.env.get(allowed_env) or "")
+        if str(profile.env.get(f"{pid.upper()}_ALLOW_ALL_USERS") or "").lower() in ("true", "1", "yes"):
+            return {**result(True, f"{name} is open: {pid.upper()}_ALLOW_ALL_USERS is set."), "auth_posture": "open"}
+        if count := len([u for u in allowlist.split(",") if u.strip()]):
+            return {**result(True, f"Connected. {count} user{'s' if count != 1 else ''} allowlisted via "
+                                   f"{allowed_env}."), "auth_posture": "allowlist"}
+        store = self.pairing_store(profile)
+        approved = [u for u in store["approved"] if u["platform"] == pid]
+        pending = [u for u in store["pending"] if u["platform"] == pid]
+        if approved:
+            return {**result(True, f"Connected. {len(approved)} user{'s' if len(approved) != 1 else ''} paired."),
+                    "auth_posture": "pairing"}
+        message = (f"{name} is connected, but no users are authorized yet — set {allowed_env}, approve a pairing "
+                   "request, or enable pairing for new users.")
+        if pending:
+            message += f" {len(pending)} pairing request{'s' if len(pending) != 1 else ''} pending approval."
+        return {**result(True, message), "auth_posture": "deny_all"}
+
+    # Telegram / WhatsApp QR onboarding: the setup service is faked; a pairing completes on its
+    # ``--onboarding-polls``-th status poll, or at once through the debug route.
+
+    def onboarding(self, kind: str, pairing_id: str) -> dict[str, Any]:
+        record = self.onboardings.get(pairing_id)
+        if record is not None and record["expires"] <= time.time():
+            self.onboardings.pop(pairing_id, None)
+            record = None
+        if record is None or record["kind"] != kind:
+            raise HttpError(404, TELEGRAM_SESSION_NOT_FOUND if kind == "telegram" else WHATSAPP_SESSION_NOT_FOUND)
+        return record
+
+    def telegram_start(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py POST /api/messaging/telegram/onboarding/start {bot_name?}: a pairing with the setup service
+        (a deep link and QR payload into Telegram)."""
+        bot_name = str(body.get("bot_name") or "Hermes Agent").strip() or "Hermes Agent"
+        pairing_id = "tgp_" + secrets.token_hex(8)
+        expires = time.time() + ONBOARDING_TTL
+        suggested = re.sub(r"[^a-z0-9]+", "_", bot_name.lower()).strip("_")[:20] + f"_{secrets.token_hex(2)}_bot"
+        deep_link = f"https://t.me/HermesSetupBot?start={pairing_id}"
+        self.onboardings[pairing_id] = {"kind": "telegram", "polls": 0, "ready": False, "expires": expires,
+                                        "expires_at": iso_at(expires).replace("+00:00", "Z"), "bot_name": bot_name,
+                                        "username": suggested, "owner": "123456789", "token": None}
+        return {"pairing_id": pairing_id, "suggested_username": suggested, "deep_link": deep_link,
+                "qr_payload": deep_link, "expires_at": self.onboardings[pairing_id]["expires_at"]}
+
+    def finish_onboarding(self, record: dict[str, Any]) -> None:
+        if record["kind"] == "telegram":
+            record.update(ready=True, token=f"{secrets.randbelow(9_000_000_000) + 1_000_000_000}:" +
+                          secrets.token_urlsafe(26)[:35])
+        else:
+            record.update(status="connected", account_id="15550100123:7", account_name="Demo Phone",
+                          account_phone="15550100123", qr_payload=None)
+
+    def telegram_status(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py GET /api/messaging/telegram/onboarding/{id}: waiting, then ready with the new bot."""
+        record = self.onboarding("telegram", request.path_params["pairing_id"])
+        record["polls"] += 1
+        if not record["ready"] and record["polls"] >= self.onboarding_polls:
+            self.finish_onboarding(record)
+        if not record["ready"]:
+            return {"status": "waiting", "expires_at": record["expires_at"]}
+        return {"status": "ready", "bot_username": record["username"], "owner_user_id": record["owner"],
+                "expires_at": record["expires_at"]}
+
+    def telegram_apply(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py POST .../telegram/onboarding/{id}/apply {allowed_user_ids, profile?}: saves the bot token and
+        the allowlist into the profile's .env, enables Telegram and restarts the gateway (best effort)."""
+        ids = body_field(body, "allowed_user_ids", list)
+        normalized = [str(v).strip() if re.fullmatch(r"\d+", str(v).strip()) else None for v in ids]
+        if not all(normalized):
+            raise HttpError(400, "Allowed Telegram user IDs must be numeric.")
+        allowed = list(dict.fromkeys(normalized))
+        if not allowed:
+            raise HttpError(400, "Add at least one allowed Telegram user ID.")
+        record = self.onboarding("telegram", request.path_params["pairing_id"])
+        if not record["ready"]:
+            raise HttpError(409, "Telegram setup is not ready yet.")
+        profile = self.scoped(request, body)
+        profile.env["TELEGRAM_BOT_TOKEN"] = record["token"]
+        profile.env["TELEGRAM_ALLOWED_USERS"] = ",".join(allowed)
+        self.write_platform_enabled(profile, "telegram", True)
+        self.onboardings.pop(request.path_params["pairing_id"], None)
+        log(f"telegram onboarding applied for profile {profile.name} ({len(allowed)} allowed users)")
+        restart = self.restart_after(profile)
+        return {"ok": True, "platform": "telegram", "bot_username": record["username"],
+                "needs_restart": not restart["restart_started"], **restart}
+
+    def onboarding_cancel(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py DELETE .../{telegram,whatsapp}/onboarding/{id}: always ok."""
+        self.onboardings.pop(request.path_params["pairing_id"], None)
+        return {"ok": True}
+
+    def whatsapp_payload(self, pairing_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        """web_server_messaging.py _whatsapp_onboarding_payload."""
+        return {"pairing_id": pairing_id, **{k: record.get(k) for k in (
+            "status", "qr_payload", "expires_at", "mode", "allowed_users", "account_id", "account_name",
+            "account_phone", "error")}}
+
+    def whatsapp_start(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py POST /api/messaging/whatsapp/onboarding/start {mode, allowed_users, profile?, reset_session}:
+        a bridge pairing that shows a QR code, then connects; one at a time per profile (409)."""
+        mode = str(body.get("mode") or "bot").strip().lower()
+        if mode not in ("bot", "self-chat"):
+            raise HttpError(400, "WhatsApp mode must be 'bot' or 'self-chat'.")
+        allowed = ",".join(p.replace(" ", "") for p in str(body.get("allowed_users") or "").split(",") if p.strip())
+        profile = self.scoped(request, body)
+        if any(r["kind"] == "whatsapp" and r["profile"] == profile.name and r["status"] in ("starting", "waiting")
+               for r in self.onboardings.values()):
+            raise HttpError(409, "Another WhatsApp QR setup is still active. Cancel it or wait for it to stop before "
+                                 "re-pairing.")
+        pairing_id = secrets.token_urlsafe(12)
+        expires = time.time() + ONBOARDING_TTL
+        record = {"kind": "whatsapp", "polls": 0, "expires": expires, "profile": profile.name, "status": "starting",
+                  "qr_payload": None, "expires_at": iso_at(expires).replace("+00:00", "Z"), "mode": mode,
+                  "allowed_users": allowed, "account_id": None, "account_name": None, "account_phone": None,
+                  "error": None}
+        self.onboardings[pairing_id] = record
+        return self.whatsapp_payload(pairing_id, record)
+
+    def whatsapp_status(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py GET /api/messaging/whatsapp/onboarding/{id}: starting -> waiting (a QR payload) -> connected."""
+        pairing_id = request.path_params["pairing_id"]
+        record = self.onboarding("whatsapp", pairing_id)
+        record["polls"] += 1
+        if record["status"] == "starting":
+            record.update(status="waiting", qr_payload=f"2@{secrets.token_urlsafe(24)},{secrets.token_urlsafe(16)}")
+        if record["status"] == "waiting" and record["polls"] >= self.onboarding_polls:
+            self.finish_onboarding(record)
+        return self.whatsapp_payload(pairing_id, record)
+
+    def whatsapp_apply(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """messaging.py POST .../whatsapp/onboarding/{id}/apply {mode?, allowed_users?, profile?}: WHATSAPP_* into the
+        .env (DM policy ``pairing``; self-chat allows the linked phone), enabled, gateway restarted."""
+        pairing_id = request.path_params["pairing_id"]
+        record = self.onboarding("whatsapp", pairing_id)
+        if record["status"] != "connected":
+            raise HttpError(409, "WhatsApp setup is not connected yet.")
+        mode = str(body.get("mode") or record["mode"]).strip().lower()
+        if mode not in ("bot", "self-chat"):
+            raise HttpError(400, "WhatsApp mode must be 'bot' or 'self-chat'.")
+        raw = record["allowed_users"] if body.get("allowed_users") is None else str(body["allowed_users"])
+        allowed = ",".join(p.replace(" ", "") for p in raw.split(",") if p.strip())
+        if mode == "self-chat" and not allowed:
+            allowed = record["account_phone"] or record["account_id"] or ""
+        named = body.get("profile") or request.query_params.get("profile")
+        profile = self.scoped(request, body) if named else self.profile_named(record["profile"])
+        profile.env.update({"WHATSAPP_MODE": mode, "WHATSAPP_DM_POLICY": "pairing", "WHATSAPP_ENABLED": "true"})
+        if allowed:
+            profile.env["WHATSAPP_ALLOWED_USERS"] = allowed
+        self.write_platform_enabled(profile, "whatsapp", True)
+        self.onboardings.pop(pairing_id, None)
+        restart = self.restart_after(profile)
+        return {"ok": True, "platform": "whatsapp", "needs_restart": not restart["restart_started"], **restart}
+
+    def debug_complete_onboarding(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """Fake only: POST /api/messaging/debug/onboarding/{id}/complete finishes a Telegram or WhatsApp pairing now
+        (as if the phone scanned the QR code)."""
+        pairing_id = request.path_params["pairing_id"]
+        record = self.onboardings.get(pairing_id)
+        if record is None:
+            raise HttpError(404, "No such onboarding pairing")
+        self.finish_onboarding(record)
+        return {"ok": True, "kind": record["kind"]}
+
+    # ── pairing (ops.py over gateway/pairing.py PairingStore) ─────────────────────────────────────
+
+    def pairing_store(self, profile: FakeProfile) -> dict[str, Any]:
+        return self.pairing.setdefault(profile.name, {"pending": [], "approved": [], "failures": {}})
+
+    def pairing_list(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py GET /api/pairing?profile=: pending requests (by request id, never the code) and approved users."""
+        store = self.pairing_store(self.scoped(request))
+        now = time.time()
+        store["pending"] = [p for p in store["pending"] if now - p["created"] < 3600]
+        return {"pending": [{"platform": p["platform"], "request_id": p["request_id"], "user_id": p["user_id"],
+                             "user_name": p["user_name"], "age_minutes": int((now - p["created"]) / 60)}
+                            for p in store["pending"]],
+                "approved": [dict(a) for a in store["approved"]]}
+
+    def pairing_approve(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/pairing/approve {platform, request_id | code, profile?}: the profile comes from the body;
+        a wrong code counts toward a lockout (429), a stale request id never does."""
+        store = self.pairing_store(self.scoped(request, body))
+        platform = str(body.get("platform") or "").lower().strip()
+        target = str(body.get("request_id") or body.get("code") or "").strip()
+        if not platform or not target:
+            raise HttpError(400, "platform and request_id or code are required")
+        by_request = bool(body.get("request_id")) or re.fullmatch(r"[0-9a-fA-F]{16}", target) is not None
+        match = next((p for p in store["pending"] if p["platform"] == platform and (
+            p["request_id"] == target.lower() if by_request else p["code"] == target.upper())), None)
+        if match is None:
+            if not by_request:
+                store["failures"][platform] = store["failures"].get(platform, 0) + 1
+                if store["failures"][platform] >= PAIRING_LOCKOUT:
+                    raise HttpError(429, f"Platform '{platform}' is locked out after too many failed approvals.")
+            raise HttpError(404, f"Pairing request or code not found or expired for platform '{platform}'.")
+        store["pending"].remove(match)
+        store["failures"].pop(platform, None)
+        store["approved"] = [a for a in store["approved"] if not (a["platform"] == platform and
+                                                                  a["user_id"] == match["user_id"])]
+        store["approved"].append({"platform": platform, "user_id": match["user_id"], "user_name": match["user_name"],
+                                  "approved_at": time.time()})
+        return {"ok": True, "user": {"user_id": match["user_id"], "user_name": match["user_name"]}}
+
+    def pairing_revoke(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/pairing/revoke {platform, user_id, profile?}."""
+        store = self.pairing_store(self.scoped(request, body))
+        platform = str(body.get("platform") or "").lower().strip()
+        user_id = str(body.get("user_id") or "")
+        if not platform or not user_id:
+            raise HttpError(400, "platform and user_id are required")
+        kept = [a for a in store["approved"] if not (a["platform"] == platform and a["user_id"] == user_id)]
+        if len(kept) == len(store["approved"]):
+            raise HttpError(404, f"User {user_id} not found in approved list for {platform}.")
+        store["approved"] = kept
+        return {"ok": True}
+
+    def pairing_clear(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/pairing/clear-pending?profile=."""
+        store = self.pairing_store(self.scoped(request))
+        cleared, store["pending"] = len(store["pending"]), []
+        return {"ok": True, "cleared": cleared}
+
+    def debug_pairing_request(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """Fake only: POST /api/pairing/debug/request {platform, user_id, user_name?, profile?} — a stranger DMs the
+        bot and gets a one-time code (returned here so a test can approve by code)."""
+        store = self.pairing_store(self.scoped(request, body))
+        platform = str(body_field(body, "platform", str)).lower().strip()
+        user_id = str(body_field(body, "user_id", str)).strip()
+        code = "".join(secrets.choice(PAIRING_ALPHABET) for _ in range(8))
+        row = {"platform": platform, "request_id": secrets.token_hex(8), "code": code, "user_id": user_id,
+               "user_name": str(body.get("user_name") or ""), "created": time.time()}
+        store["pending"].append(row)
+        return {"request_id": row["request_id"], "code": code}
+
+    # ── webhooks (ops.py over hermes_cli/webhook.py) ──────────────────────────────────────────────
+
+    def webhook_config(self, profile: FakeProfile) -> dict[str, Any]:
+        platforms = profile.config.get("platforms") if isinstance(profile.config.get("platforms"), dict) else {}
+        return platforms.get("webhook") if isinstance(platforms.get("webhook"), dict) else {}
+
+    def webhook_base_url(self, profile: FakeProfile) -> str:
+        """webhook.py _get_webhook_base_url."""
+        extra = self.webhook_config(profile).get("extra") or {}
+        host = extra.get("host")
+        shown = "localhost" if not host or host in ("0.0.0.0", "::") else str(host)
+        if ":" in shown and not shown.startswith("["):
+            shown = f"[{shown}]"
+        return f"http://{shown}:{extra.get('port', 8644)}"
+
+    @staticmethod
+    def webhook_summary(name: str, route: dict[str, Any], base_url: str) -> dict[str, Any]:
+        """ops.py _webhook_route_summary: the secret only as ``secret_set``."""
+        return {"name": name, "description": route.get("description", ""), "events": list(route.get("events") or []),
+                "deliver": route.get("deliver", "log"), "deliver_only": bool(route.get("deliver_only")),
+                "prompt": route.get("prompt", ""), "script": route.get("script", ""),
+                "skills": list(route.get("skills") or []), "created_at": route.get("created_at"),
+                "url": f"{base_url}/webhooks/{name}", "secret_set": bool(route.get("secret")),
+                "enabled": route.get("enabled", True) is not False}
+
+    def webhooks_list(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py GET /api/webhooks?profile=."""
+        profile = self.scoped(request)
+        base = self.webhook_base_url(profile)
+        routes = self.webhooks.setdefault(profile.name, {})
+        return {"enabled": bool(self.webhook_config(profile).get("enabled")), "base_url": base,
+                "subscriptions": [self.webhook_summary(n, r, base) for n, r in routes.items()]}
+
+    def webhooks_enable(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/webhooks/enable?profile=: platforms.webhook.enabled, then a best-effort restart."""
+        profile = self.scoped(request)
+        self.write_platform_enabled(profile, "webhook", True)
+        restart = self.restart_after(profile)
+        return {"ok": True, "platform": "webhook", "enabled": True, "needs_restart": not restart["restart_started"],
+                **restart}
+
+    def webhook_create(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/webhooks {name, description?, events, prompt?, script?, skills, deliver, deliver_only,
+        deliver_chat_id?, secret?}: the route summary plus its HMAC secret, shown this once (never logged)."""
+        profile = self.scoped(request)
+        raw_name = body_field(body, "name", str)
+        if not self.webhook_config(profile).get("enabled"):
+            raise HttpError(400, "Webhook platform is not enabled. Enable it from the Webhooks page first.")
+        name = raw_name.strip().lower().replace(" ", "-")
+        if not WEBHOOK_NAME.match(name):
+            raise HttpError(400, "Invalid name. Use lowercase alphanumeric with hyphens/underscores.")
+        deliver = str(body.get("deliver") or "log")
+        if body.get("deliver_only") and deliver == "log":
+            raise HttpError(400, "Direct delivery requires a real target (telegram, discord, …), not 'log'.")
+        secret = str(body.get("secret") or "") or secrets.token_urlsafe(32)
+        route: dict[str, Any] = {
+            "description": body.get("description") or f"Dashboard-created subscription: {name}",
+            "events": [str(e).strip() for e in body.get("events") or [] if str(e).strip()], "secret": secret,
+            "prompt": body.get("prompt") or "", "skills": [str(s).strip() for s in body.get("skills") or []
+                                                           if str(s).strip()],
+            "deliver": deliver, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        if str(body.get("script") or "").strip():
+            route["script"] = str(body["script"]).strip()
+        if body.get("deliver_only"):
+            route["deliver_only"] = True
+        if body.get("deliver_chat_id"):
+            route["deliver_extra"] = {"chat_id": str(body["deliver_chat_id"])}
+        self.webhooks.setdefault(profile.name, {})[name] = route
+        log(f"webhook {name} saved for profile {profile.name} (secret: {len(secret)} characters)")
+        return {**self.webhook_summary(name, route, self.webhook_base_url(profile)), "secret": secret}
+
+    def webhook_delete(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py DELETE /api/webhooks/{name}?profile=: destructive, so the profile must be named."""
+        profile = self.explicit_profile(request, "DELETE /api/webhooks/{name}")
+        key = request.path_params["name"].strip().lower()
+        routes = self.webhooks.setdefault(profile.name, {})
+        if key not in routes:
+            raise HttpError(404, f"No subscription named '{key}'")
+        del routes[key]
+        return {"ok": True}
+
+    def webhook_set_enabled(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py PUT /api/webhooks/{name}/enabled {enabled}: a disabled route stays (its events get 403)."""
+        enabled = body_field(body, "enabled", bool)
+        profile = self.scoped(request)
+        key = request.path_params["name"].strip().lower()
+        routes = self.webhooks.setdefault(profile.name, {})
+        if key not in routes:
+            raise HttpError(404, f"No subscription named '{key}'")
+        routes[key]["enabled"] = enabled
+        return {"ok": True, "name": key, "enabled": enabled}
+
+    # ── the learning graph / star map (status.py, agent/learning_graph.py, learning_mutations.py) ──
+
+    def memory_cards(self, profile: FakeProfile) -> list[dict[str, Any]]:
+        """learning_graph.py _memory_cards: MEMORY.md entries, then USER.md's; a file reset away has none."""
+        files = self.caps(profile).builtin_memory
+        entries = self.memories.setdefault(profile.name, {"memory": [], "profile": []})
+        base = self.started_m5 - 14 * DAY
+        cards = []
+        for source, key in (("memory", "memory"), ("profile", "user")):
+            if key not in files:
+                continue
+            for index, chunk in enumerate(entries.get(source, [])):
+                first = chunk.splitlines()[0].strip().lstrip("# ").strip()
+                cards.append({"source": source, "timestamp": int(base + index * DAY + (0 if source == "memory" else
+                                                                                       HOUR)),
+                              "title": (first[:80] + "…") if len(first) > 80 else first, "body": chunk[:1200],
+                              "fingerprint": hashlib.sha256(chunk.strip().encode()).hexdigest()[:12]})
+        return cards
+
+    def learned_skills(self, profile: FakeProfile) -> dict[str, dict[str, Any]]:
+        """Non-base skills with a learning signal (agent-created, or used); external mounts never count."""
+        caps, out = self.caps(profile), {}
+        for index, (name, skill) in enumerate(sorted(caps.skills.items())):
+            provenance = skill.get("provenance")
+            if provenance in ("bundled", "external"):
+                continue
+            created_by = "agent" if provenance == "agent" else None
+            if created_by != "agent" and not skill.get("usage"):
+                continue
+            out[name] = {"id": name, "label": name, "kind": "skill",
+                         "timestamp": int(self.started_m5 - (30 - 3 * index) * DAY), "category": skill["category"],
+                         "useCount": int(skill.get("usage") or 0), "state": "active", "createdBy": created_by,
+                         "pinned": False}
+        return out
+
+    def learning_graph(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py GET /api/learning/graph?profile=: learned skills and memory entries as nodes, declared
+        related_skills and lexical memory→skill links as edges, clusters by category, density stats."""
+        profile = self.scoped(request)
+        skills = self.learned_skills(profile)
+        cards = self.memory_cards(profile)
+        skill_edges = list(dict.fromkeys((min(a, b), max(a, b)) for a in skills for b in LEARNING_RELATED.get(a, [])
+                                         if b in skills and b != a))
+        memory_edges = []
+        def tokens(text: str) -> set[str]:
+            return {t for t in re.split(r"[^a-z0-9]+", text.lower()) if len(t) >= 3}
+
+        for index, card in enumerate(cards):
+            text = f"{card['title']}\n{card['body']}".lower()
+            scored = [((6 if name in text else 0) + len(tokens(name) & tokens(text)), name) for name in skills]
+            memory_edges += [(f"memory:{card['source']}:{index}:{card['fingerprint']}", name)
+                             for score, name in sorted(scored, key=lambda s: (-s[0], s[1]))[:4] if score > 0]
+        clusters: dict[str, int] = {}
+        for node in skills.values():
+            clusters[node["category"]] = clusters.get(node["category"], 0) + 1
+        if cards:
+            clusters["memory"] = len(cards)
+        nodes = list(skills.values()) + [
+            {"id": f"memory:{c['source']}:{i}:{c['fingerprint']}", "label": c["title"], "kind": "memory",
+             "memorySource": c["source"], "timestamp": c["timestamp"], "category": "memory", "useCount": 0,
+             "state": "active", "createdBy": "memory", "pinned": False} for i, c in enumerate(cards)]
+        linked = {x for edge in skill_edges for x in edge}
+        n = len(skills) or 1
+        categories = sorted(((c, k) for c, k in clusters.items() if c != "memory"), key=lambda ck: -ck[1])
+        return {
+            "nodes": nodes, "edges": [{"source": a, "target": b} for a, b in skill_edges + memory_edges],
+            "clusters": [{"category": c, "count": k} for c, k in sorted(clusters.items(), key=lambda ck: -ck[1])],
+            "memory": cards,
+            "stats": {"nodes": len(skills), "related_edges": len(skill_edges),
+                      "edges_per_node": round(len(skill_edges) / n, 3), "linked_nodes": len(linked),
+                      "isolated_pct": round(100 * (n - len(linked)) / n, 1), "categories": len(categories),
+                      "agent_created": sum(1 for s in skills.values() if s["createdBy"] == "agent"),
+                      "used": sum(1 for s in skills.values() if s["useCount"] > 0),
+                      "top_categories": [[c, k] for c, k in categories[:8]], "memory_nodes": len(cards),
+                      "memory_skill_edges": len(memory_edges), "learned_skills": len(skills)}}
+
+    def locate_memory(self, profile: FakeProfile, node_id: str) -> tuple[str, int]:
+        """learning_mutations.py _locate_memory: (source, entry index), the fingerprint naming the entry."""
+        parts = node_id.split(":")
+        try:
+            if len(parts) not in (3, 4) or parts[0] != "memory" or parts[1] not in MEMORY_FILES:
+                raise ValueError
+            source, global_index, fingerprint = parts[1], int(parts[2]), parts[3] if len(parts) == 4 else ""
+        except ValueError:
+            raise HttpError(400, f"bad memory node id: {node_id!r}") from None
+        key = "memory" if source == "memory" else "user"
+        if key not in self.caps(profile).builtin_memory:
+            raise HttpError(400, f"{MEMORY_FILES[source]} not found")
+        chunks = self.memories.setdefault(profile.name, {"memory": [], "profile": []}).setdefault(source, [])
+        if fingerprint:
+            local = next((i for i, c in enumerate(chunks)
+                          if hashlib.sha256(c.strip().encode()).hexdigest()[:12] == fingerprint), None)
+        else:
+            offset = 0 if source == "memory" else len(self.memories[profile.name].get("memory", []))
+            local = global_index - offset if 0 <= global_index - offset < len(chunks) else None
+        if local is None:
+            raise HttpError(400, "memory node id is stale — refresh the graph")
+        return source, local
+
+    def learning_node(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py GET /api/learning/node?id=&profile=: a skill's SKILL.md or a memory entry, for an edit prefill
+        (404 with the message when it cannot be found)."""
+        node_id = query_text(request, "id")
+        profile = self.scoped(request)
+        if node_id.startswith("memory:"):
+            try:
+                source, local = self.locate_memory(profile, node_id)
+            except HttpError as exc:
+                raise HttpError(404, exc.detail) from None
+            content = self.memories[profile.name][source][local].strip()
+            return {"ok": True, "kind": "memory", "id": node_id, "label": content.splitlines()[0][:80],
+                    "content": content}
+        skill = self.caps(profile).skills.get(node_id)
+        if skill is None:
+            raise HttpError(404, f"skill '{node_id}' not found")
+        return {"ok": True, "kind": "skill", "id": node_id, "label": node_id, "content": skill["content"]}
+
+    def learning_edit(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py PUT /api/learning/node {id, content, profile?}: rewrites SKILL.md (checked like a skill edit) or
+        the memory entry (400 with the message on a refusal)."""
+        node_id, content = body_field(body, "id", str), body_field(body, "content", str)
+        profile = self.scoped(request, body)
+        if node_id.startswith("memory:"):
+            source, local = self.locate_memory(profile, node_id)
+            if not content.strip():
+                raise HttpError(400, "content cannot be empty")
+            self.memories[profile.name][source][local] = content.strip()
+            return {"ok": True, "message": f"updated memory in {MEMORY_FILES[source]}"}
+        caps = self.caps(profile)
+        if node_id not in caps.skills:
+            raise HttpError(400, f"skill '{node_id}' not found")
+        if problem := skill_problem(content):
+            raise HttpError(400, problem)
+        caps.skills[node_id]["content"] = content
+        return {"ok": True, "message": f"updated skill '{node_id}'"}
+
+    def learning_delete(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py DELETE /api/learning/node {id, profile?}: a memory entry is removed here; a skill is archived by
+        CapabilityFeatures.delete_learning_node."""
+        node_id = body.get("id")
+        if not isinstance(node_id, str) or not node_id.startswith("memory:"):
+            return self.delete_learning_node(request, body)
+        profile = self.scoped(request, body)
+        source, local = self.locate_memory(profile, node_id)
+        del self.memories[profile.name][source][local]
+        return {"ok": True, "message": f"deleted memory from {MEMORY_FILES[source]}"}
+
+    # ── dashboard plugins (dashboard_ui.py) ───────────────────────────────────────────────────────
+
+    def kanban_on(self, profile: FakeProfile) -> bool:
+        """web_server_dashboard.py _plugin_consent_withheld for the bundled kanban plugin: present unless the fake
+        runs with --no-kanban or the profile explicitly disabled it."""
+        record = self.caps(profile).plugins.get("kanban")
+        return self.kanban_enabled and (record is None or record.get("status") != "disabled")
+
+    def dashboard_plugins(self, request: Request, body: dict[str, Any]) -> list[dict[str, Any]]:
+        """dashboard_ui.py GET /api/dashboard/plugins?profile=: the discovered dashboard plugins the profile allows
+        (minus dashboard.hidden_plugins), internal fields stripped."""
+        profile = self.scoped(request)
+        hidden = (profile.loaded().get("dashboard") or {}).get("hidden_plugins") or []
+        out = []
+        if self.kanban_on(profile):
+            out.append(copy.deepcopy(KANBAN_MANIFEST))
+        voice = self.caps(profile).plugins.get("hermes_voice")
+        if voice is not None and voice.get("status") == "enabled":
+            out.append(copy.deepcopy(VOICE_MANIFEST))
+        return [p for p in out if p["name"] not in hidden]
+
+    def dashboard_plugins_rescan(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "count": len(self.dashboard_plugins(request, body))}
+
+    # ── session import (tui_gateway/methods_session_foreign.py, foreign_sessions_browser.py) ──────
+
+    def foreign_candidates(self, source: Any = None) -> list[dict[str, Any]]:
+        """The Claude Code / Codex logs on the host, newest first; the id is an opaque handle, never a path."""
+        if source is not None and source not in FOREIGN_LABELS:
+            raise RpcError(-32602, "Unknown session source")
+        rows = []
+        for kind, path, age, cwd, turns in FOREIGN_SEEDS:
+            if self.seed_mode == "minimal" or source not in (None, kind):
+                continue
+            rows.append({"handle": hashlib.sha256(f"{kind}:{path}".encode()).hexdigest(), "source": kind,
+                         "path": path, "mtime": self.started_m5 - age, "cwd": cwd,
+                         "turns": [{"role": r, "content": c} for r, c in turns]})
+        return sorted(rows, key=lambda r: (r["mtime"], r["handle"]), reverse=True)
+
+    @staticmethod
+    def foreign_title(row: dict[str, Any]) -> str:
+        """foreign_sessions_browser.py _display_title: a Codex attachment envelope's request after its file list."""
+        first = next((t["content"] for t in row["turns"] if t["role"] == "user"), "")
+        request = re.split(r"(?im)^#{1,6}\s*My request:\s*$", first, maxsplit=1)
+        title = request[-1].strip().splitlines()[0] if len(request) > 1 and request[-1].strip() else \
+            (first.strip().splitlines() or [""])[0]
+        return (title or FOREIGN_LABELS[row["source"]]).lstrip("# ")[:180]
+
+    def foreign_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        """session.foreign.list {source?, offset?, limit?}: one page (limit 1..50), unparsable logs counted."""
+        self.rpc_profile(params)
+        offset = params.get("offset") if params.get("offset") is not None else 0
+        limit = params.get("limit") if params.get("limit") is not None else 25
+        if not isinstance(offset, int) or offset < 0 or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise RpcError(-32602, "Invalid session page")
+        candidates = self.foreign_candidates(params.get("source"))
+        rows, unreadable = [], 0
+        for row in candidates[offset:offset + limit]:
+            if not row["turns"]:
+                unreadable += 1
+                continue
+            rows.append({"id": row["handle"], "source": row["source"], "label": FOREIGN_LABELS[row["source"]],
+                         "title": self.foreign_title(row), "cwd": row["cwd"], "mtime": row["mtime"],
+                         "turn_count": len(row["turns"]), "excerpt": row["turns"][0]["content"][:200]})
+        next_offset = offset + limit
+        return {"sessions": rows, "next_offset": next_offset if next_offset < len(candidates) else None,
+                "host": FOREIGN_HOST, "unreadable": unreadable}
+
+    def foreign_resolve(self, handle: Any) -> dict[str, Any]:
+        if not isinstance(handle, str) or len(handle) != 64:
+            raise RpcError(-32602, "Unknown session. Refresh the list and try again")
+        row = next((r for r in self.foreign_candidates() if r["handle"] == handle), None)
+        if row is None:
+            raise RpcError(-32602, "Session no longer available. Refresh the list and try again")
+        if not row["turns"]:
+            raise RpcError(-32602, "This session has no readable conversation messages")
+        return row
+
+    def foreign_preview(self, params: dict[str, Any]) -> dict[str, Any]:
+        """session.foreign.preview {id, profile?}: the last 40 turns (8000 characters each) and whether this profile
+        already imported it."""
+        profile = self.rpc_profile(params)
+        row = self.foreign_resolve(params.get("id"))
+        tail = row["turns"][-40:]
+        return {"messages": [{**t, "content": t["content"][:8000]} for t in tail], "total": len(row["turns"]),
+                "truncated": len(row["turns"]) > 40 or any(len(t["content"]) > 8000 for t in tail),
+                "already_imported": self.imported_id(profile, row), "cwd": row["cwd"]}
+
+    def imported_id(self, profile: FakeProfile, row: dict[str, Any]) -> str | None:
+        key = self.imported.get((profile.name, row["handle"]))
+        return key if key in self.sessions else None
+
+    def foreign_import(self, params: dict[str, Any]) -> dict[str, Any]:
+        """session.foreign.import {id, profile?}: a new session in the profile's history (source claude-code /
+        codex-cli), idempotent per origin."""
+        profile = self.rpc_profile(params)
+        row = self.foreign_resolve(params.get("id"))
+        if existing := self.imported_id(profile, row):
+            return {"session_id": existing, "already_imported": True}
+        key = datetime.fromtimestamp(row["mtime"]).strftime("%Y%m%d_%H%M%S_") + secrets.token_hex(6)
+        title = self.foreign_title(row)
+        if any(s.title == title and s.profile == profile.name for s in self.sessions.values()):
+            title = f"{title} ({key[-12:]})"
+        branch, root = git_info(row["cwd"] or "")
+        stored = StoredSession(key=key, source=FOREIGN_TOOLS[row["source"]], title=title,
+                               started_at=row["mtime"] - 60 * len(row["turns"]), profile=profile.name,
+                               cwd=row["cwd"] or "", git_branch=branch, git_repo_root=root)
+        self.sessions[key] = stored
+        for index, turn in enumerate(row["turns"]):
+            added = self.add_row(stored, turn["role"], turn["content"],
+                                 **({"finish_reason": "stop"} if turn["role"] == "assistant" else {}))
+            added["timestamp"] = stored.started_at + 60 * (index + 1)
+        stored.last_active = row["mtime"]
+        self.imported[(profile.name, row["handle"])] = key
+        return {"session_id": key, "already_imported": False}
+
+    # ── agents: the subagent fleet (methods_subagents.py) ─────────────────────────────────────────
+
+    async def demo_fleet(self, rt: Runtime, stored: StoredSession) -> str:
+        """The "fleet" trigger: one delegate_task fanning out to three children (one spawns a grandchild, one fails),
+        spread over ``--fleet-seconds`` so the agents tree can be watched, steered and interrupted."""
+        delegation = "dlg_" + secrets.token_hex(6)
+        roster = self.subagents.setdefault(rt.sid, {})
+        step = max(self.fleet_seconds, 0.05) / 6
+        outcomes: list[dict[str, Any]] = []
+
+        async def child(index: int, goal: str, toolsets: list[str], tools: tuple[str, ...], outcome: str,
+                        nested: str | None, parent: str | None = None, depth: int = 1) -> None:
+            sid = f"sa-{index}-{secrets.token_hex(4)}" if parent is None else f"{parent}-c{secrets.token_hex(2)}"
+            base = {"goal": goal, "task_count": len(FLEET_TASKS), "task_index": index, "subagent_id": sid,
+                    "parent_id": parent, "child_session_id": self.new_key(), "delegation_id": delegation,
+                    "depth": depth, "model": stored.model, "toolsets": toolsets}
+            started = time.time()
+            record = {"subagent_id": sid, "parent_id": parent, "depth": depth, "goal": goal,
+                      "delegation_id": delegation, "model": stored.model, "started_at": started, "status": "running",
+                      "tool_count": 0, "last_tool": "", "accepting_steer": True}
+            self.fleet[sid] = {"session": rt.sid, "transcript": [f"[{iso_at(started)}] goal: {goal}"],
+                               "steers": [], "interrupted": False}
+            await self.emit(rt, "subagent.spawn_requested", {**base, "tool_count": 0, "text": goal})
+            roster[sid] = record
+            await self.emit(rt, "subagent.start", {**base, "tool_count": 0, "text": goal})
+            await self.emit(rt, "subagent.thinking", {**base, "tool_count": 0, "text": f"Planning: {goal.lower()}."})
+            status, summary = outcome, ""
+            for count, tool in enumerate(tools, 1):
+                await asyncio.sleep(step)
+                if self.fleet[sid]["interrupted"]:
+                    status = "interrupted"
+                    break
+                for text in self.fleet[sid]["steers"]:
+                    self.fleet[sid]["transcript"].append(f"steer: {text}")
+                    await self.emit(rt, "subagent.progress", {**base, "tool_count": count - 1,
+                                                              "text": f"Steered: {text[:120]}"})
+                self.fleet[sid]["steers"].clear()
+                record.update(tool_count=count, last_tool=tool)
+                self.fleet[sid]["transcript"].append(f"tool {tool} #{count}")
+                await self.emit(rt, "subagent.tool", {**base, "tool_count": count, "tool_name": tool,
+                                                      "text": f"{tool} #{count}", "tool_preview": f"{tool} #{count}"})
+                if nested and count == 1:
+                    await child(index, nested, ["file"], ("read_file",), "completed", None, parent=sid,
+                                depth=depth + 1)
+            record["accepting_steer"] = False
+            if status == "completed":
+                summary = f"Done: {goal}."
+            elif status == "failed":
+                summary = "CI config not found: .github/workflows is empty."
+            else:
+                summary = "Interrupted before it finished."
+            roster.pop(sid, None)
+            duration = round(time.time() - started, 2)
+            self.fleet[sid]["transcript"].append(f"{status}: {summary}")
+            if parent is None:  # delegate_task reports one result per task; a grandchild belongs to its parent
+                outcomes.append({"task_index": index, "status": status, "summary": summary,
+                                 "api_calls": len(tools) + 1, "duration_seconds": duration, "exit_reason": status})
+            await self.emit(rt, "subagent.complete", {
+                **base, "tool_count": record["tool_count"], "text": summary[:160], "status": status,
+                "summary": summary, "duration_seconds": duration, "input_tokens": 900 * len(tools),
+                "output_tokens": 120 * len(tools), "reasoning_tokens": 0, "api_calls": len(tools) + 1,
+                "files_read": [], "output_tail": [{"tool": tools[-1], "preview": summary[:80],
+                                                   "is_error": status != "completed"}]})
+
+        result: dict[str, Any] = {"results": outcomes, "total_duration_seconds": 0.0}
+
+        async def work(tool_id: str) -> None:
+            started = time.time()
+            await asyncio.gather(*(child(i, *task) for i, task in enumerate(FLEET_TASKS)))
+            outcomes.sort(key=lambda o: o["task_index"])
+            result["total_duration_seconds"] = round(time.time() - started, 2)
+        try:
+            await self.run_native_tool(rt, stored, "delegate_task", {"tasks": [{"goal": t[0]} for t in FLEET_TASKS]},
+                                       result, work=work)
+        finally:
+            for sid in [s for s, rec in roster.items() if rec.get("delegation_id") == delegation]:
+                roster.pop(sid, None)
+        done = sum(1 for o in outcomes if o["status"] == "completed")
+        return f"The fleet finished: {done} of {len(outcomes)} subagents completed."
+
+    def fleet_record(self, params: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        """methods_subagents.py: subagent_id required (4000), the session must be this transport's (4001)."""
+        subagent_id = str(params.get("subagent_id") or "")
+        if not subagent_id:
+            raise RpcError(4000, "subagent_id required")
+        rt = self.runtime(params, "session not found or not owned by this transport")
+        record = self.subagents.get(rt.sid, {}).get(subagent_id)
+        return subagent_id, record
+
+    def subagent_interrupt(self, params: dict[str, Any]) -> dict[str, Any]:
+        """subagent.interrupt {session_id, subagent_id}: a hard interrupt of a live child; ``found`` false otherwise."""
+        subagent_id, record = self.fleet_record(params)
+        live = record is not None and subagent_id in self.fleet
+        if live:
+            self.fleet[subagent_id]["interrupted"] = True
+        return {"found": live, "subagent_id": subagent_id}
+
+    def subagent_tail(self, params: dict[str, Any]) -> dict[str, Any]:
+        """subagent.tail: the last 16 KB of a live child's transcript."""
+        subagent_id, record = self.fleet_record(params)
+        if record is None or subagent_id not in self.fleet:
+            return {"subagent_id": subagent_id, "available": False, "text": "", "truncated": False}
+        text = "\n".join(self.fleet[subagent_id]["transcript"]) + "\n"
+        return {"subagent_id": subagent_id, "available": True, "text": text[-16384:], "truncated": len(text) > 16384}
+
+    def subagent_steer(self, params: dict[str, Any]) -> dict[str, Any]:
+        """subagent.steer {session_id, subagent_id, text}: queued for the child's next tool batch, or rejected."""
+        subagent_id, record = self.fleet_record(params)
+        text = str(params.get("text") or "")
+        if not text.strip():
+            raise RpcError(4000, "text required")
+        if record is None or not record.get("accepting_steer") or subagent_id not in self.fleet:
+            return {"status": "rejected", "subagent_id": subagent_id, "text": text}
+        self.fleet[subagent_id]["steers"].append(text)
+        return {"status": "queued", "subagent_id": subagent_id, "text": text}
+
+    # ── kanban (plugins/kanban/dashboard/plugin_api.py over hermes_cli/kanban_db*.py) ──────────────
+
+    def kanban_rest(self, handler: Callable[..., Any], raw: bool = False) -> Callable[[Request], Awaitable[Response]]:
+        """A plugin API route: sign-in first (401 before anything else, so no plugin-name oracle), then the profile
+        scope, then the runtime gate (404 "Plugin not found" when kanban is off for that profile), then any running
+        fake worker is settled."""
+        async def gated(request: Request, body: dict[str, Any] | None = None) -> Any:
+            if not self.kanban_on(self.scoped(request)):
+                raise HttpError(404, "Plugin not found")
+            self.kanban_settle()
+            if raw:
+                return await handler(request)
+            result = handler(request, body or {})
+            return await result if inspect.isawaitable(result) else result
+        return self.raw_rest(gated) if raw else self.rest(gated)
+
+    def board_meta(self, slug: str, **extra: Any) -> dict[str, Any]:
+        """kanban_db_boards.py read_board_metadata defaults (``atm10-server`` -> ``Atm10 Server``)."""
+        name = " ".join(p.capitalize() for p in slug.replace("_", "-").split("-") if p) or slug
+        meta = {"slug": slug, "name": name, "description": "", "icon": "", "color": "", "default_workdir": None,
+                "project_id": None, "created_at": None, "archived": False}
+        meta.update(extra)
+        if meta["created_at"] is not None:
+            meta["created_at"] = int(meta["created_at"])
+        return meta
+
+    def kanban_event(self, board: KanbanBoard, task_id: str, kind: str, payload: dict[str, Any] | None = None,
+                     run_id: int | None = None, at: float | None = None) -> None:
+        """kanban_db.py _append_event: one task_events row (the /events socket tails these)."""
+        event_id = max(board.next_event, board.latest_event() + 1)
+        board.next_event = event_id + 1
+        board.events.append({"id": event_id, "task_id": task_id, "run_id": run_id, "kind": kind,
+                             "payload": payload, "created_at": int(at if at is not None else time.time())})
+
+    def seed_kanban(self) -> None:
+        """A default board with a card in every column (links, comments, runs, an attachment, a card that keeps
+        failing) and a project board for Atlas."""
+        now = time.time()
+        board = self.kanban_boards["default"]
+        board.meta["created_at"] = int(now - 30 * DAY)
+
+        def add(task_id: str, title: str, status: str, age: float, **extra: Any) -> dict[str, Any]:
+            task = kanban_task(task_id, title, status, now - age, **extra)
+            board.tasks[task_id] = task
+            self.kanban_event(board, task_id, "created", {"assignee": task["assignee"], "status": status,
+                                                          "parents": [], "tenant": None,
+                                                          "workspace_kind": task["workspace_kind"]}, at=now - age)
+            return task
+
+        add("t_1a2b3c4d", "Investigate the flaky token test", "triage", 2 * HOUR,
+            body="test_token_at_epoch_zero fails about one run in ten on CI.")
+        run_task = add("t_5e6f7a8b", "Refresh tokens before they expire", "running", 6 * HOUR, assignee="default",
+                       priority=2, body="Refresh a token when fewer than 60 seconds remain.",
+                       workspace_kind="worktree", workspace_path=f"{project_path('atlas')}/.worktrees/token-refresh",
+                       branch_name="hermes/token-refresh", project_id="p_a7a5c0de", started_at=int(now - 20 * 60),
+                       worker_pid=41_207, claim_lock="fake-host:41207", claim_expires=int(now + 15 * 60),
+                       last_heartbeat_at=int(now - 30), current_run_id=1)
+        add("t_9c0d1e2f", "Write the storage v2 migration", "todo", 5 * HOUR, assignee="default", priority=1)
+        board.links.append((run_task["id"], "t_9c0d1e2f"))
+        self.kanban_event(board, "t_9c0d1e2f", "dependency_wait", {"reason": "parent_not_done",
+                                                                   "parent": run_task["id"]}, at=now - 5 * HOUR)
+        add("t_3a4b5c6d", "Draft release notes for 0.4", "ready", 4 * HOUR, assignee="research", priority=1)
+        add("t_7e8f9a0b", "Bump dependencies every Monday", "scheduled", 3 * DAY)
+        blocked = add("t_1c2d3e4f", "Rotate the staging API key", "blocked", 2 * DAY, assignee="default",
+                      block_kind="needs_input", consecutive_failures=3,
+                      last_failure_error="HTTP 401 from staging: the API key was revoked")
+        review = add("t_5a6b7c8d", "Add rate limiting to /login", "review", DAY, assignee="default",
+                     started_at=int(now - 20 * HOUR))
+        done = add("t_9e0f1a2b", "Set up CI for Atlas", "done", 9 * DAY, assignee="default",
+                   started_at=int(now - 9 * DAY + HOUR), completed_at=int(now - 8 * DAY),
+                   result="CI runs pytest on every push; badge added to the README.")
+        add("t_3c4d5e6f", "Spike: SQLite full-text search", "archived", 20 * DAY)
+        board.runs = [
+            {"id": 1, "task_id": run_task["id"], "profile": "default", "step_key": None, "status": "running",
+             "claim_lock": "fake-host:41207", "claim_expires": int(now + 15 * 60), "worker_pid": 41_207,
+             "max_runtime_seconds": None, "last_heartbeat_at": int(now - 30), "started_at": int(now - 20 * 60),
+             "ended_at": None, "outcome": None, "summary": None, "metadata": None, "error": None},
+            {"id": 2, "task_id": review["id"], "profile": "default", "step_key": None, "status": "review",
+             "claim_lock": None, "claim_expires": None, "worker_pid": None, "max_runtime_seconds": None,
+             "last_heartbeat_at": None, "started_at": int(now - 20 * HOUR), "ended_at": int(now - 19 * HOUR),
+             "outcome": "review_requested", "summary": "Added a 10/minute limiter on /login with a test. Please "
+             "check the window size.", "metadata": {"files_changed": 2}, "error": None},
+            {"id": 3, "task_id": done["id"], "profile": "default", "step_key": None, "status": "done",
+             "claim_lock": None, "claim_expires": None, "worker_pid": None, "max_runtime_seconds": None,
+             "last_heartbeat_at": None, "started_at": int(now - 9 * DAY + HOUR), "ended_at": int(now - 8 * DAY),
+             "outcome": "completed", "summary": "CI runs pytest on every push.", "metadata": None, "error": None},
+            {"id": 4, "task_id": blocked["id"], "profile": "default", "step_key": None, "status": "blocked",
+             "claim_lock": None, "claim_expires": None, "worker_pid": None, "max_runtime_seconds": None,
+             "last_heartbeat_at": None, "started_at": int(now - 2 * DAY), "ended_at": int(now - 2 * DAY + 600),
+             "outcome": "blocked", "summary": "Needs a fresh staging API key.", "metadata": None,
+             "error": "HTTP 401 from staging: the API key was revoked"}]
+        board.finish_at[run_task["id"]] = now + KANBAN_SEEDED_RUN_SECONDS
+        board.logs[run_task["id"]] = (f"[worker] claimed {run_task['id']} as profile default\n"
+                                      "[worker] reading src/atlas/auth.py\n[worker] tool: patch src/atlas/auth.py\n")
+        self.kanban_event(board, run_task["id"], "claimed", {"lock": "fake-host:41207", "run_id": 1}, run_id=1,
+                          at=now - 20 * 60)
+        self.kanban_event(board, review["id"], "review_requested", {"summary": board.runs[1]["summary"]}, run_id=2,
+                          at=now - 19 * HOUR)
+        self.kanban_event(board, done["id"], "completed", {"result": done["result"]}, run_id=3, at=now - 8 * DAY)
+        self.kanban_event(board, blocked["id"], "blocked", {"kind": "needs_input", "reason": "Needs a fresh staging "
+                                                            "API key."}, run_id=4, at=now - 2 * DAY + 600)
+        for task_id, author, text, age in (
+                (blocked["id"], "default", "Blocked: the staging key was revoked. Paste a new one into "
+                                           "STAGING_API_KEY and unblock me.", 2 * DAY - 700),
+                (review["id"], "default", "Limiter is per IP; 10 requests a minute.", 19 * HOUR),
+                (review["id"], "desktop", "Looks good, checking the window size.", 3 * HOUR)):
+            board.comments.append({"id": len(board.comments) + 1, "task_id": task_id, "author": author,
+                                   "body": text, "created_at": int(now - age)})
+            self.kanban_event(board, task_id, "commented", {"author": author, "len": len(text)}, at=now - age)
+        note = b"window_seconds,limit\n60,10\n"
+        board.attachments.append({"id": 1, "task_id": review["id"], "filename": "limits.csv",
+                                  "content_type": "text/csv", "size": len(note), "uploaded_by": "default",
+                                  "stored_path": f"{DEMO_HERMES_HOME}/kanban/attachments/{review['id']}/limits.csv",
+                                  "created_at": int(now - 19 * HOUR)})
+        board.blobs[1] = note
+        board.events.sort(key=lambda e: e["created_at"])
+        for index, event in enumerate(board.events, 1):
+            event["id"] = index
+        board.next_event = len(board.events) + 1
+        atlas = KanbanBoard("atlas", self.board_meta("atlas", name="Atlas", description="Token service work",
+                                                     icon="🗺", color="#0053fd", default_workdir=project_path("atlas"),
+                                                     project_id="p_a7a5c0de", created_at=now - 12 * DAY))
+        self.kanban_boards["atlas"] = atlas
+        for task_id, title, status in (("t_aa11bb22", "Document the token flow", "ready"),
+                                       ("t_cc33dd44", "Profile the storage layer", "triage")):
+            atlas.tasks[task_id] = kanban_task(task_id, title, status, now - DAY, workspace_kind="worktree",
+                                               project_id="p_a7a5c0de", assignee="default" if status == "ready"
+                                               else None)
+            self.kanban_event(atlas, task_id, "created", {"assignee": atlas.tasks[task_id]["assignee"],
+                                                          "status": status, "parents": []}, at=now - DAY)
+
+    def kanban_live_board(self, raw: str | None) -> KanbanBoard:
+        """plugin_api.py _resolve_board: blank = the current board; malformed 400; unknown or archived 404."""
+        if raw is None or raw == "":
+            return self.kanban_boards[self.kanban_current]
+        slug = raw.strip().lower()
+        if not KANBAN_SLUG.match(slug):
+            raise HttpError(400, f"invalid board slug {raw!r}: must be 1-64 chars, lowercase alphanumerics / hyphens "
+                                 "/ underscores, not starting with '-' or '_'")
+        board = self.kanban_boards.get(slug)
+        if board is None:
+            if slug == "default":
+                return self.kanban_boards["default"]
+            raise HttpError(404, f"board {slug!r} does not exist")
+        if board.meta.get("archived"):
+            raise HttpError(404, f"board {slug!r} is archived")
+        return board
+
+    def kanban_board_of(self, request: Request) -> KanbanBoard:
+        return self.kanban_live_board(request.query_params.get("board"))
+
+    def kanban_require(self, board: KanbanBoard, task_id: str) -> dict[str, Any]:
+        task = board.tasks.get(task_id)
+        if task is None:
+            raise HttpError(404, f"task {task_id} not found")
+        return task
+
+    def kanban_parents(self, board: KanbanBoard, task_id: str) -> list[str]:
+        return sorted(p for p, c in board.links if c == task_id)
+
+    def kanban_children(self, board: KanbanBoard, task_id: str) -> list[str]:
+        return sorted(c for p, c in board.links if p == task_id)
+
+    def kanban_parents_done(self, board: KanbanBoard, task_id: str) -> bool:
+        return all(board.tasks.get(p, {}).get("status") in ("done", "archived", None)
+                   for p in self.kanban_parents(board, task_id))
+
+    def kanban_latest_summary(self, board: KanbanBoard, task_id: str) -> str | None:
+        return next((r["summary"] for r in reversed(board.runs) if r["task_id"] == task_id and r["summary"]), None)
+
+    def kanban_current_run_start(self, board: KanbanBoard, task: dict[str, Any]) -> int | None:
+        run = next((r for r in board.runs if r["id"] == task.get("current_run_id") and r["ended_at"] is None), None)
+        return run["started_at"] if run else None
+
+    def kanban_diagnostics_for(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        """kanban_diagnostics.py, the one signal the fake raises: a card whose worker keeps failing."""
+        if task["status"] == "archived" or task["consecutive_failures"] < 2:
+            return []
+        return [{"kind": "repeated_failures", "severity": "error" if task["consecutive_failures"] < 3 else "critical",
+                 "title": "The worker keeps failing",
+                 "detail": task["last_failure_error"] or "The last runs ended in an error.",
+                 "actions": [{"kind": "reclaim", "label": "Reclaim", "payload": {}, "suggested": False},
+                             {"kind": "comment", "label": "Add a hint", "payload": {}, "suggested": True}],
+                 "count": task["consecutive_failures"], "last_seen_at": int(time.time() - 2 * DAY + 600), "data": {}}]
+
+    def kanban_task_dict(self, board: KanbanBoard, task: dict[str, Any], *, preview: bool = False) -> dict[str, Any]:
+        """plugin_api.py _task_dict: the Task fields, age metrics, the latest run summary, the current run's start."""
+        now = int(time.time())
+        out = dict(task)
+        created, started, completed = task["created_at"], task["started_at"], task["completed_at"]
+        out["age"] = {"created_age_seconds": now - created if created is not None else None,
+                      "started_age_seconds": now - started if started is not None else None,
+                      "time_to_complete_seconds": completed - (started or created) if completed is not None else None}
+        summary = self.kanban_latest_summary(board, task["id"])
+        out["latest_summary"] = summary[:KANBAN_SUMMARY_PREVIEW] if summary and preview else summary
+        out["current_run_started_at"] = self.kanban_current_run_start(board, task)
+        diagnostics = self.kanban_diagnostics_for(task)
+        if diagnostics:
+            out["diagnostics"] = diagnostics
+            out["warnings"] = {"count": sum(d["count"] for d in diagnostics),
+                               "kinds": {d["kind"]: d["count"] for d in diagnostics},
+                               "latest_at": max(d["last_seen_at"] for d in diagnostics),
+                               "highest_severity": max((d["severity"] for d in diagnostics),
+                                                       key=["warning", "error", "critical"].index)}
+        return out
+
+    def kanban_settle(self) -> None:
+        """The fake dispatcher's workers: a running card whose time is up completes (its run closes, children whose
+        parents are all done get promoted)."""
+        now = time.time()
+        for board in self.kanban_boards.values():
+            for task_id, deadline in list(board.finish_at.items()):
+                task = board.tasks.get(task_id)
+                if task is None or task["status"] != "running":
+                    board.finish_at.pop(task_id, None)
+                    continue
+                if now < deadline:
+                    continue
+                board.finish_at.pop(task_id, None)
+                summary = f"Finished: {task['title']}. Tests pass."
+                run_id = self.kanban_end_run(board, task, "completed", "done", summary)
+                task.update(status="done", result=summary, completed_at=int(now), worker_pid=None, claim_lock=None,
+                            claim_expires=None)
+                board.logs[task_id] = board.logs.get(task_id, "") + f"[worker] done: {summary}\n"
+                self.kanban_event(board, task_id, "completed", {"result": summary, "summary": summary},
+                                  run_id=run_id)
+                self.kanban_recompute_ready(board)
+
+    def kanban_end_run(self, board: KanbanBoard, task: dict[str, Any], outcome: str, status: str,
+                       summary: str | None) -> int | None:
+        run = next((r for r in board.runs if r["id"] == task.get("current_run_id") and r["ended_at"] is None), None)
+        if run is None:
+            return None
+        run.update(ended_at=int(time.time()), outcome=outcome, status=status, summary=summary, worker_pid=None,
+                   claim_lock=None)
+        task["current_run_id"] = None
+        return run["id"]
+
+    def kanban_recompute_ready(self, board: KanbanBoard) -> None:
+        """kanban_db.py recompute_ready: a ``todo`` card whose parents are all done or archived becomes ``ready``."""
+        for task in board.tasks.values():
+            if task["status"] == "todo" and self.kanban_parents(board, task["id"]) and \
+                    self.kanban_parents_done(board, task["id"]):
+                task["status"] = "ready"
+                self.kanban_event(board, task["id"], "promoted", None)
+
+    def kanban_board(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py GET /board?board=&tenant=&include_archived=: the columns (archived only on request), queue
+        order priority-first, done newest-completed-first, link / comment / progress rollups, the event tail."""
+        board = self.kanban_board_of(request)
+        tenant = request.query_params.get("tenant")
+        include_archived = query_flag(request, "include_archived")
+        columns: dict[str, list[dict[str, Any]]] = {c: [] for c in KANBAN_COLUMNS}
+        if include_archived:
+            columns["archived"] = []
+        tasks = [t for t in board.tasks.values() if (include_archived or t["status"] != "archived") and
+                 (tenant is None or t["tenant"] == tenant)]
+        tasks.sort(key=lambda t: (-t["priority"], t["created_at"], t["id"]))
+        for task in tasks:
+            card = self.kanban_task_dict(board, task, preview=True)
+            card["link_counts"] = {"parents": len(self.kanban_parents(board, task["id"])),
+                                   "children": len(self.kanban_children(board, task["id"]))}
+            card["comment_count"] = sum(1 for c in board.comments if c["task_id"] == task["id"])
+            children = self.kanban_children(board, task["id"])
+            card["progress"] = {"done": sum(1 for c in children if board.tasks.get(c, {}).get("status") == "done"),
+                                "total": len(children)} if children else None
+            columns[task["status"] if task["status"] in columns else "todo"].append(card)
+        columns["done"].sort(key=lambda d: d["id"], reverse=True)
+        columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
+        tenants = sorted({t["tenant"] for t in board.tasks.values() if t["tenant"]})
+        return {"columns": [{"name": n, "tasks": columns[n]} for n in columns], "tenants": tenants,
+                "assignees": [a["name"] for a in self.kanban_known_assignees(board)],
+                "latest_event_id": board.latest_event(), "now": int(time.time())}
+
+    def kanban_known_assignees(self, board: KanbanBoard) -> list[dict[str, Any]]:
+        """kanban_db.py known_assignees: on-disk profiles plus anyone holding a live card."""
+        counts: dict[str, dict[str, int]] = {}
+        for task in board.tasks.values():
+            if task["assignee"] and task["status"] != "archived":
+                counts.setdefault(task["assignee"], {}).setdefault(task["status"], 0)
+                counts[task["assignee"]][task["status"]] += 1
+        return [{"name": n, "on_disk": n in self.profiles, "counts": counts.get(n, {})}
+                for n in sorted(set(self.profiles) | set(counts))]
+
+    def kanban_task_detail(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py GET /tasks/{id}: the task and its comments, events, attachments, links (with titles), child
+        results and runs as siblings."""
+        board = self.kanban_board_of(request)
+        q = request.query_params
+        if (q.get("run_state_type") is None) ^ (q.get("run_state_name") is None):
+            raise HttpError(400, "run_state_type and run_state_name must be passed together or omitted")
+        if q.get("run_state_type") not in (None, "status", "outcome"):
+            raise HttpError(400, "run_state_type must be 'status' or 'outcome'")
+        task = self.kanban_require(board, request.path_params["task_id"])
+        task_id = task["id"]
+        links = {"parents": self.kanban_parents(board, task_id), "children": self.kanban_children(board, task_id)}
+        runs = [r for r in board.runs if r["task_id"] == task_id and (
+            q.get("run_state_type") is None or r[q["run_state_type"]] == q.get("run_state_name"))]
+        return {
+            "task": self.kanban_task_dict(board, task),
+            "comments": [dict(c) for c in board.comments if c["task_id"] == task_id],
+            "events": [{k: e[k] for k in ("id", "task_id", "kind", "payload", "created_at", "run_id")}
+                       for e in board.events if e["task_id"] == task_id],
+            "attachments": [self.kanban_attachment_dict(a) for a in board.attachments if a["task_id"] == task_id],
+            "links": links,
+            "link_tasks": [{"id": i, "title": board.tasks[i]["title"], "status": board.tasks[i]["status"]}
+                           for i in dict.fromkeys(links["parents"] + links["children"]) if i in board.tasks],
+            "child_results": [{"id": c, "title": board.tasks[c]["title"], "status": board.tasks[c]["status"],
+                               "latest_summary": self.kanban_latest_summary(board, c),
+                               "result": board.tasks[c]["result"]} for c in links["children"] if c in board.tasks],
+            "runs": [dict(r) for r in runs]}
+
+    @staticmethod
+    def kanban_attachment_dict(a: dict[str, Any]) -> dict[str, Any]:
+        return {k: a[k] for k in ("id", "task_id", "filename", "content_type", "size", "uploaded_by", "stored_path",
+                                  "created_at")}
+
+    def kanban_create_task(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /tasks (CreateTaskBody): ``triage`` when asked, ``todo`` behind an open parent, else
+        ``ready``; a ready assigned card warns when no gateway would dispatch it."""
+        board = self.kanban_board_of(request)
+        title = body_field(body, "title", str)
+        if not title.strip():
+            raise HttpError(400, "title is required")
+        kind = body.get("workspace_kind")
+        project_id = body.get("project_id")
+        if project_id is None and kind != "scratch":
+            project_id = board.meta.get("project_id")
+        kind = kind or ("worktree" if project_id else "scratch")
+        if kind not in KANBAN_WORKSPACES:
+            raise HttpError(400, f"workspace_kind must be one of {sorted(KANBAN_WORKSPACES)}, got {kind!r}")
+        parents = [p for p in body_field(body, "parents", list, required=False, default=[]) if p]
+        missing = [p for p in parents if p not in board.tasks]
+        if missing:
+            raise HttpError(400, f"unknown parent task(s): {', '.join(missing)}")
+        key = body.get("idempotency_key")
+        if key and (same := next((t for t in board.tasks.values() if t["idempotency_key"] == key and
+                                  t["status"] != "archived"), None)):
+            return {"task": self.kanban_task_dict(board, same)}
+        status = "triage" if body.get("triage") else "todo" if any(
+            board.tasks[p]["status"] != "done" for p in parents) else "ready"
+        task_id = "t_" + secrets.token_hex(4)
+        workspace_path = body.get("workspace_path")
+        if workspace_path is None and kind in ("dir", "worktree"):
+            workspace_path = board.meta.get("default_workdir")
+        task = kanban_task(task_id, title.strip(), status, time.time(), body=body.get("body"),
+                           assignee=(body.get("assignee") or None), tenant=body.get("tenant"),
+                           priority=int(body.get("priority") or 0), workspace_kind=kind,
+                           workspace_path=workspace_path, project_id=project_id or None, idempotency_key=key,
+                           max_runtime_seconds=body.get("max_runtime_seconds"), skills=body.get("skills"),
+                           model_override=body.get("model_override"), provider_override=body.get("provider_override"),
+                           reasoning_effort=body.get("reasoning_effort"), goal_mode=bool(body.get("goal_mode")),
+                           goal_max_turns=body.get("goal_max_turns"))
+        board.tasks[task_id] = task
+        for parent in parents:
+            board.links.append((parent, task_id))
+        self.kanban_event(board, task_id, "created", {"assignee": task["assignee"], "status": status,
+                                                      "parents": parents, "tenant": task["tenant"],
+                                                      "workspace_kind": kind, "workspace_path": workspace_path})
+        gating = next((p for p in parents if board.tasks[p]["status"] not in ("done", "archived")), None)
+        if status == "todo" and gating is not None:
+            self.kanban_event(board, task_id, "dependency_wait", {"reason": "parent_not_done", "parent": gating})
+        out: dict[str, Any] = {"task": self.kanban_task_dict(board, task)}
+        if status == "ready" and task["assignee"] and not self.gateway_running(self.scoped(request).name):
+            out["warning"] = NO_GATEWAY_WARNING
+        return out
+
+    def kanban_status_verb(self, board: KanbanBoard, task: dict[str, Any], status: str,
+                           body: dict[str, Any], unknown: str) -> bool:
+        """plugin_api.py _apply_status / _STATUS_HANDLERS over the kanban_db verbs; False is a refused transition."""
+        task_id, current, now = task["id"], task["status"], int(time.time())
+        if status == "running":
+            raise HttpError(400, KANBAN_RUNNING_DIRECT)
+        if status == "done":
+            if current != "review" and not any(str(body.get(k) or "").strip() for k in ("result", "summary")) and \
+                    not str(task["result"] or "").strip():
+                self.kanban_event(board, task_id, "completion_blocked_empty_result", {"result_preview": None,
+                                                                                    "summary_preview": None})
+                raise HttpError(400, f"completion blocked: {task_id} has no result or summary evidence")
+            if current not in ("running", "ready", "blocked", "review") or not self.kanban_parents_done(board, task_id):
+                return False
+            summary = body.get("summary") if body.get("summary") is not None else body.get("result")
+            run_id = self.kanban_end_run(board, task, "completed", "done", summary)
+            task.update(status="done", result=body.get("result") if body.get("result") is not None else
+                        task["result"], completed_at=now, claim_lock=None, claim_expires=None, worker_pid=None,
+                        block_kind=None, block_recurrences=0)
+            board.finish_at.pop(task_id, None)
+            self.kanban_event(board, task_id, "completed", {"result": body.get("result"), "summary": summary},
+                              run_id=run_id)
+            self.kanban_recompute_ready(board)
+            return True
+        if status in ("blocked", "scheduled"):
+            allowed = ("running", "ready") if status == "blocked" else ("todo", "ready", "running", "blocked")
+            if current not in allowed:
+                return False
+            run_id = self.kanban_end_run(board, task, status, status, body.get("block_reason"))
+            task.update(status=status, claim_lock=None, claim_expires=None, worker_pid=None)
+            if status == "blocked":
+                task["block_kind"] = "needs_input"
+            board.finish_at.pop(task_id, None)
+            self.kanban_event(board, task_id, status, {"reason": body.get("block_reason"),
+                                                       **({"kind": "needs_input"} if status == "blocked" else {})},
+                              run_id=run_id)
+            return True
+        if status == "review":
+            if current not in ("running", "ready"):
+                return False
+            run_id = self.kanban_end_run(board, task, "review_requested", "review", body.get("summary"))
+            task.update(status="review", claim_lock=None, claim_expires=None, worker_pid=None)
+            if body.get("assignee"):
+                task["assignee"] = body["assignee"]
+            board.finish_at.pop(task_id, None)
+            self.kanban_event(board, task_id, "review_requested", {"summary": body.get("summary"),
+                                                                   "reviewer": body.get("assignee")}, run_id=run_id)
+            return True
+        if status in ("ready", "todo", "triage"):
+            if status == "ready" and current in ("blocked", "scheduled"):
+                landing = "ready" if self.kanban_parents_done(board, task_id) else "todo"
+                task.update(status=landing)
+                self.kanban_event(board, task_id, "unblocked", {"status": landing})
+                return True
+            if current == "review":
+                landing = "ready" if self.kanban_parents_done(board, task_id) else "todo"
+                task.update(status=landing)
+                self.kanban_event(board, task_id, "review_reopened", None if landing == "ready" else
+                                  {"status": landing})
+                return True
+            if status == "ready" and not self.kanban_parents_done(board, task_id):
+                return False
+            run_id = None
+            if current == "running":
+                run_id = self.kanban_end_run(board, task, "reclaimed", "reclaimed",
+                                             f"status changed to {status} (dashboard/direct)")
+                board.finish_at.pop(task_id, None)
+            task.update(status=status, claim_lock=None, claim_expires=None, worker_pid=None)
+            if current in ("done", "archived"):
+                task["completed_at"] = None
+            self.kanban_event(board, task_id, "status", {"status": status, "requested_status": status},
+                              run_id=run_id)
+            if status in ("ready",):
+                self.kanban_recompute_ready(board)
+            return True
+        raise HttpError(400, unknown)
+
+    def kanban_archive(self, board: KanbanBoard, task: dict[str, Any]) -> bool:
+        """kanban_db.py archive_task: any live card (a running worker's run is closed)."""
+        if task["status"] == "archived":
+            return False
+        run_id = self.kanban_end_run(board, task, "archived", "archived", None)
+        task.update(status="archived", claim_lock=None, claim_expires=None, worker_pid=None)
+        board.finish_at.pop(task["id"], None)
+        self.kanban_event(board, task["id"], "archived", None, run_id=run_id)
+        self.kanban_recompute_ready(board)
+        return True
+
+    def kanban_assign(self, board: KanbanBoard, task: dict[str, Any], profile: str | None, *,
+                      reclaim_first: bool = False) -> bool:
+        """kanban_db.py assign_task / reassign_task: a running card refuses unless it is reclaimed first."""
+        if task["status"] == "running" and task["claim_lock"] is not None:
+            if not reclaim_first:
+                raise HttpError(409, f"cannot reassign {task['id']}: currently running (claimed). Wait for "
+                                     "completion or reclaim the stale lock first.")
+            self.kanban_reclaim_task(board, task, None)
+        previous = task["assignee"]
+        if previous != profile:
+            task.update(consecutive_failures=0, last_failure_error=None)
+        task["assignee"] = profile
+        self.kanban_event(board, task["id"], "assigned", {"assignee": profile, "from": previous})
+        return True
+
+    def kanban_reclaim_task(self, board: KanbanBoard, task: dict[str, Any], reason: str | None) -> bool:
+        """kanban_db.py reclaim_task: a claimed card goes back to ``ready``; its run closes as reclaimed."""
+        if task["status"] != "running" and task["claim_lock"] is None:
+            return False
+        if task["status"] not in ("running", "ready", "blocked"):
+            return False
+        run_id = self.kanban_end_run(board, task, "reclaimed", "reclaimed", reason)
+        task.update(status="ready", claim_lock=None, claim_expires=None, worker_pid=None)
+        board.finish_at.pop(task["id"], None)
+        board.logs[task["id"]] = board.logs.get(task["id"], "") + "[worker] terminated (reclaimed)\n"
+        self.kanban_event(board, task["id"], "reclaimed", {"reason": reason}, run_id=run_id)
+        return True
+
+    def kanban_update_task(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py PATCH /tasks/{id} (UpdateTaskBody): assignee, status (409 naming the open parents when a
+        transition is refused), overrides, priority, title/body."""
+        board = self.kanban_board_of(request)
+        task = self.kanban_require(board, request.path_params["task_id"])
+        status = body.get("status")
+        deferred = status == "review" and body.get("assignee") is not None
+        if body.get("assignee") is not None and not deferred:
+            self.kanban_assign(board, task, body["assignee"] or None)
+        if status is not None:
+            ok = self.kanban_archive(board, task) if status == "archived" else \
+                self.kanban_status_verb(board, task, status, body, f"unknown status: {status}")
+            if not ok:
+                blockers = [p for p in self.kanban_parents(board, task["id"])
+                            if board.tasks.get(p, {}).get("status") not in ("done", None)]
+                if status == "ready" and blockers:
+                    names = ", ".join(f"{board.tasks[p]['title']!r} ({p}, status={board.tasks[p]['status']})"
+                                      for p in blockers)
+                    raise HttpError(409, f"Cannot move to 'ready': blocked by parent(s) not done — {names}")
+                if status in ("done", "review") and blockers:
+                    detail = ", ".join(f"{p} ({board.tasks[p]['status']})" for p in blockers)
+                    raise HttpError(409, f"cannot move {task['id']} to {status!r}: unsatisfied parent dependencies: "
+                                         f"{detail}; complete the parents first (done or archived)")
+                raise HttpError(409, f"status transition to {status!r} not valid from current state")
+        if body.get("clear_model_override") or body.get("model_override") is not None:
+            task["model_override"] = None if body.get("clear_model_override") else \
+                (str(body.get("model_override") or "").strip() or None)
+            task["provider_override"] = body.get("provider_override") if task["model_override"] else None
+        if body.get("clear_reasoning_effort") or body.get("reasoning_effort") is not None:
+            task["reasoning_effort"] = None if body.get("clear_reasoning_effort") else body.get("reasoning_effort")
+        if body.get("priority") is not None:
+            task["priority"] = int(body["priority"])
+            self.kanban_event(board, task["id"], "reprioritized", {"priority": task["priority"]})
+        if body.get("title") is not None or body.get("body") is not None:
+            if body.get("title") is not None:
+                if not str(body["title"]).strip():
+                    raise HttpError(400, "title cannot be empty")
+                task["title"] = str(body["title"]).strip()
+            if body.get("body") is not None:
+                task["body"] = body["body"]
+            self.kanban_event(board, task["id"], "edited", None)
+        return {"task": self.kanban_task_dict(board, task)}
+
+    def kanban_delete_task(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py DELETE /tasks/{id}: a hard delete with its comments, events, runs and links (no event)."""
+        board = self.kanban_board_of(request)
+        task_id = request.path_params["task_id"]
+        if board.tasks.pop(task_id, None) is None:
+            raise HttpError(404, f"task {task_id} not found")
+        board.comments = [c for c in board.comments if c["task_id"] != task_id]
+        board.events = [e for e in board.events if e["task_id"] != task_id]
+        board.runs = [r for r in board.runs if r["task_id"] != task_id]
+        board.attachments = [a for a in board.attachments if a["task_id"] != task_id]
+        board.links = [(p, c) for p, c in board.links if task_id not in (p, c)]
+        board.finish_at.pop(task_id, None)
+        self.kanban_recompute_ready(board)
+        return {"deleted": True, "task_id": task_id}
+
+    def kanban_bulk(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /tasks/bulk: one patch per id, failures reported per id without aborting the rest."""
+        board = self.kanban_board_of(request)
+        ids = [i for i in body_field(body, "ids", list) if i]
+        if not ids:
+            raise HttpError(400, "ids is required")
+        results = []
+        for task_id in ids:
+            entry: dict[str, Any] = {"id": task_id, "ok": True}
+            task = board.tasks.get(task_id)
+            try:
+                if task is None:
+                    entry.update(ok=False, error="not found")
+                else:
+                    if body.get("archive") and not self.kanban_archive(board, task):
+                        entry.update(ok=False, error="archive refused")
+                    if body.get("status") is not None and not body.get("archive"):
+                        s = body["status"]
+                        if not self.kanban_status_verb(board, task, s, body, f"unknown status {s!r}"):
+                            entry.update(ok=False, error=f"transition to {s!r} refused")
+                    if body.get("assignee") is not None:
+                        self.kanban_assign(board, task, body["assignee"] or None,
+                                           reclaim_first=bool(body.get("reclaim_first")))
+                    if body.get("priority") is not None:
+                        task["priority"] = int(body["priority"])
+                        self.kanban_event(board, task_id, "reprioritized", {"priority": task["priority"]})
+            except HttpError as exc:
+                entry.update(ok=False, error=str(exc.detail))
+            results.append(entry)
+        return {"results": results}
+
+    def kanban_comment(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /tasks/{id}/comments {body, author?}."""
+        text = body_field(body, "body", str)
+        if not text.strip():
+            raise HttpError(400, "body is required")
+        board = self.kanban_board_of(request)
+        task = self.kanban_require(board, request.path_params["task_id"])
+        author = str(body.get("author") or "dashboard")
+        board.comments.append({"id": max([c["id"] for c in board.comments] or [0]) + 1, "task_id": task["id"],
+                               "author": author, "body": text, "created_at": int(time.time())})
+        self.kanban_event(board, task["id"], "commented", {"author": author, "len": len(text)})
+        return {"ok": True}
+
+    def kanban_attachments(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board = self.kanban_board_of(request)
+        task = self.kanban_require(board, request.path_params["task_id"])
+        return {"attachments": [self.kanban_attachment_dict(a) for a in board.attachments
+                                if a["task_id"] == task["id"]]}
+
+    async def kanban_upload(self, request: Request) -> dict[str, Any]:
+        """plugin_api.py POST /tasks/{id}/attachments (multipart file, uploaded_by?): a sanitized, collision-free name,
+        25 MB at most."""
+        board = self.kanban_board_of(request)
+        task = self.kanban_require(board, request.path_params["task_id"])
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or isinstance(upload, str):
+            raise HttpError(422, [{"type": "missing", "loc": ["body", "file"], "msg": "Field required"}])
+        name = (upload.filename or "").replace("\\", "/").split("/")[-1].strip()
+        name = "".join(ch for ch in name if ch.isprintable()).strip().lstrip(".").strip()
+        if not name:
+            raise HttpError(400, "invalid attachment filename")
+        data = await upload.read()
+        if len(data) > KANBAN_ATTACHMENT_MAX:
+            raise HttpError(413, f"attachment exceeds {KANBAN_ATTACHMENT_MAX // (1024 * 1024)} MB limit")
+        taken = {a["filename"] for a in board.attachments if a["task_id"] == task["id"]}
+        stem, dot, ext = name[:200].partition(".")
+        candidate, n = name[:200], 1
+        while candidate in taken:
+            candidate, n = f"{stem} ({n}){dot}{ext}", n + 1
+        attachment_id = max([a["id"] for a in board.attachments] or [0]) + 1
+        row = {"id": attachment_id, "task_id": task["id"], "filename": candidate,
+               "content_type": upload.content_type, "size": len(data),
+               "uploaded_by": str(form.get("uploaded_by") or "dashboard"),
+               "stored_path": f"{DEMO_HERMES_HOME}/kanban/attachments/{task['id']}/{candidate}",
+               "created_at": int(time.time())}
+        board.attachments.append(row)
+        board.blobs[attachment_id] = data
+        self.kanban_event(board, task["id"], "attached", {"filename": candidate, "size": len(data),
+                                                          "by": row["uploaded_by"]})
+        return {"attachment": self.kanban_attachment_dict(row)}
+
+    def kanban_attachment_of(self, request: Request) -> tuple[KanbanBoard, dict[str, Any]]:
+        board = self.kanban_board_of(request)
+        try:
+            attachment_id = int(request.path_params["attachment_id"])
+        except ValueError:
+            raise HttpError(422, [{"type": "int_parsing", "loc": ["path", "attachment_id"],
+                                   "msg": "Input should be a valid integer"}]) from None
+        row = next((a for a in board.attachments if a["id"] == attachment_id), None)
+        if row is None:
+            raise HttpError(404, "attachment not found")
+        return board, row
+
+    def kanban_download(self, request: Request, body: dict[str, Any]) -> Response:
+        board, row = self.kanban_attachment_of(request)
+        return Response(board.blobs.get(row["id"], b""), media_type=row["content_type"] or "application/octet-stream",
+                        headers={"content-disposition": f'attachment; filename="{row["filename"]}"'})
+
+    def kanban_remove_attachment(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board, row = self.kanban_attachment_of(request)
+        board.attachments.remove(row)
+        board.blobs.pop(row["id"], None)
+        self.kanban_event(board, row["task_id"], "attachment_removed", {"filename": row["filename"]})
+        return {"ok": True, "id": row["id"]}
+
+    def kanban_log(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py GET /tasks/{id}/log?tail=: the worker's stdout/stderr tail."""
+        board = self.kanban_board_of(request)
+        task = self.kanban_require(board, request.path_params["task_id"])
+        tail = query_int(request, "tail", 0, ge=1, le=2_000_000) if request.query_params.get("tail") else None
+        content = board.logs.get(task["id"])
+        data = (content or "").encode()
+        shown = data[-tail:] if tail else data
+        return {"task_id": task["id"], "path": f"{DEMO_HERMES_HOME}/kanban/logs/{task['id']}.log",
+                "exists": content is not None, "size_bytes": len(data),
+                "content": shown.decode("utf-8", errors="replace"), "truncated": bool(tail and len(data) > tail)}
+
+    def kanban_reclaim(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board = self.kanban_board_of(request)
+        task_id = request.path_params["task_id"]
+        task = board.tasks.get(task_id)
+        if task is None or not self.kanban_reclaim_task(board, task, body.get("reason")):
+            raise HttpError(409, f"cannot reclaim {task_id}: not in a claimable state (not running, or unknown id)")
+        return {"ok": True, "task_id": task_id}
+
+    def kanban_reassign(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /tasks/{id}/reassign {profile, reclaim_first, reason}."""
+        board = self.kanban_board_of(request)
+        task_id = request.path_params["task_id"]
+        task = board.tasks.get(task_id)
+        profile = body.get("profile") or None
+        try:
+            ok = task is not None and self.kanban_assign(board, task, profile,
+                                                         reclaim_first=bool(body.get("reclaim_first")))
+        except HttpError:
+            ok = False
+        if not ok:
+            raise HttpError(409, f"cannot reassign {task_id}: unknown id, or still running (pass reclaim_first=true "
+                                 "to release the claim first)")
+        return {"ok": True, "task_id": task_id, "assignee": profile}
+
+    @staticmethod
+    def kanban_estimate(title: str, text: str | None) -> dict[str, Any]:
+        """plugin_api.py _run_estimate, with a fixed fake model instead of an auxiliary LLM call."""
+        if not (title or "").strip():
+            return {"ok": False, "reason": "a title is required to estimate"}
+        size = len(title) + len(text or "")
+        complexity = "S" if size < 60 else "M" if size < 200 else "L"
+        return {"ok": True, "est_tokens": {"S": 40_000, "M": 150_000, "L": 450_000}[complexity],
+                "complexity": complexity, "rationale": f"A rough guess from a {len(title.split())}-word title.",
+                "model": "fake-hermes-mini"}
+
+    def kanban_estimate_task(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board = self.kanban_board_of(request)
+        task = self.kanban_require(board, request.path_params["task_id"])
+        return self.kanban_estimate(task["title"], task["body"])
+
+    def kanban_estimate_text(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return self.kanban_estimate(str(body.get("title") or ""), body.get("body"))
+
+    def kanban_specify(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /tasks/{id}/specify: the triage specifier fleshes out a triage card (non-OK is no HTTP
+        error)."""
+        board = self.kanban_board_of(request)
+        task_id = request.path_params["task_id"]
+        task = board.tasks.get(task_id)
+        if task is None or task["status"] != "triage":
+            return {"ok": False, "task_id": task_id, "reason": "task is not in triage", "new_title": None}
+        task["body"] = (task["body"] or "") + "\n\nAcceptance: the test passes 50 runs in a row on CI."
+        task["status"] = "todo"
+        self.kanban_event(board, task_id, "specified", {"changed_fields": ["body", "status"]})
+        return {"ok": True, "task_id": task_id, "reason": None, "new_title": task["title"]}
+
+    def kanban_decompose(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /tasks/{id}/decompose: the decomposer fans a triage card out into children."""
+        board = self.kanban_board_of(request)
+        task_id = request.path_params["task_id"]
+        task = board.tasks.get(task_id)
+        if task is None or task["status"] != "triage":
+            return {"ok": False, "task_id": task_id, "reason": "task is not in triage", "fanout": False,
+                    "child_ids": [], "new_title": None}
+        children = []
+        for title in ("Reproduce it locally", "Write the fix and a regression test"):
+            child_id = "t_" + secrets.token_hex(4)
+            board.tasks[child_id] = kanban_task(child_id, title, "todo", time.time(), assignee="default")
+            board.links.append((task_id, child_id))
+            self.kanban_event(board, child_id, "created", {"assignee": "default", "status": "todo",
+                                                           "parents": [task_id]})
+            children.append(child_id)
+        task["status"] = "ready"
+        self.kanban_event(board, task_id, "decomposed", {"children": children})
+        return {"ok": True, "task_id": task_id, "reason": None, "fanout": True, "child_ids": children,
+                "new_title": task["title"]}
+
+    def kanban_subscribe(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST|DELETE /tasks/{id}/home-subscribe/{platform}: needs that platform's home channel."""
+        board = self.kanban_board_of(request)
+        platform = request.path_params["platform"]
+        home = next((h for h in self.kanban_homes(self.scoped(request)) if h["platform"] == platform), None)
+        if home is None:
+            raise HttpError(404, f"No home channel configured for platform {platform!r}.")
+        task = self.kanban_require(board, request.path_params["task_id"])
+        subs = board.notify.setdefault(task["id"], set())
+        if request.method == "POST":
+            subs.add(platform)
+        else:
+            subs.discard(platform)
+        return {"ok": True, "task_id": task["id"], "home_channel": home}
+
+    def kanban_homes(self, profile: FakeProfile) -> list[dict[str, Any]]:
+        """plugin_api.py _configured_home_channels: platforms with a home channel, by platform."""
+        platforms = profile.config.get("platforms") if isinstance(profile.config.get("platforms"), dict) else {}
+        homes = []
+        for pid, cfg in sorted(platforms.items()):
+            if isinstance(cfg, dict) and isinstance(cfg.get("home_channel"), dict):
+                hc = cfg["home_channel"]
+                homes.append({"platform": pid, "chat_id": str(hc.get("chat_id") or ""),
+                              "thread_id": str(hc.get("thread_id") or ""), "name": hc.get("name") or "Home"})
+        return homes
+
+    def kanban_home_channels(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        homes = self.kanban_homes(self.scoped(request))
+        task_id = request.query_params.get("task_id")
+        subs = self.kanban_board_of(request).notify.get(task_id or "", set()) if task_id else set()
+        return {"home_channels": [{**h, "subscribed": h["platform"] in subs} for h in homes]}
+
+    def kanban_link(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /links {parent_id, child_id} (kanban_db.py link_tasks): ``gated`` when a ``ready`` child
+        went back to ``todo`` behind an open parent; a running child, a cycle or an unknown id is 400."""
+        board = self.kanban_board_of(request)
+        parent, child = body_field(body, "parent_id", str), body_field(body, "child_id", str)
+        if parent == child:
+            raise HttpError(400, "a task cannot depend on itself")
+        missing = [t for t in (parent, child) if t not in board.tasks]
+        if missing:
+            raise HttpError(400, f"unknown task(s): {', '.join(missing)}")
+        if board.tasks[child]["status"] == "running":
+            raise HttpError(400, f"cannot link {parent} -> {child}: child is already running")
+        if parent in self.kanban_descendants(board, child):
+            raise HttpError(400, f"linking {parent} -> {child} would create a cycle")
+        if (parent, child) not in board.links:
+            board.links.append((parent, child))
+        gated = board.tasks[parent]["status"] not in ("done", "archived") and board.tasks[child]["status"] == "ready"
+        if gated:
+            board.tasks[child]["status"] = "todo"
+            self.kanban_event(board, child, "dependency_wait", {"reason": "parent_not_done", "demoted": True,
+                                                                "parent": parent})
+        self.kanban_event(board, child, "linked", {"parent": parent, "child": child})
+        return {"ok": True, "gated": gated}
+
+    def kanban_descendants(self, board: KanbanBoard, task_id: str) -> set[str]:
+        out, todo = set(), [task_id]
+        while todo:
+            for child in self.kanban_children(board, todo.pop()):
+                if child not in out:
+                    out.add(child)
+                    todo.append(child)
+        return out
+
+    def kanban_unlink(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board = self.kanban_board_of(request)
+        parent, child = query_text(request, "parent_id"), query_text(request, "child_id")
+        removed = (parent, child) in board.links
+        if removed:
+            board.links.remove((parent, child))
+            self.kanban_event(board, child, "unlinked", {"parent": parent, "child": child})
+            self.kanban_recompute_ready(board)
+        return {"ok": removed}
+
+    def kanban_diagnostics(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board = self.kanban_board_of(request)
+        order = ["warning", "error", "critical"]
+        floor = request.query_params.get("severity")
+        out = []
+        for task in board.tasks.values():
+            diagnostics = [d for d in self.kanban_diagnostics_for(task)
+                           if floor not in order or order.index(d["severity"]) >= order.index(floor)]
+            if diagnostics:
+                out.append({"task_id": task["id"], "task_title": task["title"], "task_status": task["status"],
+                            "task_assignee": task["assignee"], "diagnostics": diagnostics})
+        return {"diagnostics": out, "count": sum(len(d["diagnostics"]) for d in out)}
+
+    def kanban_workers(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board = self.kanban_board_of(request)
+        workers = [{"run_id": r["id"], "task_id": r["task_id"], "task_title": board.tasks[r["task_id"]]["title"],
+                    "task_status": "running", "task_assignee": board.tasks[r["task_id"]]["assignee"],
+                    "profile": r["profile"], "worker_pid": r["worker_pid"], "started_at": r["started_at"],
+                    "claim_lock": r["claim_lock"], "claim_expires": r["claim_expires"],
+                    "last_heartbeat_at": r["last_heartbeat_at"], "max_runtime_seconds": r["max_runtime_seconds"]}
+                   for r in board.runs if r["ended_at"] is None and r["worker_pid"] is not None and
+                   board.tasks.get(r["task_id"], {}).get("status") == "running"]
+        return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+
+    def kanban_run_of(self, request: Request) -> tuple[KanbanBoard, dict[str, Any]]:
+        board = self.kanban_board_of(request)
+        raw = request.path_params["run_id"]
+        run = next((r for r in board.runs if str(r["id"]) == raw), None)
+        if run is None:
+            raise HttpError(404, f"run {raw} not found")
+        return board, run
+
+    def kanban_run(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return {"run": dict(self.kanban_run_of(request)[1])}
+
+    def kanban_inspect_run(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py GET /runs/{id}/inspect: psutil stats for a live run's worker, else ``{alive: false, reason}``
+        (404 for an unknown run). The fake's workers are imaginary, so their numbers are made up but steady."""
+        _board, run = self.kanban_run_of(request)
+        run_id = run["id"]
+        if run["ended_at"] is not None:
+            return {"run_id": run_id, "alive": False, "reason": "run already ended"}
+        pid = run.get("worker_pid")
+        if pid is None:
+            return {"run_id": run_id, "alive": False, "reason": "no worker_pid recorded"}
+        started = float(run.get("started_at") or time.time())
+        return {"run_id": run_id, "alive": True, "pid": pid, "cpu_percent": 12.5,
+                "memory_rss_bytes": 182 * 1024 * 1024, "memory_vms_bytes": 1_536 * 1024 * 1024, "num_threads": 9,
+                "num_fds": 41, "status": "running", "create_time": started,
+                "cmdline": ["python3", "-m", "hermes_cli.main", "kanban", "work", run["task_id"]]}
+
+    def kanban_terminate_run(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /runs/{id}/terminate {reason?}: reclaim_task on the run's card (409 when it ended)."""
+        board, run = self.kanban_run_of(request)
+        if run["ended_at"] is not None:
+            raise HttpError(409, f"run {run['id']} already ended")
+        task = board.tasks.get(run["task_id"])
+        if task is None or not self.kanban_reclaim_task(board, task, body.get("reason")):
+            raise HttpError(409, f"cannot terminate run {run['id']}: task {run['task_id']} is no longer in a "
+                                 "reclaimable state")
+        return {"ok": True, "run_id": run["id"], "task_id": run["task_id"]}
+
+    def kanban_config(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        cfg = ((self.scoped(request).loaded().get("dashboard") or {}).get("kanban") or {})
+        return {"default_tenant": cfg.get("default_tenant") or "", "lane_by_profile": bool(cfg.get("lane_by_profile",
+                                                                                                   True)),
+                "include_archived_by_default": bool(cfg.get("include_archived_by_default", False)),
+                "render_markdown": bool(cfg.get("render_markdown", True))}
+
+    def kanban_stats(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        board = self.kanban_board_of(request)
+        by_status: dict[str, int] = {}
+        for task in board.tasks.values():
+            if task["status"] != "archived":
+                by_status[task["status"]] = by_status.get(task["status"], 0) + 1
+        ready = [t["created_at"] for t in board.tasks.values() if t["status"] == "ready"]
+        now = int(time.time())
+        return {"by_status": by_status, "by_assignee": {a["name"]: a["counts"] for a in
+                                                        self.kanban_known_assignees(board) if a["counts"]},
+                "oldest_ready_age_seconds": now - min(ready) if ready else None, "now": now}
+
+    def kanban_assignees(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return {"assignees": self.kanban_known_assignees(self.kanban_board_of(request))}
+
+    def kanban_dispatch(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /dispatch?dry_run=&max=: one dispatcher pass (DispatchResult): ready cards with an
+        assignee (or the orchestration default) get a fake worker that finishes after ``--kanban-run-seconds``."""
+        board = self.kanban_board_of(request)
+        profile = self.scoped(request)
+        dry_run = query_flag(request, "dry_run")
+        limit = query_int(request, "max", 8)
+        default_assignee = str(((profile.loaded().get("kanban") or {}).get("default_assignee")) or "").strip()
+        result: dict[str, Any] = {"reclaimed": 0, "promoted": 0, "reconciled_orphans": [],
+                                  "reaped_terminal_workers": [], "spawned": [], "skipped_unassigned": [],
+                                  "auto_assigned_default": [], "skipped_nonspawnable": [],
+                                  "skipped_per_profile_capped": [], "crashed": [], "auto_blocked": [], "timed_out": [],
+                                  "stale": [], "respawn_guarded": [], "rate_limited": [], "skipped_locked": False,
+                                  "memory_pressure": None}
+        if not self.gateway_running(profile.name):
+            return result
+        ready = sorted((t for t in board.tasks.values() if t["status"] == "ready"),
+                       key=lambda t: (-t["priority"], t["created_at"]))
+        for task in ready:
+            if len(result["spawned"]) >= limit:
+                break
+            if not task["assignee"]:
+                if not default_assignee:
+                    result["skipped_unassigned"].append(task["id"])
+                    continue
+                result["auto_assigned_default"].append(task["id"])
+                if not dry_run:
+                    self.kanban_assign(board, task, default_assignee)
+            assignee = task["assignee"] or default_assignee
+            workspace = task["workspace_path"] or f"{DEMO_HERMES_HOME}/kanban/workspaces/{task['id']}"
+            result["spawned"].append([task["id"], assignee, workspace])
+            if dry_run:
+                continue
+            run_id = max([r["id"] for r in board.runs] or [0]) + 1
+            pid = 20_000 + secrets.randbelow(40_000)
+            now = int(time.time())
+            board.runs.append({"id": run_id, "task_id": task["id"], "profile": assignee, "step_key": None,
+                               "status": "running", "claim_lock": f"fake-host:{pid}", "claim_expires": now + 900,
+                               "worker_pid": pid, "max_runtime_seconds": task["max_runtime_seconds"],
+                               "last_heartbeat_at": now, "started_at": now, "ended_at": None, "outcome": None,
+                               "summary": None, "metadata": None, "error": None})
+            task.update(status="running", started_at=task["started_at"] or now, worker_pid=pid,
+                        claim_lock=f"fake-host:{pid}", claim_expires=now + 900, last_heartbeat_at=now,
+                        current_run_id=run_id)
+            board.finish_at[task["id"]] = time.time() + self.kanban_run_seconds
+            board.logs[task["id"]] = board.logs.get(task["id"], "") + (
+                f"[worker] claimed {task['id']} as profile {assignee}\n[worker] workspace {workspace}\n")
+            self.kanban_event(board, task["id"], "claimed", {"lock": f"fake-host:{pid}", "run_id": run_id},
+                              run_id=run_id)
+            self.kanban_event(board, task["id"], "spawned", {"pid": pid, "profile": assignee}, run_id=run_id)
+        return result
+
+    def kanban_model_options(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return {"providers": [{"slug": slug, "label": name, "models": list(models)}
+                              for slug, name, models in DEMO_PROVIDERS]}
+
+    def kanban_projects(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return {"projects": [{"id": p["id"], "slug": p["slug"], "name": p["name"],
+                              "primary_path": p["primary_path"] or "", "icon": p["icon"] or "",
+                              "color": p["color"] or ""} for p in self.projects if not p.get("archived")]}
+
+    def kanban_board_row(self, board: KanbanBoard) -> dict[str, Any]:
+        """plugin_api.py list_boards row: metadata, counts, live total, recommended workspace, project name."""
+        meta = dict(board.meta)
+        meta["db_path"] = f"{DEMO_HERMES_HOME}/kanban.db" if board.slug == "default" else \
+            f"{DEMO_HERMES_HOME}/kanban/boards/{board.slug}/kanban.db"
+        counts: dict[str, int] = {}
+        for task in board.tasks.values():
+            counts[task["status"]] = counts.get(task["status"], 0) + 1
+        workdir = str(meta.get("default_workdir") or "")
+        project = next((p for p in self.projects if p["id"] == meta.get("project_id")), None)
+        meta.update(is_current=board.slug == self.kanban_current, counts=counts,
+                    total=sum(n for s, n in counts.items() if s != "archived"),
+                    default_workspace_kind="scratch" if not workdir else "worktree" if self.git_locate(workdir)[1]
+                    else "dir", project_id=meta.get("project_id") or None,
+                    project_name=project["name"] if project else None)
+        return meta
+
+    def kanban_boards_list(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        include = query_flag(request, "include_archived")
+        rows = [self.kanban_board_row(b) for slug, b in sorted(self.kanban_boards.items(),
+                                                              key=lambda kv: (kv[0] != "default", kv[0]))
+                if include or not b.meta.get("archived")]
+        return {"boards": rows, "current": self.kanban_current}
+
+    def kanban_workdir(self, raw: str) -> str:
+        """plugin_api.py _validate_workdir."""
+        path = fs_absolute(raw) if raw.startswith(("/", "~")) else None
+        if path is None:
+            raise HttpError(400, "Project directory must be an absolute path.")
+        if not self.host_is_dir(path) or self.host_data(path) is not None:
+            raise HttpError(400, "Project directory must be an existing directory.")
+        return path
+
+    def kanban_project(self, ref: Any) -> dict[str, Any] | None:
+        if not ref or not str(ref).strip():
+            return None
+        project = next((p for p in self.projects if str(ref).strip() in (p["id"], p["slug"])), None)
+        if project is None:
+            raise HttpError(400, f"project {ref!r} does not exist")
+        return project
+
+    def kanban_create_board(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /boards (CreateBoardBody): idempotent; a project's primary folder becomes the default
+        workdir unless one was given; ``switch`` makes it current."""
+        slug = str(body_field(body, "slug", str)).strip().lower()
+        if not slug:
+            raise HttpError(400, "board slug is required")
+        if not KANBAN_SLUG.match(slug):
+            raise HttpError(400, f"invalid board slug {body['slug']!r}: must be 1-64 chars, lowercase alphanumerics / "
+                                 "hyphens / underscores, not starting with '-' or '_'")
+        workdir = self.kanban_workdir(str(body["default_workdir"])) if body.get("default_workdir") else None
+        project = self.kanban_project(body.get("project_id"))
+        if project and not workdir:
+            workdir = project["primary_path"]
+        board = self.kanban_boards.get(slug)
+        display = {k: body.get(k) for k in ("name", "description", "icon", "color") if body.get(k) is not None}
+        if board is None or board.meta.get("archived"):
+            board = KanbanBoard(slug, self.board_meta(slug, created_at=time.time()))
+            self.kanban_boards[slug] = board
+        board.meta.update({k: str(v) for k, v in display.items()}, archived=False)
+        if workdir:
+            board.meta["default_workdir"] = workdir
+        if project:
+            board.meta["project_id"] = project["id"]
+        if body.get("switch"):
+            self.kanban_current = slug
+        return {"board": self.kanban_board_row(board), "current": self.kanban_current}
+
+    def kanban_update_board(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py PATCH /boards/{slug}: display metadata, default workdir ("" clears), project scope."""
+        slug = request.path_params["slug"].strip().lower()
+        board = self.kanban_boards.get(slug)
+        if board is None or not KANBAN_SLUG.match(slug):
+            raise HttpError(404, f"board {request.path_params['slug']!r} does not exist")
+        workdir = None
+        if body.get("default_workdir") is not None:
+            raw = str(body["default_workdir"]).strip()
+            workdir = self.kanban_workdir(raw) if raw else ""
+        if body.get("project_id") is not None:
+            if str(body["project_id"]).strip():
+                project = self.kanban_project(body["project_id"])
+                board.meta["project_id"] = project["id"] if project else None
+                if project and workdir is None:
+                    workdir = project["primary_path"]
+            else:
+                board.meta["project_id"] = None
+        if workdir is not None:
+            board.meta["default_workdir"] = workdir or None
+        if body.get("name") is not None:
+            board.meta["name"] = str(body["name"]).strip() or self.board_meta(slug)["name"]
+        for key in ("description", "icon", "color"):
+            if body.get(key) is not None:
+                board.meta[key] = str(body[key])
+        return {"board": self.kanban_board_row(board)}
+
+    def kanban_delete_board(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py DELETE /boards/{slug}?delete=: archive (default, a tombstone stays) or hard-delete; never the
+        default board; the current pointer falls back to default."""
+        slug = request.path_params["slug"].strip().lower()
+        hard = query_flag(request, "delete")
+        if slug == "default":
+            raise HttpError(400, "the 'default' board cannot be removed")
+        board = self.kanban_boards.get(slug)
+        if board is None or (board.meta.get("archived") and not hard):
+            raise HttpError(400, f"board {slug!r} does not exist")
+        if self.kanban_current == slug:
+            self.kanban_current = "default"
+        target = f"{DEMO_HERMES_HOME}/kanban/boards/_archived/{slug}-{int(time.time())}"
+        if hard:
+            del self.kanban_boards[slug]
+        else:
+            board.meta["archived"] = True
+        return {"result": {"slug": slug, "action": "deleted" if hard else "archived",
+                           "new_path": None if hard else target}, "current": self.kanban_current}
+
+    def kanban_export_board(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /boards/{slug}/export {output}: an archive written on the backend host (paths, not
+        bytes; the files panel can download it)."""
+        slug = request.path_params["slug"]
+        board = self.kanban_live_board(slug)
+        output = str(body.get("output") or "").strip() or \
+            f"{DEMO_HERMES_HOME}/kanban/board-exports/{slug}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+        target = fs_absolute(output)
+        data = json.dumps({"board": board.meta, "tasks": list(board.tasks.values())}).encode()
+        self.host_write(target, data)
+        return {"board": board.slug, "archive": target, "size": len(data)}
+
+    def kanban_import_board(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /boards/import {archive, slug?, switch?}: lands as a NEW board (a taken slug gets a
+        suffix)."""
+        archive = str(body.get("archive") or "").strip()
+        if not archive:
+            raise HttpError(400, "archive path is required")
+        data = self.host_data(fs_absolute(archive))
+        if data is None:
+            raise HttpError(404, f"archive not found: {archive}")
+        try:
+            payload = json.loads(data)
+            meta, tasks = dict(payload["board"]), list(payload["tasks"])
+        except (ValueError, KeyError, TypeError):
+            raise HttpError(400, "not a kanban board archive") from None
+        requested = str(body.get("slug") or meta.get("slug") or "imported").strip().lower()
+        slug, n = requested, 2
+        while slug in self.kanban_boards:
+            slug, n = f"{requested}-{n}", n + 1
+        board = KanbanBoard(slug, self.board_meta(slug, **{k: v for k, v in meta.items() if k in (
+            "name", "description", "icon", "color", "default_workdir", "project_id")}, created_at=time.time()))
+        for task in tasks:
+            board.tasks[task["id"]] = {**task, "status": "triage" if task.get("status") == "running" else
+                                       task.get("status", "triage")}
+        self.kanban_boards[slug] = board
+        if body.get("switch"):
+            self.kanban_current = slug
+        return {"board": slug, "name": board.meta["name"], "renamed": slug != requested, "requested_board": requested,
+                "counts": {"tasks": len(tasks)}, "warnings": [], "current": self.kanban_current}
+
+    def kanban_switch_board(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        slug = request.path_params["slug"].strip().lower()
+        if slug not in self.kanban_boards:
+            raise HttpError(404, f"board {request.path_params['slug']!r} does not exist")
+        self.kanban_current = slug
+        return {"current": slug}
+
+    def kanban_profiles(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py GET /profiles: the roster the decomposer routes across."""
+        rows = []
+        for profile in self.profiles.values():
+            model, provider = profile.main_model()
+            rows.append({"name": profile.name, "is_default": profile.is_default, "model": model, "provider": provider,
+                         "description": profile.description or "", "description_auto": profile.description_auto,
+                         "skill_count": len(self.caps(profile).skills) or profile.skill_count})
+        return {"profiles": rows}
+
+    def kanban_describe(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py PATCH /profiles/{name} {description}: user-written (description_auto false)."""
+        name = request.path_params["name"]
+        canon = "default" if name.strip().casefold() == "default" else name.strip().lower()
+        profile = self.profiles.get(canon)
+        if profile is None:
+            raise HttpError(404, f"profile '{name}' not found")
+        text = str(body.get("description") or "").strip()
+        profile.description, profile.description_auto = text, False
+        return {"ok": True, "profile": canon, "description": text}
+
+    def kanban_describe_auto(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py POST /profiles/{name}/describe-auto {overwrite}: a fake describer (non-OK is no HTTP error)."""
+        name = request.path_params["name"].strip().lower()
+        profile = self.profiles.get(name)
+        if profile is None:
+            return {"ok": False, "profile": name, "reason": f"profile '{name}' does not exist", "description": None}
+        if profile.description and not profile.description_auto and not body.get("overwrite"):
+            return {"ok": False, "profile": name, "reason": "has a user-written description (pass overwrite)",
+                    "description": profile.description}
+        skills = sorted(self.caps(profile).skills)[:3]
+        profile.description = f"Works with {', '.join(skills)}." if skills else "A general-purpose profile."
+        profile.description_auto = True
+        return {"ok": True, "profile": name, "reason": None, "description": profile.description}
+
+    def kanban_orchestration(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py GET /orchestration: the profile's config.yaml ``kanban`` knobs and their resolved values."""
+        profile = self.scoped(request)
+        cfg = profile.loaded().get("kanban") if isinstance(profile.loaded().get("kanban"), dict) else {}
+        explicit = {k: str(cfg.get(k) or "").strip() for k in ("orchestrator_profile", "default_assignee")}
+        resolved = {k: v if v in self.profiles else profile.name for k, v in explicit.items()}
+        return {**explicit, "auto_decompose": bool(cfg.get("auto_decompose", True)),
+                "auto_promote_children": bool(cfg.get("auto_promote_children", True)),
+                "resolved_orchestrator_profile": resolved["orchestrator_profile"],
+                "resolved_default_assignee": resolved["default_assignee"], "active_profile": profile.name}
+
+    def kanban_set_orchestration(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py PUT /orchestration: only the fields passed are written (an unknown profile is 400)."""
+        profile = self.scoped(request)
+        section = profile.config.setdefault("kanban", {})
+        for key in ("orchestrator_profile", "default_assignee", "auto_decompose", "auto_promote_children"):
+            if body.get(key) is None:
+                continue
+            if key in ("orchestrator_profile", "default_assignee"):
+                name = str(body[key]).strip()
+                if name and name not in self.profiles:
+                    raise HttpError(400, f"profile '{name}' does not exist")
+                section[key] = name
+            else:
+                section[key] = bool(body[key])
+        return self.kanban_orchestration(request, {})
+
+    async def kanban_events(self, ws: WebSocket) -> None:
+        """plugin_api.py WS /events?ticket=&board=&since=: closed before accept (a 403 handshake) without a valid
+        single-use ticket or while kanban is off; a stale (archived or unknown) board closes with 1008 after accept;
+        then every 0.3 s ``{events, cursor}`` with the task_events rows past the cursor (200 at most). No ``since``
+        starts at the tail; an explicit one replays."""
+        peer = f"{ws.client.host}:{ws.client.port}" if ws.client else "?"
+        expiry = self.tickets.pop(ws.query_params.get("ticket", ""), None)
+        name = (ws.query_params.get("profile") or "").strip()
+        profile = self.profiles.get(name) if name and name.lower() != "current" else self.profiles["default"]
+        if expiry is None or expiry < time.time() or profile is None or not self.kanban_on(profile):
+            log(f"ws /api/plugins/kanban/events peer={peer} refused")
+            await ws.close(code=1008)
+            return
+        await ws.accept()
+        raw = (ws.query_params.get("board") or "").strip().lower()
+        if raw:
+            board = self.kanban_boards.get(raw) if KANBAN_SLUG.match(raw) else None
+            if board is None and raw == "default":
+                board = self.kanban_boards["default"]
+            if board is None or board.meta.get("archived"):
+                log(f"ws /api/plugins/kanban/events peer={peer} board {raw!r} is gone -> close 1008")
+                await ws.close(code=1008)
+                return
+        else:
+            board = self.kanban_boards[self.kanban_current]  # pinned at the handshake
+        try:
+            cursor = max(0, int(ws.query_params.get("since", "")))
+        except ValueError:
+            cursor = board.latest_event()
+        target = board
+        log(f"ws /api/plugins/kanban/events peer={peer} board={target.slug} cursor={cursor}")
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(ws.receive(), timeout=KANBAN_POLL_SECONDS)
+                    if message["type"] == "websocket.disconnect":
+                        return
+                except asyncio.TimeoutError:
+                    pass
+                self.kanban_settle()
+                rows = [dict(e) for e in target.events if e["id"] > cursor][:200]
+                if rows:
+                    cursor = rows[-1]["id"]
+                    await ws.send_json({"events": rows, "cursor": cursor})
+        except Exception as exc:  # noqa: BLE001 - a dropped client ends the tail, never the server
+            log(f"ws /api/plugins/kanban/events peer={peer} closed ({type(exc).__name__})")
+
+
+class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures, WorkspaceFeatures):
     def __init__(self, args: argparse.Namespace) -> None:
         self.username = args.username
         self.password = args.password
@@ -7382,12 +11280,17 @@ class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
         if self.seed_mode in ("demo", "full"):
             self._seed_demo()
         self._init_capabilities(args)
+        self._init_workspace(args)  # M5
 
     # ── helpers ───────────────────────────────────────────────────────────────────────────────────
 
     def new_key(self) -> str:
         # Server-minted keys are %Y%m%d_%H%M%S_ + 6 hex (tui_gateway/server.py _MINTED_SESSION_KEY_RE).
         return datetime.now().strftime("%Y%m%d_%H%M%S_") + secrets.token_hex(3)
+
+    def chat_demos(self) -> dict[str, Callable[[Runtime, StoredSession], Awaitable[str]]]:
+        """ChatFeatures' trigger words, then the M5 ones (``fleet``)."""
+        return {**ChatFeatures.chat_demos(self), **self.workspace_demos()}
 
     def add_row(self, stored: StoredSession, role: str, content: str | None, **extra: Any) -> dict[str, Any]:
         row = {
@@ -7720,7 +11623,7 @@ class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
             "request.answer": lambda: self.request_answer(params),
             "clarify.lock": lambda: self.clarify_lock(params),
         }.get(method) or self.chat_methods(conn, params).get(method) or self.settings_methods(conn, params).get(method) \
-            or self.capability_methods(conn, params).get(method)
+            or self.capability_methods(conn, params).get(method) or self.workspace_methods(conn, params).get(method)
         if handler is None:
             return _err(rid, -32601, f"unknown method: {method} — the client and the Hermes backend are out of sync "
                         "(different versions); run `hermes update` and restart both")
@@ -8548,6 +12451,9 @@ def build_app(fake: FakeHermes) -> Starlette:
         Route("/api/media", fake.get_media, methods=["GET"]),
         # M3: settings, profiles, providers.
         *fake.settings_routes(),
+        # M5: files + git review, messaging, learning graph, kanban (before M4: its DELETE /api/learning/node also
+        # takes memory ids and hands skill ids to M4's handler).
+        *fake.workspace_routes(),
         # M4: capabilities, cron, command center, artifacts.
         *fake.capabilities_routes(),
     ])
@@ -8583,6 +12489,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="seconds before an MCP OAuth flow approves itself (0 = only through its callback)")
     parser.add_argument("--cron-fire-token", default=CRON_FIRE_TOKEN,
                         help="bearer token POST /api/cron/fire accepts (stands in for the Chronos JWT)")
+    # M5
+    parser.add_argument("--no-kanban", action="store_true",
+                        help="run without the kanban dashboard plugin (not listed; /api/plugins/kanban/* -> 404)")
+    parser.add_argument("--kanban-run-seconds", type=float, default=20.0,
+                        help="seconds a fake kanban worker runs before its card completes")
+    parser.add_argument("--onboarding-polls", type=int, default=3,
+                        help="status polls before a Telegram or WhatsApp QR onboarding completes")
+    parser.add_argument("--fleet-seconds", type=float, default=8.0,
+                        help="roughly how long the 'fleet' chat trigger's subagents run")
+    parser.add_argument("--custom-home", action="store_true",
+                        help="a single-profile dashboard whose HERMES_HOME is outside ~/.hermes: /api/profiles/active "
+                             "answers current 'custom' and destructive routes take an unnamed profile")
+    parser.add_argument("--gh", choices=("auto", "ready", "signed-out", "missing"), default="auto",
+                        help="the gh CLI on the fake host: ready, signed out, missing, or auto (ready unless "
+                             "--seed minimal)")
     return parser
 
 

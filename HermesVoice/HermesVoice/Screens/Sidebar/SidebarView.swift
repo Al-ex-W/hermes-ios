@@ -5,6 +5,8 @@ import UIKit
 /// dividers, one section per messaging platform, and the profile switcher in the title.
 struct SidebarView: View {
     @ObservedObject var sidebar: SidebarModel
+    /// For the bottom bar's Agents count.
+    let agents: AgentsStore
     @EnvironmentObject private var calls: CallController
     @EnvironmentObject private var model: AppModel
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -24,8 +26,9 @@ struct SidebarView: View {
 
     private var searching: Bool { !sidebar.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-    /// The Command Center shows beside the sidebar (iPad), so its button reads as on.
-    private var commandCenterOpen: Bool { sizeClass != .compact && sidebar.selection == .commandCenter }
+    /// The Command Center shows beside the sidebar (iPad), so its button reads as on. The sidebar column's own size
+    /// class is compact on iPad too, so this reads the shell's layout.
+    private var commandCenterOpen: Bool { !sidebar.compact && sidebar.selection == .commandCenter }
 
     var body: some View {
         List(selection: $sidebar.selection) {
@@ -47,7 +50,12 @@ struct SidebarView: View {
             await sidebar.search()
         }
         .task { await sidebar.refresh() }
-        .refreshable { await sidebar.refresh() }
+        .task { await sidebar.refreshKanban() }
+        .refreshable {
+            async let kanban: Void = sidebar.refreshKanban()
+            await sidebar.refresh()
+            await kanban
+        }
         .navigationTitle(sidebar.scopeTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarTitleMenu { profileSwitcher }
@@ -66,6 +74,13 @@ struct SidebarView: View {
                 SidebarFilterMenu(sidebar: sidebar)
                 Button { sidebar.newSession() } label: { Image(systemName: Theme.Icon.newSession) }
                     .accessibilityLabel("New session")
+            }
+            // The desktop's statusbar items that open overlays (Agents, Webhooks), and its palette's Memory Graph.
+            ToolbarItemGroup(placement: .bottomBar) {
+                SidebarAgentsButton(sidebar: sidebar, agents: agents)
+                Spacer()
+                SidebarOverlayButton(sidebar: sidebar, overlay: .webhooks)
+                SidebarOverlayButton(sidebar: sidebar, overlay: .memoryGraph)
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -151,13 +166,18 @@ struct SidebarView: View {
             }
             .buttonStyle(.plain)
             .sidebarRow(background: .clear)
-            ForEach(SidebarDestination.screens, id: \.self) { destination in
+            ForEach(navigationRows, id: \.self) { destination in
                 NavigationLink(value: destination) {
                     SidebarNavRow(title: destination.title, icon: destination.icon)
                 }
                 .sidebarRow(background: background(destination))
             }
         }
+    }
+
+    /// The desktop's rows, then the ones plugins contribute (Kanban, while the host serves it).
+    private var navigationRows: [SidebarDestination] {
+        SidebarDestination.screens + (sidebar.kanbanAvailable ? [.kanban] : [])
     }
 
     @ViewBuilder private var sessions: some View {
@@ -364,6 +384,50 @@ struct SidebarView: View {
     /// The open row's fill. Stacked on iPhone, the open row is off screen.
     private func background(_ destination: SidebarDestination) -> Color {
         sizeClass != .compact && sidebar.selection == destination ? Theme.Fill.rowActive : .clear
+    }
+}
+
+/// The sidebar's bottom bar holds the desktop statusbar's overlay items, Agents and Webhooks, and the Memory Graph
+/// the desktop opens from its command palette. Each opens over the detail column; on iPad pressing it again goes
+/// back to what was open, as the desktop's toggles do.
+///
+/// Agents shows the statusbar's count: "N subagents" while some run, else "N failed". Running ones count from every
+/// session, failed ones only from the chat the user is in, the scope the tree it opens shows; any failure tints it.
+private struct SidebarAgentsButton: View {
+    @ObservedObject var sidebar: SidebarModel
+    @ObservedObject var agents: AgentsStore
+
+    var body: some View {
+        let live = agents.roster.liveCount, failed = agents.roster.failedCount(focus: agents.focusSession)
+        // The sidebar column is compact on iPad too, so the shell's layout says whether the overlay shows beside it.
+        let open = !sidebar.compact && sidebar.selection == .agents
+        let count = live > 0 ? "\(live) subagent\(live == 1 ? "" : "s")" : failed > 0 ? "\(failed) failed" : nil
+        Button { sidebar.toggleOverlay(.agents) } label: {
+            // A bar shows a label's icon only, so the count is text of its own.
+            HStack(spacing: Theme.Spacing.xs) {
+                Image(systemName: failed > 0 ? Theme.Icon.error : Theme.Icon.agents)
+                if let count { Text(count).hermesText(.meta).monospacedDigit() }
+            }
+        }
+        .tint(failed > 0 ? Theme.destructive : nil)
+        .accessibilityLabel(open ? "Close agents" : "Open agents")
+        .accessibilityValue([live > 0 ? "\(live) running" : nil, failed > 0 ? "\(failed) failed" : nil]
+            .compactMap { $0 }.joined(separator: ", "))
+    }
+}
+
+/// A bottom-bar button for an overlay without a count (Webhooks, Memory Graph).
+private struct SidebarOverlayButton: View {
+    @ObservedObject var sidebar: SidebarModel
+    let overlay: SidebarDestination
+
+    var body: some View {
+        let open = !sidebar.compact && sidebar.selection == overlay
+        Button { sidebar.toggleOverlay(overlay) } label: {
+            Image(systemName: overlay.icon)
+                .foregroundStyle(open ? Theme.primary : Theme.Text.secondary)
+        }
+        .accessibilityLabel("\(open ? "Close" : "Open") \(overlay.title.lowercased())")
     }
 }
 

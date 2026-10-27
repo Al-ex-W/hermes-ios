@@ -10,6 +10,8 @@ enum SlashAction: Equatable {
     case chooseModel
     /// `/resume`: the session list.
     case chooseSession
+    /// `/journey` (`/learning`, `/memory-graph`): the memory graph.
+    case openMemoryGraph
 }
 
 /// What a slash command asks of the chat it runs in (`ChatModel` provides it).
@@ -67,13 +69,13 @@ struct SlashCommandRunner {
 
     /// Desktop-local commands with no counterpart here.
     nonisolated static let unavailable: Set<String> = [
-        "wake", "pet", "hatch", "generate-pet", "skin", "browser", "journey", "learning", "memory-graph", "handoff",
-        "profile", "voice",
+        "wake", "pet", "hatch", "generate-pet", "skin", "browser", "handoff", "profile", "voice",
     ]
     /// The commands run here rather than through `slash.exec`.
     nonisolated static let local: Set<String> = [
         "new", "reset", "clear", "branch", "fork", "model", "resume", "sessions", "switch", "stop", "title", "reasoning",
-        "yolo", "help", "commands", "compress", "compact", "btw", "bg", "background", "save", "status",
+        "yolo", "help", "commands", "compress", "compact", "btw", "bg", "background", "save", "status", "journey",
+        "learning", "memory-graph",
     ]
     /// The commands that rewind Hermes' stored transcript before their directive comes back.
     nonisolated static let rewinding: Set<String> = ["retry", "undo"]
@@ -115,6 +117,9 @@ struct SlashCommandRunner {
             await host.performSlashAction(.chooseModel)
         case "resume", "sessions", "switch":
             await host.performSlashAction(.chooseSession)
+        case "journey", "learning", "memory-graph":
+            // The desktop opens its memory graph instead of printing the timeline; arguments are ignored.
+            await host.performSlashAction(.openMemoryGraph)
         case "stop":
             await stop(sessionID)
         case "title" where !command.arg.isEmpty:

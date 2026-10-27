@@ -8,15 +8,18 @@ struct StatusStackView: View {
     @ObservedObject var composer: ComposerModel
     @ObservedObject var sender: SendController
     let busy: Bool
+    /// Opens the subagent tree (the subagent section's Agents button); nil hides the button.
+    var openAgents: (() -> Void)?
     @State private var openSubagent: String?
     @State private var steerDrafts: [String: String] = [:]
     @State private var openProcess: String?
 
-    init(status: StatusStackModel, composer: ComposerModel, busy: Bool) {
+    init(status: StatusStackModel, composer: ComposerModel, busy: Bool, openAgents: (() -> Void)? = nil) {
         self.status = status
         self.composer = composer
         sender = composer.sender
         self.busy = busy
+        self.openAgents = openAgents
     }
 
     private var sections: [String] {
@@ -123,6 +126,14 @@ struct StatusStackView: View {
         let live = status.liveSubagents
         return StatusSection(icon: "person.2", tint: Theme.Semantic.purple,
                              label: "\(live.count) Subagent\(live.count == 1 ? "" : "s")", running: true) {
+            if let openAgents {
+                Button("Agents", action: openAgents)
+                    .buttonStyle(.plain)
+                    .hermesText(.meta)
+                    .foregroundStyle(Theme.Text.tertiary)
+                    .accessibilityHint("Opens the spawn tree")
+            }
+        } content: {
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 VStack(spacing: 0) {
                     ForEach(live) { agent in subagentRow(agent, now: context.date) }

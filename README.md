@@ -265,6 +265,25 @@ this app's **Connection** page, and **Calls** is this app's own.
   session, Reject), a single question with a typed reply, and tapping a notification opens its chat. The plugin
   must support alert pushes for these to arrive; with an older plugin only the registration happens.
 
+## Files, review, messaging, agents and kanban
+
+These follow the desktop app's screens and sit where the desktop puts them, adapted to the phone:
+
+- **Files and Review** (the desktop's right sidebar) open from the chat's header button: beside the chat on iPad,
+  as a sheet on iPhone. Files browses the session's folder on the host, previews text, markdown and images, adds
+  `@file:` references to the composer, copies paths and downloads files. Like the desktop on a remote backend, it
+  doesn't rename, delete or upload: Hermes' file-write routes act on the dashboard's own disk, not on the profile's
+  workspace (which can be an SSH machine). Review shows the git changes (uncommitted, branch, last turn) with diffs,
+  stage, unstage and revert, commits and pushes, and opens pull requests through `gh` on the host. The desktop's
+  terminal tab isn't ported.
+- **Messaging** is a sidebar row: platform status, setup fields (tokens go only to your own dashboard and are never
+  kept or logged by the app), Telegram and WhatsApp setup, pairing requests and approved users, the connection test.
+- **Kanban** is a sidebar row while the host serves the kanban plugin: boards, cards with drag and drop, the task
+  sheet, and live updates over the plugin's event socket.
+- The sidebar's bottom bar holds the desktop statusbar's **Agents** (the subagent tree, with its running count) and
+  **Webhooks**, and the **Memory Graph** (also `/journey` in a chat). The chat's subagent status opens Agents too.
+- **Import session** (continue a Claude Code or Codex conversation found on the host) is in the Command Center.
+
 ## Building the app
 
 ```bash

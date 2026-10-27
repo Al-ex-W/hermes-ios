@@ -60,17 +60,22 @@ struct CommandCenterScreen: View {
     let profileScope: String
     let openSession: (_ sessionID: String, _ profile: String?) -> Void
     var sessionActions = CommandCenterSessionActions()
+    /// "Import session" (the desktop palette's Command Center item, `/session-import`); nil hides it.
+    var sessionImport: SessionImportScreen.Context?
 
     @State private var opened: CommandCenterSection?
+    @State private var importing = false
     private let initialSection: CommandCenterSection?
 
     init(client: DashboardClient, profileScope: String = SidebarOptions.allProfiles,
          initialSection: CommandCenterSection? = nil, sessionActions: CommandCenterSessionActions = CommandCenterSessionActions(),
+         sessionImport: SessionImportScreen.Context? = nil,
          openSession: @escaping (_ sessionID: String, _ profile: String?) -> Void) {
         self.client = client
         self.profileScope = profileScope
         self.initialSection = initialSection
         self.sessionActions = sessionActions
+        self.sessionImport = sessionImport
         self.openSession = openSession
         _opened = State(initialValue: initialSection)
     }
@@ -82,17 +87,12 @@ struct CommandCenterScreen: View {
         List {
             Section {
                 ForEach(CommandCenterSection.allCases) { section in
-                    Button { opened = section } label: {
-                        HStack {
-                            PageRow(title: section.title, detail: section.detail, systemImage: section.systemImage)
-                            Spacer(minLength: 0)
-                            Image(systemName: Theme.Icon.disclosure)
-                                .font(.system(size: Theme.IconSize.xs, weight: .semibold))
-                                .foregroundStyle(Theme.Text.quaternary)
-                        }
-                        .contentShape(Rectangle())
+                    row(title: section.title, detail: section.detail, systemImage: section.systemImage) { opened = section }
+                    // The desktop lists Import session right after Sessions.
+                    if section == .sessions, sessionImport != nil {
+                        row(title: "Import session", detail: "Bring a conversation into Hermes and pick up where you left off.",
+                            systemImage: Theme.Icon.sessionImport) { importing = true }
                     }
-                    .foregroundStyle(Theme.Text.primary)
                 }
             } footer: {
                 FormNote(profile.map { "Acts on the \($0) profile." } ?? "Acts on the dashboard's own profile.")
@@ -116,6 +116,23 @@ struct CommandCenterScreen: View {
                 CommandCenterMaintenanceView(client: client, profile: profile)
             }
         }
+        .navigationDestination(isPresented: $importing) {
+            if let sessionImport { SessionImportScreen(context: sessionImport) }
+        }
+    }
+
+    private func row(title: String, detail: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                PageRow(title: title, detail: detail, systemImage: systemImage)
+                Spacer(minLength: 0)
+                Image(systemName: Theme.Icon.disclosure)
+                    .font(.system(size: Theme.IconSize.xs, weight: .semibold))
+                    .foregroundStyle(Theme.Text.quaternary)
+            }
+            .contentShape(Rectangle())
+        }
+        .foregroundStyle(Theme.Text.primary)
     }
 }
 
