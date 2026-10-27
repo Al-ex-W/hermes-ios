@@ -243,7 +243,13 @@ class FakeHermes:
                 return True
             return False
 
+        def redact_sensitive_text(text: str, *, force: bool = False, **_: Any) -> str:
+            import re
+            return re.sub(r"\b(sk-[A-Za-z0-9-]{6}|ghp_[A-Za-z0-9]{2})[A-Za-z0-9_-]{8,}([A-Za-z0-9]{4})\b",
+                          lambda m: f"{m.group(1)[:6]}...{m.group(2)}", text)
+
         module("agent.secret_scope", get_secret=get_secret)
+        module("agent.redact", redact_sensitive_text=redact_sensitive_text)
         module("agent.memory_provider", spawn_context_thread=spawn_context_thread)
         module("agent.subagent_lifecycle", get_active_subagent_parent=lambda: fake.subagent_parent)
         module("hermes_constants", get_hermes_home=lambda: fake.home)

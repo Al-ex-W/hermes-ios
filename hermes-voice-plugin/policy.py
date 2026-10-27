@@ -1,9 +1,16 @@
 """Who may ring the user's phone, how often, and when.
 
 Only a new ring is checked: speaking into a call the conversation already has is always allowed. Defaults:
-dashboard / desktop conversations and the owner's own messaging DMs may call; scheduled jobs, subagents and group
-chats may not; at most 3 rings per conversation per 10 minutes and 10 per hour overall; no quiet hours. Every
-decision and every call's outcome goes to ``<HERMES_HOME>/hermes-voice/rings.jsonl``.
+dashboard / desktop / TUI / CLI conversations and the owner's own messaging DMs may call; scheduled jobs, subagents,
+group chats, finite runs nobody is at the keyboard for (``oneshot``: ``hermes chat -q``, ``hermes -z``) and
+third-party integrations (``tool``) may not; at most 3 rings per conversation per 10 minutes and 10 per hour
+overall; no quiet hours.
+Every decision and every call's outcome goes to ``<HERMES_HOME>/hermes-voice/rings.jsonl``.
+
+The policy runs in the dashboard process's hub for every process (calls from other processes come in over
+``hubsock.py``), so the rate limits and quiet hours count every ring, wherever it came from. Who the owner of a
+messaging DM is gets decided in the process that hosts the chat (``gateway_owner``), where the gateway's own
+allowlist and pairing records are.
 """
 
 from __future__ import annotations
@@ -11,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -24,11 +32,13 @@ from .config import QuietHours, Settings
 
 logger = logging.getLogger("hermes_voice")
 
-# Surfaces that are not a human messaging channel (mirrors Hermes' NON_MESSAGING_SESSION_SURFACES).
+# Surfaces that are not a human messaging channel (mirrors Hermes' NON_MESSAGING_SESSION_SURFACES, plus the
+# dashboard and "oneshot": a finite `hermes chat -q` / `hermes -z` run, see hermes.unattended_source).
 NON_MESSAGING = frozenset({
     "", "api_server", "cli", "codex", "desktop", "gateway", "kanban", "local", "msgraph_webhook", "tool", "tui",
-    "webhook", "dashboard",
+    "webhook", "dashboard", "oneshot",
 })
+PLATFORM_NAME = re.compile(r"[a-z][a-z0-9_]{1,31}")
 RING_LOG_MAX_LINES = 1000
 CONFIRM_WINDOW_S = 900.0
 
@@ -77,7 +87,7 @@ class Policy:
             if origin.chat_type != "dm":
                 if not cfg.allow_groups:
                     return Decision(False, "group", "Calls can't be placed from group chats.")
-            elif not (cfg.allow_owner_dms and origin.user_id and origin.user_id in cfg.owner_ids):
+            elif not (cfg.allow_owner_dms and is_owner(origin, cfg.owner_ids)):
                 return Decision(False, "not_owner",
                                 "Only the owner's own direct messages may call them. Reply in text.")
         elif surface not in cfg.allowed_sources:
@@ -94,7 +104,7 @@ class Policy:
             return Decision(False, "rate_global", "Too many calls lately. Reply in text instead.")
         quiet = cfg.quiet_hours
         if quiet is not None and in_quiet_hours(quiet, now):
-            if quiet.action == "confirm" and self._confirmed(origin.session_id, now):
+            if quiet.action == "confirm" and self._confirmed(origin.session_id, now, origin.user_turn_at):
                 return Decision(True, "confirmed")
             with self.lock:
                 self.refused_at[origin.session_id] = now
@@ -105,10 +115,12 @@ class Policy:
             return Decision(False, "quiet_hours", "It's the user's quiet hours, so calls are off. Reply in text.")
         return Decision(True)
 
-    def _confirmed(self, session_id: str, now: float) -> bool:
+    def _confirmed(self, session_id: str, now: float, reported: float = 0.0) -> bool:
+        """The user wrote in the conversation after it was refused for quiet hours. A conversation in another
+        process reports its user's last message itself (``reported``; same host, same clock)."""
         with self.lock:
             refused = self.refused_at.get(session_id)
-            wrote = self.user_turn_at.get(session_id)
+            wrote = max(self.user_turn_at.get(session_id) or 0.0, reported if 0 < reported <= now else 0.0)
         return bool(refused and wrote and wrote > refused and now - refused < CONFIRM_WINDOW_S)
 
     def note_user_turn(self, session_id: str) -> None:
@@ -162,6 +174,46 @@ def users_own_message(message: Any) -> bool:
         return False
     text = text.lstrip()
     return bool(text) and not text.startswith("[")
+
+
+def is_owner(origin: hermes.Origin, owner_ids: tuple[str, ...] = ()) -> bool:
+    """Whether a messaging DM comes from the owner: named in ``owner_ids`` (a user id, or
+    ``"<platform>:<user id>"``) when that is set, else as the process hosting the chat found it
+    (``origin.is_owner``, from ``gateway_owner``)."""
+    user = (origin.user_id or "").strip()
+    if not user:
+        return False
+    if owner_ids:
+        platform = (origin.platform or "").strip().lower()
+        for entry in owner_ids:
+            scope, sep, rest = entry.partition(":")
+            # "telegram:123" names a platform; "@alice:matrix.org" is a whole id.
+            if sep and PLATFORM_NAME.fullmatch(scope.strip().lower()):
+                if scope.strip().lower() != platform:
+                    continue
+                entry = rest
+            if hermes.same_user(platform, entry.strip(), user):
+                return True
+        return False
+    return bool(origin.is_owner)
+
+
+def gateway_owner(platform: str, user_id: str) -> bool:
+    """Whether the messaging gateway was told to serve this user: named in the platform's allowlist
+    (``TELEGRAM_ALLOWED_USERS`` ...) or ``GATEWAY_ALLOWED_USERS``, or paired with a code the owner approved. An
+    allow-all switch, a ``*`` wildcard, a group-only allowlist or an adapter's role grant makes nobody the owner:
+    those let strangers write to Hermes. Runs in the process that hosts the chat (the gateway)."""
+    platform, user_id = (platform or "").strip().lower(), (user_id or "").strip()
+    if not platform or not user_id or platform in NON_MESSAGING:
+        return False
+    if any(hermes.same_user(platform, name, user_id) for name in hermes.gateway_allowed_users(platform)):
+        return True
+    return hermes.gateway_paired(platform, user_id)
+
+
+def is_messaging(surface: str) -> bool:
+    """A messaging platform rather than one of the owner's own clients (``_surface`` values)."""
+    return (surface or "").strip().lower() not in NON_MESSAGING
 
 
 def _surface(origin: hermes.Origin) -> str:

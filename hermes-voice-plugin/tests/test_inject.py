@@ -138,3 +138,18 @@ def test_without_a_drop_sink_the_methods_still_run(core, fake, monkeypatch):
     fake.host.add("s1")
     delivery = core.inject.TuiInjector().deliver(_owner(core), "[Voice] hi")
     assert delivery.ok and fake.host.bound == [fake.host.stdout]
+
+
+def test_a_session_whose_turns_run_in_a_compute_host_gets_a_queued_submit(core, fake):
+    """Under dashboard.turn_isolation the dashboard's copy of the agent never runs a turn: a steer applied to it
+    (session.steer answers "queued" while the child's turn winds down) would never be read. A queued submit starts
+    a turn now when idle, and waits for the running one otherwise."""
+    fake.host.add("s1", _compute_host_active=True, running=True)
+    fake.host.turn_isolation = True
+    fake.host.answers["prompt.submit"] = "queued"
+    delivery = core.inject.TuiInjector().deliver(_owner(core), "[Voice] hi")
+    assert (delivery.ok, delivery.via, delivery.status) == (True, "submit", "queued")
+    assert fake.host.calls == [("prompt.submit", {"session_id": "rt-s1", "text": "[Voice] hi", "queued": True})]
+    fake.host.turn_isolation = False  # isolation turned off since: the usual chain again
+    fake.host.calls.clear()
+    assert core.inject.TuiInjector().deliver(_owner(core), "[Voice] hi").via == "redirect"

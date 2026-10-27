@@ -1,10 +1,13 @@
 """hermes_voice routes on the Hermes dashboard, mounted at /api/plugins/hermes_voice/.
 
 - ``WS /phone?ticket=<single-use ws-ticket>``: the phone's call link (protocol in ``hub.py``).
-- ``POST /devices {voip_token, alert_token?, environment, bundle_id}``: where to send VoIP pushes.
+- ``POST /devices {voip_token, alert_token?, environment, bundle_id, alerts?}``: where to send VoIP pushes, and
+  alert pushes (``notify.py``) to the alert token. ``alerts`` turns kinds off or back on for this phone
+  (``{"approval": bool, "clarify": bool, "turn_done": bool}``; a kind it never names stays on). A registration
+  without ``alert_token`` keeps the one stored for the phone; ``"alert_token": null`` clears it.
 - ``POST /scribe-token``: a single-use ElevenLabs Scribe token for on-phone speech recognition; the API key stays
   on this host.
-- ``GET /status``: what works here (TTS, h2, APNs, Scribe) and the call in progress.
+- ``GET /status``: what works here (TTS, h2, APNs, Scribe), the call in progress and the alert watcher.
 
 HTTP routes sit behind the dashboard's own auth middleware. WebSocket upgrades skip that middleware, so the socket
 checks the dashboard's WebSocket auth itself (the check ``/api/audio/speak-stream`` uses), failing closed.
@@ -65,7 +68,10 @@ def _core(name: str) -> Any:
 hub_module = _core("hub")
 hermes = _core("hermes")
 push = _core("push")
+notify = _core("notify")
 hub_module.mark_routes_mounted()
+# Alert pushes: the watcher acts once this process serves the dashboard (hub.routes_mounted()).
+notify.start()
 
 router = APIRouter()
 
@@ -140,16 +146,20 @@ async def devices(request: Request) -> Any:
     if len(raw) > MAX_BODY_BYTES:
         return _error(413, "Body too large")
     try:
-        device = push.parse_device(json.loads(raw or b"null"))
+        body = json.loads(raw or b"null")
+        device = push.parse_device(body)
     except (ValueError, UnicodeDecodeError) as error:
         return _error(400, str(error) if isinstance(error, push.DeviceError) else "Body must be JSON")
     store = getattr(hub.pusher, "store", None) or push.DeviceStore()
     try:
-        await run_in_threadpool(store.register, device)
+        stored = await run_in_threadpool(store.register, device, push.kept_fields(body))
     except OSError:
         logger.warning("hermes_voice: could not save the device", exc_info=True)
         return _error(500, "Could not save the device")
-    logger.info("hermes_voice: registered a %s device for %s", device.environment, device.bundle_id)
+    stored = stored if isinstance(stored, push.Device) else device
+    off = [kind for kind in push.ALERT_KINDS if not stored.wants(kind)] if stored.alert_token else []
+    logger.info("hermes_voice: registered a %s device for %s (%s)", stored.environment, stored.bundle_id,
+                "no alerts" if not stored.alert_token else f"alerts off: {', '.join(off)}" if off else "alerts on")
     return {"ok": True}
 
 
@@ -185,4 +195,13 @@ async def scribe_token() -> Any:
 @router.get("/status")
 async def status() -> Any:
     hub = _hub()
-    return await run_in_threadpool(hub.status)
+
+    def collect() -> dict:
+        report = dict(hub.status())
+        try:
+            report["alerts"] = notify.alerts().status()
+        except Exception:  # noqa: BLE001 - the call status still answers
+            logger.debug("hermes_voice: alert status unavailable", exc_info=True)
+        return report
+
+    return await run_in_threadpool(collect)

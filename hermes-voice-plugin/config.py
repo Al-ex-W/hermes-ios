@@ -34,11 +34,19 @@ class QuietHours:
 
 @dataclass(frozen=True)
 class PolicyConfig:
-    # Session sources (HERMES_SESSION_SOURCE) whose conversations may ring the phone.
-    allowed_sources: tuple[str, ...] = ("desktop", "dashboard", "tui")
-    # The owner's own direct messages on a messaging platform (by the platform's user id).
+    # Session sources (HERMES_SESSION_SOURCE, or the plugin's session surface) whose conversations may ring the
+    # phone: the owner's own local clients ("local": a CLI / TUI session whose turns run in the gateway). Left out:
+    # "oneshot" (`hermes chat -q`, `hermes -z`) and "tool" (`--source tool` integrations), runs nobody is at the
+    # keyboard for, which a prompt injection in what they read could otherwise make ring.
+    allowed_sources: tuple[str, ...] = ("desktop", "dashboard", "tui", "cli", "local")
+    # The owner's own direct messages on a messaging platform. The owner is whoever owner_ids names (a user id,
+    # or "<platform>:<user id>"); with no owner_ids, whoever the gateway's allowlist names or pairing approved.
     allow_owner_dms: bool = True
     owner_ids: tuple[str, ...] = ()
+    # Other profiles whose processes may ring through this dashboard's hub (one without a dashboard of its own
+    # finds the root profile's). Their DMs ring only for a user owner_ids names: this profile can't vouch for
+    # another profile's allowlist or pairings.
+    allowed_profiles: tuple[str, ...] = ()
     allow_cron: bool = False
     allow_subagents: bool = False
     allow_groups: bool = False
@@ -105,6 +113,8 @@ def _policy(raw: dict) -> PolicyConfig:
         allow_owner_dms=_bool(raw.get("allow_owner_dms"), default.allow_owner_dms),
         owner_ids=tuple(str(v).strip() for v in raw.get("owner_ids") or [] if str(v).strip())
         if isinstance(raw.get("owner_ids"), list) else (),
+        allowed_profiles=tuple(str(v).strip() for v in raw.get("allowed_profiles") or [] if str(v).strip())
+        if isinstance(raw.get("allowed_profiles"), list) else (),
         allow_cron=_bool(raw.get("allow_cron"), False),
         allow_subagents=_bool(raw.get("allow_subagents"), False),
         allow_groups=_bool(raw.get("allow_groups"), False),

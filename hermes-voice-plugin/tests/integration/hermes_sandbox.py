@@ -12,6 +12,11 @@
   recorder and exposes the pushes and deliveries: APNs is the one part that can't run here.
 - ``Dashboard`` (cookie sign-in, ws-tickets, REST), ``Gateway`` (``/api/ws`` JSON-RPC) and ``Phone`` (the app's side
   of ``/api/plugins/hermes_voice/phone``).
+- ``MockApns``: APNs for the plugin's real sender (``push.Apns``, with a provider key written into the sandbox),
+  without TLS and HTTP/2: the helper plugin's ``/arm-apns`` points the sender's transport at it.
+
+Ports: ``HERMES_VOICE_IT_PORTS=<low>-<high>`` makes every server the tests start (the dashboards, the stub models,
+the mock APNs) take a free port from that range; by default any free port.
 
 Finding Hermes: ``HERMES_PYTHON`` (an interpreter with Hermes' dependencies), else the environment Hermes' package
 manager committed for the checkout at ``HERMES_AGENT_DIR`` (default ``~/.hermes/hermes-agent``), read from
@@ -25,6 +30,7 @@ import contextlib
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import signal
@@ -89,10 +95,47 @@ def hermes_python() -> tuple[Optional[Path], str]:
     return (python, "") if python.exists() else (None, f"{python} does not exist (set HERMES_PYTHON)")
 
 
+# Ports handed out by free_port() in this test run (one isn't handed out twice before its server binds it).
+_HANDED_OUT: set[int] = set()
+
+
+def port_range() -> Optional[range]:
+    """``HERMES_VOICE_IT_PORTS=<low>-<high>``, when set."""
+    low, _, high = os.environ.get("HERMES_VOICE_IT_PORTS", "").strip().partition("-")
+    if low.isdigit() and high.isdigit() and 0 < int(low) <= int(high) < 65536:
+        return range(int(low), int(high) + 1)
+    return None
+
+
 def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    """A free port on 127.0.0.1: from ``HERMES_VOICE_IT_PORTS`` when set (in random order: other runs may pick from
+    the same range), else any."""
+    ports = port_range()
+    if ports is None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+    candidates = [port for port in ports if port not in _HANDED_OUT]
+    random.shuffle(candidates)
+    for port in candidates:
+        with socket.socket() as probe, contextlib.suppress(OSError):
+            probe.bind(("127.0.0.1", port))
+            _HANDED_OUT.add(port)
+            return port
+    raise RuntimeError(f"no free port left in HERMES_VOICE_IT_PORTS={os.environ.get('HERMES_VOICE_IT_PORTS')}")
+
+
+def http_server(handler: type[BaseHTTPRequestHandler]) -> ThreadingHTTPServer:
+    """A threaded HTTP server on 127.0.0.1, on a port free_port() picks (retried if another process got it first)."""
+    for _ in range(5):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", free_port() if port_range() else 0), handler)
+        except OSError:
+            continue
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, name=handler.__name__, daemon=True).start()
+        return server
+    raise RuntimeError("could not bind a test server")
 
 
 def iso(offset: float = 0.0) -> str:
@@ -115,7 +158,17 @@ class ToolCall:
     delay: float = 0.0
 
 
-Reply = Union[Text, ToolCall]
+@dataclass
+class Fail:
+    """The provider refuses the request (an HTTP 4xx Hermes doesn't retry): the turn ends on an early return,
+    without ``on_session_end``."""
+
+    status: int = 400
+    message: str = "unsupported parameter (test)"
+    delay: float = 0.0
+
+
+Reply = Union[Text, ToolCall, Fail]
 
 
 def message_text(message: dict[str, Any]) -> str:
@@ -146,9 +199,7 @@ class StubModel:
         self.requests: list[dict[str, Any]] = []
         self.lock = threading.Lock()
         self.calls = 0
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
-        self.server.daemon_threads = True
-        threading.Thread(target=self.server.serve_forever, name="stub-model", daemon=True).start()
+        self.server = http_server(self._handler())
 
     @property
     def base_url(self) -> str:
@@ -227,6 +278,9 @@ class StubModel:
                     self._reply(reply, bool(body.get("stream")))
 
             def _reply(self, reply: Reply, stream: bool) -> None:
+                if isinstance(reply, Fail):
+                    return self._json(reply.status, {"error": {"message": reply.message,
+                                                               "type": "invalid_request_error"}})
                 usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
                 if isinstance(reply, ToolCall):
                     with stub.lock:
@@ -276,11 +330,13 @@ class StubModel:
 # ── the sandbox ────────────────────────────────────────────────────────────────────────────────────────────
 
 # Written into the sandbox only. It swaps the plugin's APNs sender for a recorder (the payload the phone would get
-# in its VoIP push) and shows the plugin's deliveries into conversations (which path each injection took).
+# in its VoIP push) or points the real sender at a MockApns (``/arm-apns``), and shows the plugin's deliveries into
+# conversations (which path each injection took).
 HELPER_API = '''
 import sys
 import threading
 
+import httpx
 from fastapi import APIRouter
 
 router = APIRouter()
@@ -309,6 +365,30 @@ def _hub():
 @router.post("/arm")
 async def arm():
     _hub().pusher = Recorder()
+    return {"ok": True}
+
+
+class ToMockApns(httpx.BaseTransport):
+    """The real sender's requests go to the test's mock APNs (plain HTTP/1.1); the host they were meant for goes
+    along as x-apns-host."""
+
+    def __init__(self, url):
+        self.url = httpx.URL(url)
+
+    def handle_request(self, request):
+        target = request.url.copy_with(scheme=self.url.scheme, host=self.url.host, port=self.url.port)
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+        headers["x-apns-host"] = request.url.host
+        with httpx.Client(trust_env=False, timeout=10.0) as client:
+            answer = client.request(request.method, target, headers=headers, content=request.read())
+        return httpx.Response(answer.status_code, headers={"apns-id": answer.headers.get("apns-id", "")},
+                              content=answer.content)
+
+
+@router.post("/arm-apns")
+async def arm_apns(body: dict):
+    push = hub_module().push
+    _hub().pusher = push.Apns(transport=ToMockApns(str(body["url"])))
     return {"ok": True}
 
 
@@ -456,6 +536,100 @@ class Sandbox:
             self._log.close()
 
 
+# ── a mock APNs ────────────────────────────────────────────────────────────────────────────────────────────
+
+
+class MockApns:
+    """APNs for the plugin's real sender, minus TLS and HTTP/2. It holds an ES256 provider key (written into a
+    sandbox with ``install``, as the plugin's three secrets), records every push (the host it was meant for, the
+    device token, the headers, the payload, whether the provider token verifies against the key) and answers 200,
+    or what ``answers`` sets for a device token."""
+
+    KEY_ID = "ITKEY00001"
+    TEAM_ID = "ITTEAM0001"
+
+    def __init__(self) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        self.pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                     serialization.NoEncryption()).decode()
+        self.public_key = key.public_key()
+        self.pushes: list[dict[str, Any]] = []
+        self.answers: dict[str, tuple[int, str]] = {}
+        self.lock = threading.Lock()
+        self.server = http_server(self._handler())
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def install(self, sandbox: "Sandbox") -> None:
+        """The provider key as the plugin reads it: a .p8 file and HERMES_VOICE_APNS_* in the sandbox's .env."""
+        path = sandbox.root / "apns" / "AuthKey.p8"
+        path.parent.mkdir(mode=0o700)
+        path.write_text(self.pem, encoding="utf-8")
+        os.chmod(path, 0o600)
+        with open(sandbox.hermes_home / ".env", "a", encoding="utf-8") as env:
+            env.write(f"HERMES_VOICE_APNS_KEY_PATH={path}\nHERMES_VOICE_APNS_KEY_ID={self.KEY_ID}\n"
+                      f"HERMES_VOICE_APNS_TEAM_ID={self.TEAM_ID}\n")
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def received(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self.pushes)
+
+    def _verify(self, authorization: str) -> bool:
+        import jwt
+
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            return False
+        try:
+            claims = jwt.decode(token, self.public_key, algorithms=["ES256"], options={"verify_aud": False})
+            header = jwt.get_unverified_header(token)
+        except jwt.PyJWTError:
+            return False
+        return claims.get("iss") == self.TEAM_ID and header.get("kid") == self.KEY_ID
+
+    def _handler(self) -> type[BaseHTTPRequestHandler]:
+        mock = self
+
+        class MockApnsHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_: Any) -> None:
+                pass
+
+            def do_POST(self) -> None:  # noqa: N802
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                token = self.path.rsplit("/", 1)[-1] if self.path.startswith("/3/device/") else ""
+                try:
+                    payload = json.loads(raw or b"null")
+                except ValueError:
+                    payload = None
+                record = {"host": self.headers.get("x-apns-host", ""), "token": token,
+                          "headers": {k.lower(): v for k, v in self.headers.items()
+                                      if k.lower().startswith("apns-")},
+                          "token_ok": mock._verify(self.headers.get("authorization", "")),
+                          "payload": payload, "size": len(raw), "at": time.time()}
+                with mock.lock:
+                    mock.pushes.append(record)
+                    status, reason = mock.answers.get(token, (200, ""))
+                data = json.dumps({"reason": reason}).encode() if status != 200 else b""
+                self.send_response(status)
+                self.send_header("apns-id", secrets.token_hex(16))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        return MockApnsHandler
+
+
 # ── clients ────────────────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -506,6 +680,12 @@ class Dashboard:
 
     async def deliveries(self) -> list[dict]:
         return (await self.get(f"{HELPER}/deliveries")).json()["deliveries"]
+
+    async def messages(self, session_id: str) -> list[dict]:
+        """A conversation's stored transcript (``state.db``, through the dashboard's REST API)."""
+        response = await self.get(f"/api/sessions/{session_id}/messages")
+        response.raise_for_status()
+        return response.json()["messages"]
 
 
 class Gateway:
