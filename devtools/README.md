@@ -229,7 +229,9 @@ its source. Everything lives in the "M5" section of `fake_hermes.py` (`class Wor
   profile's `terminal.cwd`, else the home folder), and the managed files `GET`/`DELETE /api/files`,
   `/api/files/read`, `/download`, `/upload` (a base64 data URL), `/upload-stream` (multipart) and `/mkdir`. The
   host is `/home/demo` (notes, the Atlas and Beacon projects, a markdown doc and two PNGs); writes land in the same
-  files the M4 `read-text`/`read-data-url`/`download` routes and the chat's `@file:` refs read.
+  files the M4 `read-text`/`read-data-url`/`download` routes and the chat's `@file:` refs read. A `session_id` on
+  `read-data-url` or `download` must name a stored session of the requested profile (else `404 Session not found`),
+  and a relative path resolves against that session's folder.
 - **Git review**: `/api/git/status`, `gh-auth`, `worktrees`, `branches`, `base-branches`, `review/list` (scopes
   `uncommitted`, `branch`, `lastTurn`), `review/diff`, `file-diff`, `review/commit-context`, `review/rev-parse`,
   `review/ship-info`, `review/pr-list`, and the mutations `review/stage`, `unstage`, `revert`, `commit` (+ push),
@@ -257,6 +259,8 @@ its source. Everything lives in the "M5" section of `fake_hermes.py` (`class Wor
   `POST /api/pairing/debug/request {platform, user_id, user_name?}` adds a pending request and returns its code.
 - **Webhooks**: `GET /api/webhooks`, `POST /api/webhooks/enable`, `POST /api/webhooks` (the secret is shown once),
   `PUT /api/webhooks/{name}/enabled`, `DELETE /api/webhooks/{name}?profile=` (the profile must be named).
+  `--custom-home` stands for a single-profile dashboard whose home is outside `~/.hermes`: `/api/profiles/active`
+  answers `current: "custom"` (a name no profile resolves to) and destructive routes take an unnamed profile.
 - **Gateway**: `POST /api/gateway/start` and `POST /api/gateway/stop?interrupt=` (409 while a turn runs) are
   actions (`gateway-start`, `gateway-stop`) tailed with `/api/actions/{name}/status`. Each profile has its own
   gateway; `/api/status` reports it (`gateway_running`, `gateway_state`, `gateway_platforms`).
@@ -273,7 +277,7 @@ its source. Everything lives in the "M5" section of `fake_hermes.py` (`class Wor
   `/api/plugins/kanban/*` with `404 Plugin not found`. The plugin routes: `board`, `workflow`, `tasks` (+ `/{id}`
   GET/PATCH/DELETE, `/bulk`, `/comments`, `/attachments` (multipart), `/log`, `/reclaim`, `/reassign`,
   `/estimate`, `/specify`, `/decompose`, `/home-subscribe/{platform}`), `attachments/{id}`, `links`, `estimate`,
-  `diagnostics`, `workers/active`, `runs/{id}` (+ `/terminate`), `config`, `home-channels`, `stats`, `assignees`,
+  `diagnostics`, `workers/active`, `runs/{id}` (+ `/inspect`, `/terminate`), `config`, `home-channels`, `stats`, `assignees`,
   `dispatch`, `model-options`, `projects`, `boards` (+ create, `PATCH`/`DELETE /{slug}`, `/export`, `/import`,
   `/switch`), `profiles` (+ `PATCH`, `/describe-auto`) and `orchestration`. Boards are shared by every profile; the
   orchestration knobs live in the profile's config. `WS /api/plugins/kanban/events?ticket=&board=&since=` (the same
