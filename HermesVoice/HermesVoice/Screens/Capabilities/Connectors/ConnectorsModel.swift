@@ -156,9 +156,22 @@ final class ConnectorsModel: ObservableObject {
             let result = try await api.install(entry, env: env)
             if result.background, let action = result.action {
                 let deadline = Date().addingTimeInterval(10 * 60)
+                // A failed status read is retried: the install keeps running on the host either way.
+                var failures = 0
                 while true {
                     try await Task.sleep(for: .seconds(1.5))
-                    let status = try await api.actionStatus(action)
+                    let status: (running: Bool, exitCode: Int?)
+                    do {
+                        status = try await api.actionStatus(action)
+                        failures = 0
+                    } catch {
+                        if error.isCancellation { throw error }
+                        failures += 1
+                        if failures >= Self.statusTolerance {
+                            throw CapabilityActionLost(name: action, reason: error.dashboardMessage)
+                        }
+                        continue
+                    }
                     if !status.running {
                         if let code = status.exitCode, code != 0 { throw DashboardError.rpc("Failed to install \(entry.name).") }
                         break
@@ -170,12 +183,19 @@ final class ConnectorsModel: ObservableObject {
             if let catalog = try? await api.catalog() { self.catalog = catalog.entries }
             if server(entry.name)?.enabled == true { await probe(entry.name) }
             return true
+        } catch let lost as CapabilityActionLost {
+            failure = "Installing \(entry.name): \(lost.localizedDescription)"
+            await reloadServers()
+            return false
         } catch {
             guard !error.isCancellation else { return false }
             failure = "Failed to install \(entry.name). \(error.dashboardMessage)"
             return false
         }
     }
+
+    /// Failed status reads in a row a background install survives (as `OpsActionPoll` does).
+    static let statusTolerance = 5
 
     /// Adds a server, then probes it. Throws for the form to show.
     func create(_ draft: MCPServerDraft) async throws {

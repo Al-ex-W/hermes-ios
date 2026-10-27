@@ -456,6 +456,10 @@ final class ToolsetSetupModel: ObservableObject {
                 failure = "Setting up \(EnvVar.prettyName(key)) did not finish. Read the log below, then run setup again."
             }
             await load()
+        } catch let lost as CapabilityActionLost {
+            postSetup[key]?.running = false
+            failure = "Setting up \(EnvVar.prettyName(key)): \(lost.localizedDescription)"
+            await load()
         } catch {
             postSetup[key]?.running = false
             guard !error.isCancellation else { return }

@@ -439,11 +439,42 @@ final class OpsScreensTests: XCTestCase {
         XCTAssertEqual(running.lines, ["a", "b"])
         XCTAssertEqual(OpsActionStatus(response: try json(#"{"running": false, "exit_code": 0}"#), fallbackName: "d").outcome, .done)
         XCTAssertEqual(OpsActionStatus(response: try json(#"{"running": false, "exit_code": 2}"#), fallbackName: "d").outcome, .failed)
-        XCTAssertEqual(OpsActionStatus(response: try json(#"{"running": false, "exit_code": null}"#), fallbackName: "d").outcome, .failed)
-        let receipt = OpsActionStatus(response: try json(#"{"running": false, "exit_code": null, "receipt": {"outcome": "success"}}"#),
-                                      fallbackName: "hermes-update")
-        XCTAssertEqual(receipt.outcome, .done, "the update receipt is the durable outcome")
+        XCTAssertEqual(OpsActionStatus(response: try json(#"{"running": false, "exit_code": null}"#), fallbackName: "d").outcome, .unknown,
+                       "stopped with no exit code: the result isn't known")
+        let started = OpsActionStart(response: try json(#"{"ok": true, "pid": 9, "name": "hermes-update", "action_id": "run-2"}"#),
+                                     fallbackName: "hermes-update")
+        XCTAssertEqual(started.actionID, "run-2")
+        let receipt = OpsActionStatus(response: try json("""
+        {"running": false, "exit_code": null, "receipt": {"outcome": "success", "action_id": "run-2"}}
+        """), fallbackName: "hermes-update", startedActionID: started.actionID)
+        XCTAssertEqual(receipt.outcome, .done, "the update receipt of this run is the durable outcome")
         XCTAssertEqual(receipt.outcomeLabel, "done")
+        let failedRun = OpsActionStatus(response: try json("""
+        {"running": false, "exit_code": null, "receipt": {"outcome": "failed", "action_id": "run-2"}}
+        """), fallbackName: "hermes-update", startedActionID: "run-2")
+        XCTAssertEqual(failedRun.outcome, .failed)
+        let older = OpsActionStatus(response: try json("""
+        {"running": false, "exit_code": null, "receipt": {"outcome": "success", "action_id": "run-1"}}
+        """), fallbackName: "hermes-update", startedActionID: "run-2")
+        XCTAssertEqual(older.outcome, .unknown, "an older run's receipt says nothing about this one")
+        let unnamed = OpsActionStatus(response: try json(#"{"running": false, "exit_code": null, "receipt": {"outcome": "failed"}}"#),
+                                      fallbackName: "hermes-update", startedActionID: "run-2")
+        XCTAssertEqual(unnamed.outcome, .unknown)
+        XCTAssertEqual(older.pill.text, "unknown")
+    }
+
+    func testActionPollAsksAgainWhileTheResultIsUnknown() {
+        var poll = OpsActionPoll(limit: 100, maxConsecutiveFailures: 3)
+        let unknown = OpsActionStatus(name: "hermes-update", running: false)
+        XCTAssertEqual(poll.record(unknown), .wait)
+        XCTAssertEqual(poll.record(unknown), .wait)
+        XCTAssertEqual(poll.record(unknown), .finished, "the tolerance ends the wait")
+        XCTAssertEqual(poll.latest?.outcome, .unknown)
+
+        var settles = OpsActionPoll(limit: 100, maxConsecutiveFailures: 3)
+        XCTAssertEqual(settles.record(unknown), .wait)
+        XCTAssertEqual(settles.record(OpsActionStatus(name: "hermes-update", running: false, exitCode: 0)), .finished)
+        XCTAssertEqual(settles.latest?.outcome, .done)
     }
 
     func testActionPollStopsWhenDoneOrOverBudget() {
@@ -533,6 +564,32 @@ final class OpsScreensTests: XCTestCase {
     func testOriginOfBase() throws {
         XCTAssertEqual(DashboardClient.origin(of: try XCTUnwrap(URL(string: "https://host.example:8443/dash"))), "https://host.example:8443")
         XCTAssertEqual(DashboardClient.origin(of: try XCTUnwrap(URL(string: "http://10.0.0.2"))), "http://10.0.0.2")
+    }
+
+    func testOnlyARealRedirectReadsAsSignedOut() throws {
+        let base = try XCTUnwrap(URL(string: "https://host.example"))
+        func redirected(_ final: String, _ asked: String, base: URL = base) throws -> Bool {
+            DashboardClient.isSignInRedirect(final: try XCTUnwrap(URL(string: final)), requested: try XCTUnwrap(URL(string: asked)), base: base)
+        }
+        let probe = "https://host.example/api/mcp/servers/login-helper/test?profile=work"
+        XCTAssertFalse(try redirected(probe, probe), "a name with “login” in it isn't a sign-in page")
+        let action = "https://host.example/api/actions/skills-install-login-kit-ab12/status"
+        XCTAssertFalse(try redirected(action, action))
+        XCTAssertTrue(try redirected("https://host.example/login?next=/api/mcp/servers", probe))
+        XCTAssertTrue(try redirected("https://sso.example/authorize", probe), "another host is a redirect away")
+        XCTAssertFalse(try redirected("https://host.example/api/mcp/servers", "https://host.example/api/mcp/servers/"),
+                       "a trailing-slash redirect is the same route")
+        let prefixed = try XCTUnwrap(URL(string: "https://host.example/hermes/"))
+        XCTAssertTrue(try redirected("https://host.example/hermes/login", "https://host.example/hermes/api/status", base: prefixed))
+        XCTAssertFalse(try redirected("https://host.example/hermes/api/status", "https://host.example/hermes/api/status", base: prefixed))
+    }
+
+    func testPathSegmentsAreEncodedOnce() throws {
+        let client = try DashboardClient(settings: ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "u", password: "p"))
+        let id = "20261027 abc%2"
+        let url = client.url("/api/sessions/\(try DashboardClient.segment(id))")
+        XCTAssertEqual(URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath, "/api/sessions/20261027%20abc%252")
+        XCTAssertThrowsError(try DashboardClient.segment("a/b"), "a slash would split the route")
     }
 
     // MARK: Artifacts: classification

@@ -80,18 +80,19 @@ struct SessionActions {
             _ = try? await gateway.sessionInterrupt(.init(sessionId: runtimeID, profile: target.profile))
             _ = try? await gateway.sessionClose(.init(sessionId: runtimeID, profile: target.profile))
         }
-        _ = try await client.request("DELETE", path(target), query: target.profile.map { ["profile": $0] } ?? [:])
+        _ = try await client.request("DELETE", try path(target), query: target.profile.map { ["profile": $0] } ?? [:])
     }
 
     /// The owning profile rides in the body: the dashboard opens that profile's store from it.
     private func patch(_ target: SessionMenuTarget, _ body: JSON) async throws -> Any {
         var body = body
         if let profile = target.profile { body["profile"] = profile }
-        return try await client.request("PATCH", path(target), body: body)
+        return try await client.request("PATCH", try path(target), body: body)
     }
 
-    private func path(_ target: SessionMenuTarget) -> String {
-        "/api/sessions/\(target.storedID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? target.storedID)"
+    /// The id goes in as is: `DashboardClient.url` percent-encodes the path once.
+    private func path(_ target: SessionMenuTarget) throws -> String {
+        "/api/sessions/\(try DashboardClient.segment(target.storedID))"
     }
 
     /// The whole conversation into a new session: from the live one (`session.branch_whole`, or `session.branch`
@@ -173,7 +174,7 @@ struct SessionActions {
         while true {
             var query = ["limit": "\(pageSize)", "offset": "\(offset)", "order": "oldest", "include_compacted": "true"]
             if let profile = target.profile { query["profile"] = profile }
-            let page = try await client.request("GET", "\(path(target))/messages", query: query) as? JSON ?? [:]
+            let page = try await client.request("GET", "\(try path(target))/messages", query: query) as? JSON ?? [:]
             if let id = page["session_id"] as? String { sessionID = id }
             let rows = page["messages"] as? [Any] ?? []
             messages += rows

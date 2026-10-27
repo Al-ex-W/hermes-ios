@@ -9,9 +9,25 @@ import Foundation
 /// The REST calls the Capabilities screens make (`DashboardClient.request`), so tests can record them.
 protocol CapabilitiesTransport: AnyObject {
     func request(_ method: String, _ path: String, query: [String: String], body: JSON?) async throws -> Any
+    /// The same, waiting up to `timeout` for the answer: for routes the host answers only once the work is done
+    /// (a hub search across every source, a bundle fetched and scanned), past the client's usual 30 s.
+    func request(_ method: String, _ path: String, query: [String: String], body: JSON?,
+                 timeout: TimeInterval) async throws -> Any
 }
 
-extension DashboardClient: CapabilitiesTransport {}
+extension CapabilitiesTransport {
+    func request(_ method: String, _ path: String, query: [String: String], body: JSON?,
+                 timeout: TimeInterval) async throws -> Any {
+        try await request(method, path, query: query, body: body)
+    }
+}
+
+extension DashboardClient: CapabilitiesTransport {
+    func request(_ method: String, _ path: String, query: [String: String], body: JSON?,
+                 timeout: TimeInterval) async throws -> Any {
+        try await opsRequest(method, path, query: query, body: body, timeout: timeout)
+    }
+}
 
 /// A route family scoped to one profile: `?profile=` on every call when `profile` is set (nil is the dashboard's
 /// own profile), like the desktop's `capabilityScoped`.
@@ -25,6 +41,10 @@ extension CapabilityRoutes {
 
     func get(_ path: String, _ query: [String: String] = [:]) async throws -> Any {
         try await transport.request("GET", path, query: scopeQuery.merging(query) { _, new in new }, body: nil)
+    }
+
+    func get(_ path: String, _ query: [String: String] = [:], timeout: TimeInterval) async throws -> Any {
+        try await transport.request("GET", path, query: scopeQuery.merging(query) { _, new in new }, body: nil, timeout: timeout)
     }
 
     func send(_ method: String, _ path: String, _ body: JSON) async throws -> Any {
@@ -88,17 +108,39 @@ struct CapabilityActionsAPI {
         return CapabilityActionStatus(response: result, name: name)
     }
 
-    /// Polls the log every `interval` until the action stops (or `attempts` polls), reporting each tail.
-    func follow(_ name: String, interval: Duration = .milliseconds(1200), attempts: Int = 150,
+    /// Polls the log every `interval` until the action stops (or `attempts` polls), reporting each tail. A failed
+    /// status read (a timeout on a phone network, a proxy's 502) is retried; `tolerance` failures in a row give up
+    /// with `CapabilityActionLost`, since the action itself keeps running on the host.
+    func follow(_ name: String, interval: Duration = .milliseconds(1200), attempts: Int = 150, tolerance: Int = 5,
                 onUpdate: @MainActor (CapabilityActionStatus) -> Void) async throws -> CapabilityActionStatus {
         var last = CapabilityActionStatus(name: name, running: true)
+        var failures = 0
         for _ in 0..<attempts {
             try await Task.sleep(for: interval)
-            last = try await status(name)
+            do {
+                last = try await status(name)
+            } catch {
+                if error.isCancellation { throw error }
+                failures += 1
+                if failures >= max(1, tolerance) { throw CapabilityActionLost(name: name, reason: error.dashboardMessage) }
+                continue
+            }
+            failures = 0
             await onUpdate(last)
             if !last.running { break }
         }
         return last
+    }
+}
+
+/// The status of a background action couldn't be read several times in a row. The action itself isn't stopped:
+/// it may still finish on the host.
+struct CapabilityActionLost: LocalizedError, Equatable {
+    let name: String
+    let reason: String
+
+    var errorDescription: String? {
+        "Lost track of it, but it may still be running on the host. \(reason)"
     }
 }
 
@@ -456,6 +498,11 @@ struct SkillsAPI: CapabilityRoutes {
 
     // MARK: Hub
 
+    /// The host answers a hub search only once every source has answered (its own budget is 30 s, after building
+    /// the source router), and a preview or scan once the bundle is fetched, quarantined and scanned; the desktop
+    /// waits 45 s for these (`HUB_REQUEST_TIMEOUT_MS`).
+    static let hubTimeout: TimeInterval = 60
+
     func official() async throws -> [OfficialSkill] {
         OfficialSkill.list(try await get("/api/skills/hub/official"))
     }
@@ -463,15 +510,17 @@ struct SkillsAPI: CapabilityRoutes {
     func search(_ query: String, limit: Int = 20) async throws -> HubSearchResponse {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return HubSearchResponse() }
-        return HubSearchResponse(response: try await get("/api/skills/hub/search", ["q": query, "source": "all", "limit": "\(limit)"]))
+        return HubSearchResponse(response: try await get("/api/skills/hub/search", ["q": query, "source": "all", "limit": "\(limit)"],
+                                                         timeout: Self.hubTimeout))
     }
 
     func preview(_ identifier: String) async throws -> HubSkillPreview {
-        HubSkillPreview(response: try await get("/api/skills/hub/preview", ["identifier": identifier]), identifier: identifier)
+        HubSkillPreview(response: try await get("/api/skills/hub/preview", ["identifier": identifier], timeout: Self.hubTimeout),
+                        identifier: identifier)
     }
 
     func scan(_ identifier: String) async throws -> HubSkillScan {
-        HubSkillScan(response: try await get("/api/skills/hub/scan", ["identifier": identifier]))
+        HubSkillScan(response: try await get("/api/skills/hub/scan", ["identifier": identifier], timeout: Self.hubTimeout))
     }
 
     /// Spawns `hermes skills install <identifier> --yes`; follow its log with `CapabilityActionsAPI`.

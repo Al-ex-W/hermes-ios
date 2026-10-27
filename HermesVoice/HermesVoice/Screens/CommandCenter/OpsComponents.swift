@@ -179,6 +179,7 @@ extension OpsActionStatus {
         case .running: return OpsPill("running", tone: .good)
         case .done: return OpsPill("done", tone: .muted)
         case .failed: return OpsPill("failed", tone: .bad)
+        case .unknown: return OpsPill("unknown", tone: .muted)
         }
     }
 }

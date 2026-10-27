@@ -8,6 +8,8 @@ private final class RecordingCapabilitiesTransport: CapabilitiesTransport {
         let path: String
         let query: [String: String]
         let body: JSON?
+        /// The longer wait the call asked for; nil is the client's usual one.
+        var timeout: TimeInterval?
     }
 
     private(set) var calls: [Call] = []
@@ -15,11 +17,27 @@ private final class RecordingCapabilitiesTransport: CapabilitiesTransport {
     var responses: [String: Any] = [:]
     /// `"METHOD path"` → the error that call throws.
     var failures: [String: Error] = [:]
+    /// `"METHOD path"` → how many more times that call fails before it answers.
+    var transientFailures: [String: Int] = [:]
 
     func request(_ method: String, _ path: String, query: [String: String], body: JSON?) async throws -> Any {
-        calls.append(Call(method: method, path: path, query: query, body: body))
-        if let failure = failures["\(method) \(path)"] { throw failure }
-        return responses["\(method) \(path)"] ?? JSON()
+        try answer(Call(method: method, path: path, query: query, body: body))
+    }
+
+    func request(_ method: String, _ path: String, query: [String: String], body: JSON?,
+                 timeout: TimeInterval) async throws -> Any {
+        try answer(Call(method: method, path: path, query: query, body: body, timeout: timeout))
+    }
+
+    private func answer(_ call: Call) throws -> Any {
+        calls.append(call)
+        let key = "\(call.method) \(call.path)"
+        if let failure = failures[key] { throw failure }
+        if let left = transientFailures[key], left > 0 {
+            transientFailures[key] = left - 1
+            throw URLError(.timedOut)
+        }
+        return responses[key] ?? JSON()
     }
 
     var last: Call? { calls.last }
@@ -226,6 +244,16 @@ final class CapabilitiesTests: XCTestCase {
         XCTAssertEqual(transport.calls.count, count, "an empty hub search never leaves the phone")
         _ = try await api.search(" pdf ")
         XCTAssertEqual(transport.last?.query, ["profile": "work", "q": "pdf", "source": "all", "limit": "20"])
+        XCTAssertEqual(transport.last?.timeout, SkillsAPI.hubTimeout, "a hub search waits past the client's 30 s")
+        XCTAssertGreaterThanOrEqual(SkillsAPI.hubTimeout, 45, "at least the desktop's HUB_REQUEST_TIMEOUT_MS")
+        _ = try await api.preview("official/docs/pdf")
+        XCTAssertEqual(transport.last?.path, "/api/skills/hub/preview")
+        XCTAssertEqual(transport.last?.timeout, SkillsAPI.hubTimeout)
+        _ = try await api.scan("official/docs/pdf")
+        XCTAssertEqual(transport.last?.path, "/api/skills/hub/scan")
+        XCTAssertEqual(transport.last?.timeout, SkillsAPI.hubTimeout)
+        _ = try await api.official()
+        XCTAssertNil(transport.last?.timeout, "the local catalog read keeps the usual wait")
 
         let unscoped = SkillsAPI(transport: transport, profile: nil)
         _ = try await unscoped.skills()
@@ -234,6 +262,31 @@ final class CapabilitiesTests: XCTestCase {
         _ = try await CapabilityActionsAPI(transport: transport).status("skills-install-pdf-abcd")
         XCTAssertEqual(transport.last?.path, "/api/actions/skills-install-pdf-abcd/status")
         XCTAssertEqual(transport.last?.query, ["lines": "200"])
+    }
+
+    func testActionTailSurvivesAFewFailedReads() async throws {
+        let transport = RecordingCapabilitiesTransport()
+        let key = "GET /api/actions/skills-install-pdf-abcd/status"
+        transport.responses[key] = ["name": "skills-install-pdf-abcd", "running": false, "exit_code": 0, "lines": ["done"]]
+        transport.transientFailures[key] = 2
+        let actions = CapabilityActionsAPI(transport: transport)
+        var updates = 0
+        let finished = try await actions.follow("skills-install-pdf-abcd", interval: .milliseconds(1), tolerance: 3) { _ in
+            updates += 1
+        }
+        XCTAssertTrue(finished.succeeded)
+        XCTAssertEqual(updates, 1, "failed reads report nothing")
+        XCTAssertEqual(transport.calls.count, 3)
+
+        transport.transientFailures[key] = 10
+        do {
+            _ = try await actions.follow("skills-install-pdf-abcd", interval: .milliseconds(1), tolerance: 3) { _ in }
+            XCTFail("three failed reads in a row give up")
+        } catch let lost as CapabilityActionLost {
+            XCTAssertEqual(lost.name, "skills-install-pdf-abcd")
+            XCTAssertTrue(lost.localizedDescription.contains("may still be running on the host"))
+        }
+        XCTAssertEqual(transport.transientFailures[key], 7)
     }
 
     // MARK: Toolsets decoding

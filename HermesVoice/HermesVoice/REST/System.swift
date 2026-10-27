@@ -247,6 +247,8 @@ struct OpsActionStart: Hashable {
     var message: String?
     /// `POST /api/ops/backup`: where the archive is being written on the host.
     var archive: String?
+    /// `POST /api/hermes/update`: the run's id, which its update receipt carries.
+    var actionID: String?
 
     init(response: JSON, fallbackName: String) {
         name = LenientField.text(response["name"]) ?? fallbackName
@@ -255,6 +257,7 @@ struct OpsActionStart: Hashable {
         alreadyRunning = LenientField.bool(response["already_running"])
         message = LenientField.text(response["message"]) ?? LenientField.text(response["error"])
         archive = LenientField.text(response["archive"])
+        actionID = LenientField.text(response["action_id"])
     }
 }
 
@@ -264,8 +267,13 @@ struct OpsActionStatus: Hashable {
     var running: Bool
     var exitCode: Int?
     var lines: [String]
-    /// `hermes-update` only: the durable update receipt's outcome ("success", "partial", "failed", …).
+    /// `hermes-update` only: the update receipt's outcome ("success", "partial", "failed", …) and the id of the run
+    /// that wrote it. The host falls back to the newest receipt of any run, so it only counts for the run started
+    /// here (`startedActionID`).
     var receiptOutcome: String?
+    var receiptActionID: String?
+    /// The id `POST /api/hermes/update` answered with; set by whoever started the action.
+    var startedActionID: String?
 
     init(name: String, running: Bool, exitCode: Int? = nil, lines: [String] = []) {
         self.name = name
@@ -274,20 +282,28 @@ struct OpsActionStatus: Hashable {
         self.lines = lines
     }
 
-    init(response: JSON, fallbackName: String) {
+    init(response: JSON, fallbackName: String, startedActionID: String? = nil) {
         name = LenientField.text(response["name"]) ?? fallbackName
         running = LenientField.bool(response["running"])
         exitCode = LenientField.optionalInt(response["exit_code"])
         lines = (response["lines"] as? [Any] ?? []).compactMap { $0 as? String }
-        receiptOutcome = LenientField.text((response["receipt"] as? JSON)?["outcome"])
+        let receipt = response["receipt"] as? JSON
+        receiptOutcome = LenientField.text(receipt?["outcome"])
+        receiptActionID = LenientField.text(receipt?["action_id"])
+        self.startedActionID = startedActionID
     }
 
-    enum Outcome: Equatable { case running, done, failed }
+    /// `unknown`: it stopped without an exit code or a receipt of its own (the dashboard restarted under an
+    /// update and lost the process), so the result may still come.
+    enum Outcome: Equatable { case running, done, failed, unknown }
 
     /// Running, done (exit 0) or failed (`actionRunning` / `actionDone` / `actionFailed`).
     var outcome: Outcome {
         if running { return .running }
-        if let receiptOutcome { return receiptOutcome == "success" ? .done : .failed }
+        if let receiptOutcome, let startedActionID, receiptActionID == startedActionID {
+            return receiptOutcome == "success" ? .done : .failed
+        }
+        guard let exitCode else { return .unknown }
         return exitCode == 0 ? .done : .failed
     }
 
@@ -296,6 +312,7 @@ struct OpsActionStatus: Hashable {
         case .running: return "running"
         case .done: return "done"
         case .failed: return "failed"
+        case .unknown: return "unknown"
         }
     }
 }
@@ -326,11 +343,16 @@ struct OpsActionPoll: Equatable {
         self.maxConsecutiveFailures = maxConsecutiveFailures
     }
 
-    /// Records a status read.
+    /// Records a status read. A stop with no result yet (`unknown`) is asked again, within the same tolerance as a
+    /// failed read.
     mutating func record(_ status: OpsActionStatus) -> Step {
         polls += 1
-        failures = 0
         latest = status
+        if status.outcome == .unknown {
+            failures += 1
+            return failures < maxConsecutiveFailures && polls < limit ? .wait : .finished
+        }
+        failures = 0
         return status.running && polls < limit ? .wait : .finished
     }
 
@@ -621,8 +643,7 @@ extension DashboardClient {
             let (data, response) = try await session.data(for: request)
             let http = response as? HTTPURLResponse
             let code = http?.statusCode ?? 0
-            let redirectedAway = http?.url.map { $0.host != base.host || $0.path.contains("login") } ?? false
-            if code == 401 || code == 403 || redirectedAway {
+            if code == 401 || code == 403 || isSignInRedirect(http, for: request) {
                 if attempt == 0 { try await signIn(); continue }
                 throw DashboardError.signedOut
             }

@@ -771,8 +771,7 @@ extension DashboardClient: MCPTransport {
             let (data, response) = try await Self.slowSession.data(for: request)
             let http = response as? HTTPURLResponse
             let code = http?.statusCode ?? 0
-            let redirectedAway = http?.url.map { $0.host != base.host || $0.path.contains("login") } ?? false
-            if code == 401 || code == 403 || redirectedAway {
+            if code == 401 || code == 403 || isSignInRedirect(http, for: request) {
                 if attempt == 0 { try await signIn(); continue }
                 throw DashboardError.signedOut
             }

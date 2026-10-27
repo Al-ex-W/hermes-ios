@@ -236,6 +236,12 @@ final class SkillsStore: ObservableObject {
             case .update: notice = "Installed skills are up to date."
             }
             return true
+        } catch let lost as CapabilityActionLost {
+            // The action may still finish on the host: show what the lists say now.
+            failure = "\(Self.verb(kind)) \(label): \(lost.localizedDescription)"
+            await load()
+            if let query = hubQuery { await refreshHubInstalled(query) }
+            return false
         } catch {
             guard !error.isCancellation else { return false }
             failure = "Skill action failed. \(error.dashboardMessage)"

@@ -101,9 +101,10 @@ extension PushedCallRouter {
 extension DashboardClient {
     /// One stored session (`GET /api/sessions/:id`); nil when the store holds no such session.
     func storedSession(_ id: String, profile: String?) async throws -> SessionInfo? {
-        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        // The id goes in raw: `url(_:query:)` percent-encodes the path once (a "/" can't be addressed at all).
+        guard let segment = try? Self.segment(id) else { return nil }
         do {
-            let row = try await request("GET", "/api/sessions/\(encoded)", query: profile.map { ["profile": $0] } ?? [:]) as? JSON
+            let row = try await request("GET", "/api/sessions/\(segment)", query: profile.map { ["profile": $0] } ?? [:]) as? JSON
             return row.flatMap(SessionInfo.init(row:))
         } catch DashboardError.http(404, _) {
             return nil

@@ -43,7 +43,8 @@ final class OpsActionRunner: ObservableObject {
                 try? await Task.sleep(for: .seconds(OpsActionPoll.interval))
                 guard let self, !Task.isCancelled else { return }
                 do {
-                    let status = try await self.client.opsActionStatus(name)
+                    var status = try await self.client.opsActionStatus(name)
+                    status.startedActionID = started.actionID
                     guard !Task.isCancelled else { return }
                     self.status = status
                     step = poll.record(status)
