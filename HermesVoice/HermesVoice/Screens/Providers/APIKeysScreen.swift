@@ -188,6 +188,10 @@ struct EnvFieldSection: View {
                         .disabled(trimmedDraft.isEmpty)
                 }
             }
+            // On this one row: a Section hands its modifiers to every row, and several rows presenting one alert
+            // make UIKit dismiss Settings itself.
+            .failureAlert($failure)
+            .onChange(of: draft) { _, _ in rejected = nil }
             if let rejected {
                 VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                     Text(rejected).hermesText(.caption).foregroundStyle(Theme.destructive)
@@ -200,6 +204,11 @@ struct EnvFieldSection: View {
                 Button(info.isSecret ? "Remove key" : "Clear", role: .destructive) { confirmingRemove = true }
                     .foregroundStyle(Theme.destructive)
                     .disabled(saving)
+                    .confirmationDialog("Remove \(info.key)?", isPresented: $confirmingRemove, titleVisibility: .visible) {
+                        Button("Remove", role: .destructive) { Task { await remove() } }
+                    } message: {
+                        Text("Hermes deletes it from this profile's .env on the host, with every copy of it in the config.")
+                    }
             }
         } header: {
             HStack {
@@ -215,13 +224,6 @@ struct EnvFieldSection: View {
             }
         }
         .hermesFormRows()
-        .confirmationDialog("Remove \(info.key)?", isPresented: $confirmingRemove, titleVisibility: .visible) {
-            Button("Remove", role: .destructive) { Task { await remove() } }
-        } message: {
-            Text("Hermes deletes it from this profile's .env on the host, with every copy of it in the config.")
-        }
-        .failureAlert($failure)
-        .onChange(of: draft) { _, _ in rejected = nil }
     }
 
     private var trimmedDraft: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
