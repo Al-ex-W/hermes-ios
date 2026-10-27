@@ -215,8 +215,18 @@ enum Theme {
         static let messaging = "bubble.left"
         static let artifacts = "doc.on.doc"
         static let scheduledJobs = "clock"
+        /// The kanban plugin's row (codicon `project`).
+        static let kanban = "rectangle.split.3x1"
         /// The statusbar's Command Center button (Tabler `Command`).
         static let commandCenter = "command"
+        /// The statusbar's Agents (codicon `hubot`) and Webhooks (Tabler `Globe`) items, and the Memory Graph.
+        static let agents = "cpu"
+        static let webhooks = "globe"
+        static let memoryGraph = "point.3.connected.trianglepath.dotted"
+        /// Import session (Tabler `Download`).
+        static let sessionImport = "square.and.arrow.down"
+        /// The titlebar's right-sidebar toggle (codicon `layout-sidebar-right`): Files and Review.
+        static let workspace = "sidebar.right"
         static let search = "magnifyingglass"
         static let filter = "line.3.horizontal.decrease"
         static let settings = "gearshape"

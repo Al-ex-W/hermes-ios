@@ -177,8 +177,16 @@ struct WebhooksAPI: CapabilityRoutes {
         return created
     }
 
+    /// Hermes refuses an unnamed profile here while it serves several (`destructive_profile`), so the dashboard's own
+    /// profile goes by name (`GET /api/profiles/active`).
     func delete(_ name: String) async throws {
-        _ = try await transport.request("DELETE", "/api/webhooks/\(try MessagingAPI.segment(name))", query: scopeQuery, body: nil)
+        let path = "/api/webhooks/\(try MessagingAPI.segment(name))"
+        var query = scopeQuery
+        if profile == nil {
+            let active = try await transport.request("GET", "/api/profiles/active", query: [:], body: nil) as? JSON
+            query["profile"] = ProfileActivity(response: active ?? [:]).current
+        }
+        _ = try await transport.request("DELETE", path, query: query, body: nil)
     }
 
     /// A disabled route stays on disk; the gateway rejects its events with 403 until it is enabled again.

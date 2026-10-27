@@ -12,6 +12,10 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
         case newChat
         case sessions
         case session(SessionSummary)
+        /// The subagent tree (the status stack's Agents button).
+        case agents
+        /// The memory graph (`/journey`, `/learning`, `/memory-graph`).
+        case memoryGraph
     }
 
     @Published private(set) var transcript = Transcript()
@@ -36,6 +40,12 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
     var onStoredID: ((String) -> Void)?
     /// Opens what the chat asks for; set by the screen showing it.
     var navigate: ((Route) -> Void)?
+    /// The folder a new chat's session starts in (a worktree's "New chat here"); nil uses the profile's default
+    /// project folder, or the host's.
+    var startFolder: String?
+
+    /// The folder the session works in as far as this chat knows: the start folder of a new chat.
+    var workingFolder: String? { startFolder ?? DefaultProjectFolder.dir(base: client.base, profile: profile) }
 
     /// The send decision tree and its local queue. They live with the chat, so the queue outlives the screen.
     private(set) lazy var sender = SendController(chat: self, ownedByChat: true)
@@ -247,7 +257,7 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                     session = try await LiveSession.attach({
                         try await connection.client.sessionCreate(.init(
                             profile: profile, cols: 96, source: "desktop",
-                            cwd: DefaultProjectFolder.dir(base: client.base, profile: profile),
+                            cwd: workingFolder,
                             model: pick?.model, provider: pick?.provider,
                             reasoningEffort: effort, fast: fast, idempotencyKey: id.uuidString
                         ))
@@ -1210,6 +1220,7 @@ extension ChatModel: SlashCommandHost {
         case .chooseSession: navigate?(.sessions)
         case .chooseModel: composer.modelMenuRequested = true
         case .branch: await branch()
+        case .openMemoryGraph: navigate?(.memoryGraph)
         }
     }
 

@@ -748,6 +748,10 @@ final class MessagingTests: XCTestCase {
         XCTAssertEqual(transport.last("PUT", "/api/webhooks/hook/enabled")?.body as NSDictionary?, ["enabled": false] as NSDictionary)
         try await api.delete("hook")
         XCTAssertEqual(transport.last("DELETE", "/api/webhooks/hook")?.query, ["profile": "work"])
+        // The dashboard's own profile is named on the delete, which Hermes refuses unnamed on a multi-profile host.
+        transport.responses["GET /api/profiles/active"] = ["active": "default", "current": "ops"]
+        try await WebhooksAPI(transport: transport, profile: nil).delete("hook")
+        XCTAssertEqual(transport.last("DELETE", "/api/webhooks/hook")?.query, ["profile": "ops"])
 
         transport.responses["POST /api/webhooks"] = ["name": "hook", "url": "u"]
         do {

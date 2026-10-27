@@ -224,6 +224,16 @@ final class ComposerTests: XCTestCase {
         XCTAssertTrue(gateway.calls.filter { $0.method != "client.capabilities" }.isEmpty)
     }
 
+    func testJourneyOpensTheMemoryGraph() async {
+        // The desktop opens its memory graph for /journey and its aliases instead of printing the timeline.
+        _ = await run("/journey")
+        _ = await run("/learning")
+        _ = await run("/memory-graph last week")
+        XCTAssertEqual(host.actions, [.openMemoryGraph, .openMemoryGraph, .openMemoryGraph])
+        XCTAssertTrue(host.outputs.isEmpty)
+        XCTAssertTrue(gateway.calls("slash.exec").isEmpty)
+    }
+
     func testCommandsThisAppCantOfferAreRefused() async {
         let catalog = CommandsCatalogResult(commands: ["/config": CommandCatalogMeta(desktop: "terminal")])
         _ = await run("/voice")

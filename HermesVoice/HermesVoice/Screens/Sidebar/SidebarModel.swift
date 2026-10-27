@@ -8,9 +8,22 @@ enum SidebarDestination: Hashable {
     /// A stored session, by id.
     case session(String)
     case capabilities, messaging, artifacts, scheduledJobs
+    /// The kanban plugin's board (a contributed `/kanban` page): a navigation row while the host serves the plugin.
+    case kanban
     /// The Command Center: the desktop's overlay route, opened from its statusbar button (here, the sidebar's
     /// toolbar), not a navigation row.
     case commandCenter
+    /// More of the desktop's overlay routes: the statusbar's Agents ("Spawn tree") and Webhooks items, and the
+    /// command palette's Memory Graph. Here they open from the sidebar's bottom bar.
+    case agents, webhooks, memoryGraph
+
+    /// Floats over what the detail column showed on the desktop (`OVERLAY_VIEWS`): opening one again goes back.
+    var isOverlay: Bool {
+        switch self {
+        case .commandCenter, .agents, .webhooks, .memoryGraph: return true
+        case .draft, .session, .capabilities, .messaging, .artifacts, .scheduledJobs, .kanban: return false
+        }
+    }
 }
 
 /// How the sidebar lists sessions (the desktop's `store/layout.ts` view atoms), remembered on this device.
@@ -98,6 +111,8 @@ final class SidebarModel: ObservableObject {
     /// A selection change alone doesn't: a draft settling into its listed row changes it too.
     @Published private(set) var externalOpens = 0
     @Published private(set) var options: SidebarOptions
+    /// The host serves the kanban plugin (`KanbanAvailability`): its board shows as a navigation row.
+    @Published private(set) var kanbanAvailable = false
 
     /// Stored ids whose turn is running, and those waiting on an answer.
     @Published private(set) var workingIDs: Set<String> = []
@@ -139,8 +154,8 @@ final class SidebarModel: ObservableObject {
     }
 
     private var edits: [String: Edit] = [:]
-    /// What the detail column showed when the Command Center opened.
-    private var beforeCommandCenter: SidebarDestination?
+    /// What the detail column showed when the first overlay (Command Center, Agents…) opened over it.
+    private var beforeOverlay: SidebarDestination?
     /// Sessions marked unread while open; they aren't marked read again until left.
     private var keptUnread: Set<String> = []
     /// Rows as they were when opened, so the detail can still name one that left its list.
@@ -557,16 +572,40 @@ final class SidebarModel: ObservableObject {
     /// Opens the Command Center over what the detail column shows; again, it goes back there (the desktop's
     /// `toggleCommandCenter`, which returns to the route under the overlay).
     func toggleCommandCenter() {
-        if selection == .commandCenter {
+        toggleOverlay(.commandCenter)
+    }
+
+    /// Opens an overlay route over what the detail column shows; again, it goes back there. Switching from one
+    /// overlay to another keeps the page under both, as the desktop's overlays float over the same workspace.
+    func toggleOverlay(_ overlay: SidebarDestination) {
+        if selection == overlay {
             // A chat that left every list meanwhile (deleted elsewhere) isn't reopened.
-            if case let .session(id)? = beforeCommandCenter, row(id) == nil, opened[id] == nil {
-                beforeCommandCenter = nil
+            if case let .session(id)? = beforeOverlay, row(id) == nil, opened[id] == nil {
+                beforeOverlay = nil
             }
-            selection = beforeCommandCenter
+            selection = beforeOverlay
         } else {
-            beforeCommandCenter = selection
-            selection = .commandCenter
+            if selection?.isOverlay != true { beforeOverlay = selection }
+            selection = overlay
         }
+    }
+
+    /// Starts a chat in `folder` (a new worktree's "New chat here"), for `profile`'s store.
+    func newSession(in folder: String, profile: String?) {
+        guard let chat = app?.chat(for: nil, profile: profile) else { return }
+        chat.startFolder = folder
+        draft = chat
+        selection = .draft
+        watch()
+    }
+
+    // MARK: Kanban
+
+    /// The kanban plugin answers on this host, so its board has a navigation row. A failed probe (offline,
+    /// signed out) keeps the last answer.
+    func refreshKanban() async {
+        guard let available = try? await KanbanAvailability.check(client: client) else { return }
+        if available != kanbanAvailable { kanbanAvailable = available }
     }
 
     /// The detail column shows `chat`.
@@ -693,8 +732,8 @@ final class SidebarModel: ObservableObject {
     func applied(_ event: SessionMenuEvent, to id: String) async {
         if event == .deleted {
             app?.forget(id)
-            // The Command Center toggle must not lead back to a deleted chat.
-            if beforeCommandCenter == .session(id) { beforeCommandCenter = nil }
+            // An overlay toggle (Command Center, Agents…) must not lead back to a deleted chat.
+            if beforeOverlay == .session(id) { beforeOverlay = nil }
         }
         guard let session = row(id) ?? opened[id] else { return scheduleRefresh() }
         switch event {

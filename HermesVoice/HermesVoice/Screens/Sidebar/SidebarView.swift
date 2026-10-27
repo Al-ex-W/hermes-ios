@@ -5,6 +5,8 @@ import UIKit
 /// dividers, one section per messaging platform, and the profile switcher in the title.
 struct SidebarView: View {
     @ObservedObject var sidebar: SidebarModel
+    /// For the bottom bar's Agents count.
+    let agents: AgentsStore
     @EnvironmentObject private var calls: CallController
     @EnvironmentObject private var model: AppModel
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -47,7 +49,12 @@ struct SidebarView: View {
             await sidebar.search()
         }
         .task { await sidebar.refresh() }
-        .refreshable { await sidebar.refresh() }
+        .task { await sidebar.refreshKanban() }
+        .refreshable {
+            async let kanban: Void = sidebar.refreshKanban()
+            await sidebar.refresh()
+            await kanban
+        }
         .navigationTitle(sidebar.scopeTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbarTitleMenu { profileSwitcher }
@@ -66,6 +73,13 @@ struct SidebarView: View {
                 SidebarFilterMenu(sidebar: sidebar)
                 Button { sidebar.newSession() } label: { Image(systemName: Theme.Icon.newSession) }
                     .accessibilityLabel("New session")
+            }
+            // The desktop's statusbar items that open overlays (Agents, Webhooks), and its palette's Memory Graph.
+            ToolbarItemGroup(placement: .bottomBar) {
+                SidebarAgentsButton(sidebar: sidebar, agents: agents)
+                Spacer()
+                SidebarOverlayButton(sidebar: sidebar, overlay: .webhooks)
+                SidebarOverlayButton(sidebar: sidebar, overlay: .memoryGraph)
             }
         }
         .safeAreaInset(edge: .bottom) {
@@ -151,13 +165,18 @@ struct SidebarView: View {
             }
             .buttonStyle(.plain)
             .sidebarRow(background: .clear)
-            ForEach(SidebarDestination.screens, id: \.self) { destination in
+            ForEach(navigationRows, id: \.self) { destination in
                 NavigationLink(value: destination) {
                     SidebarNavRow(title: destination.title, icon: destination.icon)
                 }
                 .sidebarRow(background: background(destination))
             }
         }
+    }
+
+    /// The desktop's rows, then the ones plugins contribute (Kanban, while the host serves it).
+    private var navigationRows: [SidebarDestination] {
+        SidebarDestination.screens + (sidebar.kanbanAvailable ? [.kanban] : [])
     }
 
     @ViewBuilder private var sessions: some View {
@@ -364,6 +383,47 @@ struct SidebarView: View {
     /// The open row's fill. Stacked on iPhone, the open row is off screen.
     private func background(_ destination: SidebarDestination) -> Color {
         sizeClass != .compact && sidebar.selection == destination ? Theme.Fill.rowActive : .clear
+    }
+}
+
+/// The sidebar's bottom bar holds the desktop statusbar's overlay items, Agents and Webhooks, and the Memory Graph
+/// the desktop opens from its command palette. Each opens over the detail column; on iPad pressing it again goes
+/// back to what was open, as the desktop's toggles do.
+///
+/// Agents shows the statusbar's count: "N subagents" while some run, else "N failed".
+private struct SidebarAgentsButton: View {
+    @ObservedObject var sidebar: SidebarModel
+    @ObservedObject var agents: AgentsStore
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    var body: some View {
+        let live = agents.roster.liveCount, failed = agents.roster.failedCount
+        let showsFailure = live == 0 && failed > 0
+        let open = sizeClass != .compact && sidebar.selection == .agents
+        Button { sidebar.toggleOverlay(.agents) } label: {
+            Label(live > 0 ? "\(live) subagent\(live == 1 ? "" : "s")" : showsFailure ? "\(failed) failed" : "Agents",
+                  systemImage: showsFailure ? Theme.Icon.error : Theme.Icon.agents)
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(showsFailure ? Theme.destructive : open ? Theme.primary : Theme.Text.secondary)
+        }
+        .accessibilityLabel(open ? "Close agents" : "Open agents")
+        .accessibilityValue(live > 0 ? "\(live) running" : showsFailure ? "\(failed) failed" : "")
+    }
+}
+
+/// A bottom-bar button for an overlay without a count (Webhooks, Memory Graph).
+private struct SidebarOverlayButton: View {
+    @ObservedObject var sidebar: SidebarModel
+    let overlay: SidebarDestination
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    var body: some View {
+        let open = sizeClass != .compact && sidebar.selection == overlay
+        Button { sidebar.toggleOverlay(overlay) } label: {
+            Image(systemName: overlay.icon)
+                .foregroundStyle(open ? Theme.primary : Theme.Text.secondary)
+        }
+        .accessibilityLabel("\(open ? "Close" : "Open") \(overlay.title.lowercased())")
     }
 }
 

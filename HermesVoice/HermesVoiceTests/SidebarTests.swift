@@ -96,6 +96,18 @@ final class SidebarTests: XCTestCase {
 
     // MARK: Date groups
 
+    func testNavigationRowsAndOverlays() {
+        // The desktop's SIDEBAR_NAV order; Kanban (a plugin row) and the overlay routes aren't in it.
+        XCTAssertEqual(SidebarDestination.screens, [.capabilities, .messaging, .artifacts, .scheduledJobs])
+        let overlays: [SidebarDestination] = [.commandCenter, .agents, .webhooks, .memoryGraph]
+        XCTAssertTrue(overlays.allSatisfy(\.isOverlay))
+        XCTAssertFalse(([.draft, .session("s1"), .kanban] + SidebarDestination.screens).contains(where: \.isOverlay))
+        // Screens without a profile stay put when the sidebar's profile changes.
+        XCTAssertEqual([SidebarDestination.artifacts, .kanban, .agents, .messaging, .webhooks, .memoryGraph].map(\.followsProfile),
+                       [false, false, false, true, true, true])
+        XCTAssertEqual(SidebarDestination.kanban.title, "Kanban")
+    }
+
     func testCalendarBuckets() {
         let calendar = calendar()
         let now = date("2026-06-17T12:00:00Z") // a Wednesday; the week starts Monday the 15th

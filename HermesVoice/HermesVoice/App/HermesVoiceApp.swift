@@ -75,6 +75,9 @@ struct RootView: View {
 /// The signed-in app: the session sidebar beside the screen it opens on iPad, stacked on iPhone.
 struct AppShell: View {
     @StateObject private var sidebar: SidebarModel
+    /// The subagents of every chat on this connection, heard from sign-in on, so the tree and the sidebar's Agents
+    /// count are current before the tree opens.
+    @StateObject private var agents: AgentsStore
     @EnvironmentObject private var model: AppModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
@@ -82,15 +85,18 @@ struct AppShell: View {
     /// Whether the sidebar is on screen; nil until it first shows.
     @State private var sidebarShown: Bool?
     private let client: DashboardClient
+    private let connection: GatewayConnection
 
     init(model: AppModel, client: DashboardClient, connection: GatewayConnection) {
         self.client = client
+        self.connection = connection
         _sidebar = StateObject(wrappedValue: SidebarModel(app: model, client: client, connection: connection))
+        _agents = StateObject(wrappedValue: AgentsStore(connection: connection))
     }
 
     var body: some View {
         NavigationSplitView(preferredCompactColumn: $compactColumn) {
-            SidebarView(sidebar: sidebar)
+            SidebarView(sidebar: sidebar, agents: agents)
                 .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
                 .onAppear {
                     let returning = sidebarShown == false
@@ -99,8 +105,9 @@ struct AppShell: View {
                 }
                 .onDisappear { sidebarShown = false }
         } detail: {
-            DetailColumn(sidebar: sidebar, client: client)
+            DetailColumn(sidebar: sidebar, client: client, connection: connection)
         }
+        .environmentObject(agents)
         .onChange(of: sidebar.selection) { _, selection in
             if selection != nil {
                 compactColumn = .detail
@@ -110,7 +117,10 @@ struct AppShell: View {
         }
         .onChange(of: compactColumn) { _, _ in backToList() }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await sidebar.refresh() } }
+            if phase == .active {
+                Task { await sidebar.refresh() }
+                Task { await sidebar.refreshKanban() }
+            }
         }
         // A tapped notification opens its session (also one that launched the app).
         .onReceive(model.notifications.$openRequest.compactMap { $0 }.receive(on: DispatchQueue.main)) { target in
@@ -130,15 +140,22 @@ struct AppShell: View {
 private struct DetailColumn: View {
     @ObservedObject var sidebar: SidebarModel
     let client: DashboardClient
+    let connection: GatewayConnection
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var agents: AgentsStore
+    /// The workspace panel (the desktop's right sidebar) beside the chat. It stays open from chat to chat, as the
+    /// desktop's does.
+    @State private var workspaceOpen = false
 
     var body: some View {
         // One branch for every chat, so a draft that becomes its listed session keeps its screen.
         if let chat = openChat {
-            NavigationStack { ChatScreen(chat: chat, sidebar: sidebar) }
+            ChatColumn(chat: chat, sidebar: sidebar, client: client, connection: connection, folder: folder(of: chat),
+                       workspaceOpen: $workspaceOpen)
                 .id(chat.id)
                 .onAppear {
                     sidebar.show(chat)
+                    agents.focus(chat)
                     model.notifications.showing(chat)
                 }
                 .onDisappear { model.notifications.hid(chat) }
@@ -152,10 +169,10 @@ private struct DetailColumn: View {
             case .draft?, nil:
                 nothingOpen
             case let destination?:
-                // Each screen starts on the sidebar's profile and is rebuilt when that changes (Artifacts always
-                // spans every profile, so it stays).
+                // Each screen starts on the sidebar's profile and is rebuilt when that changes. Artifacts spans
+                // every profile, and Kanban boards and the subagent tree belong to no profile, so they stay.
                 NavigationStack { screen(destination) }
-                    .id("\(destination.title)|\(destination == .artifacts ? "" : scope)")
+                    .id("\(destination.title)|\(destination.followsProfile ? scope : "")")
             }
         }
     }
@@ -164,21 +181,40 @@ private struct DetailColumn: View {
         switch destination {
         case .capabilities:
             CapabilitiesView(profile: scope == SidebarOptions.allProfiles ? nil : scope)
+        case .messaging:
+            MessagingScreen(context: MessagingContext(client: client, profileScope: scope))
         case .artifacts:
             // The desktop indexes every profile's sessions here, whatever the sidebar shows.
             ArtifactsScreen(client: client, profile: SidebarOptions.allProfiles, openSession: openSession)
         case .scheduledJobs:
             ScheduledJobsScreen(client: client, profileScope: scope, openSession: openSession)
+        case .kanban:
+            KanbanScreen(context: KanbanContext(client: client))
         case .commandCenter:
             CommandCenterScreen(client: client, profileScope: scope, sessionActions: sessionActions,
+                                sessionImport: SessionImportScreen.Context(client: client, connection: connection,
+                                                                           profileScope: scope, openSession: openSession),
                                 openSession: openSession)
-        case .messaging, .draft, .session:
-            PlaceholderScreen(destination: destination)
+        case .agents:
+            AgentsScreen(context: .init(store: agents, openSession: openSession))
+        case .webhooks:
+            WebhooksScreen(context: MessagingContext(client: client, profileScope: scope))
+        case .memoryGraph:
+            StarmapScreen(context: .init(client: client, profileScope: scope))
+        case .draft, .session:
+            // Chats show above; these never reach here.
+            nothingOpen
         }
     }
 
     /// The sidebar's profile, or `SidebarOptions.allProfiles`.
     private var scope: String { sidebar.options.profileScope }
+
+    /// The chat's folder on the host: its session row's, or the folder a new chat starts in.
+    private func folder(of chat: ChatModel) -> String? {
+        if let id = chat.storedID, let cwd = sidebar.row(id)?.cwd, !cwd.isEmpty { return cwd }
+        return chat.isNewChat ? chat.workingFolder : nil
+    }
 
     /// A session a screen links to opens in this column, as a tapped sidebar row would.
     private var openSession: (String, String?) -> Void {
