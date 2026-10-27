@@ -679,7 +679,7 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                 // The stopped turn still runs its post-turn hooks; a rewind must not land in it.
                 if busySince == nil {
                     busySince = Date()
-                    if let runtimeID { try? await connection.client.sessionInterrupt(.init(sessionId: runtimeID)) }
+                    if let runtimeID { _ = try? await connection.client.sessionInterrupt(.init(sessionId: runtimeID)) }
                 }
                 try? await Task.sleep(nanoseconds: 150_000_000)
             } catch {

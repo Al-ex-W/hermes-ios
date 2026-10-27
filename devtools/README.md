@@ -166,7 +166,8 @@ come from `hermes_cli/web_routers/{skills,tools,mcp,cron,ops,status,analytics,ac
   `POST /api/mcp/oauth/flows/{id}/debug {outcome: "approve" | "deny"}`.
 - **Plugins**: the gateway RPC `plugins.manage` with `list`, `toggle`, `install` (a `catalog_name` or a git
   repo), `update` (one update asks for consent first), `remove` and `settings`. An enabled plugin can add a
-  toolset or an MCP server (`source: "plugin"`, read-only).
+  toolset or an MCP server (`source: "plugin"`, read-only). `GET /api/dashboard/plugins/catalog` lists the
+  curated catalog with each entry's installed state, as the Plugins tab's "Available to install" reads it.
 - **Cron**: jobs CRUD, `runs`, `pause`, `resume`, `trigger`, `delivery-targets`, `blueprints` and
   `blueprints/instantiate`, with the schedule parser of `cron/jobs.py` (`30m`, `every 2h`, `in 45m`,
   `weekdays at 9am`, five-field cron, ISO time). A triggered agent job leaves a `source: cron` chat that the run

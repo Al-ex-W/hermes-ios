@@ -77,6 +77,9 @@ struct ToolsetDetailScreen: View {
         }
         .task { await setup.loadOnce() }
         .failureAlert($setup.failure)
+        // The store's failures (the switch) show here too: the Tools tab's alert doesn't show while this page
+        // covers it.
+        .failureAlert($store.failure)
         .capabilityNotice($setup.notice)
     }
 }

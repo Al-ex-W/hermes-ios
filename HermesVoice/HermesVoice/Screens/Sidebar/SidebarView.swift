@@ -24,6 +24,9 @@ struct SidebarView: View {
 
     private var searching: Bool { !sidebar.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
+    /// The Command Center shows beside the sidebar (iPad), so its button reads as on.
+    private var commandCenterOpen: Bool { sizeClass != .compact && sidebar.selection == .commandCenter }
+
     var body: some View {
         List(selection: $sidebar.selection) {
             navigation
@@ -49,9 +52,15 @@ struct SidebarView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarTitleMenu { profileSwitcher }
         .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
+            ToolbarItemGroup(placement: .topBarLeading) {
                 Button { showSettings = true } label: { Image(systemName: Theme.Icon.settings) }
                     .accessibilityLabel("Settings")
+                // The desktop's statusbar Command Center button: it opens in the detail column (pushed on iPhone),
+                // and on iPad pressing it again goes back to what was open.
+                Button { sidebar.toggleCommandCenter() } label: {
+                    Image(systemName: commandCenterOpen ? "command.square.fill" : Theme.Icon.commandCenter)
+                }
+                .accessibilityLabel(commandCenterOpen ? "Close Command Center" : "Open Command Center")
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 SidebarFilterMenu(sidebar: sidebar)

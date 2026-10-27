@@ -79,8 +79,12 @@ struct AppShell: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
     @State private var compactColumn = NavigationSplitViewColumn.sidebar
+    /// Whether the sidebar is on screen; nil until it first shows.
+    @State private var sidebarShown: Bool?
+    private let client: DashboardClient
 
     init(model: AppModel, client: DashboardClient, connection: GatewayConnection) {
+        self.client = client
         _sidebar = StateObject(wrappedValue: SidebarModel(app: model, client: client, connection: connection))
     }
 
@@ -88,8 +92,14 @@ struct AppShell: View {
         NavigationSplitView(preferredCompactColumn: $compactColumn) {
             SidebarView(sidebar: sidebar)
                 .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
+                .onAppear {
+                    let returning = sidebarShown == false
+                    sidebarShown = true
+                    if returning { backToList() }
+                }
+                .onDisappear { sidebarShown = false }
         } detail: {
-            DetailColumn(sidebar: sidebar)
+            DetailColumn(sidebar: sidebar, client: client)
         }
         .onChange(of: sidebar.selection) { _, selection in
             if selection != nil {
@@ -98,10 +108,7 @@ struct AppShell: View {
                 compactColumn = .sidebar
             }
         }
-        // Back to the list on iPhone: nothing is open, so the same row can open again.
-        .onChange(of: compactColumn) { _, column in
-            if column == .sidebar, sizeClass == .compact { sidebar.selection = nil }
-        }
+        .onChange(of: compactColumn) { _, _ in backToList() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await sidebar.refresh() } }
         }
@@ -111,11 +118,18 @@ struct AppShell: View {
             sidebar.open(sessionID: target.id, profile: target.profile)
         }
     }
+
+    /// Back to the list on iPhone: nothing is open, so the same row can open again. Only once the list shows again:
+    /// SwiftUI also reports the sidebar column when a page pushed inside a screen pops back to that screen.
+    private func backToList() {
+        if sizeClass == .compact, compactColumn == .sidebar, sidebarShown == true { sidebar.selection = nil }
+    }
 }
 
-/// What the sidebar opened: a chat, a screen still to come, or nothing yet.
+/// What the sidebar opened: a chat, one of the desktop's screens, or nothing yet.
 private struct DetailColumn: View {
     @ObservedObject var sidebar: SidebarModel
+    let client: DashboardClient
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
@@ -138,9 +152,42 @@ private struct DetailColumn: View {
             case .draft?, nil:
                 nothingOpen
             case let destination?:
-                NavigationStack { PlaceholderScreen(destination: destination) }
+                // Each screen starts on the sidebar's profile and is rebuilt when that changes.
+                NavigationStack { screen(destination) }
+                    .id("\(destination.title)|\(scope)")
             }
         }
+    }
+
+    @ViewBuilder private func screen(_ destination: SidebarDestination) -> some View {
+        switch destination {
+        case .capabilities:
+            CapabilitiesView(profile: scope == SidebarOptions.allProfiles ? nil : scope)
+        case .artifacts:
+            ArtifactsScreen(client: client, profile: scope, openSession: openSession)
+        case .scheduledJobs:
+            ScheduledJobsScreen(client: client, profileScope: scope, openSession: openSession)
+        case .commandCenter:
+            CommandCenterScreen(client: client, profileScope: scope, sessionActions: sessionActions,
+                                openSession: openSession)
+        case .messaging, .draft, .session:
+            PlaceholderScreen(destination: destination)
+        }
+    }
+
+    /// The sidebar's profile, or `SidebarOptions.allProfiles`.
+    private var scope: String { sidebar.options.profileScope }
+
+    /// A session a screen links to opens in this column, as a tapped sidebar row would.
+    private var openSession: (String, String?) -> Void {
+        { [sidebar] id, profile in sidebar.open(sessionID: id, profile: profile) }
+    }
+
+    /// The Command Center's session rows act through the sidebar, so its lists stay in step.
+    private var sessionActions: CommandCenterSessionActions {
+        CommandCenterSessionActions(setPinned: { [sidebar] in try await sidebar.trySetPinned($0, $1) },
+                                    export: { [sidebar] in try await sidebar.tryExport($0) },
+                                    delete: { [sidebar] in try await sidebar.tryDelete($0) })
     }
 
     private var openChat: ChatModel? {

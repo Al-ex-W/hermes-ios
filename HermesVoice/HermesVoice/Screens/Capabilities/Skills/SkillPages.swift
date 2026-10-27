@@ -85,7 +85,8 @@ struct SkillDetailScreen: View {
                 }
             }
         }
-        // Failures of the store's writes show in the Skills tab's alert, below this page.
+        // The store's failures show here too: the Skills tab's alert doesn't show while this page covers it.
+        .failureAlert($store.failure)
         .capabilityConfirmation($confirmation)
     }
 

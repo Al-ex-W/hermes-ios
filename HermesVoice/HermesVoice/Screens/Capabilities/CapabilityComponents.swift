@@ -41,6 +41,10 @@ struct CapabilityFlow: Layout {
     var spacing: CGFloat
     var lineSpacing: CGFloat?
 
+    /// The bounds a row is placed in can come back rounded to the pixel grid, a hair narrower than the width it
+    /// measured: without some slack the last pill would wrap onto a line the measured height has no room for.
+    private static let slack: CGFloat = 0.5
+
     private func sizes(_ subviews: Subviews, width: CGFloat?) -> [CGSize] {
         subviews.map { subview in
             let ideal = subview.sizeThatFits(.unspecified)
@@ -53,7 +57,7 @@ struct CapabilityFlow: Layout {
         let limit = proposal.width.flatMap { $0.isFinite ? $0 : nil }
         var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, widest: CGFloat = 0
         for size in sizes(subviews, width: limit) {
-            if x > 0, let limit, x + size.width > limit {
+            if x > 0, let limit, x + size.width > limit + Self.slack {
                 y += rowHeight + (lineSpacing ?? spacing)
                 x = 0
                 rowHeight = 0
@@ -68,7 +72,7 @@ struct CapabilityFlow: Layout {
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
         for (subview, size) in zip(subviews, sizes(subviews, width: bounds.width)) {
-            if x > bounds.minX, x + size.width > bounds.maxX {
+            if x > bounds.minX, x + size.width > bounds.maxX + Self.slack {
                 y += rowHeight + (lineSpacing ?? spacing)
                 x = bounds.minX
                 rowHeight = 0

@@ -74,13 +74,14 @@ status,analytics,actions,files}.py and tui_gateway/methods_tools.py (plugins.man
 ``?profile=`` with per-profile state (the section comment above ``class CapabilityFeatures`` has the details):
   /api/skills (+ toggle, content, hub/official|preview|install|uninstall|update), /api/tools/toolsets (+ /{name},
   config, models, model, provider, env, post-setup), /api/tools/terminal/backend(s), /api/mcp/servers (+ /{name},
-  enabled, test, auth), /api/mcp/oauth/flows/{id} (+ /debug), /api/mcp/oauth/callback/{server}, /api/mcp/catalog
-  (+ install), /api/cron/jobs (+ /{id}, runs, pause, resume, trigger), /api/cron/{delivery-targets,blueprints,
-  blueprints/instantiate,fire}, /api/health, /api/system/stats, /api/logs, /api/analytics/{usage,models},
-  /api/curator (+ paused, run), /api/ops/{doctor,security-audit,backup,backup/download,debug-share,checkpoints,
-  checkpoints/prune}, /api/gateway/restart, /api/hermes/update (+ check), /api/actions/{name}/status (a
-  background action shows more log per poll and ends on the ``--action-polls``-th), /api/fs/read-data-url,
-  /api/fs/download, /api/media/proxy, and the RPC plugins.manage. /api/audio/* is never served.
+  enabled, test, auth), /api/mcp/oauth/flows/{id} (+ /debug), /api/mcp/oauth/callback/{server}, /api/mcp/catalog (+
+  install), /api/dashboard/plugins/catalog, /api/cron/jobs (+ /{id}, runs, pause, resume, trigger),
+  /api/cron/{delivery-targets,blueprints,blueprints/instantiate,fire}, /api/health, /api/system/stats, /api/logs,
+  /api/analytics/{usage,models}, /api/curator (+ paused, run),
+  /api/ops/{doctor,security-audit,backup,backup/download,debug-share,checkpoints,checkpoints/prune},
+  /api/gateway/restart, /api/hermes/update (+ check), /api/actions/{name}/status (a background action shows more log
+  per poll and ends on the ``--action-polls``-th), /api/fs/read-data-url, /api/fs/download, /api/media/proxy, and the
+  RPC plugins.manage. /api/audio/* is never served.
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
 the plugin would send ({aps, hermes}: approval or clarify waiting, turn done) and the alert tokens they go to.
@@ -3895,7 +3896,7 @@ def skill_document(name: str, description: str, body: str) -> str:
 SKILL_SEEDS: dict[str, tuple[tuple[str, str, str, int, str, str], ...]] = {
     "default": (
         ("google-workspace", "productivity", "bundled", 14,
-         "Gmail, Calendar and Drive through the Google Workspace APIs: daily briefs, inbox triage, meeting prep.",
+         "Mail, Calendar and Drive through the Google Workspace APIs: daily briefs, inbox triage, meeting prep.",
          "# Google Workspace\n\n1. Read today's calendar window.\n2. Flag conflicts and prep notes.\n"
          "3. Summarize mail that needs a reply today."),
         ("github-pr-review", "software-development", "bundled", 9,
@@ -4837,6 +4838,8 @@ class CapabilityFeatures:
             Route("/fake-oauth/authorize", self.fake_oauth_page, methods=["GET"]),
             Route("/api/mcp/catalog", r(self.mcp_catalog), methods=["GET"]),
             Route("/api/mcp/catalog/install", r(self.install_mcp_catalog_entry), methods=["POST"]),
+            # dashboard_ui.py
+            Route("/api/dashboard/plugins/catalog", r(self.dashboard_plugin_catalog), methods=["GET"]),
             # cron.py
             Route("/api/cron/jobs", r(self.list_cron_jobs), methods=["GET"]),
             Route("/api/cron/jobs", r(self.create_cron_job), methods=["POST"]),
@@ -5811,6 +5814,30 @@ class CapabilityFeatures:
             entries.append({**{k: v for k, v in entry.items() if not k.startswith("_")},
                             "installed": cfg is not None, "enabled": isinstance(cfg, dict) and mcp_enabled(cfg)})
         return {"entries": entries, "diagnostics": []}
+
+    def dashboard_plugin_catalog(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """dashboard_ui.py GET /api/dashboard/plugins/catalog (plugins_cmd_catalog.installed_catalog_state): the
+        curated entries with the dashboard profile's installed state, matched by the install's catalog name."""
+        caps = self.caps(self.profiles["default"])
+        by_catalog = {record["catalog"]["name"]: record for record in caps.plugins.values() if record["catalog"]}
+        entries = []
+        for name, entry in PLUGIN_CATALOG.items():
+            local = by_catalog.get(name) or self.plugin_record_named(caps, name)
+            installed_sha = (local["catalog"] or {}).get("sha") if local else None
+            entries.append({
+                "name": name, "repo": entry["repo"], "sha": entry["sha"], "description": entry["description"],
+                "maintainer": "example", "tier": entry["tier"], "category": "agent", "requires_hermes": "",
+                "subdir": "", "docs_url": "", "version": entry["version"], "image": "", "screenshots": [],
+                "readme": False, "platforms": [], "title": "", "onboarding": False,
+                "capabilities": {"provides_tools": [], "provides_hooks": [], "provides_middleware": [],
+                                 "requires_env": []},
+                "known_issues": [], "sha_short": entry["sha"][:7],
+                "capability_summary": "Runs Python code in the agent process with your user's permissions.",
+                "installed": local is not None, "installed_sha": installed_sha,
+                "update_available": bool(installed_sha) and installed_sha != entry["sha"],
+                "runtime_status": local["status"] if local else None,
+            })
+        return {"entries": entries, "removed": [], "generated_at": iso_at(time.time())}
 
     def install_mcp_catalog_entry(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """mcp.py POST /api/mcp/catalog/install {name, env, enable, profile?}: declared env only; secrets go to .env,

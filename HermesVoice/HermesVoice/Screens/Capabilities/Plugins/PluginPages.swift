@@ -124,6 +124,8 @@ struct PluginDetailScreen: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(Theme.sidebar, for: .navigationBar)
         .refreshable { await store.reloadPlugins() }
+        // The store's failures show here too: the Plugins tab's alert doesn't show while this page covers it.
+        .failureAlert($store.failure)
         .capabilityConfirmation($confirmation)
     }
 

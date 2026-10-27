@@ -65,19 +65,17 @@ struct ScheduledJobsScreen: View {
             }
             .navigationDestination(item: $opened) { id in
                 CronJobDetailView(store: store, jobID: id, openSession: openSession,
-                                  edit: { editor = .edit($0) }, delete: { pendingDelete = $0 })
+                                  edit: { editor = .edit($0) }, delete: deleteNow)
             }
             .sheet(item: $editor) { mode in
                 CronEditorSheet(store: store, mode: mode)
             }
-            // An alert, not a dialog: the job's page asks too, and a dialog would anchor to the list behind it.
+            // The list's swipe and context menu ask here; the job's page asks on its own (an alert of this
+            // list doesn't show while that page covers it).
             .alert("Delete cron job?", isPresented: Binding(get: { pendingDelete != nil },
                                                             set: { if !$0 { pendingDelete = nil } }),
                    presenting: pendingDelete) { job in
-                Button("Delete", role: .destructive) {
-                    if opened == job.id { opened = nil }
-                    Task { await store.delete(job) }
-                }
+                Button("Delete", role: .destructive) { deleteNow(job) }
                 Button("Cancel", role: .cancel) {}
             } message: { job in
                 Text("This will remove \(CronText.truncate(job.title, 60)) permanently. It will stop firing immediately.")
@@ -172,6 +170,12 @@ struct ScheduledJobsScreen: View {
             .disabled(store.triggering.contains(job.id) || store.pendingRuns[job.id] != nil)
         Divider()
         Button(role: .destructive) { pendingDelete = job } label: { Label("Delete", systemImage: Theme.Icon.delete) }
+    }
+
+    /// Deletes a job the user confirmed, leaving its page if that's open.
+    private func deleteNow(_ job: CronJob) {
+        if opened == job.id { opened = nil }
+        Task { await store.delete(job) }
     }
 
     /// A job opened from elsewhere (its id or name) shows once the list holds it.

@@ -120,7 +120,12 @@ final class FakeVoicePluginTests: XCTestCase {
         push.setAlerts(.defaults)
         // A change while the first registration is on its way goes out after it, so the last state wins.
         let first = Task { await push.send(to: client) }
-        await waitUntil(timeout: 5) { push.upload == .sending }
+        // Against a fake on the loopback the first upload can finish between two polls: then the change goes out
+        // after it all the same.
+        await waitUntil(timeout: 5) {
+            if case .sent = push.upload { return true }
+            return push.upload == .sending
+        }
         push.setAlerts(NotificationPreferences(approval: false, clarify: true, turnDone: false))
         await push.send(to: client)
         await first.value

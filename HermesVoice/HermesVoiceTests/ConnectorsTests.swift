@@ -205,7 +205,7 @@ final class ConnectorsTests: XCTestCase {
 
     func testEntryOverStoredKeepsWhatTheFormDoesntOwn() throws {
         let stored = try object("""
-        {"command": "uvx", "args": ["old"], "env": {"API_KEY": "sk-live-abcdefghijklmnop", "OLD": "1"},
+        {"command": "uvx", "args": ["old"], "env": {"API_KEY": "fake-stored-abcdefghijklmnop", "OLD": "1"},
          "enabled": false, "tools": {"exclude": ["drop"]}, "timeout": 30}
         """)
         var draft = MCPServerDraft(editing: "srv", entry: stored)
@@ -215,7 +215,7 @@ final class ConnectorsTests: XCTestCase {
         draft.env.append(.init("NEW", "typed"))
         draft.args = [.init("new")]
         let entry = draft.entry(over: stored)
-        XCTAssertEqual(entry["env"], ["API_KEY": "sk-live-abcdefghijklmnop", "NEW": "typed"], "kept value from the host, typed one as typed")
+        XCTAssertEqual(entry["env"], ["API_KEY": "fake-stored-abcdefghijklmnop", "NEW": "typed"], "kept value from the host, typed one as typed")
         XCTAssertEqual(entry["args"], ["new"])
         XCTAssertEqual(entry["enabled"], false)
         XCTAssertEqual(entry["tools"], ["exclude": ["drop"]])
@@ -223,7 +223,7 @@ final class ConnectorsTests: XCTestCase {
 
         // A kept row renamed keeps its stored value under the new key; a replaced value wins.
         draft.env[0].key = "API_TOKEN"
-        XCTAssertEqual(draft.entry(over: stored)["env"]?["API_TOKEN"], "sk-live-abcdefghijklmnop")
+        XCTAssertEqual(draft.entry(over: stored)["env"]?["API_TOKEN"], "fake-stored-abcdefghijklmnop")
         draft.env[0].value = "rotated"
         draft.env[0].kept = nil
         XCTAssertEqual(draft.entry(over: stored)["env"]?["API_TOKEN"], "rotated")
@@ -240,11 +240,11 @@ final class ConnectorsTests: XCTestCase {
 
     func testEditDraftMasksValuesAndReadsPassthroughsAndBearer() throws {
         let stdio = MCPServerDraft(editing: "fs", entry: try object("""
-        {"command": "npx", "args": ["-y", "fs"], "cwd": "/srv", "env": {"HOME": "${HOME}", "TOKEN": "sk-proj-1234567890abcd", "PIN": "42"}}
+        {"command": "npx", "args": ["-y", "fs"], "cwd": "/srv", "env": {"HOME": "${HOME}", "TOKEN": "fake-proj-1234567890abcd", "PIN": "42"}}
         """))
         XCTAssertEqual(stdio.transport, .stdio)
         XCTAssertEqual(stdio.passthrough.map(\.value), ["HOME"])
-        XCTAssertEqual(stdio.env.first { $0.key == "TOKEN" }?.kept, "sk-p...abcd", "mask_secret: first and last four")
+        XCTAssertEqual(stdio.env.first { $0.key == "TOKEN" }?.kept, "fake...abcd", "mask_secret: first and last four")
         XCTAssertEqual(stdio.env.first { $0.key == "PIN" }?.kept, CredentialMask.placeholder, "short values are fully masked")
         XCTAssertEqual(stdio.cwd, "/srv")
 
@@ -280,7 +280,7 @@ final class ConnectorsTests: XCTestCase {
     }
 
     func testMasking() {
-        XCTAssertEqual(MCPServerDraft.mask(.string("sk-live-0123456789")), "sk-l...6789")
+        XCTAssertEqual(MCPServerDraft.mask(.string("fake-value-0123456789")), "fake...6789")
         XCTAssertEqual(MCPServerDraft.mask(.string("short")), CredentialMask.placeholder)
         XCTAssertEqual(MCPServerDraft.mask(.string("")), "")
         XCTAssertEqual(MCPServerDraft.mask(.int(12345)), CredentialMask.placeholder)

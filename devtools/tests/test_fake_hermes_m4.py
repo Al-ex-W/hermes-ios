@@ -425,6 +425,7 @@ def test_plugins_manage_lists_toggles_installs_updates_and_removes():
                 listed = await gateway.call("plugins.manage", {"action": "list"})
                 research = await gateway.call("plugins.manage", {"action": "list", "profile": "research"})
                 legacy = await gateway.call("plugins.list", {})
+                catalog = (await http.get("/api/dashboard/plugins/catalog")).json()
                 enabled = await gateway.call("plugins.manage", {"action": "toggle", "key": "weather-briefing",
                                                                 "enable": True})
                 servers = [s["name"] for s in (await http.get("/api/mcp/servers")).json()["servers"]]
@@ -458,12 +459,13 @@ def test_plugins_manage_lists_toggles_installs_updates_and_removes():
                                                                    "values": {"api_key": "x"}})
                 removed = await gateway.call("plugins.manage", {"action": "remove", "name": "todo"})
                 after = await gateway.call("plugins.manage", {"action": "list"})
+                catalog_after = (await http.get("/api/dashboard/plugins/catalog")).json()
                 await gateway.close()
-        return (listed, research, legacy, enabled, servers, plugin_server, locked, same, errors, installed, git,
-                consent, updated, unchanged, settings, secret, removed, after, gateway)
+        return (listed, research, legacy, catalog, enabled, servers, plugin_server, locked, same, errors, installed,
+                git, consent, updated, unchanged, settings, secret, removed, after, catalog_after, gateway)
 
-    (listed, research, legacy, enabled, servers, plugin_server, locked, same, errors, installed, git, consent,
-     updated, unchanged, settings, secret, removed, after, gateway) = asyncio.run(scenario())
+    (listed, research, legacy, catalog, enabled, servers, plugin_server, locked, same, errors, installed, git, consent,
+     updated, unchanged, settings, secret, removed, after, catalog_after, gateway) = asyncio.run(scenario())
     rows = {p["key"]: p for p in listed["plugins"]}
     assert listed["user_count"] == 3 and listed["bundled_count"] == 4
     assert rows["hermes_voice"]["status"] == "enabled" and rows["hermes_voice"]["source"] == "user"
@@ -500,6 +502,14 @@ def test_plugins_manage_lists_toggles_installs_updates_and_removes():
     keys = {p["key"] for p in after["plugins"]}
     assert "todo" not in keys and "notion-digest" in keys
     assert {p["key"]: p for p in after["plugins"]}["linear-sync"]["version"] == "1.3.0"
+    # The dashboard's curated catalog (installed_catalog_state): installs matched by catalog name.
+    entries = {e["name"]: e for e in catalog["entries"]}
+    assert set(entries) == {"linear-sync", "weather-briefing", "notion-digest"}
+    assert entries["linear-sync"]["installed"] and entries["linear-sync"]["update_available"]
+    assert not entries["notion-digest"]["installed"] and entries["notion-digest"]["runtime_status"] is None
+    assert entries["notion-digest"]["capabilities"]["requires_env"] == [] and entries["notion-digest"]["sha_short"]
+    after_entries = {e["name"]: e for e in catalog_after["entries"]}
+    assert after_entries["notion-digest"]["installed"] and not after_entries["linear-sync"]["update_available"]
     assert contract_problems(gateway) == []
 
 

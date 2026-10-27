@@ -529,15 +529,29 @@ final class SidebarModel: ObservableObject {
         watch()
     }
 
-    /// Opens a stored session by id (a tapped notification), even one the lists don't hold: a listed row whose
-    /// compression chain holds the id opens as that row.
+    /// Opens a stored session by id (a tapped notification, a cron run, an artifact's chat), even one the lists
+    /// don't hold: a listed row whose compression chain holds the id opens as that row.
     func open(sessionID id: String, profile: String?) {
         let listed = (recents + messaging + archived).first { $0.allIDs.contains(id) }
         let target = listed?.id ?? id
-        if row(target) == nil { opened[target] = SessionInfo(id: target, profile: profile) }
+        if row(target) == nil {
+            opened[target] = SessionInfo(id: target, profile: profile)
+            nameUnlisted(target, profile: profile)
+        }
         selection = .session(target)
         externalOpens += 1
         watch()
+    }
+
+    /// A session opened from outside the lists has no title yet: its stored row (`GET /api/sessions/:id`) gives it.
+    private func nameUnlisted(_ id: String, profile: String?) {
+        let client = client
+        Task { [weak self] in
+            guard let stored = try? await client.storedSession(id, profile: profile),
+                  let title = stored.title, !title.isEmpty, let self, self.opened[id] != nil else { return }
+            self.opened[id]?.title = title
+            self.app?.existingChat(id)?.renamed(title)
+        }
     }
 
     /// Opens the Command Center over what the detail column shows; again, it goes back there (the desktop's

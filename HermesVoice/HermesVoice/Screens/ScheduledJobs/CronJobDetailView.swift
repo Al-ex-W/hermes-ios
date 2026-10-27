@@ -7,12 +7,14 @@ struct CronJobDetailView: View {
     let jobID: String
     let openSession: (_ sessionID: String, _ profile: String?) -> Void
     let edit: (CronJob) -> Void
+    /// Deletes the job (asked here first) and leaves the page.
     let delete: (CronJob) -> Void
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var runs: [CronRun]?
     @State private var showsFullError = false
     @State private var viewOnlyRun: CronRun?
+    @State private var confirmingDelete: CronJob?
 
     /// Runs come from the scheduler's tick; while a trigger waits, poll every second (`RUNS_POLL_INTERVAL_MS`,
     /// `PENDING_RUNS_POLL_INTERVAL_MS`).
@@ -42,7 +44,9 @@ struct CronJobDetailView: View {
                     Menu {
                         Button { edit(job) } label: { Label("Edit cron", systemImage: Theme.Icon.rename) }
                         Divider()
-                        Button(role: .destructive) { delete(job) } label: { Label("Delete", systemImage: Theme.Icon.delete) }
+                        Button(role: .destructive) { confirmingDelete = job } label: {
+                            Label("Delete", systemImage: Theme.Icon.delete)
+                        }
                     } label: {
                         Image(systemName: Theme.Icon.more)
                     }
@@ -63,6 +67,15 @@ struct CronJobDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: { _ in
             Text("The scheduler never closed this run and no longer owns it. Read it, but don't write into it.")
+        }
+        // Asked on this page: an alert of the list underneath doesn't show while this page covers it.
+        .alert("Delete cron job?", isPresented: Binding(get: { confirmingDelete != nil },
+                                                        set: { if !$0 { confirmingDelete = nil } }),
+               presenting: confirmingDelete) { job in
+            Button("Delete", role: .destructive) { delete(job) }
+            Button("Cancel", role: .cancel) {}
+        } message: { job in
+            Text("This will remove \(CronText.truncate(job.title, 60)) permanently. It will stop firing immediately.")
         }
     }
 
