@@ -44,7 +44,7 @@ Chat screens (M2). More trigger words, combinable in one prompt, each turn endin
 RPCs: commands.catalog, complete.slash/path, slash.exec, command.dispatch, model.options, config.set,
 image.attach_bytes, file.attach, process.list/kill/stop, subagent.list, session.usage, session.context_breakdown,
 session.workspace.move, session.branch, projects.list. REST: GET /api/profiles, /api/profiles/sessions/sidebar,
-/api/sessions/search, /api/media; PATCH and DELETE /api/sessions/{id}. ``--seed demo`` adds chats across two
+/api/sessions/search, /api/media; GET, PATCH and DELETE /api/sessions/{id}. ``--seed demo`` adds chats across two
 projects, two profiles and several days (one pinned, one archived, one unread, a cron and a Telegram one);
 ``--seed minimal`` keeps only the welcome chat; ``--seed full`` (the default) is demo plus the M4 chats below.
 
@@ -72,16 +72,18 @@ passwords, vault secrets) are never logged.
 Capabilities, cron, command center and artifacts (M4), from hermes_cli/web_routers/{skills,tools,mcp,cron,ops,
 status,analytics,actions,files}.py and tui_gateway/methods_tools.py (plugins.manage); every route honours
 ``?profile=`` with per-profile state (the section comment above ``class CapabilityFeatures`` has the details):
-  /api/skills (+ toggle, content, hub/official|preview|install|uninstall|update), /api/tools/toolsets (+ /{name},
-  config, models, model, provider, env, post-setup), /api/tools/terminal/backend(s), /api/mcp/servers (+ /{name},
+  /api/skills (+ toggle, content, hub/official|search|preview|scan|install|uninstall|update), DELETE
+  /api/learning/node (archives a learned skill), /api/tools/toolsets (+ /{name}, config, models, model, provider, env,
+  post-setup), /api/tools/terminal/backend(s), /api/tools/computer-use/status, /api/mcp/servers (+ /{name},
   enabled, test, auth), /api/mcp/oauth/flows/{id} (+ /debug), /api/mcp/oauth/callback/{server}, /api/mcp/catalog (+
   install), /api/dashboard/plugins/catalog, /api/cron/jobs (+ /{id}, runs, pause, resume, trigger),
   /api/cron/{delivery-targets,blueprints,blueprints/instantiate,fire}, /api/health, /api/system/stats, /api/logs,
   /api/analytics/{usage,models}, /api/curator (+ paused, run),
   /api/ops/{doctor,security-audit,backup,backup/download,debug-share,checkpoints,checkpoints/prune},
-  /api/gateway/restart, /api/hermes/update (+ check), /api/actions/{name}/status (a background action shows more log
-  per poll and ends on the ``--action-polls``-th), /api/fs/read-data-url, /api/fs/download, /api/media/proxy, and the
-  RPC plugins.manage. /api/audio/* is never served.
+  /api/memory/reset, /api/gateway/restart, /api/hermes/update (+ check), /api/actions/{name}/status (a background
+  action shows more log per poll and ends on the ``--action-polls``-th), /api/fs/read-data-url, /api/fs/read-text,
+  /api/fs/download, /api/media/proxy, and the RPCs plugins.manage and session.active_list (the live sessions).
+  /api/audio/* is never served.
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
 the plugin would send ({aps, hermes}: approval or clarify waiting, turn done) and the alert tokens they go to.
@@ -104,6 +106,7 @@ import inspect
 import io
 import json
 import math
+import mimetypes
 import os
 import posixpath
 import random
@@ -3008,7 +3011,9 @@ class SettingsFeatures:
                               "setup": {"pip_dependencies": [], "python_dependencies_declared": True,
                                         "external_dependencies": [], "required_env": ["FAKE_RECALL_API_KEY"],
                                         "dependencies_installed": True}})
-        return {"active": active, "providers": providers, "builtin_files": {"memory": 812, "user": 245}}
+        files = self.caps(profile).builtin_memory
+        return {"active": active, "providers": providers,
+                "builtin_files": {"memory": files.get("memory", 0), "user": files.get("user", 0)}}
 
     def memory_provider_config(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """memory_providers.py GET .../config?surface=declared: the declared fields with their values (secrets
@@ -3936,6 +3941,24 @@ OFFICIAL_SKILLS = (
     ("blender", "creative", "Build and render 3D scenes with Blender's Python API.", ("3d", "rendering")),
     ("invoice-extractor", "finance", "Pull totals, dates and line items out of PDF invoices.", ("pdf", "finance")),
 )
+# tools/skills_hub_search.py: what the hub's other sources (GitHub taps, skills.sh) answer for a search (the fake never
+# goes online), with what the install-time scan (skills_guard.py scan_skill) finds in each bundle.
+HUB_COMMUNITY_SKILLS: tuple[dict[str, Any], ...] = (
+    {"name": "git-changelog", "source": "github", "identifier": "github/acme-labs/skills/git-changelog",
+     "trust_level": "community", "repo": "acme-labs/skills",
+     "description": "Write a changelog from git history, grouped by conventional-commit type.",
+     "tags": ["git", "writing"], "findings": []},
+    {"name": "shell-helpers", "source": "skills.sh", "identifier": "skills-sh/shell-helpers",
+     "trust_level": "community", "repo": None,
+     "description": "Shell one-liners for git and log triage, with a setup script that fetches a helper binary.",
+     "tags": ["shell", "git", "ops"],
+     "findings": [{"severity": "medium", "category": "network", "file": "scripts/setup.sh", "line": 4,
+                   "description": "Downloads a remote script and pipes it to sh"}]},
+)
+# skills_guard.py INSTALL_POLICY (safe, caution, dangerous) and VERDICT_INDEX.
+SCAN_INSTALL_POLICY = {"builtin": ("allow", "allow", "allow"), "trusted": ("allow", "allow", "block"),
+                       "community": ("allow", "block", "block"), "agent-created": ("allow", "allow", "ask")}
+SCAN_VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
 
 def skill_problem(content: str) -> str | None:
@@ -4683,6 +4706,24 @@ ARTIFACT_CSV = f"{ARTIFACT_DIR}/q3-latency.csv"
 ARTIFACT_RESEARCH_IMAGE = f"{DEMO_HERMES_HOME}/profiles/research/images/attention-heads.png"
 ARTIFACT_LINK_HOST = "images.example.com"  # the one host /api/media/proxy fetches (from memory)
 FS_DATA_URL_MAX = 25 * 1024 * 1024  # web_server.py _FS_DATA_URL_MAX_BYTES
+# files.py _FS_TEXT_SOURCE_MAX_BYTES, _FS_TEXT_PREVIEW_MAX_BYTES, _FS_PREVIEW_LANGUAGE_BY_EXT and _FS_MIME_TYPES.
+FS_TEXT_SOURCE_MAX = 64 * 1024 * 1024
+FS_TEXT_PREVIEW_MAX = 512 * 1024
+FS_PREVIEW_LANGUAGES = {
+    ".c": "c", ".conf": "ini", ".cpp": "cpp", ".css": "css", ".csv": "csv", ".go": "go",
+    ".graphql": "graphql", ".h": "c", ".hpp": "cpp", ".html": "html", ".java": "java",
+    ".js": "javascript", ".json": "json", ".jsx": "jsx", ".kt": "kotlin", ".lua": "lua",
+    ".md": "markdown", ".mjs": "javascript", ".py": "python", ".rb": "ruby", ".rs": "rust",
+    ".sh": "shell", ".sql": "sql", ".svg": "xml", ".toml": "toml", ".ts": "typescript",
+    ".tsx": "tsx", ".txt": "text", ".xml": "xml", ".yaml": "yaml", ".yml": "yaml", ".zsh": "shell",
+}
+FS_PREVIEW_MIME_TYPES = {
+    ".avi": "video/x-msvideo", ".bmp": "image/bmp", ".flac": "audio/flac", ".gif": "image/gif",
+    ".jpeg": "image/jpeg", ".jpg": "image/jpeg", ".m4a": "audio/mp4", ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime", ".mp3": "audio/mpeg", ".mp4": "video/mp4", ".ogg": "audio/ogg",
+    ".opus": "audio/ogg; codecs=opus", ".png": "image/png", ".svg": "image/svg+xml",
+    ".wav": "audio/wav", ".webm": "video/webm", ".webp": "image/webp",
+}
 FS_MEDIA_TYPES = {".pdf": "application/pdf", ".csv": "text/csv", ".md": "text/markdown", ".txt": "text/plain",
                   ".json": "application/json", ".py": "text/x-python", ".zip": "application/zip", **MEDIA_TYPES}
 
@@ -4730,6 +4771,10 @@ class Caps:
                                                              "last_run_at": None, "min_idle_hours": 2,
                                                              "stale_after_days": 30, "archive_after_days": 90})
     usage: list[dict[str, Any]] = field(default_factory=list)
+    # skill_usage.py archive_skill: learned skills moved to skills/.archive (``hermes curator restore`` brings them
+    # back), and the built-in memory files (memories/MEMORY.md, USER.md) by key with their sizes.
+    archived_skills: dict[str, dict[str, Any]] = field(default_factory=dict)
+    builtin_memory: dict[str, int] = field(default_factory=lambda: {"memory": 812, "user": 245})
 
 
 @dataclass
@@ -4808,10 +4853,14 @@ class CapabilityFeatures:
             Route("/api/skills/content", r(self.skill_content), methods=["GET"]),
             Route("/api/skills/content", r(self.update_skill_content), methods=["PUT"]),
             Route("/api/skills/hub/official", r(self.official_skills), methods=["GET"]),
+            Route("/api/skills/hub/search", r(self.search_hub_skills), methods=["GET"]),
             Route("/api/skills/hub/preview", r(self.preview_hub_skill), methods=["GET"]),
+            Route("/api/skills/hub/scan", r(self.scan_hub_skill), methods=["GET"]),
             Route("/api/skills/hub/install", r(self.install_hub_skill), methods=["POST"]),
             Route("/api/skills/hub/uninstall", r(self.uninstall_hub_skill), methods=["POST"]),
             Route("/api/skills/hub/update", r(self.update_hub_skills), methods=["POST"]),
+            # status.py (the learning graph's delete: a skill is archived)
+            Route("/api/learning/node", r(self.delete_learning_node), methods=["DELETE"]),
             # tools.py
             Route("/api/tools/toolsets", r(self.list_toolsets), methods=["GET"]),
             Route("/api/tools/toolsets/{name}", r(self.toggle_toolset), methods=["PUT"]),
@@ -4823,6 +4872,7 @@ class CapabilityFeatures:
             Route("/api/tools/toolsets/{name}/post-setup", r(self.toolset_post_setup), methods=["POST"]),
             Route("/api/tools/terminal/backends", r(self.terminal_backends), methods=["GET"]),
             Route("/api/tools/terminal/backend", r(self.select_terminal_backend), methods=["PUT"]),
+            Route("/api/tools/computer-use/status", r(self.computer_use_status), methods=["GET"]),
             # mcp.py
             Route("/api/mcp/servers", r(self.list_mcp_servers), methods=["GET"]),
             Route("/api/mcp/servers", r(self.add_mcp_server), methods=["POST"]),
@@ -4871,6 +4921,7 @@ class CapabilityFeatures:
             Route("/api/ops/backup/download", r(self.download_backup), methods=["GET"]),
             Route("/api/ops/checkpoints", r(self.list_checkpoints), methods=["GET"]),
             Route("/api/ops/checkpoints/prune", r(self.prune_checkpoints), methods=["POST"]),
+            Route("/api/memory/reset", r(self.reset_memory), methods=["POST"]),
             # actions.py
             Route("/api/gateway/restart", r(self.restart_gateway), methods=["POST"]),
             Route("/api/hermes/update", r(self.update_hermes), methods=["POST"]),
@@ -4878,13 +4929,15 @@ class CapabilityFeatures:
             Route("/api/actions/{name}/status", r(self.action_status), methods=["GET"]),
             # files.py (what the Artifacts screen opens)
             Route("/api/fs/read-data-url", r(self.fs_read_data_url), methods=["GET"]),
+            Route("/api/fs/read-text", r(self.fs_read_text), methods=["GET"]),
             Route("/api/fs/download", r(self.fs_download), methods=["GET"]),
             Route("/api/media/proxy", r(self.media_proxy), methods=["GET"]),
         ]
 
     def capability_methods(self, conn: "Conn", params: dict[str, Any]) -> dict[str, Callable[[], Any]]:
         return {"plugins.manage": lambda: self.plugins_manage(params),
-                "plugins.list": lambda: self.plugins_list_legacy(params)}
+                "plugins.list": lambda: self.plugins_list_legacy(params),
+                "session.active_list": lambda: self.session_active_list(params)}
 
     def caps(self, profile: FakeProfile) -> Caps:
         """The profile's M4 state, created on first use (a new profile starts with only the bundled plugins)."""
@@ -5190,20 +5243,118 @@ class CapabilityFeatures:
     def official_skill(self, identifier: str) -> tuple[str, str, str, tuple[str, ...]] | None:
         return next((row for row in OFFICIAL_SKILLS if f"official/{row[1]}/{row[0]}" == identifier), None)
 
+    @staticmethod
+    def hub_skills() -> list[dict[str, Any]]:
+        """Every skill the hub's sources know: the official catalog, then the community taps."""
+        official = [{"name": name, "description": description, "source": "official",
+                     "identifier": f"official/{category}/{name}", "trust_level": "builtin", "repo": None,
+                     "tags": list(tags), "findings": []} for name, category, description, tags in OFFICIAL_SKILLS]
+        return official + [dict(row) for row in HUB_COMMUNITY_SKILLS]
+
+    def hub_skill(self, identifier: str) -> dict[str, Any] | None:
+        """skills.py _resolve_hub_skill: the hub's metadata for ``identifier``, or None."""
+        return next((row for row in self.hub_skills() if row["identifier"] == identifier), None)
+
+    @staticmethod
+    def hub_payload(row: dict[str, Any]) -> dict[str, Any]:
+        """skills.py _skill_meta_to_payload."""
+        return {key: row[key] for key in ("name", "description", "source", "identifier", "trust_level", "repo",
+                                          "tags")}
+
+    def search_hub_skills(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py GET /api/skills/hub/search?q=&source=all&limit=20: every source searched in parallel (30 s
+        budget), deduped by identifier, capped at 1..50; an empty query answers empty without a search."""
+        query = (request.query_params.get("q") or "").strip()
+        if not query:
+            return {"results": [], "source_counts": {}, "timed_out": [], "installed": {}}
+        profile = self.scoped(request)
+        source = (request.query_params.get("source") or "all").strip() or "all"
+        try:
+            limit = int(request.query_params.get("limit") or 20)
+        except ValueError:
+            raise HttpError(422, [{"type": "int_parsing", "loc": ["query", "limit"],
+                                   "msg": "Input should be a valid integer, unable to parse string as an integer"}])
+        needle = query.lower()
+        matches = [row for row in self.hub_skills()
+                   if (source == "all" or row["source"] == source)
+                   and any(needle in text.lower() for text in (row["name"], row["description"], *row["tags"]))]
+        counts: dict[str, int] = {}
+        for row in matches:
+            counts[row["source"]] = counts.get(row["source"], 0) + 1
+        return {"results": [self.hub_payload(row) for row in matches[:min(max(limit, 1), 50)]],
+                "source_counts": counts, "timed_out": [], "installed": self.hub_installed(self.caps(profile))}
+
     def preview_hub_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """skills.py GET /api/skills/hub/preview?identifier=: SKILL.md + manifest without installing."""
         identifier = (request.query_params.get("identifier") or "").strip()
         if not identifier:
             raise HttpError(400, "identifier is required")
         self.scoped(request)
-        row = self.official_skill(identifier)
+        row = self.hub_skill(identifier)
         if row is None:
             raise HttpError(404, f"Skill not found: {identifier}")
-        name, category, description, tags = row
-        return {"name": name, "description": description, "source": "official", "identifier": identifier,
-                "trust_level": "builtin", "repo": None, "tags": list(tags),
-                "skill_md": skill_document(name, description, f"# {name}\n\nInstall to read the full procedure."),
-                "files": ["SKILL.md", "references/overview.md"]}
+        files = ["SKILL.md", "references/overview.md"] + sorted({f["file"] for f in row["findings"]})
+        return {**self.hub_payload(row),
+                "skill_md": skill_document(row["name"], row["description"],
+                                           f"# {row['name']}\n\nInstall to read the full procedure."),
+                "files": sorted(files)}
+
+    def scan_hub_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py GET /api/skills/hub/scan?identifier=: the install-time scan of the quarantined bundle without
+        installing it (skills_guard.py scan_skill + should_allow_install); 404 when no source has the skill."""
+        identifier = (request.query_params.get("identifier") or "").strip()
+        if not identifier:
+            raise HttpError(400, "identifier is required")
+        self.scoped(request)
+        row = self.hub_skill(identifier)
+        if row is None:
+            raise HttpError(404, f"Skill not found: {identifier}")
+        findings = [dict(f) for f in row["findings"]]
+        severities = {f["severity"] for f in findings}
+        verdict = "dangerous" if severities & {"critical", "high"} else "caution" if findings else "safe"
+        trust, n = row["trust_level"], len(findings)
+        decision = SCAN_INSTALL_POLICY.get(trust, SCAN_INSTALL_POLICY["community"])[SCAN_VERDICT_INDEX[verdict]]
+        if decision == "allow":
+            reason = f"Allowed ({trust} source, {verdict} verdict)"
+        elif decision == "ask":
+            reason = f"Requires confirmation ({trust} source + {verdict} verdict, {n} findings)"
+        else:
+            hard = verdict == "dangerous" and trust in ("community", "trusted")
+            reason = (f"Blocked ({trust} source + {verdict} verdict, {n} findings). "
+                      + ("--force does not override a dangerous verdict." if hard else "Use --force to override."))
+        summary = (f"{row['name']}: clean scan, no threats detected" if not findings else
+                   f"{row['name']}: {verdict} — {n} finding(s) in {', '.join(sorted({f['category'] for f in findings}))}")
+        counts = {sev: sum(f["severity"] == sev for f in findings) for sev in ("critical", "high", "medium", "low")}
+        return {"name": row["name"], "identifier": identifier,
+                "source": "official" if row["source"] == "official" else identifier, "trust_level": trust,
+                "verdict": verdict, "summary": summary, "policy": decision, "policy_reason": reason,
+                "findings": findings, "severity_counts": counts, "tier1": None}
+
+    def delete_learning_node(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py DELETE /api/learning/node {id, profile?} (``?profile=`` too; the body's wins): a skill is
+        archived (learning_mutations.py _delete_skill -> skill_usage.py archive_skill); a refusal is 400 with its
+        message."""
+        node_id = body.get("id")
+        if not isinstance(node_id, str):
+            raise HttpError(422, [{"type": "missing" if node_id is None else "string_type", "loc": ["body", "id"],
+                                   "msg": "Field required" if node_id is None else "Input should be a valid string"}])
+        caps = self.caps(self.scoped(request, body))
+        if node_id.startswith("memory:"):
+            raise HttpError(400, f"bad memory node id: {node_id!r}")
+        skill = caps.skills.get(node_id)
+        if skill is not None and skill["provenance"] == "external":
+            raise HttpError(400, f"skill '{node_id}' lives in skills.external_dirs; external skills are read-only to "
+                                 "the curator")
+        if skill is not None and skill["provenance"] == "hub":
+            raise HttpError(400, f"skill '{node_id}' is hub-installed; never archive")
+        if skill is not None and skill["provenance"] == "bundled":
+            raise HttpError(400, f"skill '{node_id}' is a bundled built-in; enable curator.prune_builtins to allow "
+                                 "pruning it")
+        if skill is None:
+            raise HttpError(400, f"skill '{node_id}' not found")
+        caps.archived_skills[node_id] = caps.skills.pop(node_id)
+        caps.disabled_skills.discard(node_id)
+        return {"ok": True, "message": f"archived '{node_id}' — restore with: hermes curator restore {node_id}"}
 
     def install_hub_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """skills.py POST /api/skills/hub/install {identifier, profile?}: ``hermes skills install`` in the background
@@ -5522,6 +5673,14 @@ class CapabilityFeatures:
             return ("ready", "") if env.get("DAYTONA_API_KEY") else (
                 "needs_setup", "Set DAYTONA_API_KEY to use the Daytona backend.")
         return "unavailable", f"Unknown backend: {name}"
+
+    def computer_use_status(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py GET /api/tools/computer-use/status (computer_use/permissions.py computer_use_status) on a Linux
+        host without cua-driver: not installed, readiness unknown, no TCC grants to ask for."""
+        self.scoped(request)
+        return {"platform": "linux", "platform_supported": True, "installed": False, "version": None, "ready": None,
+                "can_grant": False, "checks": [], "source": None, "error": None, "accessibility": None,
+                "screen_recording": None, "screen_recording_capturable": None}
 
     def select_terminal_backend(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """tools.py PUT /api/tools/terminal/backend {backend}: writes terminal.backend (setup is not required)."""
@@ -6696,6 +6855,20 @@ class CapabilityFeatures:
         return Response(data, media_type="application/zip",
                         headers={"content-disposition": f'attachment; filename="{name}"'})
 
+    def reset_memory(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/memory/reset {target: all|memory|user}: deletes the profile's built-in memory files
+        (MEMORY.md, USER.md); destructive, so the profile must be named."""
+        target = str(body.get("target") or "all").strip().lower()
+        if target not in ("all", "memory", "user"):
+            raise HttpError(400, "target must be all, memory, or user")
+        files = self.caps(self.explicit_profile(request, "POST /api/memory/reset")).builtin_memory
+        deleted = []
+        for fname, key in (("MEMORY.md", "memory"), ("USER.md", "user")):
+            if target in ("all", key) and key in files:
+                del files[key]
+                deleted.append(fname)
+        return {"ok": True, "deleted": deleted}
+
     def list_checkpoints(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """ops.py GET /api/ops/checkpoints: /rollback shadow-store size per session."""
         caps = self.caps(self.scoped(request))
@@ -6791,6 +6964,22 @@ class CapabilityFeatures:
             raise HttpError(413, "File too large")
         kind = FS_MEDIA_TYPES.get(posixpath.splitext(path)[1].lower(), "application/octet-stream")
         return {"dataUrl": f"data:{kind};base64,{base64.b64encode(data).decode()}"}
+
+    def fs_read_text(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/fs/read-text?path=: the first 512 KB as text with its language and MIME type (413 over
+        64 MB); ``binary`` from the first 4 KB."""
+        path, data = self.fs_target(request)
+        if len(data) > FS_TEXT_SOURCE_MAX:
+            raise HttpError(413, "File too large")
+        preview = data[:FS_TEXT_PREVIEW_MAX]
+        head = preview[:4096]
+        suspicious = sum(1 for byte in head if byte < 32 and byte not in (9, 10, 13))
+        binary = bool(head) and (b"\0" in head or suspicious / len(head) > 0.12)
+        suffix = posixpath.splitext(path)[1].lower()
+        mime = FS_PREVIEW_MIME_TYPES.get(suffix) or mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return {"binary": binary, "byteSize": len(data), "language": FS_PREVIEW_LANGUAGES.get(suffix, "text"),
+                "mimeType": mime, "path": path, "text": preview.decode("utf-8", errors="replace"),
+                "truncated": len(data) > FS_TEXT_PREVIEW_MAX}
 
     def fs_download(self, request: Request, body: dict[str, Any]) -> Response:
         """files.py GET /api/fs/download?path=: the file as an attachment."""
@@ -6953,6 +7142,39 @@ class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
         if any(r.sid == rt.sid for r in self.requests.values()):
             return "waiting"
         return "working" if rt.running else "idle"
+
+    def session_active_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_session.py session.active_list: the live sessions in this process, in creation order
+        (session_registry.py _session_live_item); ``current`` marks ``current_session_id``."""
+        current = str(params.get("current_session_id") or "")
+        rows = []
+        for rt in self.runtimes.values():
+            stored = self.sessions.get(rt.key)
+            messages = stored.messages if stored else []
+            preview = next((" ".join(str(m.get("content") or "").split())[:160] for m in reversed(messages)
+                            if str(m.get("content") or "").strip()), "")
+            if rt.queued:
+                preview = " ".join(rt.queued.split())[:160]
+            elif rt.inflight:
+                preview = " ".join(str(rt.inflight.get("assistant") or rt.inflight.get("user") or preview).split())[:160]
+            rows.append({"current": rt.sid == current, "id": rt.sid,
+                         "last_active": float(stored.last_active if stored else rt.created_at),
+                         "message_count": len(messages), "model": stored.model if stored else "fake-hermes",
+                         "preview": preview, "session_key": rt.key, "started_at": float(rt.created_at),
+                         "status": self.live_status(rt), "title": (stored.title or "") if stored else ""})
+        return {"sessions": rows}
+
+    def get_session(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """sessions.py GET /api/sessions/{id}?profile=: the stored row from that profile's store, stamped with the
+        serving profile; 404 when that store has no such session (a draft has no row yet)."""
+        sid = request.path_params["session_id"]
+        serving = self.scoped(request).name
+        stored = self.sessions.get(sid)
+        if stored is None or not stored.persisted or stored.profile != serving:
+            raise HttpError(404, "Session not found")
+        row = stored.row()
+        row.update(profile=serving, is_default_profile=serving == "default")
+        return row
 
     def live_payload(self, rt: Runtime, omit: bool) -> dict[str, Any]:
         """session.activate / fast-path session.resume (server.py _live_session_payload)."""
@@ -8007,6 +8229,7 @@ def build_app(fake: FakeHermes) -> Starlette:
         Route("/api/profiles/sessions/sidebar", fake.sidebar_sessions, methods=["GET"]),
         Route("/api/sessions/search", fake.search_sessions, methods=["GET"]),
         Route("/api/sessions/{session_id}", fake.manage_session, methods=["PATCH", "DELETE"]),
+        Route("/api/sessions/{session_id}", fake.rest(fake.get_session), methods=["GET"]),
         Route("/api/media", fake.get_media, methods=["GET"]),
         # M3: settings, profiles, providers.
         *fake.settings_routes(),

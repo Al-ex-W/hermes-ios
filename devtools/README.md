@@ -78,6 +78,9 @@ Use a short grace to test what happens when the app was backgrounded for too lon
   hidden: false, …}], total, …}`. A draft only appears once it has a prompt.
 - `GET /api/sessions/{id}/messages` returns `{session_id, profile, messages: [{id, role, content,
   display_kind, tool_calls, …}], pagination}`. A draft with no prompt yet gets 404.
+- `GET /api/sessions/{id}?profile=` returns the stored row from that profile's store (the dashboard's own without
+  `?profile=`), stamped with `profile` and `is_default_profile`. A session in another profile's store, or a draft,
+  gets 404.
 - Any unauthenticated `/api/*` call gets Hermes' 401 envelope `{error: "unauthenticated", …}`. A `POST`
   whose `Origin` doesn't match its `Host` gets 403.
 - `WS /api/ws?ticket=…` sends `gateway.ready {skin, change_events, heartbeat: true, replay_epoch}` first. A bad
@@ -151,12 +154,16 @@ come from `hermes_cli/web_routers/{skills,tools,mcp,cron,ops,status,analytics,ac
 `plugins.manage` in `tui_gateway/methods_tools.py`; each handler names its source.
 
 - **Skills**: `GET /api/skills`, `PUT /api/skills/toggle`, `GET`/`PUT /api/skills/content`, `POST /api/skills`
-  (the same name, category and frontmatter checks as Hermes), plus the official hub catalog
-  (`/api/skills/hub/official`, `preview`, `install`, `uninstall`, `update`).
+  (the same name, category and frontmatter checks as Hermes), plus the hub: the official catalog
+  (`/api/skills/hub/official`), `search` (the official catalog and two community skills; an empty `q` answers
+  empty), `preview`, `scan` (the install-time security scan: verdict, policy and findings; the community
+  `shell-helpers` has a finding and is blocked), `install`, `uninstall` and `update`. `DELETE /api/learning/node
+  {id}` archives a learned skill; a built-in, hub or external skill is refused with 400 and Hermes' message.
 - **Toolsets**: `GET /api/tools/toolsets` (the voice toolsets `tts` and `stt` are listed; the app strips them),
   `PUT /{name}`, `/config` (providers with `ready` / `needs_keys` / `needs_auth` / `needs_setup`), `/models`,
   `/model`, `/provider` (web picks a backend per capability), `/env` (declared keys only, into `.env`),
-  `/post-setup`, and `GET`/`PUT /api/tools/terminal/backend(s)` (writes `terminal.backend`).
+  `/post-setup`, `GET`/`PUT /api/tools/terminal/backend(s)` (writes `terminal.backend`), and
+  `GET /api/tools/computer-use/status` (a Linux host without cua-driver).
 - **MCP**: `GET`/`POST`/`PUT /api/mcp/servers`, `DELETE /{name}`, `PUT /{name}/enabled`, `POST /{name}/test`
   (an `auth: oauth` server needs a token first; a URL or command with `offline` in it fails to connect),
   `POST /{name}/auth` + `GET`/`DELETE /api/mcp/oauth/flows/{id}`, and `GET`/`POST /api/mcp/catalog(/install)`.
@@ -176,16 +183,20 @@ come from `hermes_cli/web_routers/{skills,tools,mcp,cron,ops,status,analytics,ac
   search filters), `/api/analytics/usage` and `/models`, `/api/curator` (+ `paused`, `run`), and the maintenance
   actions `POST /api/ops/doctor`, `security-audit`, `backup` (+ `GET /api/ops/backup/download?archive=` once it's
   done), `debug-share`, `GET /api/ops/checkpoints` + `POST …/prune`, `POST /api/gateway/restart`, and
-  `GET /api/hermes/update/check` + `POST /api/hermes/update`. Curator runs and checkpoint prunes need an explicit
-  `?profile=` (400 otherwise), as on a multi-profile Hermes.
+  `GET /api/hermes/update/check` + `POST /api/hermes/update`, and `POST /api/memory/reset {target}` (deletes the
+  built-in MEMORY.md and USER.md that `GET /api/memory` sizes). Curator runs, checkpoint prunes and memory resets
+  need an explicit `?profile=` (400 otherwise), as on a multi-profile Hermes.
 - **Actions**: every background action is tailed with `GET /api/actions/{name}/status`. Each poll shows more of
   its log, and the `--action-polls`-th poll (default 3) finishes it with its exit code. An action nobody polls
   finishes after `--action-seconds` (default 6, `0` = only by polls). What it changes (a new skill or server, the
   archive, pruned checkpoints, the update) happens when it finishes.
 - **Artifacts**: the screen reads chats, so `--seed full` adds chats whose messages carry an image (`MEDIA:`),
-  files (a PDF and a CSV, also in a `write_file` result) and links. `GET /api/fs/read-data-url` and
-  `/api/fs/download` serve those files, and `GET /api/media/proxy` serves the one remote image (from memory; the
-  fake never goes online).
+  files (a PDF and a CSV, also in a `write_file` result) and links. `GET /api/fs/read-data-url`,
+  `/api/fs/read-text` (`{binary, byteSize, language, mimeType, path, text, truncated}`) and `/api/fs/download`
+  serve those files, and `GET /api/media/proxy` serves the one remote image (from memory; the fake never goes
+  online).
+- **Live sessions**: the RPC `session.active_list` lists the sessions live in the fake (`{sessions: [{id,
+  session_key, title, status, …}]}`), which the app's push router checks after `GET /api/sessions/{id}`.
 
 `--seed` picks the data: `full` (the default) is `demo` plus the artifact chats and one chat per past cron run.
 `demo` seeds both profiles with skills, MCP servers, plugins, cron jobs (one paused, one failing), checkpoints

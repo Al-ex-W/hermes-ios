@@ -877,3 +877,146 @@ def test_artifact_chats_and_the_files_they_point_at():
     assert home["dataUrl"].startswith("data:text/markdown;base64,")
     assert "Attention heads figure" in {s["title"] for s in research}
     assert "Morning briefing" in cron_chats, "--seed full gives past cron runs their chats"
+
+
+def test_hub_search_and_scan_archive_and_computer_use():
+    async def scenario():
+        async with serving(seed="demo", action_seconds=0) as (fake, base):
+            async with signed_in(base) as http:
+                empty = (await http.get("/api/skills/hub/search", params={"q": "  "})).json()
+                git = (await http.get("/api/skills/hub/search", params={"q": "git", "source": "all",
+                                                                        "limit": 20})).json()
+                capped = (await http.get("/api/skills/hub/search", params={"q": "git", "limit": 1})).json()
+                github_only = (await http.get("/api/skills/hub/search", params={"q": "git",
+                                                                                "source": "github"})).json()
+                weekly = (await http.get("/api/skills/hub/search", params={"q": "weekly"})).json()
+                research = (await http.get("/api/skills/hub/search", params={"q": "weekly",
+                                                                             "profile": "research"})).json()
+                safe = (await http.get("/api/skills/hub/scan",
+                                       params={"identifier": "official/smart-home/home-assistant"})).json()
+                risky = (await http.get("/api/skills/hub/scan", params={"identifier": "skills-sh/shell-helpers"})).json()
+                community_preview = (await http.get("/api/skills/hub/preview",
+                                                    params={"identifier": "github/acme-labs/skills/git-changelog"})).json()
+                scan_status = {label: (await http.get("/api/skills/hub/scan", params=params)).status_code
+                               for label, params in {"unknown": {"identifier": "official/x/y"}, "blank": {}}.items()}
+
+                archived = (await http.request("DELETE", "/api/learning/node", json={"id": "release-notes"})).json()
+                after = {s["name"] for s in (await http.get("/api/skills")).json()}
+                refused = {name: (await http.request("DELETE", "/api/learning/node", json={"id": name}))
+                           for name in ("arxiv", "weekly-review-planning", "brand-voice", "ghost")}
+                refused = {name: (r.status_code, r.json()["detail"]) for name, r in refused.items()}
+                scoped = await http.request("DELETE", "/api/learning/node", params={"profile": "nobody"},
+                                            json={"id": "deploy-checklist"})
+                no_id = await http.request("DELETE", "/api/learning/node", json={})
+
+                computer_use = (await http.get("/api/tools/computer-use/status")).json()
+        return (empty, git, capped, github_only, weekly, research, safe, risky, community_preview, scan_status,
+                archived, after, refused, scoped.status_code, no_id.status_code, computer_use)
+
+    (empty, git, capped, github_only, weekly, research, safe, risky, community_preview, scan_status, archived, after,
+     refused, scoped, no_id, computer_use) = asyncio.run(scenario())
+    assert empty == {"results": [], "source_counts": {}, "timed_out": [], "installed": {}}
+    assert {r["identifier"] for r in git["results"]} == {"github/acme-labs/skills/git-changelog",
+                                                         "skills-sh/shell-helpers"}
+    assert git["source_counts"] == {"github": 1, "skills.sh": 1} and git["timed_out"] == []
+    assert set(git["results"][0]) == {"name", "description", "source", "identifier", "trust_level", "repo", "tags"}
+    assert len(capped["results"]) == 1 and capped["source_counts"] == {"github": 1, "skills.sh": 1}
+    assert [r["source"] for r in github_only["results"]] == ["github"]
+    weekly_id = "official/productivity/weekly-review-planning"
+    assert [r["identifier"] for r in weekly["results"]] == [weekly_id]
+    assert weekly_id in weekly["installed"], "the default profile has it from the hub"
+    assert weekly_id not in research["installed"]
+    assert safe["verdict"] == "safe" and safe["policy"] == "allow" and safe["findings"] == []
+    assert safe["summary"] == "home-assistant: clean scan, no threats detected"
+    assert safe["severity_counts"] == {"critical": 0, "high": 0, "medium": 0, "low": 0} and safe["tier1"] is None
+    assert risky["verdict"] == "caution" and risky["policy"] == "block"
+    assert risky["policy_reason"].startswith("Blocked (community source + caution verdict, 1 findings)")
+    assert risky["findings"][0]["file"] == "scripts/setup.sh" and risky["severity_counts"]["medium"] == 1
+    assert community_preview["trust_level"] == "community" and community_preview["repo"] == "acme-labs/skills"
+    assert scan_status == {"unknown": 404, "blank": 400}
+
+    assert archived == {"ok": True, "message": "archived 'release-notes' — restore with: hermes curator restore "
+                                               "release-notes"}
+    assert "release-notes" not in after
+    assert refused["arxiv"] == (400, "skill 'arxiv' is a bundled built-in; enable curator.prune_builtins to allow "
+                                     "pruning it")
+    assert refused["weekly-review-planning"] == (400, "skill 'weekly-review-planning' is hub-installed; never archive")
+    assert refused["brand-voice"][0] == 400 and "external skills are read-only" in refused["brand-voice"][1]
+    assert refused["ghost"] == (400, "skill 'ghost' not found")
+    assert scoped == 404 and no_id == 422
+    assert computer_use["platform"] == "linux" and computer_use["installed"] is False and computer_use["ready"] is None
+    assert {"accessibility", "screen_recording", "screen_recording_capturable", "can_grant"} <= set(computer_use)
+
+
+def test_memory_reset_text_previews_and_session_lookups():
+    async def scenario():
+        async with serving(seed="full") as (fake, base):
+            async with signed_in(base) as http:
+                before = (await http.get("/api/memory", params={"profile": "research"})).json()["builtin_files"]
+                unnamed = await http.post("/api/memory/reset", json={"target": "all"})
+                bad_target = await http.post("/api/memory/reset", params={"profile": "research"}, json={"target": "x"})
+                user_only = (await http.post("/api/memory/reset", params={"profile": "research"},
+                                             json={"target": "user"})).json()
+                rest = (await http.post("/api/memory/reset", params={"profile": "research"}, json={})).json()
+                again = (await http.post("/api/memory/reset", params={"profile": "research"}, json={})).json()
+                after = (await http.get("/api/memory", params={"profile": "research"})).json()["builtin_files"]
+                untouched = (await http.get("/api/memory")).json()["builtin_files"]
+
+                csv = (await http.get("/api/fs/read-text", params={"path": ARTIFACT_CSV})).json()
+                notes = (await http.get("/api/fs/read-text", params={"path": "~/notes.md"})).json()
+                image = (await http.get("/api/fs/read-text", params={"path": ARTIFACT_IMAGE})).json()
+                text_status = {label: (await http.get("/api/fs/read-text", params=params)).status_code
+                               for label, params in {"missing": {"path": "/home/demo/nope.txt"},
+                                                     "sensitive": {"path": "/home/demo/.hermes/.env"},
+                                                     "no path": {}}.items()}
+
+                listed = (await http.get("/api/profiles/sessions", params={"limit": 100})).json()["sessions"]
+                default_row = next(s for s in listed if s["profile"] == "default")
+                research_row = next(s for s in listed if s["profile"] == "research")
+                stored = (await http.get(f"/api/sessions/{default_row['id']}")).json()
+                scoped = (await http.get(f"/api/sessions/{research_row['id']}", params={"profile": "research"})).json()
+                lookups = {label: (await http.get(path, params=params)).status_code for label, (path, params) in {
+                    "other store": (f"/api/sessions/{research_row['id']}", {}),
+                    "unknown": ("/api/sessions/20200101_000000_abcdef", {}),
+                    "unknown profile": (f"/api/sessions/{default_row['id']}", {"profile": "nobody"}),
+                }.items()}
+
+                gateway = await Gateway.connect(base, http)
+                try:
+                    created = await gateway.call("session.create", {"source": "desktop", "title": "Live one"})
+                    live = await gateway.call("session.active_list", {"current_session_id": created["session_id"]})
+                    other = await gateway.call("session.active_list", {})
+                    draft = (await http.get(f"/api/sessions/{created['stored_session_id']}")).status_code
+                finally:
+                    await gateway.close()
+        return (before, unnamed, bad_target, user_only, rest, again, after, untouched, csv, notes, image, text_status,
+                default_row, research_row, stored, scoped, lookups, created, live, other, draft, gateway)
+
+    (before, unnamed, bad_target, user_only, rest, again, after, untouched, csv, notes, image, text_status,
+     default_row, research_row, stored, scoped, lookups, created, live, other, draft, gateway) = asyncio.run(scenario())
+    assert before == {"memory": 812, "user": 245}
+    assert unnamed.status_code == 400 and "POST /api/memory/reset" in unnamed.json()["detail"]
+    assert bad_target.status_code == 400 and bad_target.json()["detail"] == "target must be all, memory, or user"
+    assert user_only == {"ok": True, "deleted": ["USER.md"]}
+    assert rest == {"ok": True, "deleted": ["MEMORY.md"]} and again == {"ok": True, "deleted": []}
+    assert after == {"memory": 0, "user": 0} and untouched == {"memory": 812, "user": 245}
+
+    assert csv["text"].startswith("week,p50_ms,p99_ms") and csv["language"] == "csv"
+    assert csv["mimeType"] == "text/csv" and csv["binary"] is False and csv["truncated"] is False
+    assert csv["byteSize"] == len(csv["text"].encode()) and csv["path"] == ARTIFACT_CSV
+    assert set(csv) == {"binary", "byteSize", "language", "mimeType", "path", "text", "truncated"}
+    assert notes["language"] == "markdown" and notes["text"].startswith("# Notes")
+    assert image["binary"] is True and image["mimeType"] == "image/png"
+    assert text_status == {"missing": 404, "sensitive": 403, "no path": 422}
+
+    assert stored["id"] == default_row["id"] and stored["profile"] == "default" and stored["is_default_profile"] is True
+    assert stored["title"] == default_row["title"]
+    assert scoped["id"] == research_row["id"] and scoped["profile"] == "research"
+    assert lookups == {"other store": 404, "unknown": 404, "unknown profile": 404}
+    rows = {row["id"]: row for row in live["sessions"]}
+    row = rows[created["session_id"]]
+    assert row["current"] is True and row["session_key"] == created["stored_session_id"]
+    assert row["title"] == "Live one" and row["status"] == "idle" and row["message_count"] == 0
+    assert all(not r["current"] for r in other["sessions"])
+    assert draft == 404, "a draft has no stored row yet"
+    assert not contract_problems(gateway)
