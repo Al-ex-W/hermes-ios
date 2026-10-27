@@ -389,7 +389,8 @@ final class GatewayConnectionTests: XCTestCase {
         connection.track(owner, runtimeID: "r1", storedID: "s1", profile: nil)
         gateway.handlers["session.activate"] = { _ in .result(liveResult("r1")) }
 
-        await waitUntil { self.gateway.sockets.count == 2 && connection.state == .connected }
+        // About half a second alone; the budget covers a busy main actor (the fake-backed run).
+        await waitUntil(timeout: 5) { self.gateway.sockets.count == 2 && connection.state == .connected }
         XCTAssertTrue(gateway.sockets[0].closedByClient)
         XCTAssertFalse(gateway.calls("gateway.ping").filter { $0.socket == 0 }.isEmpty)
         XCTAssertEqual(owner.reattached.map(\.runtimeID), ["r1"], "the reconnect re-attaches the session")
