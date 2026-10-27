@@ -43,9 +43,10 @@ current turn (Hermes reads it after the tool calls in flight finish), or starts 
   `[Voice]` message instead. A sync call can also return `{call_id, status, note}` without a reply: `interrupted`
   (the user pressed Stop), `yielded` (a message for you came in; it follows the result) or `superseded` (a newer
   sync `start_call` waits instead). The call stays open, and the reply comes as a `[Voice]` message.
-- From a messaging chat (Telegram, Discord …) a sync wait lasts at most Hermes' limit on waiting for a person in
-  one tool call (`approvals.timeout` + 60 s, about 6 minutes by default). Past it the result is `answered` with an
-  empty `said` and a note saying so; the reply then arrives as a `[Voice]` message.
+- A sync wait lasts at most what Hermes lets one tool call wait for a person: its tool deadline
+  (`timeouts.tools.sequential_call`, 420 s by default) plus `approvals.timeout` + 60 s, about 13 minutes by
+  default, less the time the ring took. Past it the result is `answered` with an empty `said` and a note saying so;
+  the reply then arrives as a `[Voice]` message.
 
 ## Outcomes
 

@@ -24,12 +24,16 @@ Protocol: one JSON object per line (UTF-8, at most 64 KiB). The client starts wi
   follow on this connection: ``{"event": "turn", call_id, seq, text}`` (the client answers
   ``{"op": "delivered", seq, ok, via?, status?, detail?, fallback?}``) and ``{"event": "ended", call_id, outcome}``.
 
-And three one-way messages: ``{"op": "signal", ref: <request id>, interrupt?: true, yield?: true}`` (the tool
-thread waiting on ``await_turn`` / ``end`` was stopped, or Hermes asked it to yield), ``delivered`` (above) and
-``{"op": "rekey", call_id, session_id}`` (the subscriber's conversation continues under a new id after compression).
+And four one-way messages: ``{"op": "signal", ref: <request id>, interrupt?: true, yield?: true}`` (the tool
+thread waiting on ``await_turn`` / ``end`` was stopped, or Hermes asked it to yield), ``delivered`` (above),
+``{"op": "rekey", call_id, session_id}`` (the subscriber's conversation continues under a new id after compression)
+and ``{"op": "requeue", call_id, text}`` (a turn the subscriber took but no turn there read: a compute-host child
+hands it back, and it goes through the dashboard's session).
 
 ``origin`` is ``hermes.Origin`` as fields (no runtime session: that is the other process's). The policy, rate limits
-and quiet hours run here, for every process.
+and quiet hours run here, for every process. A process of another profile (one without a dashboard of its own finds
+the root profile's hub) rings only when ``policy.allowed_profiles`` names its profile, and its own word that a DM
+comes from the owner counts for nothing here: only ``owner_ids`` does.
 """
 
 from __future__ import annotations
@@ -74,6 +78,10 @@ SUN_PATH_MAX = 103 if sys.platform == "darwin" else 107
 
 _STRINGS = ("session_id", "profile", "title", "source", "platform", "chat_type", "user_id", "session_key")
 _FLAGS = ("is_cron", "is_subagent", "is_owner")
+
+
+class Taken(RuntimeError):
+    """Another live dashboard serves the hub socket in this folder."""
 
 
 class ProtocolError(ValueError):
@@ -369,6 +377,7 @@ class HubServer:
         self.token = secrets.token_hex(32)
         self.sock: Optional[socket.socket] = None
         self.bound: Optional[str] = None  # where the socket really is
+        self.bound_id: Optional[tuple[int, int]] = None  # (st_dev, st_ino) of the socket this server bound
         self.short_dir: Optional[str] = None
         self.closed = threading.Event()
         self.conns: set[Conn] = set()
@@ -381,7 +390,7 @@ class HubServer:
         self.folder.mkdir(parents=True, exist_ok=True)
         os.chmod(self.folder, 0o700)
         if _answers(self.path):
-            raise RuntimeError(f"another Hermes dashboard already serves {self.path}")
+            raise Taken(f"another Hermes dashboard already serves {self.path}")
         _remove_stale(self.path)
         # The token first: a client that can connect to the new socket reads the new token.
         _write_private(self.token_path, self.token + "\n")
@@ -393,6 +402,8 @@ class HubServer:
                 target = os.path.join(self.short_dir, SOCKET_NAME)
             sock.bind(target)
             os.chmod(target, 0o600)
+            info = os.stat(target)
+            self.bound_id = (info.st_dev, info.st_ino)
             if self.short_dir is not None:
                 os.symlink(target, self.path)
             sock.listen(16)
@@ -421,8 +432,8 @@ class HubServer:
         self._remove_files()
 
     def _remove_files(self) -> None:
-        """Remove the socket and token if they are still this server's (a newer dashboard may have replaced
-        them)."""
+        """Remove the socket and token if they are still this server's: a newer dashboard may have replaced them
+        while this one was closing (it writes its token, then binds its own socket at the same path)."""
         try:
             if self.token_path.read_text(encoding="utf-8").strip() == self.token:
                 self.token_path.unlink()
@@ -432,8 +443,10 @@ class HubServer:
             if self.path.is_symlink():
                 if self.bound is not None and os.readlink(self.path) == self.bound:
                     self.path.unlink()
-            elif self.bound == str(self.path) and self.path.exists():
-                self.path.unlink()
+            elif self.bound == str(self.path) and self.bound_id is not None:
+                info = os.stat(self.path)
+                if (info.st_dev, info.st_ino) == self.bound_id:
+                    self.path.unlink()
         except OSError:
             pass
         if self.short_dir is not None:
@@ -518,6 +531,13 @@ class HubServer:
         if op == "rekey":
             self._rekey(conn, message)
             return
+        if op == "requeue":
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                for route in list(conn.routes):
+                    if route.call.call_id == message.get("call_id"):
+                        self.hub.requeue(route.call, text[:MAX_TEXT])
+            return
         rid = message.get("id")
         if not isinstance(rid, int) or isinstance(rid, bool):
             conn.send({"ok": False, "error": "bad_request", "message": "a request needs an integer id"})
@@ -554,6 +574,9 @@ class HubServer:
             mode = message.get("mode") or "async"
             if mode not in ("async", "sync"):
                 raise ProtocolError("bad_request", 'mode must be "async" or "sync"')
+            refused = self._foreign(origin, mode)
+            if refused is not None:
+                return refused
             begun = self.hub.begin_call(origin, text, mode, route=lambda call: Route(self, call))
             if begun.waiter is None or begun.call is None:
                 return begun.result
@@ -569,6 +592,24 @@ class HubServer:
         if op == "subscribe_turns":
             return self._subscribe(conn, message)
         raise ProtocolError("unknown_op", f"unknown op {op!r}")
+
+    def _foreign(self, origin: hermes.Origin, mode: str) -> Optional[dict[str, Any]]:
+        """A process of another profile: refused unless ``policy.allowed_profiles`` names it (then it may ring, but
+        its DMs count as the owner's only through ``owner_ids``). None when it may go on."""
+        mine = hermes.profile_name()
+        if (origin.profile or "default") == (mine or "default"):
+            return None
+        settings = self.hub.settings()
+        if origin.profile not in settings.policy.allowed_profiles:
+            self.hub.policy.log({"event": "refused", "session_id": origin.session_id, "source": origin.profile,
+                                 "reason": "profile"})
+            note = (f"Calls from the {origin.profile!r} profile can't ring the phone this dashboard serves (its "
+                    f"policy.allowed_profiles doesn't list it). Reply in text.")
+            if mode == "sync":
+                return {"said": "", "ending": None, "outcome": "not_allowed", "call_id": None, "note": note}
+            return {"call_id": None, "status": "not_allowed", "note": note}
+        origin.is_owner = False  # its allowlist and pairings are its own, not this profile's
+        return None
 
     def _register(self, conn: Conn, call: Call, waiter: Waiter) -> str:
         waiter_id = secrets.token_hex(8)

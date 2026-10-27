@@ -1,8 +1,10 @@
 """Who may ring the user's phone, how often, and when.
 
 Only a new ring is checked: speaking into a call the conversation already has is always allowed. Defaults:
-dashboard / desktop / TUI / CLI conversations and the owner's own messaging DMs may call; scheduled jobs, subagents
-and group chats may not; at most 3 rings per conversation per 10 minutes and 10 per hour overall; no quiet hours.
+dashboard / desktop / TUI / CLI conversations and the owner's own messaging DMs may call; scheduled jobs, subagents,
+group chats, finite runs nobody is at the keyboard for (``oneshot``: ``hermes chat -q``, ``hermes -z``) and
+third-party integrations (``tool``) may not; at most 3 rings per conversation per 10 minutes and 10 per hour
+overall; no quiet hours.
 Every decision and every call's outcome goes to ``<HERMES_HOME>/hermes-voice/rings.jsonl``.
 
 The policy runs in the dashboard process's hub for every process (calls from other processes come in over
@@ -30,10 +32,11 @@ from .config import QuietHours, Settings
 
 logger = logging.getLogger("hermes_voice")
 
-# Surfaces that are not a human messaging channel (mirrors Hermes' NON_MESSAGING_SESSION_SURFACES).
+# Surfaces that are not a human messaging channel (mirrors Hermes' NON_MESSAGING_SESSION_SURFACES, plus the
+# dashboard and "oneshot": a finite `hermes chat -q` / `hermes -z` run, see hermes.unattended_source).
 NON_MESSAGING = frozenset({
     "", "api_server", "cli", "codex", "desktop", "gateway", "kanban", "local", "msgraph_webhook", "tool", "tui",
-    "webhook", "dashboard",
+    "webhook", "dashboard", "oneshot",
 })
 PLATFORM_NAME = re.compile(r"[a-z][a-z0-9_]{1,31}")
 RING_LOG_MAX_LINES = 1000

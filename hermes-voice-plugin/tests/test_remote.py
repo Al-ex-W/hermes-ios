@@ -25,7 +25,7 @@ TG_KEY = "agent:main:telegram:dm:42"
 def mods(core, monkeypatch):
     remote = core.loader.module("remote", PLUGIN_DIR)
     # Each test starts with a process that has seen no turns, contexts or calls.
-    monkeypatch.setattr(remote, "TURNS", core.inject.Turns())
+    monkeypatch.setattr(remote, "TURNS", core.inject.Turns(late=remote._late_delivery))
     monkeypatch.setattr(remote, "_contexts", [])
     monkeypatch.setattr(remote, "_subscriptions", {})
     monkeypatch.setattr(remote, "_user_turn_at", {})
@@ -76,13 +76,75 @@ class Agent:
         return self.buffer.pop(ticket, None) is not None
 
 
+class LiveAgent:
+    """An agent that shows its state the way Hermes' AIAgent does (``agent/interrupt_control.py``): ``steer()``
+    takes text whether or not a turn runs (only the next drain reads it), ``redirect()`` refuses unless a model
+    request is in flight (during tools it becomes a ticketless steer), and the turn lease is held from admission to
+    release on every way out of a turn."""
+
+    def __init__(self, session_id: str) -> None:
+        import threading
+        self.session_id = session_id
+        self._delegate_depth = 0
+        self._delegate_parent_ref = None
+        self._executing_tools = False
+        self._model_request_active = threading.Event()
+        self._active_session_turn_lease_holder = None
+        self.parts: list[tuple[Any, str]] = []
+        self.fates: dict[Any, bool] = {}
+        self.redirected: list[str] = []
+
+    # the turn, as run_conversation goes through it
+    def begin(self) -> None:
+        self._active_session_turn_lease_holder = "pid=1:turn=x"
+
+    def model_request(self, active: bool) -> None:
+        (self._model_request_active.set if active else self._model_request_active.clear)()
+
+    def drain(self) -> None:
+        for ticket, _ in self.parts:
+            if ticket is not None:
+                self.fates[ticket] = True
+        self.parts = []
+
+    def release(self) -> None:
+        self._active_session_turn_lease_holder = None
+
+    # InterruptControlMixin
+    def steer(self, text: str, *, ticket: Any = None) -> bool:
+        if not text.strip():
+            return False
+        self.parts.append((ticket, text.strip()))
+        return True
+
+    def redirect(self, text: str) -> bool:
+        if self._executing_tools:
+            return self.steer(text)
+        if not self._model_request_active.is_set():
+            return False
+        self.redirected.append(text)
+        return True
+
+    def withdraw_steer(self, ticket: Any) -> bool:
+        kept = [part for part in self.parts if part[0] is not ticket]
+        consumed = self.fates.pop(ticket, True)
+        if len(kept) == len(self.parts):
+            return consumed is False
+        self.parts = kept
+        return True
+
+    def buffered(self) -> list[str]:
+        return [text for _, text in self.parts]
+
+
 class Ctx:
     """A plugin context: ``inject_message`` starts a turn (or refuses, like Hermes without the setting)."""
 
-    def __init__(self, accept: bool = True, cli: bool = False, surface: str = "") -> None:
+    def __init__(self, accept: bool = True, cli: bool = False, surface: str = "", home: Any = None) -> None:
         self.accept = accept
         self.surface = surface
-        self._manager = types.SimpleNamespace(_cli_ref=object() if cli else None, home_path=None)
+        self._manager = types.SimpleNamespace(_cli_ref=object() if cli else None, home_path=home,
+                                              scope_key=str(home) if home is not None else None)
         self.injected: list[tuple[Any, str]] = []
 
     def inject_message(self, content: str, role: str = "user", *, session_key: Any = None,
@@ -335,6 +397,197 @@ def test_the_call_follows_compression_in_the_other_process(core, fake, mods):
     assert sub.rekeyed == ["tg-1b"] and target.session_id == "tg-1b"
 
 
+@pytest.mark.parametrize("how", ["early_return", "compression", "compression_then_a_turn"])
+def test_a_turn_no_hook_closed_doesnt_swallow_the_next_voice_turn(core, fake, mods, how):
+    """on_session_end doesn't fire on every way out of a turn (a provider 4xx, retries used up, an interrupt during a
+    model call), and compression gives a running turn a new id. The hooks then still say "mid-turn", but the agent
+    is idle: Hermes' steer() would take the text and no turn would ever read it. The agent's own state decides."""
+    agent, ctx = LiveAgent("tg-1"), Ctx()
+    target = _target(core, agent, ctx)
+    fake.subagent_parent = agent  # the hooks run inside the agent's turn
+    mods.remote.note_turn_start("tg-1")
+    agent.begin()
+    if how.startswith("compression"):
+        agent.session_id = "tg-1b"  # conversation_compression: agent.session_id = new_session_id
+        mods.remote.note_turn_end("tg-1b")
+        if how == "compression_then_a_turn":
+            mods.remote.note_turn_start("tg-1b")
+            mods.remote.note_turn_end("tg-1b")
+    agent.release()  # early_return: no on_session_end; the lease is released all the same
+    fake.subagent_parent = None
+    delivery = core.inject.deliver_here(target, "[Voice] are you there?", mods.remote.TURNS)
+    assert (delivery.ok, delivery.via) == (True, "inject")
+    assert ctx.injected == [(TG_KEY, "[Voice] are you there?")] and agent.buffered() == []
+    if how != "early_return":
+        assert not mods.remote.TURNS.running  # no id stranded by the rotation
+
+
+def test_mid_turn_by_the_agents_own_state(core, fake, mods):
+    agent, ctx = LiveAgent("tg-1"), Ctx()
+    target = _target(core, agent, ctx)
+    agent.begin()
+    agent.model_request(True)
+    delivery = core.inject.deliver_here(target, "[Voice] wait", mods.remote.TURNS)  # no hook seen at all
+    assert (delivery.ok, delivery.via) == (True, "redirect") and agent.redirected == ["[Voice] wait"]
+    agent.model_request(False)
+    agent._executing_tools = True
+    delivery = core.inject.deliver_here(target, "[Voice] and", mods.remote.TURNS)
+    assert (delivery.ok, delivery.via) == (True, "redirect") and agent.buffered() == ["[Voice] and"]
+    assert ctx.injected == []
+
+
+def test_a_steer_a_turn_ends_without_reading_starts_a_turn_without_the_hook(core, fake, mods):
+    """Between a model request and the tools (or while the turn winds down) redirect() refuses and the steer waits
+    in the buffer. A turn that then ends on an early return fires no on_session_end: the watcher sees the agent
+    idle, takes the steer back and starts a turn with it."""
+    agent, ctx = LiveAgent("tg-1"), Ctx()
+    target = _target(core, agent, ctx)
+    agent.begin()
+    delivery = core.inject.deliver_here(target, "[Voice] one more thing", mods.remote.TURNS)
+    assert (delivery.ok, delivery.via, delivery.status) == (True, "steer", "queued")
+    assert agent.buffered() == ["[Voice] one more thing"] and ctx.injected == []
+    agent.release()
+    asyncio.run(until(lambda: ctx.injected))
+    assert ctx.injected == [(TG_KEY, "[Voice] one more thing")] and agent.buffered() == []
+    # One the turn read stays read.
+    agent.begin()
+    core.inject.deliver_here(target, "[Voice] read this", mods.remote.TURNS)
+    agent.drain()
+    agent.release()
+    asyncio.run(until(lambda: not mods.remote.TURNS.held))
+    assert ctx.injected == [(TG_KEY, "[Voice] one more thing")]
+
+
+def test_a_steer_that_lands_as_the_turn_ends_is_taken_back_at_once(core, fake, mods):
+    agent, ctx = LiveAgent("tg-1"), Ctx()
+    target = _target(core, agent, ctx)
+    agent.begin()
+
+    def steer_then_end(text, *, ticket=None):
+        LiveAgent.steer(agent, text, ticket=ticket)
+        agent.release()  # the turn ended right after the look
+        return True
+
+    agent.steer = steer_then_end
+    delivery = core.inject.deliver_here(target, "[Voice] hello", mods.remote.TURNS)
+    assert (delivery.ok, delivery.via) == (True, "inject") and agent.buffered() == []
+    assert ctx.injected == [(TG_KEY, "[Voice] hello")] and not mods.remote.TURNS.held
+
+
+def test_a_compute_host_child_leaves_idle_turns_to_the_dashboard(core, fake, mods, monkeypatch):
+    """Under dashboard.turn_isolation the child holds a copy of the dashboard's session: a turn submitted there
+    would run behind the dashboard's back. Idle, the child says fallback (the dashboard's prompt.submit starts the
+    turn and sends it to the child); mid-turn it steers its own agent."""
+    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
+    fake.host.add("s1")
+    agent, ctx = LiveAgent("s1"), Ctx()
+    target = _target(core, agent, ctx, "s1", "s1")
+    delivery = core.inject.deliver_here(target, "[Voice] pasta", mods.remote.TURNS)
+    assert not delivery.ok and delivery.fallback
+    assert fake.host.calls == [] and ctx.injected == []
+    agent.begin()
+    agent.model_request(True)
+    delivery = core.inject.deliver_here(target, "[Voice] no, rice", mods.remote.TURNS)
+    assert (delivery.ok, delivery.via) == (True, "redirect") and fake.host.calls == []
+    # A steer its turn never read goes back to the hub, which puts it through the dashboard.
+    agent.model_request(False)
+
+    class Sub:
+        def __init__(self):
+            self.target, self.requeued = target, []
+
+        def requeue(self, text):
+            self.requeued.append(text)
+            return True
+
+    sub = Sub()
+    mods.remote._subscriptions["c" * 32] = sub
+    assert core.inject.deliver_here(target, "[Voice] sorry", mods.remote.TURNS).via == "steer"
+    agent.release()
+    asyncio.run(until(lambda: sub.requeued))
+    assert sub.requeued == ["[Voice] sorry"] and ctx.injected == []
+
+
+def test_the_call_follows_the_agent_through_compression(core, fake, mods):
+    """In-place compression rotates the agent's session id without a parent id on the next turn: the call still
+    follows, because it is the same agent."""
+    agent = LiveAgent("tg-1")
+    target = _target(core, agent, Ctx())
+
+    class Sub:
+        def __init__(self):
+            self.target, self.rekeyed = target, []
+
+        def rekey(self, session_id):
+            self.rekeyed.append(session_id)
+            self.target.rekey(session_id)
+
+    sub = Sub()
+    mods.remote._subscriptions["c" * 32] = sub
+    agent.session_id = "tg-1b"
+    fake.subagent_parent = agent
+    mods.remote.note_turn_start("tg-1b")
+    assert sub.rekeyed == ["tg-1b"] and target.session_id == "tg-1b"
+    other = LiveAgent("tg-9")
+    fake.subagent_parent = other
+    mods.remote.note_turn_start("tg-9")  # another conversation's turn in the same process
+    assert sub.rekeyed == ["tg-1b"]
+
+
+def test_the_plugin_context_is_matched_by_home_whatever_its_spelling(core, fake, mods, tmp_path):
+    real = tmp_path / "real-home"
+    real.mkdir()
+    link = tmp_path / "linked-home"
+    link.symlink_to(real)
+    other = tmp_path / "other"
+    other.mkdir()
+    mine, theirs = Ctx(home=real), Ctx(home=other)
+    mods.remote.bind_context(mine)
+    assert mods.remote.context() is mine  # one context: it is this process's
+    mods.remote.bind_context(theirs)
+    fake.home = link  # HERMES_HOME given through a symlink (/tmp vs /private/tmp)
+    assert mods.remote.context() is mine
+    fake.home = tmp_path / "unknown"
+    assert mods.remote.context() is None  # never another profile's
+
+
+@pytest.mark.parametrize(
+    ("setup", "label"),
+    [
+        (lambda fake: fake.env.update(HERMES_SINGLE_QUERY_SESSION="1"), "oneshot"),
+        (lambda fake: setattr(fake, "finite", True), "oneshot"),
+        (lambda fake: setattr(fake, "launch_source", "oneshot"), "oneshot"),
+        (lambda fake: setattr(fake, "launch_source", "tool"), "tool"),
+    ],
+)
+def test_a_run_nobody_is_at_the_keyboard_for_doesnt_ring_by_default(core, fake, mods, hub_socket, monkeypatch,
+                                                                   setup, label):
+    """`hermes chat -q`, `hermes -z` and `--source tool` run as the CLI (session surface "cli"), but nobody is there
+    to talk to: a prompt injection in what they read must not ring the phone unless the owner allows that."""
+    policy_state = types.SimpleNamespace(source="")
+    monkeypatch.setitem(sys.modules, "gateway.session_policy",
+                        types.SimpleNamespace(active_policy=lambda: policy_state if policy_state.source else None))
+    finite = types.SimpleNamespace(value=None)
+    monkeypatch.setitem(sys.modules, "gateway.session_finite", types.SimpleNamespace(
+        finite_turn_required=lambda: finite.value, unattended_turn=lambda: False))
+    fake.launch_source = ""
+    fake.finite = None
+    setup(fake)
+    policy_state.source = fake.launch_source
+    finite.value = fake.finite
+    fake.env.pop("HERMES_SESSION_SOURCE", None)
+    fake.config = {"plugins": {"entries": {"hermes_voice": {"allow_gateway_injection": True}}}}
+    mods.remote.bind_context(Ctx(surface="cli"))
+    pusher = FakePusher()
+    hub_socket(pusher=pusher)
+    origin = mods.remote.origin_for("s1")
+    assert origin.source == label
+    refused = mods.remote.start_call("s1", "Hi", "async")
+    assert refused["status"] == "not_allowed" and pusher.payloads == []
+    entries = [json.loads(line) for line in (fake.home / "hermes-voice" / "rings.jsonl").read_text().splitlines()]
+    assert entries[-1]["reason"] == "source" and entries[-1]["source"] == label
+
+
 # ── in-process remote calls: errors and the policy across processes ────────────────────────────────────────
 
 
@@ -363,17 +616,56 @@ def test_async_from_a_chat_without_allow_gateway_injection_is_refused_sync_works
     fake.interrupt_all = False
 
 
-def test_a_sync_wait_from_a_chat_is_capped_and_waits_as_a_human_wait(core, fake, mods, hub_socket, monkeypatch):
+@pytest.mark.parametrize("surface", ["telegram", "cli"])
+def test_a_sync_wait_is_capped_by_the_tool_deadline_and_waits_as_a_human_wait(core, fake, mods, hub_socket,
+                                                                             monkeypatch, surface):
+    """Hermes abandons a tool call past its deadline (timeouts.tools.sequential_call) plus at most
+    approvals.timeout + 60 s of human wait, whatever the platform: the wait ends before that, with a note."""
     hub_socket(pusher=FakePusher())
-    _as_telegram_dm(fake)
-    fake.secrets["GATEWAY_ALLOWED_USERS"] = "42"
+    if surface == "telegram":
+        _as_telegram_dm(fake)
+        fake.secrets["GATEWAY_ALLOWED_USERS"] = "42"
+    else:
+        fake.env["HERMES_SESSION_SOURCE"] = "cli"
     fake.config = {"plugins": {"entries": {"hermes_voice": {"allow_gateway_injection": True}}}}
     mods.remote.bind_context(Ctx())
+    sequential = types.ModuleType("agent.tool_executor")
+    sequential._resolve_sequential_tool_timeout = lambda: 21.0
+    monkeypatch.setitem(sys.modules, "agent.tool_executor", sequential)
     monkeypatch.setattr(core.hermes, "human_wait_ceiling", lambda: 0.5)
+    # 21 s deadline + 0.5 s of human wait - the 20 s margin - what the ring took: about a second.
     result = mods.remote.start_call("tg-1", "Are you there?", "sync")
     assert result["outcome"] == "answered" and result["said"] == ""
-    assert "approvals.timeout + 60 s" in result["note"]
+    assert "timeouts.tools.sequential_call" in result["note"] and "approvals.timeout + 60 s" in result["note"]
     assert fake.waits == 1 and fake.beats > 0  # in this process's human-wait window, with heartbeats
+
+
+def test_tool_wait_cap(core, fake, monkeypatch):
+    import time
+    assert core.hermes.tool_wait_cap(time.monotonic()) is None  # outside Hermes: no deadline known
+    sequential = types.ModuleType("agent.tool_executor")
+    sequential._resolve_sequential_tool_timeout = lambda: 420.0
+    monkeypatch.setitem(sys.modules, "agent.tool_executor", sequential)
+    monkeypatch.setattr(core.hermes, "human_wait_ceiling", lambda: 360.0)
+    cap = core.hermes.tool_wait_cap(time.monotonic() - 100)
+    assert 420 + 360 - 100 - 21 < cap <= 420 + 360 - 100 - 20
+    sequential._resolve_sequential_tool_timeout = lambda: None  # timeouts.tools.sequential_call: 0
+    assert core.hermes.tool_wait_cap(time.monotonic()) is None
+
+
+def test_a_sync_call_in_the_dashboard_is_capped_too(core, fake, make_hub, monkeypatch):
+    import time
+    hub = make_hub(pusher=FakePusher())
+    fake.host.add("s1")
+    sequential = types.ModuleType("agent.tool_executor")
+    sequential._resolve_sequential_tool_timeout = lambda: 21.0
+    monkeypatch.setitem(sys.modules, "agent.tool_executor", sequential)
+    monkeypatch.setattr(core.hermes, "human_wait_ceiling", lambda: 0.5)
+    started = time.monotonic()
+    result = json.loads(core.tools.start_call({"text": "Still there?", "mode": "sync"}, session_id="s1"))
+    assert time.monotonic() - started < 10
+    assert result["outcome"] == "answered" and "timeouts.tools.sequential_call" in result["note"]
+    assert hub.slot is not None  # the call stays open
 
 
 @pytest.mark.parametrize(

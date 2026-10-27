@@ -109,6 +109,7 @@ def _register_alerts(ctx: Any) -> None:
             logger.debug("hermes_voice: no unload callback for the alert watcher", exc_info=True)
     try:
         _core("notify").resume()  # loaded again (disabled, enabled) in the dashboard that serves the phone
+        _core("hub").resume_socket()  # and the hub socket the unload closed
     except Exception:  # noqa: BLE001
         logger.warning("hermes_voice: could not resume the alert watcher", exc_info=True)
 
@@ -128,18 +129,27 @@ def _alert_turn_end(session_id: Any = None, turn_id: Any = None, completed: Any 
     if not _core("hub").routes_mounted():
         return None
     try:
+        # A background wake whose presentation Hermes muted (agent/notification_presentation.py) says nothing.
+        agent = _core("hermes").bound_agent()
+        muted = getattr(agent, "_mute_notification_reply", False) is True
         _core("notify").alerts().turn_ended(str(session_id or ""), turn_id, completed=completed, failed=failed,
-                                            interrupted=interrupted)
+                                            interrupted=interrupted, muted=muted)
     except Exception:  # noqa: BLE001
         logger.debug("hermes_voice: on_session_end alert hook failed", exc_info=True)
     return None
 
 
 def _pause_alerts() -> None:
+    """The plugin unloads: stop the alert watcher and close the hub socket, so no other process rings through a
+    disabled plugin (both come back if it loads again)."""
     try:
         _core("notify").pause()
     except Exception:  # noqa: BLE001
         logger.debug("hermes_voice: could not stop the alert watcher", exc_info=True)
+    try:
+        _core("hub").pause_socket()
+    except Exception:  # noqa: BLE001
+        logger.debug("hermes_voice: could not close the hub socket", exc_info=True)
 
 
 # ── calls from other processes (remote.py) ─────────────────────────────────────────────────────────────────

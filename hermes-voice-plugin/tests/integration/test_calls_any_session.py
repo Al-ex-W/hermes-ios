@@ -8,7 +8,12 @@ through the hub socket:
 - sync: the spoken reply comes back as the tool result in that process;
 - async: the tool returns at once (the one-shot turn ends while the phone rings), and what the user says on the
   call starts a new turn in the gateway session (``ctx.inject_message``, allowed by ``allow_gateway_injection``):
-  a user message stored in that session's transcript, whose ``start_call`` speaks into the same call.
+  a user message stored in that session's transcript, whose ``start_call`` speaks into the same call;
+- a voice turn whose model request fails (a provider 400: the turn ends on an early return, without
+  ``on_session_end``) doesn't swallow the next one.
+
+A ``chat -q`` run is a one-shot nobody sits at (source ``oneshot``): the default policy refuses its rings, so these
+tests opt in with ``policy.allowed_sources``, after checking that refusal.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from typing import Iterator, Optional
 import pytest
 
 from hermes_sandbox import Dashboard, Phone, Sandbox, StubModel, hermes_python
-from scenario import Agent, tool_results
+from scenario import Agent, start_call_result, tool_results
 
 pytestmark = pytest.mark.integration
 
@@ -40,7 +45,8 @@ def sandbox(request) -> Iterator[tuple[Sandbox, StubModel]]:
     python, why = hermes_python()
     if python is None:
         pytest.skip(why)
-    model = StubModel(Agent())
+    agent = Agent()
+    model = StubModel(agent)
     root = os.environ.get("HERMES_VOICE_IT_TMP")
     box = Sandbox(python, model, root=Path(root) if root else None, ring_timeout_s=20.0)
     config_path = box.hermes_home / "config.yaml"
@@ -50,6 +56,7 @@ def sandbox(request) -> Iterator[tuple[Sandbox, StubModel]]:
     failed_before = request.session.testsfailed
     try:
         box.start()
+        box.agent = agent  # type: ignore[attr-defined]
         yield box, model
     finally:
         _stop_gateway(box)
@@ -59,6 +66,31 @@ def sandbox(request) -> Iterator[tuple[Sandbox, StubModel]]:
             print(f"\nhermes sandbox kept for inspection: {box.root}\n{box.log_tail(3000)}")
         else:
             shutil.rmtree(box.root, ignore_errors=True)
+
+
+DEFAULT_SOURCES = ["desktop", "dashboard", "tui", "cli", "local"]
+
+
+def allowed_sources(box: Sandbox, sources: Optional[list[str]]) -> None:
+    """Set ``policy.allowed_sources`` (None: the plugin's default), and wait until the dashboard reads it."""
+    path = box.hermes_home / "config.yaml"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    settings = config["plugins"]["entries"]["hermes_voice"]["settings"]
+    current = (settings.get("policy") or {}).get("allowed_sources")
+    if current == sources:
+        return
+    if sources is None:
+        settings.pop("policy", None)
+    else:
+        settings["policy"] = {"allowed_sources": sources}
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    time.sleep(6.0)  # the plugin re-reads its settings every 5 s
+
+
+@pytest.fixture
+def oneshots_ring(sandbox) -> Iterator[None]:
+    allowed_sources(sandbox[0], [*DEFAULT_SOURCES, "oneshot"])
+    yield
 
 
 def _stop_gateway(box: Sandbox) -> None:
@@ -144,7 +176,39 @@ def rings(box: Sandbox) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def test_a_sync_call_from_a_cli_turn_returns_the_reply_to_that_process(sandbox):
+def test_a_one_shot_run_doesnt_ring_by_default(sandbox):
+    """`hermes chat -q` runs as the CLI, but nobody sits at it: a prompt injection in what it reads must not ring the
+    phone. The default policy refuses it, and the ring log says why."""
+    box, model = sandbox
+    allowed_sources(box, None)
+
+    async def scenario():
+        dashboard = Dashboard(box)
+        cli = None
+        try:
+            assert (await dashboard.sign_in()).status_code == 200
+            assert (await dashboard.post("/api/plugins/hermes_voice_it/arm")).status_code == 200
+            seen = len(await dashboard.pushes())
+            cli = Cli(box, "cli-refused", "chat", "-Q", "-q", "call me async: Wake up.")
+            code = await cli.wait(90)
+            return seen, code, cli.output(), await dashboard.pushes()
+        finally:
+            if cli is not None:
+                cli.kill()
+            await dashboard.close()
+
+    seen, code, output, pushes = asyncio.run(scenario())
+    assert code == 0, output
+    assert len(pushes) == seen
+    with model.lock:
+        bodies = list(model.requests)
+    refused = start_call_result(bodies, key="status")
+    assert refused and refused["status"] == "not_allowed", refused
+    entry = [r for r in rings(box) if r.get("event") == "refused"][-1]
+    assert (entry["reason"], entry["source"]) == ("source", "oneshot")
+
+
+def test_a_sync_call_from_a_cli_turn_returns_the_reply_to_that_process(sandbox, oneshots_ring):
     box, model = sandbox
 
     async def scenario():
@@ -198,10 +262,11 @@ def test_a_sync_call_from_a_cli_turn_returns_the_reply_to_that_process(sandbox):
     assert any("[Voice] one more thing" in text for text in users), messages
     # The sync reply went back to the tool, never into the conversation as a turn of its own.
     assert not any("[Voice] yes please" in text for text in users), messages
-    assert rings(box)[0]["event"] == "ring" and rings(box)[0]["source"] == "cli"
+    ring = [r for r in rings(box) if r.get("event") == "ring"][0]
+    assert ring["source"] == "oneshot" and ring["call_id"] == push["call_id"]
 
 
-def test_an_async_call_from_a_finished_cli_turn_injects_the_reply_into_its_session(sandbox):
+def test_an_async_call_from_a_finished_cli_turn_injects_the_reply_into_its_session(sandbox, oneshots_ring):
     box, model = sandbox
 
     async def scenario():
@@ -246,4 +311,50 @@ def test_an_async_call_from_a_finished_cli_turn_injects_the_reply_into_its_sessi
     # What the user said is a user turn of that gateway session, stored in its transcript.
     users = [content(m) for m in messages if m.get("role") == "user"]
     assert any("[Voice] great, deploy it" in text for text in users), messages
-    assert [r["source"] for r in rings(box) if r.get("event") == "ring"][-1] == "cli"
+    assert [r["source"] for r in rings(box) if r.get("event") == "ring"][-1] == "oneshot"
+
+
+def test_a_failed_voice_turn_doesnt_swallow_the_next_one(sandbox, oneshots_ring):
+    """A voice turn whose model request the provider refuses ends on an early return: Hermes fires no
+    on_session_end. The hooks would still call the conversation mid-turn, and Hermes' steer() takes text with no
+    turn running (only a later turn would read it). The agent's own state says it is idle: the next voice turn
+    starts a turn, is answered and is stored."""
+    box, model = sandbox
+    box.agent.fail.add("break it")
+
+    async def scenario():
+        dashboard = Dashboard(box)
+        cli = None
+        try:
+            assert (await dashboard.sign_in()).status_code == 200
+            assert (await dashboard.post("/api/plugins/hermes_voice_it/arm")).status_code == 200
+            seen = len(await dashboard.pushes())
+            cli = Cli(box, "cli-fail", "chat", "-Q", "-q", "call me async: Hello there.")
+            push = await next_push(dashboard, seen, cli)
+            assert push, cli.output()
+            await cli.wait(90)
+            phone = await Phone.dial(dashboard, push["call_id"], "push", session_id=push["session_id"])
+            await phone.send({"type": "ringing"})
+            await phone.send({"type": "answered"})
+            await phone.heard("Hello there.")
+            await asyncio.sleep(0.3)
+            await phone.say("break it")
+            await asyncio.to_thread(model.wait_for, "[Voice] break it")
+            await asyncio.sleep(8.0)  # the failed turn is over
+            await phone.say("are you there")
+            answer = await phone.heard("You said are you there", timeout=60)
+            messages = await stored(dashboard, push["session_id"], "[Voice] are you there")
+            deliveries = await dashboard.deliveries()
+            await phone.hang_up()
+            return push, answer, messages, deliveries
+        finally:
+            if cli is not None:
+                cli.kill()
+            await dashboard.close()
+
+    push, answer, messages, deliveries = asyncio.run(scenario())
+    assert answer["text"] == "You said are you there."
+    later = [d for d in deliveries if d["call_id"] == push["call_id"] and d["text"].startswith("[Voice] are you")]
+    assert later and later[0]["ok"] and later[0]["via"] == "inject", deliveries
+    users = [content(m) for m in messages if m.get("role") == "user"]
+    assert any("[Voice] are you there" in text for text in users), messages

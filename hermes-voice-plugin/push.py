@@ -211,6 +211,8 @@ class PushResult:
     ok: bool
     reason: str = ""
     delivered: int = 0
+    # Nothing went out, for a passing reason (APNs unreachable, 429, 5xx): worth trying again shortly.
+    retry: bool = False
 
 
 @dataclass(frozen=True)
@@ -286,7 +288,7 @@ class Apns:
             for device in devices:
                 headers = {"apns-push-type": "voip", "apns-topic": f"{device.bundle_id}.voip",
                            "apns-priority": "10", "apns-expiration": "0"}
-                ok, why, gone = self._post(client, key, device.environment, device.voip_token, headers, body)
+                ok, why, gone, _ = self._post(client, key, device.environment, device.voip_token, headers, body)
                 if ok:
                     delivered += 1
                     continue
@@ -316,21 +318,23 @@ class Apns:
             headers["apns-collapse-id"] = collapse_id
         failures: list[str] = []
         delivered = 0
+        transient = False
         with self._client() as client:
             for device in devices:
                 token = str(device.alert_token)
-                ok, why, gone = self._post(client, key, device.environment, token,
-                                           {**headers, "apns-topic": device.bundle_id}, body)
+                ok, why, gone, passing = self._post(client, key, device.environment, token,
+                                                    {**headers, "apns-topic": device.bundle_id}, body)
                 if ok:
                     delivered += 1
                     continue
                 if gone:
                     logger.info("hermes_voice: forgetting an alert token APNs no longer knows (%s)", why)
                     self.store.forget_alert_token(token)
+                transient = transient or passing
                 failures.append(why)
         if delivered:
             return PushResult(True, "", delivered)
-        return PushResult(False, "; ".join(dict.fromkeys(failures)) or "APNs refused the alert")
+        return PushResult(False, "; ".join(dict.fromkeys(failures)) or "APNs refused the alert", retry=transient)
 
     def _ready(self) -> tuple[Optional[ApnsKey], str]:
         """The key, once APNs can be reached from here at all (else why not)."""
@@ -346,8 +350,9 @@ class Apns:
         return httpx.Client(http2=self.transport is None, transport=self.transport, timeout=PUSH_TIMEOUT_S)
 
     def _post(self, client: httpx.Client, key: ApnsKey, environment: str, token: str, headers: dict[str, str],
-              body: bytes) -> tuple[bool, str, bool]:
-        """One push to one device token: (ok, why not, whether APNs no longer knows the token)."""
+              body: bytes) -> tuple[bool, str, bool, bool]:
+        """One push to one device token: (ok, why not, whether APNs no longer knows the token, whether the failure
+        is a passing one: unreachable, 429 or 5xx)."""
         url = f"{HOSTS[environment]}/3/device/{token}"
         for attempt in range(2):
             sent = {"authorization": f"bearer {self.provider_token(key, refresh=attempt > 0)}", **headers,
@@ -355,15 +360,16 @@ class Apns:
             try:
                 response = client.post(url, content=body, headers=sent)
             except httpx.HTTPError as error:
-                return False, f"APNs unreachable ({type(error).__name__})", False
+                return False, f"APNs unreachable ({type(error).__name__})", False, True
             if response.status_code == 200:
-                return True, "", False
+                return True, "", False, False
             reason = _reason(response)
             if response.status_code == 403 and reason == "ExpiredProviderToken" and attempt == 0:
                 continue  # sign a fresh token once and resend
             gone = response.status_code == 410 or reason in GONE_REASONS
-            return False, f"APNs {response.status_code} {reason}".strip(), gone
-        return False, "APNs 403 ExpiredProviderToken", False
+            passing = response.status_code == 429 or response.status_code >= 500
+            return False, f"APNs {response.status_code} {reason}".strip(), gone, passing
+        return False, "APNs 403 ExpiredProviderToken", False, False
 
 
 def _reason(response: httpx.Response) -> str:

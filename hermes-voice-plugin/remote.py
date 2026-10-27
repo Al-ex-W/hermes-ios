@@ -4,12 +4,13 @@ hub; these processes reach it over its local socket (``hubsock.py``) and put wha
 conversation (``inject.deliver_here``).
 
 - ``start_call`` sends ``ring`` (and, for a sync call, waits with ``await_turn`` inside Hermes' human-wait window
-  while this tool thread watches for Stop and yield requests; from a messaging chat the wait is capped at
-  ``approvals.timeout`` + 60 s, Hermes' bound on one human wait).
+  while this tool thread watches for Stop and yield requests; the wait ends before Hermes' tool deadline would,
+  ``hermes.tool_wait_cap``).
 - Every call this process starts or speaks into gets a subscription: a connection that takes the call's turns and
   puts each into the conversation (steering the running turn, or starting one).
-- The ``pre_llm_call`` / ``on_session_end`` hooks tell which conversations are mid-turn (``inject.Turns``), keep the
-  call with its conversation when compression gives it a new id, and note when the user wrote (quiet hours).
+- The ``pre_llm_call`` / ``on_session_end`` hooks tell which conversations are mid-turn (``inject.Turns``, with the
+  agent's own state winning), keep the call with its conversation when compression gives it a new id, and note
+  when the user wrote (quiet hours).
 
 No dashboard (or no plugin there): ``start_call`` answers ``not_available``.
 """
@@ -203,7 +204,6 @@ class _Watch:
 
 # ── this process's conversations ───────────────────────────────────────────────────────────────────────────
 
-TURNS = inject.Turns()
 _lock = threading.Lock()
 _contexts: list[Any] = []
 _user_turn_at: dict[str, float] = {}
@@ -218,51 +218,70 @@ def bind_context(ctx: Any) -> None:
 
 
 def context() -> Any:
-    """The plugin context for the profile this thread works in."""
+    """The plugin context for the profile this thread works in (a multi-profile gateway has one per profile).
+    With several and none for this profile, None: another profile's context can't start a turn here."""
     with _lock:
         contexts = list(_contexts)
-    if not contexts:
-        return None
-    home = str(hermes.hermes_home())
+    if len(contexts) <= 1:
+        return contexts[0] if contexts else None
+    home = hermes.home_key(hermes.hermes_home())
     for ctx in contexts:
-        manager_home = getattr(getattr(ctx, "_manager", None), "home_path", None)
-        if manager_home is not None and str(manager_home) == home:
+        manager = getattr(ctx, "_manager", None)
+        key = getattr(manager, "scope_key", None) or getattr(manager, "home_path", None)
+        if key is not None and hermes.home_key(key) == home:
             return ctx
-    return contexts[-1]
+    logger.warning("hermes_voice: no plugin context for this profile's home; turns can't be started here")
+    return None
 
 
 def note_turn_start(session_id: str, parent_session_id: str = "", user_message: Any = None) -> None:
-    """``pre_llm_call`` in this process: the conversation is mid-turn; a continuation after compression keeps the
-    call; the user's own message counts as their go-ahead during quiet hours."""
+    """``pre_llm_call`` in this process: the conversation is mid-turn; its call follows it under a new id after
+    compression (the same agent, or a continuation of its id); the user's own message counts as their go-ahead
+    during quiet hours."""
     if not session_id:
         return
-    TURNS.start(session_id)
+    agent = hermes.bound_agent()
+    TURNS.start(session_id, agent)
     if policy.users_own_message(user_message):
         with _lock:
             _user_turn_at[session_id] = time.time()
             if len(_user_turn_at) > 500:
                 for key in list(_user_turn_at)[:100]:
                     _user_turn_at.pop(key, None)
-    if not parent_session_id or hermes.subagent_parent() is not None:
-        return
     with _lock:
         subscriptions = list(_subscriptions.values())
+    continuation = bool(parent_session_id) and hermes.subagent_parent() is None
     for subscription in subscriptions:
-        if parent_session_id in subscription.target.ids() and session_id not in subscription.target.ids():
+        target = subscription.target
+        if session_id == target.session_id:
+            continue
+        if (agent is not None and target.agent() is agent) or (continuation and parent_session_id in target.ids()):
             subscription.rekey(session_id)
 
 
 def note_turn_end(session_id: str) -> None:
     """``on_session_end``: the turn is over; voice turns steered into it that it never read start a turn now."""
-    for target, text in TURNS.end(session_id):
+    for target, text in TURNS.end(session_id, hermes.bound_agent()):
         hermes.spawn_thread(_late_delivery, target, text, name="hermes-voice-late-turn")
 
 
 def _late_delivery(target: inject.AgentTarget, text: str) -> None:
+    """A voice turn steered into a turn that ended without reading it. A compute-host child hands it back to the
+    hub, which puts it through the dashboard (that starts the child's turns); anywhere else it starts a turn."""
+    if hermes.is_compute_host_child():
+        with _lock:
+            found = [sub for sub in _subscriptions.values() if sub.target is target]
+        if found and found[0].requeue(text):
+            return
+        logger.warning("hermes_voice: a voice turn the conversation didn't read was lost (its call is over)")
+        return
     delivery = inject.inject_idle(target, text)
     if not delivery.ok:
         logger.warning("hermes_voice: a voice turn the conversation didn't read couldn't start a turn: %s",
                        delivery.detail)
+
+
+TURNS = inject.Turns(late=_late_delivery)
 
 
 def origin_for(session_id: Any) -> hermes.Origin:
@@ -317,6 +336,7 @@ def idle_delivery_problem(target: inject.AgentTarget, origin: hermes.Origin) -> 
 
 def start_call(session_id: Any, text: str, mode: str) -> dict[str, Any]:
     """``start_call`` from this process, through the dashboard's hub."""
+    started = time.monotonic()
     origin = origin_for(session_id)
     if not origin.session_id:
         return refusal(mode, "not_allowed", "This conversation can't place a call.")
@@ -342,7 +362,7 @@ def start_call(session_id: Any, text: str, mode: str) -> dict[str, Any]:
             waiter = result.get("waiter")
             if isinstance(waiter, str):
                 params: dict[str, Any] = {"waiter": waiter}
-                cap = hermes.human_wait_ceiling() if policy.is_messaging(origin.platform) else None
+                cap = hermes.tool_wait_cap(started)
                 if cap:
                     params["cap_s"] = cap
                 with hermes.human_wait():
@@ -450,12 +470,22 @@ class Subscription:
     def rekey(self, session_id: str) -> None:
         self.target.rekey(session_id)
         self.origin.session_id = session_id
+        self._tell({"op": "rekey", "call_id": self.call_id, "session_id": session_id})
+
+    def requeue(self, text: str) -> bool:
+        """Give the hub back a turn this process took but no turn read (a compute-host child): the dashboard puts
+        it in. False when the call's connection is gone."""
+        return not self.done.is_set() and self._tell({"op": "requeue", "call_id": self.call_id, "text": text})
+
+    def _tell(self, message: dict) -> bool:
         client = self.client
-        if client is not None:
-            try:
-                client.send({"op": "rekey", "call_id": self.call_id, "session_id": session_id})
-            except OSError:
-                pass
+        if client is None or client.closed:
+            return False
+        try:
+            client.send(message)
+            return True
+        except OSError:
+            return False
 
     def _run(self) -> None:
         try:

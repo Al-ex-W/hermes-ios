@@ -17,17 +17,20 @@ has no client, and the host's fallback is its stdout, where a reopened conversat
 A call owned by a conversation in another process (CLI, Ink TUI, messaging gateway, cron, a compute-host child)
 gets its turns over the hub's socket, and ``deliver_here`` puts them in in that process (``remote.py``):
 
-1. The process hosts the session itself (Ink TUI): the chain above, without reopening anything.
-2. A turn is running (``Turns``, from the ``pre_llm_call`` / ``on_session_end`` hooks): the agent's own
-   ``redirect()`` (a model request is cancelled and retried with the turn; during tools it becomes a steer), else
-   ``steer()`` (read after the current tool batch). A steer the turn ends without reading is taken back at
-   ``on_session_end`` and starts a turn instead.
+1. The process hosts the session itself (Ink TUI): the chain above, without reopening anything. Not in a
+   compute-host child: its copy of the session is the dashboard's to start turns in.
+2. A turn is running (``turn_live``: the agent's own state, where Hermes shows it; else the ``pre_llm_call`` /
+   ``on_session_end`` hooks, ``Turns``): the agent's ``redirect()`` (a model request is cancelled and retried with
+   the turn; during tools it becomes a steer), else ``steer()`` (read after the current tool batch). A steer the
+   turn ends without reading is taken back (at ``on_session_end``, or once the agent shows it is idle) and starts
+   a turn instead.
 3. Idle: ``ctx.inject_message`` with the conversation's route key (``get_current_session_key()``, captured when
    the call started) starts a turn. Hermes allows that in a messaging or Ink TUI session only with
-   ``plugins.entries.hermes_voice.allow_gateway_injection: true``; the classic CLI needs nothing.
+   ``plugins.entries.hermes_voice.allow_gateway_injection: true``; the classic CLI needs nothing. A compute-host
+   child (``dashboard.turn_isolation``) doesn't start one itself.
 
 What can't be delivered there is marked ``fallback``: the dashboard's hub then tries its own session host, which
-holds the session when turns run in compute-host children (``dashboard.turn_isolation``).
+holds the session when turns run in compute-host children (its ``prompt.submit`` sends the turn to the child).
 """
 
 from __future__ import annotations
@@ -308,66 +311,221 @@ class AgentTarget:
             self.owner.rekey(session_id)
 
 
-class Turns:
-    """Which conversations in this process have a turn running (``pre_llm_call`` .. ``on_session_end``), and the
-    voice turns steered into them that are still in the agent's buffer."""
+def turn_live(agent: Any) -> Optional[bool]:
+    """Whether the agent has a turn running now, read off the agent itself: a model request in flight, a tool batch
+    running, or the session's turn lease held (taken at admission and released on every way out of the turn,
+    early returns and errors included). None for an agent that doesn't show this (an older Hermes): then the
+    hooks say (``Turns``). Hermes' own ``steer()`` takes text whether or not a turn runs, so this decides whether a
+    steer will be read at all."""
+    if agent is None:
+        return None
+    try:
+        known = False
+        if hasattr(agent, "_executing_tools"):
+            known = True
+            if getattr(agent, "_executing_tools") is True:
+                return True
+        is_set = getattr(getattr(agent, "_model_request_active", None), "is_set", None)
+        if callable(is_set):
+            known = True
+            if is_set():
+                return True
+        if getattr(agent, "_active_session_turn_lease_holder", None):
+            return True
+    except Exception:  # noqa: BLE001 - an agent that can't say: the hooks decide
+        return None
+    return False if known else None
 
-    def __init__(self) -> None:
+
+@dataclass(eq=False)
+class _Held:
+    """A voice turn steered into a running turn, until that turn reads it (or ends without reading it)."""
+
+    agent_ref: Callable[[], Any]
+    ticket: Any
+    text: str
+    target: AgentTarget
+    session_ids: frozenset[str]
+    at: float = field(default_factory=time.monotonic)
+
+
+class Turns:
+    """Which conversations in this process have a turn running, and the voice turns steered into them that are
+    still in the agent's buffer.
+
+    The hooks (``pre_llm_call`` .. ``on_session_end``) mark turns by session id and by agent; the agent's own state
+    (``turn_live``) wins where Hermes shows it, since ``on_session_end`` doesn't fire on every way out of a turn
+    (early returns on a provider error, retries used up, an interrupt during a model call) and compression gives
+    the turn a new id midway. A steer is settled when its turn ends: at ``on_session_end``, or by a watcher that
+    sees the agent idle without that hook. One its turn never read is taken back (``withdraw_steer``) and handed
+    to ``late`` (``remote.py`` starts a turn with it)."""
+
+    POLL_S = 0.5
+    # A turn no hook closed and no agent state can confirm counts as over after this long.
+    STALE_S = 6 * 3600.0
+    # A steer whose agent can't show its state waits this long for on_session_end, then stays where it is (its
+    # agent's next turn reads it).
+    HELD_LIMIT_S = 1800.0
+
+    def __init__(self, late: Optional[Callable[[AgentTarget, str], None]] = None) -> None:
         self.lock = threading.Lock()
         self.running: dict[str, float] = {}
-        self.steers: dict[str, list[tuple[Any, Any, str, AgentTarget]]] = {}
+        # id(agent) -> (weak reference, the session ids its running turn was marked under)
+        self.agents: dict[int, tuple[Callable[[], Any], set[str]]] = {}
+        self.held: list[_Held] = []
+        self.late = late
+        self.watching = False
 
-    def start(self, session_id: str) -> None:
+    def start(self, session_id: str, agent: Any = None) -> None:
         if not session_id:
             return
+        now = time.time()
         with self.lock:
-            self.running[session_id] = time.time()
-            if len(self.running) > 500:
-                for key in list(self.running)[:100]:
-                    self.running.pop(key, None)
+            self.running[session_id] = now
+            if agent is not None:
+                ref, ids = self.agents.get(id(agent), (None, set()))
+                if ref is None or ref() is not agent:
+                    ref, ids = _ref(agent), set()
+                ids.add(session_id)
+                self.agents[id(agent)] = (ref, ids)
+            for key in [key for key, at in self.running.items() if now - at > self.STALE_S]:
+                self.running.pop(key, None)
+            for key in [key for key, (ref, _) in self.agents.items() if ref() is None]:
+                self.agents.pop(key, None)
 
-    def end(self, session_id: str) -> list[tuple[AgentTarget, str]]:
+    def end(self, session_id: str, agent: Any = None) -> list[tuple[AgentTarget, str]]:
         """The turn is over. Returns the voice turns it never read (taken back from the agent's buffer), which
         must start a turn now."""
         with self.lock:
             self.running.pop(session_id, None)
-            held = self.steers.pop(session_id, [])
-        unread: list[tuple[AgentTarget, str]] = []
-        for agent_ref, ticket, text, target in held:
-            agent = agent_ref()
-            withdraw = getattr(agent, "withdraw_steer", None) if agent is not None else None
-            try:
-                if callable(withdraw) and withdraw(ticket):
-                    unread.append((target, text))
-            except Exception:  # noqa: BLE001 - a broken withdraw leaves the steer where it is
-                logger.debug("hermes_voice: withdraw_steer failed", exc_info=True)
-        return unread
+            if agent is not None:
+                _, ids = self.agents.pop(id(agent), (None, set()))
+                for key in ids:  # the ids it had before compression rotated it
+                    self.running.pop(key, None)
+            settle = [held for held in self.held if self._ended_by(held, session_id, agent)]
+            self.held = [held for held in self.held if held not in settle]
+        return _withdraw(settle)
+
+    @staticmethod
+    def _ended_by(held: _Held, session_id: str, agent: Any) -> bool:
+        current = held.agent_ref()
+        if agent is not None and current is agent:
+            return True
+        return bool(session_id) and (session_id in held.session_ids
+                                     or getattr(current, "session_id", None) == session_id)
 
     def busy(self, target: AgentTarget) -> bool:
+        """Mid-turn by the hooks alone (an agent that doesn't show its state)."""
+        agent = target.agent()
         with self.lock:
+            if agent is not None:
+                entry = self.agents.get(id(agent))
+                if entry is not None and entry[0]() is agent:
+                    return True
             return any(sid in self.running for sid in target.ids())
 
-    def hold(self, session_id: str, agent: Any, ticket: Any, text: str, target: AgentTarget) -> None:
-        try:
-            ref: Any = weakref.ref(agent)
-        except TypeError:
-            ref = lambda: agent  # noqa: E731
+    def live(self, agent: Any, target: AgentTarget) -> bool:
+        """Whether a voice turn steered into `agent` now will be read by a turn."""
+        state = turn_live(agent)
+        return self.busy(target) if state is None else state
+
+    def hold(self, agent: Any, ticket: Any, text: str, target: AgentTarget) -> None:
+        held = _Held(_ref(agent), ticket, text, target,
+                     frozenset(target.ids() | {str(getattr(agent, "session_id", None) or "")}) - {""})
         with self.lock:
-            self.steers.setdefault(session_id, []).append((ref, ticket, text, target))
+            self.held.append(held)
+            start = not self.watching
+            self.watching = True
+        if start:
+            try:
+                hermes.spawn_thread(self._watch, name="hermes-voice-steers")
+            except RuntimeError:
+                with self.lock:
+                    self.watching = False
+
+    def sweep(self) -> list[tuple[AgentTarget, str]]:
+        """Settle the steers whose turn is over without an ``on_session_end`` (the agent shows it is idle)."""
+        now = time.monotonic()
+        with self.lock:
+            held = list(self.held)
+        settle, drop = [], []
+        for item in held:
+            agent = item.agent_ref()
+            if agent is None:
+                drop.append(item)  # the agent is gone, and its buffer with it
+                continue
+            state = turn_live(agent)
+            if state is False:
+                settle.append(item)
+            elif state is None and now - item.at > self.HELD_LIMIT_S:
+                drop.append(item)
+        if not settle and not drop:
+            return []
+        with self.lock:
+            self.held = [item for item in self.held if item not in settle and item not in drop]
+        for item in drop:
+            logger.info("hermes_voice: a voice turn steered into a turn stays with its agent (%s)",
+                        "agent gone" if item.agent_ref() is None else "turn end not seen")
+        return _withdraw(settle)
+
+    def _watch(self) -> None:
+        while True:
+            time.sleep(self.POLL_S)
+            unread = self.sweep()
+            for target, text in unread:
+                late = self.late
+                if late is None:
+                    logger.warning("hermes_voice: a voice turn the conversation never read was dropped")
+                    continue
+                try:
+                    late(target, text)
+                except Exception:  # noqa: BLE001 - keep settling the others
+                    logger.warning("hermes_voice: a late voice turn failed", exc_info=True)
+            with self.lock:
+                if not self.held:
+                    self.watching = False
+                    return
+
+
+def _ref(agent: Any) -> Callable[[], Any]:
+    try:
+        return weakref.ref(agent)
+    except TypeError:
+        return lambda: agent
+
+
+def _withdraw(held: list[_Held]) -> list[tuple[AgentTarget, str]]:
+    """Take the steers back from their agents' buffers: the ones no turn read."""
+    unread: list[tuple[AgentTarget, str]] = []
+    for item in held:
+        agent = item.agent_ref()
+        withdraw = getattr(agent, "withdraw_steer", None) if agent is not None else None
+        try:
+            if callable(withdraw) and withdraw(item.ticket):
+                unread.append((item.target, item.text))
+        except Exception:  # noqa: BLE001 - a broken withdraw leaves the steer where it is
+            logger.debug("hermes_voice: withdraw_steer failed", exc_info=True)
+    return unread
 
 
 def deliver_here(target: AgentTarget, text: str, turns: Turns) -> Delivery:
     """Put a voice turn into the conversation, in the process that runs it (see the module docs)."""
-    table = hermes.methods()
-    if table is not None and hermes.find_live(target.session_id) is not None:
+    child = hermes.is_compute_host_child()
+    # A compute-host child holds a copy of the dashboard's session, but its turns are the dashboard's to start:
+    # a turn submitted here would run behind the dashboard's back (it would neither show it running nor let the
+    # user's own prompt in meanwhile).
+    if not child and hermes.methods() is not None and hermes.find_live(target.session_id) is not None:
         delivery = TuiInjector().deliver_live(target.owner, text)
         if delivery.ok:
             return delivery
     agent = target.agent()
-    if agent is not None and turns.busy(target):
+    if agent is not None and turns.live(agent, target):
         delivery = _steer_agent(agent, target, text, turns)
         if delivery is not None:
             return delivery
+    if child:
+        return Delivery(False, detail="no turn is running in this compute host; the dashboard starts one",
+                        fallback=True)
     return inject_idle(target, text)
 
 
@@ -394,7 +552,15 @@ def _steer_agent(agent: Any, target: AgentTarget, text: str, turns: Turns) -> Op
     if not accepted:
         return None
     if ticket is not None:
-        turns.hold(str(getattr(agent, "session_id", None) or target.session_id), agent, ticket, text, target)
+        if turn_live(agent) is False:
+            # The turn ended between the look and the steer: take it back and start a turn instead.
+            withdraw = getattr(agent, "withdraw_steer", None)
+            try:
+                if callable(withdraw) and withdraw(ticket):
+                    return None
+            except Exception:  # noqa: BLE001
+                logger.debug("hermes_voice: withdraw_steer failed", exc_info=True)
+        turns.hold(agent, ticket, text, target)
     return Delivery(True, "steer", "queued")
 
 

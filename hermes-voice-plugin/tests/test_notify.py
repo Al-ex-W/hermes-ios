@@ -258,7 +258,7 @@ def test_without_previews_no_conversation_text_goes_to_apns(core, env):
     assert env.mock.payloads()[-1]["aps"]["alert"] == {"title": "Hermes", "body": "Hermes finished."}
 
 
-def test_payloads_fit_in_4_kb(core):
+def test_payloads_fit_in_4_kb(core, fake):
     huge = [{"qid": f"q{i}", "question": "Pick one " * 60, "choices": [f"option {j} " * 10 for j in range(12)],
              "multi_select": True} for i in range(6)]
     payload = core.notify.request_alert("clarify", {"questions": huge}, request_id=CLARIFY_ID, title="T" * 300,

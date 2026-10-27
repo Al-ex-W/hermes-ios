@@ -72,6 +72,7 @@ plugins:
         sync_reply_timeout_s: 600
         policy:
           allowed_sources: [desktop, dashboard, tui, cli, local]   # local: a CLI / TUI session the gateway runs
+                                           # add oneshot (`chat -q`, `-z`) or tool (`--source tool`) to let those ring
           allow_owner_dms: true
           owner_ids: []                    # e.g. ["telegram:123456"]; empty: the gateway's allowlist / pairing
           allow_cron: false
@@ -100,6 +101,10 @@ allow-all switch, a `*` wildcard, a group-only allowlist or a Discord role grant
 chats, scheduled jobs and subagents stay off unless their `allow_*` setting is on. The rate limits and quiet hours
 count every ring on the host, whichever process it came from.
 
+**Runs nobody sits at.** `hermes chat -q` and `hermes -z` (source `oneshot`) and third-party integrations
+(`hermes chat --source tool`, source `tool`) run as the CLI, but no one is there to talk to, and what they read
+(mail, web pages) could talk the model into ringing. They don't ring unless `allowed_sources` lists them.
+
 ## Calls from any session
 
 The phone's socket and the call slot live in the dashboard process (`hermes serve`). Once it serves, the plugin
@@ -109,8 +114,10 @@ Ink TUI, the messaging gateway, cron jobs, compute-host children under `dashboar
 end calls through it (`hubsock.py` has the protocol), and take the call's turns over it:
 
 - **Mid-turn**, a turn goes to the agent itself: `redirect()` (a model request is retried with it; during tools it
-  becomes a steer), else `steer()` (read after the current tool batch). A steer the turn ends without reading
-  starts a new turn instead.
+  becomes a steer), else `steer()` (read after the current tool batch). Whether a turn runs is read off the agent
+  (a model request in flight, a tool batch, the turn lease held), since Hermes' `on_session_end` hook doesn't fire
+  on every way out of a turn (a provider error, say). A steer the turn ends without reading starts a new turn
+  instead.
 - **Idle**, it starts a turn with `ctx.inject_message` and the conversation's route key. Hermes allows that in a
   gateway session (messaging, or a local CLI / TUI session the gateway runs) only with
 
@@ -122,10 +129,13 @@ end calls through it (`hubsock.py` has the protocol), and take the call's turns 
   ```
 
   Without it an async `start_call` from such a session is refused (`not_available`, the note says how to fix it);
-  a sync one still returns the reply. The classic CLI REPL needs nothing; a compute-host child's idle turns are
-  started by the dashboard, which holds the session.
-- A sync wait runs in Hermes' human-wait window of the tool's own process. From a messaging chat it is capped at
-  `approvals.timeout` + 60 s (Hermes' bound on one human wait inside a tool call); the result says so when it hits.
+  a sync one still returns the reply. The classic CLI REPL needs nothing. A compute-host child never starts a turn
+  itself: the dashboard, which holds the session, submits it (and sends it to the child), so the dashboard shows
+  it running and queues what the user types meanwhile.
+- A sync wait runs in Hermes' human-wait window of the tool's own process, and ends before Hermes would give up on
+  the tool call: its tool deadline (`timeouts.tools.sequential_call`, 420 s by default) plus at most
+  `approvals.timeout` + 60 s of human wait, less the time already spent (the same in the dashboard). The result
+  says so when it hits; the reply then arrives as a `[Voice]` message.
 
 A call whose process goes away (and doesn't come back within 30 s) is hung up. A messaging gateway that serves the
 dashboard app behind its own listener doesn't count as the dashboard: the phone connects to `hermes serve`.

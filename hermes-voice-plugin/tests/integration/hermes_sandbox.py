@@ -158,7 +158,17 @@ class ToolCall:
     delay: float = 0.0
 
 
-Reply = Union[Text, ToolCall]
+@dataclass
+class Fail:
+    """The provider refuses the request (an HTTP 4xx Hermes doesn't retry): the turn ends on an early return,
+    without ``on_session_end``."""
+
+    status: int = 400
+    message: str = "unsupported parameter (test)"
+    delay: float = 0.0
+
+
+Reply = Union[Text, ToolCall, Fail]
 
 
 def message_text(message: dict[str, Any]) -> str:
@@ -268,6 +278,9 @@ class StubModel:
                     self._reply(reply, bool(body.get("stream")))
 
             def _reply(self, reply: Reply, stream: bool) -> None:
+                if isinstance(reply, Fail):
+                    return self._json(reply.status, {"error": {"message": reply.message,
+                                                               "type": "invalid_request_error"}})
                 usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
                 if isinstance(reply, ToolCall):
                     with stub.lock:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from . import hermes, hub, remote
@@ -86,6 +87,7 @@ def reachable() -> bool:
 
 
 def start_call(args: Any, session_id: Any = None, task_id: Any = None, **_: Any) -> str:
+    started = time.monotonic()
     args = args if isinstance(args, dict) else {}
     mode = str(args.get("mode") or "async").strip().lower()
     try:
@@ -99,7 +101,8 @@ def start_call(args: Any, session_id: Any = None, task_id: Any = None, **_: Any)
         origin = hermes.origin(session_id)
         if not origin.session_id:
             return _answer(hub._refusal(mode, "not_allowed", "This conversation can't place a call."))
-        return _answer(hub.get_hub().start_call(origin, text, mode))
+        cap = hermes.tool_wait_cap(started) if mode == "sync" else None
+        return _answer(hub.get_hub().start_call(origin, text, mode, cap_s=cap))
     except Exception:  # noqa: BLE001 - a tool must never raise
         logger.warning("hermes_voice: start_call failed", exc_info=True)
         return _answer({"error": "The call couldn't be set up. Tell the user in your text reply instead."})

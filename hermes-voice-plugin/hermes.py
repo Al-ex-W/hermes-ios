@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
@@ -384,7 +385,8 @@ def origin(session_id: Any) -> Origin:
     sid = sid or (session_id.strip() if isinstance(session_id, str) else "")
     found = find_live(sid) if sid else None
     runtime_sid, record = found if found is not None else ("", None)
-    source = session_env("HERMES_SESSION_SOURCE") or str((record or {}).get("source") or "")
+    source = (unattended_source() or session_env("HERMES_SESSION_SOURCE")
+              or str((record or {}).get("source") or ""))
     return Origin(
         session_id=sid,
         runtime_sid=runtime_sid,
@@ -419,6 +421,19 @@ def current_session_key() -> str:
     return "" if key == "default" else key[:256]
 
 
+def bound_agent() -> Any:
+    """The agent Hermes binds for the turn running in this context (a delegated subagent's own agent included), or
+    None outside a turn. Hooks run inside that binding, so this is the agent whose turn the hook is about."""
+    try:
+        from agent.subagent_lifecycle import get_active_subagent_parent
+    except ImportError:
+        return None
+    try:
+        return get_active_subagent_parent()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def turn_agent() -> Any:
     """The top-level agent whose turn runs in this context: the agent Hermes binds for the turn, or the top of a
     delegated subagent's parent chain. None outside a turn."""
@@ -435,6 +450,41 @@ def turn_agent() -> Any:
     return subagent_parent() or agent
 
 
+# Room left between the end of a sync wait and Hermes' tool deadline, for the result to get back.
+TOOL_DEADLINE_MARGIN_S = 20.0
+
+
+def tool_wait_cap(started: float) -> Optional[float]:
+    """How long a sync start_call that began at `started` (``time.monotonic()``) may still wait inside its tool call
+    before Hermes abandons the tool with a generic timeout: the sequential tool deadline
+    (``timeouts.tools.sequential_call``, default 420 s), extended by the time spent in a human-wait window but by
+    at most ``human_wait_ceiling()`` (``approvals.timeout`` + 60 s) per window, less the time already spent and a
+    margin. None when Hermes sets no deadline (or outside Hermes)."""
+    deadline = _sequential_tool_deadline()
+    ceiling = human_wait_ceiling()
+    if deadline is None or ceiling is None:
+        return None
+    return max(1.0, deadline + ceiling - (time.monotonic() - started) - TOOL_DEADLINE_MARGIN_S)
+
+
+def _sequential_tool_deadline() -> Optional[float]:
+    try:
+        from agent import tool_executor
+        resolver = getattr(tool_executor, "_resolve_sequential_tool_timeout", None)
+        if callable(resolver):
+            value = resolver()
+        else:
+            from agent.deadline import resolve_timeout
+            value = resolve_timeout("tools.sequential_call", default=420.0)
+    except Exception:  # noqa: BLE001 - outside Hermes (or an older one): no deadline known
+        return None
+    try:
+        value = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return value if value is not None and value > 0 else None
+
+
 def human_wait_ceiling() -> Optional[float]:
     """How long one human wait may hold a tool past Hermes' tool deadline: ``approvals.timeout`` + 60 s (None
     outside Hermes)."""
@@ -447,6 +497,57 @@ def human_wait_ceiling() -> Optional[float]:
     except Exception:  # noqa: BLE001
         return None
     return value if value > 0 else None
+
+
+def redact(text: str) -> Optional[str]:
+    """``text`` with credentials masked the way Hermes masks them before any client sees them
+    (``agent.redact.redact_sensitive_text``, forced on), or None where that isn't available."""
+    try:
+        from agent.redact import redact_sensitive_text
+    except ImportError:
+        return None
+    try:
+        return str(redact_sensitive_text(text, force=True))
+    except Exception:  # noqa: BLE001 - fail closed: the caller says something generic instead
+        return None
+
+
+def unattended_source() -> str:
+    """A label for a turn nobody is at the keyboard for, else "": ``oneshot`` for a finite run (``hermes chat -q``,
+    ``hermes -z``: Hermes answers its prompts itself, since no user is there to), ``tool`` for a third-party
+    integration (``hermes chat --source tool``). Hermes runs both as the CLI, so their session surface says ``cli``;
+    the launch policy keeps their own label."""
+    label = ""
+    try:
+        from gateway.session_policy import active_policy
+        policy = active_policy()
+        label = str(getattr(policy, "source", "") or "").strip().lower() if policy is not None else ""
+    except Exception:  # noqa: BLE001 - no gateway package, or no launch policy for this turn
+        label = ""
+    if label in ("oneshot", "tool"):
+        return label
+    try:
+        from gateway.session_finite import finite_turn_required, unattended_turn
+        if finite_turn_required() is True or unattended_turn() is True:
+            return "oneshot"
+    except Exception:  # noqa: BLE001
+        pass
+    if session_env("HERMES_SINGLE_QUERY_SESSION").strip().lower() in ("1", "true", "yes", "on"):
+        return "oneshot"
+    return ""
+
+
+def home_key(path: Any) -> str:
+    """A Hermes home as Hermes keys it (``hermes_home_key``: resolved, case-normalized), so two spellings of one
+    folder (a symlink, /tmp vs /private/tmp) compare equal."""
+    try:
+        from hermes_constants import hermes_home_key
+        return str(hermes_home_key(path))
+    except Exception:  # noqa: BLE001 - an older Hermes, or outside Hermes
+        try:
+            return os.path.normcase(os.path.realpath(os.path.expanduser(str(path))))
+        except (OSError, ValueError):
+            return str(path)
 
 
 def gateway_injection_allowed() -> bool:

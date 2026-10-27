@@ -2,6 +2,7 @@
 say on the call out loud.
 
 - ``call me sync: <text>`` / ``call me async: <text>`` -> ``start_call {text, mode}``
+- ``fail now``, or a said text in ``Agent.fail`` -> the provider refuses the request (HTTP 400)
 - an injected ``[Voice] <said> (…hint…)`` turn -> ``start_call {text: "You said <said>."}`` (async); a hung-up turn
   gets a text reply
 - after a tool result, or anything else -> a short text reply
@@ -18,7 +19,7 @@ import re
 import threading
 from typing import Any, Optional
 
-from hermes_sandbox import Text, ToolCall, message_text, since_last_reply
+from hermes_sandbox import Fail, Text, ToolCall, message_text, since_last_reply
 
 # One line: Hermes may append notes of its own to a user's message (e.g. on their very first one).
 CALL_ME = re.compile(r"call me (sync|async): ([^\n]+)")
@@ -54,6 +55,8 @@ class Agent:
         self.lock = threading.Lock()
         # Seconds the model "thinks" before answering a said text (keeps that turn running).
         self.slow: dict[str, float] = {}
+        # Said texts whose turn the provider refuses.
+        self.fail: set[str] = set()
         self.answered: set[str] = set()
 
     def __call__(self, body: dict[str, Any]) -> Any:
@@ -65,12 +68,16 @@ class Agent:
                 if said in self.answered:
                     continue
                 self.answered.add(said)
+                if said in self.fail:
+                    return Fail()
                 if hint == "The user hung up":
                     return Text("Talk soon.")  # the call is over: reply in text, as the hint says
                 return invoke(body, "start_call", {"text": f"You said {said}.", "mode": "async"},
                               self.slow.get(said, 0.0))
         last = recent[-1] if recent else {}
         if last.get("role") == "user":
+            if "fail now" in message_text(last):
+                return Fail()
             match = CALL_ME.search(message_text(last))
             if match:
                 return invoke(body, "start_call", {"text": match.group(2).strip(), "mode": match.group(1)})
