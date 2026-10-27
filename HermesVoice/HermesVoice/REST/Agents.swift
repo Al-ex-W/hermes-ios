@@ -293,8 +293,15 @@ struct AgentRoster: Equatable, Sendable {
         }
     }
 
+    /// Running and queued rows in every session (`activeSubagentCount` over all of them).
     var liveCount: Int { all.filter(\.isLive).count }
-    var failedCount: Int { all.filter { $0.status == .failed || $0.status == .interrupted }.count }
+
+    /// Failed and interrupted rows of `focus` only: the tree shows finished rows for that session alone, so the
+    /// count and the tree it opens agree (the desktop's `subagentsFailed`).
+    func failedCount(focus: String?) -> Int {
+        guard let focus else { return 0 }
+        return agents(in: focus).filter { $0.status == .failed || $0.status == .interrupted }.count
+    }
 
     private mutating func set(_ session: String, previous: [AgentProgress], next: [AgentProgress]) {
         let finished = previous.filter(\.status.isTerminal).map(\.id)

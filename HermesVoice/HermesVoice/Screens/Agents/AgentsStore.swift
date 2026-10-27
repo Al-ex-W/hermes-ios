@@ -42,6 +42,8 @@ final class AgentsStore: ObservableObject {
     private var listener: UUID?
     private var stateListener: UUID?
     private var polling: Task<Void, Never>?
+    /// Trees on screen (`startPolling` minus `stopPolling`).
+    private var viewers = 0
     private weak var focused: (any AgentsSessionSource)?
     /// Chats the store was told about, for titles and profiles.
     private var known: [WeakSource] = []
@@ -177,8 +179,11 @@ final class AgentsStore: ObservableObject {
         }
     }
 
-    /// Polls while the tree is on screen; `stopPolling` ends it.
+    /// Polls while a tree is on screen; each `startPolling` is paired with a `stopPolling`. Two trees can show at
+    /// once (iPad: one pushed on a chat, one in the bottom bar's overlay), and the one that appears runs its
+    /// `onAppear` before the other's `onDisappear`, so the poll stops only when the last of them goes.
     func startPolling() {
+        viewers += 1
         guard polling == nil else { return }
         polling = Task { [weak self] in
             await self?.refresh()
@@ -191,9 +196,14 @@ final class AgentsStore: ObservableObject {
     }
 
     func stopPolling() {
+        viewers = max(0, viewers - 1)
+        guard viewers == 0 else { return }
         polling?.cancel()
         polling = nil
     }
+
+    /// Whether the safety-net poll runs.
+    var isPolling: Bool { polling != nil }
 
     // MARK: Controls (the desktop's `SubagentControls` and `SubagentTranscript`)
 

@@ -190,7 +190,23 @@ final class AgentsImportTests: XCTestCase {
         XCTAssertEqual(Set(roster.panel(focus: "s1").map(\.id)), ["s1-live", "s1-done", "s2-live"])
         XCTAssertEqual(Set(roster.panel(focus: nil).map(\.id)), ["s1-live", "s2-live"])
         XCTAssertEqual(roster.liveCount, 2)
-        XCTAssertEqual(roster.failedCount, 0)
+        XCTAssertEqual(roster.failedCount(focus: "s1"), 0)
+    }
+
+    func testFailedCountsOnlyTheFocusedSessionLikeTheTree() {
+        var roster = AgentRoster()
+        roster.upsert(session: "a", payload: payload(["subagent_id": "a-failed", "goal": "F", "status": "failed"]),
+                      createIfMissing: true, eventType: "subagent.complete", now: t0)
+        roster.upsert(session: "a", payload: payload(["subagent_id": "a-stopped", "goal": "I", "status": "interrupted"]),
+                      createIfMissing: true, eventType: "subagent.complete", now: t0)
+        roster.upsert(session: "b", payload: payload(["subagent_id": "b-live", "goal": "L"]),
+                      createIfMissing: true, eventType: "subagent.start", now: t0)
+        XCTAssertEqual(roster.failedCount(focus: "a"), 2)
+        // In chat B the tree drops A's finished rows, so the count does too; B's live row still counts.
+        XCTAssertEqual(roster.failedCount(focus: "b"), 0)
+        XCTAssertTrue(roster.panel(focus: "b").allSatisfy(\.isLive))
+        XCTAssertEqual(roster.failedCount(focus: nil), 0)
+        XCTAssertEqual(roster.liveCount, 1)
     }
 
     // MARK: Tree
@@ -332,6 +348,23 @@ final class AgentsImportTests: XCTestCase {
         gateway.current.push(event: "message.start", session: "rt-1", seq: 4)
         await waitUntil { store.roster.agents(in: "rt-1").isEmpty }
         XCTAssertEqual(store.roster.agents(in: "rt-2").count, 1, "other sessions keep their rows")
+    }
+
+    func testOverlappingTreesKeepThePollUntilTheLastOneGoes() {
+        let store = AgentsStore(connection: ScriptedGateway().connection(), now: { self.t0 })
+        // iPad: the tree pushed on a chat, then the bottom bar's overlay. The overlay appears before the chat's
+        // tree disappears.
+        store.startPolling()
+        store.startPolling()
+        store.stopPolling()
+        XCTAssertTrue(store.isPolling, "the overlay still shows")
+        store.stopPolling()
+        XCTAssertFalse(store.isPolling)
+        store.stopPolling()
+        store.startPolling()
+        XCTAssertTrue(store.isPolling, "an extra stop doesn't leave a debt")
+        store.stopPolling()
+        XCTAssertFalse(store.isPolling)
     }
 
     func testStoreReadsTheRosterAndSendsControlsThroughTheOwningSession() async throws {

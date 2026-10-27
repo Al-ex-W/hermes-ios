@@ -26,8 +26,9 @@ struct SidebarView: View {
 
     private var searching: Bool { !sidebar.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-    /// The Command Center shows beside the sidebar (iPad), so its button reads as on.
-    private var commandCenterOpen: Bool { sizeClass != .compact && sidebar.selection == .commandCenter }
+    /// The Command Center shows beside the sidebar (iPad), so its button reads as on. The sidebar column's own size
+    /// class is compact on iPad too, so this reads the shell's layout.
+    private var commandCenterOpen: Bool { !sidebar.compact && sidebar.selection == .commandCenter }
 
     var body: some View {
         List(selection: $sidebar.selection) {
@@ -390,27 +391,28 @@ struct SidebarView: View {
 /// the desktop opens from its command palette. Each opens over the detail column; on iPad pressing it again goes
 /// back to what was open, as the desktop's toggles do.
 ///
-/// Agents shows the statusbar's count: "N subagents" while some run, else "N failed".
+/// Agents shows the statusbar's count: "N subagents" while some run, else "N failed". Running ones count from every
+/// session, failed ones only from the chat the user is in, the scope the tree it opens shows; any failure tints it.
 private struct SidebarAgentsButton: View {
     @ObservedObject var sidebar: SidebarModel
     @ObservedObject var agents: AgentsStore
-    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        let live = agents.roster.liveCount, failed = agents.roster.failedCount
-        let showsFailure = live == 0 && failed > 0
-        let open = sizeClass != .compact && sidebar.selection == .agents
-        let count = live > 0 ? "\(live) subagent\(live == 1 ? "" : "s")" : showsFailure ? "\(failed) failed" : nil
+        let live = agents.roster.liveCount, failed = agents.roster.failedCount(focus: agents.focusSession)
+        // The sidebar column is compact on iPad too, so the shell's layout says whether the overlay shows beside it.
+        let open = !sidebar.compact && sidebar.selection == .agents
+        let count = live > 0 ? "\(live) subagent\(live == 1 ? "" : "s")" : failed > 0 ? "\(failed) failed" : nil
         Button { sidebar.toggleOverlay(.agents) } label: {
             // A bar shows a label's icon only, so the count is text of its own.
             HStack(spacing: Theme.Spacing.xs) {
-                Image(systemName: showsFailure ? Theme.Icon.error : Theme.Icon.agents)
+                Image(systemName: failed > 0 ? Theme.Icon.error : Theme.Icon.agents)
                 if let count { Text(count).hermesText(.meta).monospacedDigit() }
             }
         }
-        .tint(showsFailure ? Theme.destructive : nil)
+        .tint(failed > 0 ? Theme.destructive : nil)
         .accessibilityLabel(open ? "Close agents" : "Open agents")
-        .accessibilityValue(live > 0 ? "\(live) running" : showsFailure ? "\(failed) failed" : "")
+        .accessibilityValue([live > 0 ? "\(live) running" : nil, failed > 0 ? "\(failed) failed" : nil]
+            .compactMap { $0 }.joined(separator: ", "))
     }
 }
 
@@ -418,10 +420,9 @@ private struct SidebarAgentsButton: View {
 private struct SidebarOverlayButton: View {
     @ObservedObject var sidebar: SidebarModel
     let overlay: SidebarDestination
-    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        let open = sizeClass != .compact && sidebar.selection == overlay
+        let open = !sidebar.compact && sidebar.selection == overlay
         Button { sidebar.toggleOverlay(overlay) } label: {
             Image(systemName: overlay.icon)
                 .foregroundStyle(open ? Theme.primary : Theme.Text.secondary)
