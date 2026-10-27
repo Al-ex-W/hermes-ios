@@ -25,13 +25,13 @@ struct SharedMetricsRow: View {
                 .labelsHidden()
                 .disabled(consent == nil || busy)
             }
+            .task { await load() }
             if let url = Self.docsURL {
                 Link("What is collected", destination: url).hermesText(.button)
             }
         }
         .hermesFormRows()
         .id("safety.shared-metrics")
-        .task { await load() }
     }
 
     private func load() async {

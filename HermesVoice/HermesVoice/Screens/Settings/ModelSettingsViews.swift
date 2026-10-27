@@ -279,6 +279,18 @@ struct MainModelSection: View {
                 .disabled(applying)
             }
             .id("model.main-model")
+            // On this one row: a Section hands its modifiers to every row, and several rows presenting one sheet
+            // make UIKit dismiss Settings itself.
+            .modelRoutePicker(isPresented: $picking, catalog: catalog, title: "Default Model", current: main) { route in
+                if let route { Task { await apply(route) } }
+            }
+            .alert("Use this model?", isPresented: Binding(get: { pendingConfirm != nil }, set: { if !$0 { pendingConfirm = nil } }),
+                   presenting: pendingConfirm) { pending in
+                Button("Cancel", role: .cancel) {}
+                Button("Use it") { Task { await apply(pending.route, confirmed: true) } }
+            } message: { pending in
+                Text(pending.message)
+            }
             if let message { FormNote(message) }
             if caps?.reasoning ?? true {
                 let efforts = ["none"] + SettingsCatalog.reasoningEfforts
@@ -321,19 +333,9 @@ struct MainModelSection: View {
             }
         } footer: {
             FormNote("Applies to new chats. A running chat switches with the model pill in the composer.")
+                .task { await refreshInfo() }
         }
         .hermesFormRows()
-        .modelRoutePicker(isPresented: $picking, catalog: catalog, title: "Default Model", current: main) { route in
-            if let route { Task { await apply(route) } }
-        }
-        .alert("Use this model?", isPresented: Binding(get: { pendingConfirm != nil }, set: { if !$0 { pendingConfirm = nil } }),
-               presenting: pendingConfirm) { pending in
-            Button("Cancel", role: .cancel) {}
-            Button("Use it") { Task { await apply(pending.route, confirmed: true) } }
-        } message: { pending in
-            Text(pending.message)
-        }
-        .task { await refreshInfo() }
     }
 
     /// The detected context window, for the override row beside this section.
@@ -429,43 +431,47 @@ struct AuxiliaryModelsSection: View {
                     }
                 }
                 .disabled(busy)
+                // Presented from the row that was tapped: a Section hands its modifiers to every row, and several
+                // rows presenting at once make UIKit dismiss Settings itself.
+                .sheet(isPresented: Binding(get: { editing?.id == task.id }, set: { if !$0 { editing = nil } })) {
+                    AuxiliaryTaskEditor(task: task, title: Self.title(task),
+                                        baseLabel: task.inheritFrom.map { Self.baseTitle($0, in: tasks) }) { route, effort in
+                        Task { await assign(Self.assignment(task: task.task, route: route, effort: effort, catalog: catalog)) }
+                    }
+                    .environmentObject(catalog)
+                }
+                .alert("Use this model?", isPresented: Binding(get: { pendingConfirm?.assignment.task == task.task },
+                                                               set: { if !$0 { pendingConfirm = nil } }),
+                       presenting: pendingConfirm) { pending in
+                    Button("Cancel", role: .cancel) {}
+                    Button("Use it") {
+                        var confirmed = pending.assignment
+                        confirmed.confirmExpensiveModel = true
+                        Task { await assign(confirmed) }
+                    }
+                } message: { pending in
+                    Text(pending.message)
+                }
             }
             if !tasks.isEmpty {
                 Button("Reset all to main model", role: .destructive) { confirmingReset = true }
                     .disabled(busy || tasks.allSatisfy { $0.isAuto && $0.reasoningEffort == nil })
+                    .confirmationDialog("Reset every side task to the main model?", isPresented: $confirmingReset,
+                                        titleVisibility: .visible) {
+                        Button("Reset all", role: .destructive) { Task { await resetAll() } }
+                    } message: {
+                        Text("Their own models and reasoning settings are cleared.")
+                    }
             }
         } header: {
             FormNote("Side tasks")
+                .task { await reload() }
         } footer: {
             if let failure { FormNote(failure, color: Theme.destructive) }
             else { FormNote("Each side task uses the main model unless you pick one for it.") }
         }
         .hermesFormRows()
         .id("model.auxiliary")
-        .sheet(item: $editing) { task in
-            AuxiliaryTaskEditor(task: task, title: Self.title(task),
-                                baseLabel: task.inheritFrom.map { Self.baseTitle($0, in: tasks) }) { route, effort in
-                Task { await assign(Self.assignment(task: task.task, route: route, effort: effort, catalog: catalog)) }
-            }
-            .environmentObject(catalog)
-        }
-        .confirmationDialog("Reset every side task to the main model?", isPresented: $confirmingReset, titleVisibility: .visible) {
-            Button("Reset all", role: .destructive) { Task { await resetAll() } }
-        } message: {
-            Text("Their own models and reasoning settings are cleared.")
-        }
-        .alert("Use this model?", isPresented: Binding(get: { pendingConfirm != nil }, set: { if !$0 { pendingConfirm = nil } }),
-               presenting: pendingConfirm) { pending in
-            Button("Cancel", role: .cancel) {}
-            Button("Use it") {
-                var confirmed = pending.assignment
-                confirmed.confirmExpensiveModel = true
-                Task { await assign(confirmed) }
-            }
-        } message: { pending in
-            Text(pending.message)
-        }
-        .task { await reload() }
     }
 
     static func title(_ task: ConfigAPI.AuxiliaryTask) -> String {
@@ -690,20 +696,21 @@ struct MoaSection: View {
     }
 
     var body: some View {
-        Group {
-            if moa == nil {
-                Section {
+        if moa == nil {
+            // One row: its task loads the record once (a Section's modifiers run on every row).
+            Section {
+                Group {
                     if let failure { FormNote(failure, color: Theme.destructive) } else { ProgressView().frame(maxWidth: .infinity) }
                 }
-                .hermesFormRows()
-            } else {
-                presetSection
-                referenceSection
-                aggregatorSection
+                .task { await reload() }
             }
+            .hermesFormRows()
+            .id("model.moa")
+        } else {
+            presetSection.id("model.moa")
+            referenceSection
+            aggregatorSection
         }
-        .id("model.moa")
-        .task { await reload() }
     }
 
     private var presetSection: some View {
@@ -727,9 +734,31 @@ struct MoaSection: View {
                 Label("Add preset", systemImage: "plus")
             }
             .disabled(saving)
+            .alert("Add preset", isPresented: $namingPreset) {
+                TextField("new preset", text: $newPresetName)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("Cancel", role: .cancel) {}
+                Button("Add") {
+                    let name = newPresetName.trimmingCharacters(in: .whitespacesAndNewlines), source = presetName
+                    update { moa in if let next = Self.adding(name, copyOf: source, to: moa) { moa = next } }
+                    if presetNames.contains(name) { selected = name }
+                }
+                .disabled(newPresetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || presetNames.contains(newPresetName.trimmingCharacters(in: .whitespacesAndNewlines)))
+            } message: {
+                Text("A copy of “\(presetName)” under a new name.")
+            }
             if presetNames.count > 1 {
                 Button("Delete preset", role: .destructive) { deletingPreset = true }
                     .disabled(saving)
+                    .confirmationDialog("Delete preset “\(presetName)”?", isPresented: $deletingPreset, titleVisibility: .visible) {
+                        Button("Delete", role: .destructive) {
+                            let name = presetName
+                            update { moa in if let next = Self.deleting(name, from: moa) { moa = next } }
+                            selected = presetNames.first { $0 != name } ?? ""
+                        }
+                    }
             }
         } header: {
             FormNote("Presets")
@@ -737,28 +766,6 @@ struct MoaSection: View {
             FormNote("Each enabled preset shows as a model of the Mixture of Agents provider. Default preset: \(defaultPreset)")
         }
         .hermesFormRows()
-        .alert("Add preset", isPresented: $namingPreset) {
-            TextField("new preset", text: $newPresetName)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-            Button("Cancel", role: .cancel) {}
-            Button("Add") {
-                let name = newPresetName.trimmingCharacters(in: .whitespacesAndNewlines), source = presetName
-                update { moa in if let next = Self.adding(name, copyOf: source, to: moa) { moa = next } }
-                if presetNames.contains(name) { selected = name }
-            }
-            .disabled(newPresetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      || presetNames.contains(newPresetName.trimmingCharacters(in: .whitespacesAndNewlines)))
-        } message: {
-            Text("A copy of “\(presetName)” under a new name.")
-        }
-        .confirmationDialog("Delete preset “\(presetName)”?", isPresented: $deletingPreset, titleVisibility: .visible) {
-            Button("Delete", role: .destructive) {
-                let name = presetName
-                update { moa in if let next = Self.deleting(name, from: moa) { moa = next } }
-                selected = presetNames.first { $0 != name } ?? ""
-            }
-        }
     }
 
     private var referenceSection: some View {
@@ -1007,16 +1014,17 @@ struct DelegationRouteRow: View {
                 .fixedSize()
                 .disabled(gated != nil)
             }
+            // On the row itself: a Group hands its modifiers to each of its rows.
+            .modelRoutePicker(isPresented: $picking, catalog: catalog, title: "Subagent Model",
+                              current: inherits || direct ? nil : route, clearLabel: "Same as main model") { picked in
+                store.set(Self.entries(saved: saved, picked: picked))
+            }
+            .task { if !catalog.loaded { await catalog.load() } }
             if gated != nil {
                 Button("Switch to Default") { Task { await routing.choose("default") } }
                     .disabled(routing.busy)
             }
         }
-        .modelRoutePicker(isPresented: $picking, catalog: catalog, title: "Subagent Model",
-                          current: inherits || direct ? nil : route, clearLabel: "Same as main model") { picked in
-            store.set(Self.entries(saved: saved, picked: picked))
-        }
-        .task { if !catalog.loaded { await catalog.load() } }
     }
 
     /// The endpoint's host, for the row's note (never its key).

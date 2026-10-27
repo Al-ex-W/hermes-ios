@@ -413,6 +413,7 @@ struct ConfigSubpageView: View {
     let anchor: String?
     @State private var modelInfo: ConfigAPI.ModelInfo?
     @EnvironmentObject private var catalog: ModelCatalog
+    @EnvironmentObject private var routing: DelegationRoutingModel
 
     private var subpageID: String? { subpage?.id }
 
@@ -488,6 +489,7 @@ struct ConfigSubpageView: View {
         .refreshable { await store.load() }
         .task(id: subpageID) {
             if section.page == .model, subpageID == "main" { modelInfo = try? await catalog.api.modelInfo() }
+            if section.page == .model, subpageID == "delegation" { await routing.load() }
         }
     }
 

@@ -145,7 +145,7 @@ final class DelegationRoutingModel: ObservableObject {
 }
 
 /// Settings > Model > Subagents > Routing (`DelegationRoutingSlot`): the mode, why a saved mode can't run, and the
-/// routes it uses. Hidden on a host without routing.
+/// routes it uses. Hidden on a host without routing; the page loads it (`DelegationRoutingModel.load`).
 struct DelegationRoutingSection: View {
     @EnvironmentObject private var model: DelegationRoutingModel
 
@@ -184,7 +184,6 @@ struct DelegationRoutingSection: View {
                 .id("model.delegation-routing")
             }
         }
-        .task { await model.load() }
     }
 
     @ViewBuilder private func routes(_ routes: [DelegationRouting.Route], default chosen: String?, empty: String) -> some View {
