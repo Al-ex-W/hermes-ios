@@ -72,10 +72,68 @@ final class FakeVoicePluginTests: XCTestCase {
     func testRoutes() async throws {
         let status = try await VoicePluginAPI.status(client)
         XCTAssertEqual(status.tts, "fake")
-        try await VoicePluginAPI.registerDevice(client, voipToken: String(repeating: "ab", count: 32), environment: "sandbox",
-                                                bundleID: "com.example.hermesvoice")
+        let voip = String(repeating: "ab", count: 32)
+        try await VoicePluginAPI.registerDevice(client, body: PushRegistration.deviceBody(
+            voipToken: voip, environment: "sandbox", bundleID: "com.example.hermesvoice", alertToken: nil, alerts: nil))
         let token = try await VoicePluginAPI.scribeToken(client)
         XCTAssertFalse(token.isEmpty)
+    }
+
+    /// The device the fake plugin keeps for `voip` (`GET /status` lists them, with the alerts each one gets).
+    private func device(_ voip: String) async throws -> JSON? {
+        let status = try await client.request("GET", "\(VoicePluginAPI.path)/status") as? JSON
+        return (status?["devices"] as? [JSON])?.first { $0["voip_token"] as? String == voip }
+    }
+
+    private func alerts(_ device: JSON?) -> [String: Bool]? {
+        device?["alerts"] as? [String: Bool]
+    }
+
+    func testRegistrationWithAndWithoutAnAlertToken() async throws {
+        let voip = String(repeating: "c1", count: 32), alert = String(repeating: "d2", count: 32)
+        func register(alertToken: String?, alerts: NotificationPreferences?) async throws {
+            try await VoicePluginAPI.registerDevice(client, body: PushRegistration.deviceBody(
+                voipToken: voip, environment: "sandbox", bundleID: "com.example.hermesvoice",
+                alertToken: alertToken, alerts: alerts))
+        }
+        try await register(alertToken: alert, alerts: .defaults)
+        var stored = try await device(voip)
+        XCTAssertEqual(stored?["alert_token"] as? String, alert)
+        XCTAssertEqual(alerts(stored), ["approval": true, "clarify": true, "turn_done": true])
+
+        // A launch before iOS hands over the alert token: the opt-ins go through, the stored token stays.
+        try await register(alertToken: nil, alerts: NotificationPreferences(approval: true, clarify: false, turnDone: true))
+        stored = try await device(voip)
+        XCTAssertEqual(stored?["alert_token"] as? String, alert)
+        XCTAssertEqual(alerts(stored), ["approval": true, "clarify": false, "turn_done": true])
+
+        // Signing out registers no alerts at all.
+        try await register(alertToken: nil, alerts: NotificationPreferences.none)
+        stored = try await device(voip)
+        XCTAssertEqual(alerts(stored), ["approval": false, "clarify": false, "turn_done": false])
+    }
+
+    func testPushRegistrationSendsTheLatestStateInOrder() async throws {
+        let voip = String(repeating: "e3", count: 32), alert = String(repeating: "f4", count: 32)
+        let push = PushRegistration()
+        push.useTokens(voip: voip, alert: alert)
+        push.setAlerts(.defaults)
+        // A change while the first registration is on its way goes out after it, so the last state wins.
+        let first = Task { await push.send(to: client) }
+        await waitUntil(timeout: 5) { push.upload == .sending }
+        push.setAlerts(NotificationPreferences(approval: false, clarify: true, turnDone: false))
+        await push.send(to: client)
+        await first.value
+        guard case .sent = push.upload else { return XCTFail("upload is \(push.upload)") }
+        let stored = try await device(voip)
+        XCTAssertEqual(stored?["alert_token"] as? String, alert)
+        XCTAssertEqual(alerts(stored), ["approval": false, "clarify": true, "turn_done": false])
+
+        // An upload that can't reach the dashboard says so.
+        let offline = try DashboardClient(settings: ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "test",
+                                                                       password: "test"))
+        await push.send(to: offline)
+        guard case .failed = push.upload else { return XCTFail("upload is \(push.upload)") }
     }
 
     func testUserCallHearsHermesAndSendsTurns() async throws {

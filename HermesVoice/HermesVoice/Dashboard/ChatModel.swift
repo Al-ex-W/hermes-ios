@@ -239,7 +239,9 @@ final class ChatModel: ObservableObject, Identifiable, GatewaySessionOwner {
                     let pick = composer.pendingModel, effort = composer.pendingEffort, fast = composer.pendingFast
                     session = try await LiveSession.attach({
                         try await connection.client.sessionCreate(.init(
-                            profile: profile, cols: 96, source: "desktop", model: pick?.model, provider: pick?.provider,
+                            profile: profile, cols: 96, source: "desktop",
+                            cwd: DefaultProjectFolder.dir(base: client.base, profile: profile),
+                            model: pick?.model, provider: pick?.provider,
                             reasoningEffort: effort, fast: fast, idempotencyKey: id.uuidString
                         ))
                     }, LiveSession.init)

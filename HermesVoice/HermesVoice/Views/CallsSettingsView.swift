@@ -22,10 +22,11 @@ struct CallsSettingsView: View {
                     }
                 }
             } header: {
-                Text("Listening")
+                FormNote("Listening")
             } footer: {
-                Text(listeningFooter)
+                FormNote(listeningFooter)
             }
+            .hermesFormRows()
 
             SpeechLanguageSection(selection: $model.callSettings.speechLocale, provider: model.callSettings.provider)
 
@@ -37,10 +38,11 @@ struct CallsSettingsView: View {
                         .disabled(push.token == nil || push.upload == .sending)
                 }
             } header: {
-                Text("Incoming calls")
+                FormNote("Incoming calls")
             } footer: {
-                Text("Hermes rings this iPhone through a VoIP push when an agent calls you with start_call (\(PushRegistration.environment) APNs).")
+                FormNote("Hermes rings this iPhone through a VoIP push when an agent calls you with `start_call` (\(PushRegistration.environment) APNs).")
             }
+            .hermesFormRows()
 
             Section {
                 if let status {
@@ -48,7 +50,7 @@ struct CallsSettingsView: View {
                     LabeledContent("Ringing", value: status.canRing ? "Ready" : (status.apnsConfigured ? "Needs the h2 package" : "No APNs key"))
                     LabeledContent("Scribe", value: status.scribeConfigured ? "Ready" : "No ElevenLabs key")
                 } else if let statusError {
-                    Text(statusError).foregroundStyle(.red)
+                    Text(statusError).foregroundStyle(Theme.destructive)
                 }
                 Button {
                     Task { await check() }
@@ -60,10 +62,14 @@ struct CallsSettingsView: View {
                 }
                 .disabled(checking || model.client == nil)
             } header: {
-                Text("Hermes Voice plugin")
+                FormNote("Hermes Voice plugin")
             }
+            .hermesFormRows()
         }
+        .hermesForm()
         .navigationTitle("Calls")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Theme.sidebar, for: .navigationBar)
         .task { await check() }
     }
 
@@ -126,10 +132,11 @@ struct SpeechLanguageSection: View {
             }
             .pickerStyle(.navigationLink)
         } footer: {
-            Text(provider == .apple
-                 ? "The language you speak on calls. Automatic follows your iPhone's preferred languages."
-                 : "The language you speak on calls. Automatic lets Scribe detect it.")
+            FormNote(provider == .apple
+                     ? "The language you speak on calls. Automatic follows your iPhone's preferred languages."
+                     : "The language you speak on calls. Automatic lets Scribe detect it.")
         }
+        .hermesFormRows()
     }
 
     private var options: [String] {

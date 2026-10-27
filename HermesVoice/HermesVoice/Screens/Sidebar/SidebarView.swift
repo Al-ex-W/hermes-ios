@@ -6,8 +6,10 @@ import UIKit
 struct SidebarView: View {
     @ObservedObject var sidebar: SidebarModel
     @EnvironmentObject private var calls: CallController
+    @EnvironmentObject private var model: AppModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var showSettings = false
+    @State private var showProfiles = false
     @State private var renaming: SessionInfo?
     @State private var renameText = ""
     @State private var deleting: SessionInfo?
@@ -64,7 +66,29 @@ struct SidebarView: View {
             }
         }
         .sheet(isPresented: $showSettings) {
-            NavigationStack { SettingsView() }
+            NavigationStack {
+                SettingsView(profile: sidebar.options.profileScope == SidebarOptions.allProfiles ? nil : sidebar.options.profileScope)
+            }
+        }
+        // A session opened from elsewhere (a tapped notification) shows above any open sheet. Only that: the
+        // selection also changes when a sent draft settles into its listed row, which must not close a sheet.
+        .onChange(of: sidebar.externalOpens) {
+            showSettings = false
+            showProfiles = false
+        }
+        // A sheet covers the chat beside the sidebar: its alerts show as banners meanwhile.
+        .onChange(of: showSettings || showProfiles, initial: true) { _, covered in
+            model.notifications.covered = covered
+        }
+        .sheet(isPresented: $showProfiles) {
+            NavigationStack {
+                ProfilesPage()
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") { showProfiles = false }
+                        }
+                    }
+            }
         }
         .alert("Rename session", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }),
                presenting: renaming) { session in
@@ -231,6 +255,7 @@ struct SidebarView: View {
         }
     }
 
+    /// The title menu (`profile-dropdown-switcher.tsx`): the profile the list shows, then the Profiles page.
     @ViewBuilder private var profileSwitcher: some View {
         if sidebar.profiles.count > 1 {
             Picker("Profile", selection: sidebar.binding(\.profileScope)) {
@@ -238,6 +263,11 @@ struct SidebarView: View {
                 ForEach(sidebar.profiles) { profile in
                     Text(profile.label).tag(profile.name)
                 }
+            }
+        }
+        Section {
+            Button { showProfiles = true } label: {
+                Label("Manage profiles…", systemImage: Theme.Icon.settings)
             }
         }
     }

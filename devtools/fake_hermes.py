@@ -48,6 +48,31 @@ session.workspace.move, session.branch, projects.list. REST: GET /api/profiles, 
 across two projects, two profiles and several days (one pinned, one archived, one unread, a cron and a Telegram
 one); ``--seed minimal`` keeps only the welcome chat.
 
+Settings screens (M3), from hermes_cli/web_routers/{config_env,models,memory_providers,oauth,profiles,status}.py
+and tui_gateway/{methods_vault,methods_session}.py. Every route honours ``?profile=`` (each profile has its own
+config.yaml, .env, SOUL.md, logins and vault; unknown -> 404, invalid name -> 400):
+  GET  /api/config/schema         {fields: {dot.path: {type, description, category, options?}}, category_order},
+                                  built from a slice of DEFAULT_CONFIG like _build_schema_from_config
+  GET  /api/config                load_config() with the model flattened (+ model_context_length); include_defaults
+  PUT  /api/config {config}       deep-merged over the file like the server; the fake also refuses a value whose
+                                  type does not match its schema field (400), which the real server would save
+  GET  /api/model/info|options|auxiliary|moa|recommended-default, POST /api/model/set, PUT /api/model/moa
+  GET  /api/memory, GET/PUT /api/memory/providers/<name>/config?surface=declared (a declared "fake-recall")
+  GET  /api/delegation/routing, PUT /api/delegation/backend (Default, Model routes, Profile routes)
+  GET/PUT/DELETE /api/env, POST /api/env/reveal, POST /api/providers/validate (the fake never calls a provider:
+                                  a key starting "bad" is rejected, one containing "offline" can't be checked)
+  GET  /api/providers/oauth, POST .../{id}/start (device code, approved after --oauth-approve-after seconds),
+       GET .../{id}/poll/{session}, DELETE .../{id}, DELETE .../sessions/{session}
+  /api/profiles (+ POST create, PATCH rename, DELETE, /active, /{name}/soul, /{name}/export, /import, ...)
+  GET  /api/status                the public liveness probe: versions and gateway state
+RPCs vault.* (a local vault plus a fake 1Password; unlock with any master password but "wrong") and billing.*
+(a Nous Portal account; money routes need billing.step_up first), and shared_metrics.status / .set (the
+profile's telemetry.shared_metrics consent). Values typed into these routes (API keys,
+passwords, vault secrets) are never logged.
+The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
+(listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
+the plugin would send ({aps, hermes}: approval or clarify waiting, turn done) and the alert tokens they go to.
+
 Run (from hermes-voice-mcp, to reuse its venv):
   uv run python ../devtools/fake_hermes.py --port 9311 --voice-url http://127.0.0.1:8765 --voice-token <token>
 Sign in as test / test. Every RPC, event, server request and speak result is logged to stdout with the prefix FAKE.
@@ -59,6 +84,7 @@ import argparse
 import asyncio
 import base64
 import binascii
+import copy
 import inspect
 import json
 import os
@@ -71,7 +97,8 @@ import uuid
 import zlib
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
@@ -83,10 +110,11 @@ from mcp.client.streamable_http import streamable_http_client
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Route, WebSocketRoute
+from starlette.routing import BaseRoute, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from fake_voice_plugin import FakeVoicePlugin  # the fake hermes_voice plugin: /api/plugins/hermes_voice/*, start_call
+# The fake hermes_voice plugin: /api/plugins/hermes_voice/*, start_call.
+from fake_voice_plugin import PREFIX as PLUGIN_PREFIX, FakeVoicePlugin
 
 SESSION_AT_COOKIE = "hermes_session_at"  # hermes_cli/dashboard_auth/cookies.py
 SESSION_PROVIDER_COOKIE = "hermes_session_provider"
@@ -631,6 +659,7 @@ class ChatFeatures:
 
     sessions: dict[str, StoredSession]
     runtimes: dict[str, Runtime]
+    profiles: dict[str, "FakeProfile"]
 
     def _init_chat(self, args: argparse.Namespace) -> None:
         self.seed_mode = getattr(args, "seed", "demo")
@@ -1149,8 +1178,8 @@ class ChatFeatures:
         return {"items": items}
 
     def profile_mentions(self, prefix: str) -> list[dict[str, Any]]:
-        return [{"text": f"@{p['name']}", "display": f"@{p['name']}", "meta": p["description"] or "agent profile"}
-                for p in DEMO_PROFILES if p["name"].startswith(prefix.lower())]
+        return [{"text": f"@{p.name}", "display": f"@{p.name}", "meta": p.description or "agent profile"}
+                for p in self.profiles.values() if p.name.startswith(prefix.lower())]
 
     def fuzzy_paths(self, root: str, query: str, tag: str) -> list[dict[str, Any]]:
         prefix = root.rstrip("/") + "/"
@@ -1572,13 +1601,8 @@ class ChatFeatures:
     async def list_profiles(self, request: Request) -> Response:
         if not self.authed(request):
             return self.unauthorized(request)
-        profiles = [{"name": p["name"], "path": p["path"], "is_default": p["is_default"], "model": "fake-hermes",
-                     "provider": "fake", "has_env": True, "skill_count": p["skill_count"], "gateway_running": False,
-                     "description": p["description"], "description_auto": False, "display_name": "",
-                     "bot_title": "", "distribution_name": None, "distribution_version": None,
-                     "distribution_source": None, "has_alias": False, "role": None} for p in DEMO_PROFILES]
         log("http GET /api/profiles -> 200")
-        return JSONResponse({"profiles": profiles})
+        return JSONResponse({"profiles": [self.profile_row(p) for p in self.profiles.values()]})
 
     async def sidebar_sessions(self, request: Request) -> Response:
         """profiles.py /api/profiles/sessions/sidebar: recents / cron / messaging slices in one call."""
@@ -1602,7 +1626,7 @@ class ChatFeatures:
             return [r for r in rows if r["source"] not in excludes[key]]
 
         recents = pick("recents")
-        names = [p["name"] for p in DEMO_PROFILES if scope == "all" or p["name"] == scope]
+        names = [name for name in self.profiles if scope == "all" or name == scope]
         usage = {name: {"tokens": sum(r["input_tokens"] + r["output_tokens"] for r in rows if r["profile"] == name),
                         "cost_usd": 0.0} for name in names}
         truncated = {name: sum(r["profile"] == name for r in recents) >= caps["recents"] for name in names}
@@ -1733,7 +1757,2026 @@ class ChatFeatures:
         return JSONResponse({"data_url": f"data:{MEDIA_TYPES[ext]};base64,{base64.b64encode(data).decode()}"})
 
 
-class FakeHermes(ChatFeatures):
+# ── M3: settings, profiles, providers, alert pushes ───────────────────────────────────────────────
+# Shapes from hermes_cli/web_routers/{config_env,models,memory_providers,oauth,profiles,status}.py,
+# hermes_cli/{web_server_config,config_defaults,config_defaults_env,moa_config,profiles,credential_lifecycle}.py,
+# hermes_cli/web_routers/_common.py, plugins/memory/config_schema.py, agent/vault_store.py and
+# tui_gateway/{methods_vault,methods_session,billing_view}.py. Every route that takes ``?profile=`` reads and
+# writes that profile's own config.yaml, .env, SOUL.md, logins and vault (unknown profile -> 404).
+
+FAKE_VERSION = "0.42.0"
+FAKE_RELEASE_DATE = "2026-10-01"
+CONFIG_VERSION = 52
+DEFAULT_SANDBOX_IMAGE = "nousresearch/hermes-sandbox:desktop"
+# config_env.py _CATEGORY_ORDER
+CATEGORY_ORDER = ["general", "agent", "terminal", "display", "delegation", "memory", "compression", "security",
+                  "browser", "voice", "tts", "stt", "logging", "discord", "auxiliary"]
+# web_server_config.py _AUX_TASK_SLOTS (UI order of GET /api/model/auxiliary).
+AUX_TASK_SLOTS = ("vision", "compression", "skills_hub", "approval", "mcp", "title_generation", "review",
+                  "voice_chat", "triage_specifier", "kanban_decomposer", "profile_describer", "curator")
+FAKE_MEMORY_PROVIDER = "fake-recall"
+# hermes_constants.PROFILE_ID_RE and profiles.py _RESERVED_NAMES.
+PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+RESERVED_PROFILE_NAMES = frozenset({"hermes", "default", "test", "tmp", "root", "sudo"})
+PROFILE_NAME_RULE = "Use lowercase letters, numbers, '-' or '_', starting with a letter or number, up to 64 characters"
+# hermes_cli/config.py _ENV_VAR_NAME_RE and a slice of the writer denylist.
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ENV_DENYLIST = frozenset({"PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+                          "NODE_OPTIONS", "EDITOR", "VISUAL", "PAGER", "BROWSER", "SHELL", "HERMES_HOME",
+                          "HERMES_YOLO_MODE"})
+ENV_DENY_PREFIXES = ("LD_", "DYLD_", "GIT_CONFIG_")
+REDACTED_WRITE_DETAIL = "Refusing to save a redacted credential preview; re-enter the full secret to replace it."
+LEGACY_MASK = re.compile(r".{4}\.\.\..{4}")
+# config_env.py _CREDENTIAL_PROBES: the keys POST /api/providers/validate can try against the provider.
+CREDENTIAL_PROBES = frozenset({"OPENROUTER_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY"})
+REVEAL_MAX, REVEAL_WINDOW = 5, 30.0
+# The fake's own provider metadata for the demo model providers (provider_catalog()).
+DEMO_CONTEXT = {"fake-hermes": 200_000, "fake-hermes-mini": 128_000, "fake-hermes-max": 1_000_000,
+                "echo-1": 64_000, "echo-2-pro": 256_000}
+DEFAULT_SOUL = "You are Hermes, a helpful assistant. Keep answers short unless asked for detail. (Fake Hermes SOUL.md)"
+# web_server_oauth.py _OAUTH_PROVIDER_CATALOG (status_fn dropped).
+OAUTH_PROVIDERS = (
+    {"id": "nous", "name": "Nous Portal", "flow": "device_code", "cli_command": "hermes auth add nous",
+     "docs_url": "https://portal.nousresearch.com"},
+    {"id": "openai-codex", "name": "ChatGPT or Codex Subscription", "flow": "device_code",
+     "cli_command": "hermes auth add openai-codex", "docs_url": "https://platform.openai.com/docs"},
+    {"id": "qwen-oauth", "name": "Qwen (via Qwen CLI)", "flow": "external", "cli_command": "hermes auth add qwen-oauth",
+     "docs_url": "https://github.com/QwenLM/qwen-code"},
+    {"id": "minimax-oauth", "name": "MiniMax (OAuth)", "flow": "device_code",
+     "cli_command": "hermes auth add minimax-oauth", "docs_url": "https://www.minimax.io"},
+    {"id": "xai-oauth", "name": "xAI Grok OAuth (SuperGrok / Premium+)", "flow": "device_code",
+     "cli_command": "hermes auth add xai-oauth",
+     "docs_url": "https://hermes-agent.nousresearch.com/docs/guides/xai-grok-oauth"},
+    {"id": "copilot-acp", "name": "GitHub Copilot (ACP)", "flow": "external", "cli_command": "copilot login",
+     "docs_url": "https://docs.github.com/en/copilot"},
+    {"id": "anthropic", "name": "Anthropic Account", "flow": "external", "cli_command": "hermes auth add anthropic",
+     "docs_url": "https://docs.claude.com/en/api/getting-started"},
+)
+OAUTH_SESSION_TTL = 15 * 60
+OAUTH_VERIFICATION_URL = "https://example.com/fake-hermes/device"
+# tui_gateway/methods_vault.py and agent/vault_store.py.
+VAULT_ERROR = 5095
+VAULT_KINDS = ("login", "payment", "address")
+LOGIN_IDENTIFIER_TYPES = ("email", "phone", "username")
+VAULT_FIELDS = {"payment": ("card_number", "cardholder_name", "exp_month", "exp_year", "cvc", "billing_postal_code"),
+                "address": ("address_line1", "address_line2", "city", "state", "postal_code", "country")}
+VAULT_REQUIRED = {"payment": ("card_number", "exp_month", "exp_year", "cvc"),
+                  "address": ("address_line1", "city", "postal_code", "country")}
+# (name, display name, installed on the fake host). Unlock with any master password but "wrong".
+PASSWORD_MANAGERS = (("onepassword", "1Password", True), ("bitwarden", "Bitwarden", False))
+BILLING_SCOPE_MESSAGE = "This action needs the billing:manage scope."
+# The alert pushes the hermes_voice plugin sends beside the VoIP ones (the app's App/Notifications.swift).
+ALERT_KINDS = ("approval", "clarify", "turn_done")
+# A kind a device never named is on (the plugin's ``Device.wants``: ``alerts.get(kind, True)``).
+ALERT_DEFAULTS = {"approval": True, "clarify": True, "turn_done": True}
+ALERT_CATEGORIES = {"approval": "HERMES_APPROVAL", "clarify": "HERMES_CLARIFY", "turn_done": "HERMES_TURN_DONE"}
+ALERT_MEMORY = 200
+
+
+def aux_block(timeout: int, *, reasoning_effort: bool = True, **extra: Any) -> dict[str, Any]:
+    """config_defaults.py _aux: the shared auxiliary-task block."""
+    block: dict[str, Any] = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout,
+                             "extra_body": {}}
+    if reasoning_effort:
+        block["reasoning_effort"] = ""
+    block.update(extra)
+    return block
+
+
+def default_config() -> dict[str, Any]:
+    """A slice of config_defaults.py DEFAULT_CONFIG in its order and with its values: the sections the settings
+    pages read, and a few voice ones the app must leave out."""
+    return {
+        "model": "", "providers": {}, "fallback_providers": [], "toolsets": ["hermes-cli"],
+        "agent": {"max_turns": None, "gateway_timeout": 1800, "api_max_retries": 3, "service_tier": "",
+                  "fast_auto_seconds": 60, "tool_use_enforcement": "auto", "verify_on_stop": False,
+                  "clarify_timeout": 3600, "image_input_mode": "auto", "disabled_toolsets": []},
+        "terminal": {"backend": "local", "modal_mode": "auto", "cwd": ".", "timeout": 180, "env_passthrough": [],
+                     "docker_image": DEFAULT_SANDBOX_IMAGE, "modal_image": DEFAULT_SANDBOX_IMAGE,
+                     "daytona_image": DEFAULT_SANDBOX_IMAGE, "container_cpu": 1, "container_memory": 5120,
+                     "docker_mount_cwd_to_workspace": False, "persistent_shell": True},
+        "browser": {"inactivity_timeout": 120, "command_timeout": 30, "headed": False, "allow_private_urls": False,
+                    "engine": "auto", "auto_local_for_private_urls": True, "cdp_url": "", "use_real_profile": False,
+                    "dialog_policy": "must_respond"},
+        "checkpoints": {"enabled": False, "max_snapshots": 20, "max_total_size_mb": 500, "max_file_size_mb": 10,
+                        "auto_prune": True, "retention_days": 7, "min_interval_hours": 24},
+        "file_read_max_chars": 100_000,
+        "tool_output": {"max_bytes": 50000, "max_lines": 2000, "max_line_length": 2000},
+        "compression": {"enabled": True, "threshold": 0.5, "threshold_tokens": None, "target_ratio": 0.2,
+                        "tail_mode": "lean", "protect_last_n": 20, "max_attempts": 3, "protect_first_n": 3,
+                        "codex_gpt55_autoraise": True, "in_place": True},
+        "auxiliary": {
+            "transient_retries": 2, "free_only": False, "openrouter_model": "", "stream_only_base_urls": [],
+            "vision": aux_block(120, download_timeout=30), "compression": aux_block(120, no_progress_timeout=None),
+            "skills_hub": aux_block(30), "approval": aux_block(30),
+            "review": {"provider": "auto", "model": "", "base_url": "", "api_key": "", "api_mode": ""},
+            "mcp": aux_block(30),
+            "title_generation": {"enabled": True, "model_upgrade_enabled": True, "provider": "auto", "model": "",
+                                 "prefer_fast_model": False, "base_url": "", "api_key": "", "timeout": 30,
+                                 "extra_body": {}, "reasoning_effort": "", "language": ""},
+            "voice_chat": {**aux_block(120), "reasoning_effort": "none"},
+            "triage_specifier": aux_block(120), "kanban_decomposer": aux_block(180),
+            "profile_describer": aux_block(60), "curator": aux_block(600),
+            "moa_reference": aux_block(900, reasoning_effort=False),
+            "moa_aggregator": aux_block(900, reasoning_effort=False)},
+        "display": {"compact": False, "personality": "", "resume_display": "full", "busy_input_mode": "interrupt",
+                    "show_reasoning": True, "streaming": False, "show_cost": False, "skin": "default"},
+        "dashboard": {"theme": "default"},
+        "tts": {"provider": "edge", "edge": {"voice": "en-US-AriaNeural"},
+                "openai": {"model": "gpt-4o-mini-tts", "voice": "alloy"}},
+        "stt": {"enabled": True, "provider": "local", "local": {"model": "base", "language": ""}},
+        "voice": {"voice_chat_mode": "chained", "max_recording_seconds": 120, "auto_tts": False},
+        "wake_word": {"enabled": False, "provider": "auto", "phrase": "hey hermes"},
+        "human_delay": {"mode": "off", "min_ms": 800, "max_ms": 2500},
+        "context": {"engine": "compressor"},
+        "memory": {"memory_enabled": True, "user_profile_enabled": True, "prefetch_spill_enabled": False,
+                   "write_approval": False, "memory_char_limit": 2200, "user_char_limit": 1375, "nudge_interval": 10,
+                   "provider": ""},
+        "delegation": {"backend": "default", "model": "", "provider": "", "base_url": "", "api_key": "",
+                       "api_mode": "", "max_iterations": 250, "child_timeout_seconds": 0, "reasoning_effort": "",
+                       "max_concurrent_children": 10, "max_spawn_depth": 1, "orchestrator_enabled": True,
+                       "subagent_auto_approve": False},
+        "moa": {"default_preset": "default", "active_preset": "", "save_traces": False, "trace_dir": "",
+                "privacy_filter": "", "presets": {"default": {
+                    "reference_models": [{"provider": "openai-codex", "model": "gpt-5.5"},
+                                         {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}],
+                    "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"}, "enabled": True}}},
+        "timezone": "",
+        "approvals": {"mode": "smart", "timeout": 300, "cron_mode": "deny", "single_query_mode": "deny",
+                      "unattended_mode": "deny", "smart_policy": "", "denial_breaker_threshold": 3, "deny": [],
+                      "mcp_reload_confirm": True, "destructive_slash_confirm": True},
+        "command_allowlist": [],
+        "personalities": {},
+        "security": {"allow_private_urls": False, "redact_secrets": True, "protected_instruction_files": True,
+                     "website_blocklist": {"enabled": False, "domains": []}, "allow_lazy_installs": True},
+        "code_execution": {"mode": "project", "kernel_idle_timeout": 1800, "max_session_kernels": 4},
+        "logging": {"level": "INFO", "max_size_mb": 5, "backup_count": 3},
+        "sessions": {"auto_prune": False, "retention_days": 90, "auto_archive": False, "auto_archive_days": 3,
+                     "show_subagents": False},
+        "updates": {"check": True, "pre_update_backup": "quick", "backup_keep": 5,
+                    "non_interactive_local_changes": "stash", "refresh_cua_driver": True},
+        "vault": {"key_storage": "file", "onepassword": {"enabled": True, "account": "", "binary_path": ""},
+                  "bitwarden": {"enabled": True, "binary_path": ""}},
+        "desktop": {"font_family": "", "repo_scan_enabled": True, "repo_scan_roots": [], "repo_scan_exclude_paths": []},
+        "_config_version": CONFIG_VERSION,
+    }
+
+
+def schema_select(description: str, *options: str, **extra: Any) -> dict[str, Any]:
+    return {"type": "select", "description": description, "options": list(options), **extra}
+
+
+def timezone_options() -> list[str]:
+    try:
+        import zoneinfo
+        return sorted(zoneinfo.available_timezones()) or ["UTC"]
+    except Exception:  # noqa: BLE001
+        return ["UTC"]
+
+
+# web_server_config.py _SCHEMA_OVERRIDES (the slice the fake's defaults reach).
+SCHEMA_OVERRIDES: dict[str, dict[str, Any]] = {
+    "timezone": schema_select("IANA timezone (e.g. America/New_York). Blank uses the system timezone.",
+                              *timezone_options(), searchable=True, clearable=True),
+    "memory.provider": schema_select("Memory provider plugin", "", FAKE_MEMORY_PROVIDER),
+    "model": {"type": "string", "description": "Default model (e.g. anthropic/claude-sonnet-4.6)",
+              "category": "general"},
+    "model_context_length": {"type": "number", "description": "Context window override (0 = auto-detect from model "
+                             "metadata)", "category": "general"},
+    "terminal.backend": schema_select("Terminal execution backend", "local", "docker", "ssh", "modal", "daytona",
+                                      "vercel_sandbox"),
+    "terminal.modal_mode": schema_select("Modal sandbox mode", "sandbox", "function"),
+    "wake_word.provider": schema_select("Wake engine. Auto selects a platform-supported engine; Porcupine requires "
+                                        "PORCUPINE_ACCESS_KEY.", "auto", "openwakeword", "sherpa", "porcupine"),
+    "tts.provider": schema_select("Text-to-speech provider", "edge", "elevenlabs", "openai", "xai", "minimax",
+                                  "mistral", "gemini", "neutts", "kittentts", "piper"),
+    "stt.provider": schema_select("Speech-to-text provider", "local", "groq", "openai", "mistral", "xai", "elevenlabs",
+                                  "deepinfra"),
+    "stt.local.model": schema_select("Local faster-whisper model size", "base", "tiny", "small", "medium", "large-v3",
+                                     "turbo"),
+    "display.skin": schema_select("CLI visual theme", "default", "ares", "mono", "slate"),
+    "dashboard.theme": schema_select("Web dashboard visual theme", "default", "midnight", "ember", "mono", "cyberpunk",
+                                     "rose"),
+    "display.resume_display": schema_select("How resumed sessions display history", "minimal", "full", "off"),
+    "display.busy_input_mode": schema_select("Input behavior while agent is running", "interrupt", "queue", "steer"),
+    "approvals.mode": schema_select("Dangerous command approval mode", "manual", "smart", "off"),
+    "context.engine": schema_select("Context management engine", "default", "custom"),
+    "human_delay.mode": schema_select("Simulated typing delay mode", "off", "typing", "fixed"),
+    "logging.level": schema_select("Log level for agent.log", "DEBUG", "INFO", "WARNING", "ERROR"),
+    "agent.service_tier": schema_select("Fast mode: fast = always, auto = first N seconds of each turn, cold = first "
+                                        "turn only", "", "normal", "fast", "auto", "cold"),
+    "delegation.reasoning_effort": schema_select("Reasoning effort for delegated subagents", "", "minimal", "low",
+                                                 "medium", "high", "xhigh", "max", "ultra"),
+    "updates.non_interactive_local_changes": schema_select(
+        "When the chat app / gateway updates Hermes (no terminal prompt), what to do with uncommitted local source "
+        "edits. 'stash' keeps them and re-applies them after the update; 'discard' throws them away. Terminal "
+        "updates always ask, regardless of this setting.", "stash", "discard"),
+    "updates.refresh_cua_driver": {"type": "boolean", "description": "Refresh an already-installed cua-driver during "
+                                   "hermes update. Disable this on non-admin macOS accounts where /Applications is "
+                                   "not writable."},
+    "browser.headed": {"type": "boolean", "description": "Run the local browser in headed mode (visible window). Also "
+                       "keeps the window open between turns; idle sessions are still reaped after "
+                       "browser.inactivity_timeout."},
+}
+# web_server_config.py _CATEGORY_MERGE (the slice the fake's defaults reach).
+CATEGORY_MERGE = {"context": "agent", "checkpoints": "agent", "approvals": "security", "human_delay": "display",
+                  "dashboard": "display", "code_execution": "agent", "updates": "general", "session": "general"}
+SCHEMA_TYPES = ((bool, "boolean"), (int, "number"), (float, "number"), (list, "list"), (dict, "object"))
+
+
+def build_config_schema(config: dict[str, Any], prefix: str = "") -> dict[str, dict[str, Any]]:
+    """web_server_config.py _build_schema_from_config: DEFAULT_CONFIG walked into flat dot-path fields."""
+    schema: dict[str, dict[str, Any]] = {}
+    for key, value in config.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if path == "_config_version":
+            continue
+        if isinstance(value, dict):
+            schema.update(build_config_schema(value, path))
+            continue
+        entry: dict[str, Any] = {"type": next((ui for py, ui in SCHEMA_TYPES if isinstance(value, py)), "string"),
+                                 "description": path.replace(".", " → ").replace("_", " ").title(),
+                                 "category": prefix.split(".")[0] if prefix else "general"}
+        entry.update(SCHEMA_OVERRIDES.get(path, {}))
+        entry["category"] = CATEGORY_MERGE.get(entry["category"], entry["category"])
+        schema[path] = entry
+        if path == "model":
+            schema["model_context_length"] = dict(SCHEMA_OVERRIDES["model_context_length"])
+    return schema
+
+
+DEFAULT_CONFIG = default_config()
+CONFIG_SCHEMA = build_config_schema(DEFAULT_CONFIG)
+
+
+def flatten(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in config.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict) and value:
+            out.update(flatten(value, path))
+        else:
+            out[path] = value
+    return out
+
+
+DEFAULT_FLAT = flatten(DEFAULT_CONFIG)
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """hermes_cli/config.py _deep_merge: dicts merge per key; None over a section is ignored."""
+    result = dict(base)
+    for key, value in override.items():
+        over_dict = isinstance(result.get(key), dict)
+        if over_dict and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif not (over_dict and value is None):
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def strip_defaults(config: dict[str, Any], defaults: dict[str, Any], keep: set[str],
+                   prefix: str = "") -> dict[str, Any]:
+    """save_config's _strip_default_values: what equals the default is not written unless the user set it before."""
+    out: dict[str, Any] = {}
+    for key, value in config.items():
+        path = f"{prefix}.{key}" if prefix else key
+        default = defaults.get(key, _MISSING) if isinstance(defaults, dict) else _MISSING
+        if path in NO_STRIP:
+            if value != default or path in keep:
+                out[key] = value
+        elif isinstance(value, dict) and isinstance(default, dict) and value:
+            if (stripped := strip_defaults(value, default, keep, path)) or path in keep:
+                out[key] = stripped
+        elif value != default or path in keep or key == "_config_version":
+            out[key] = value
+    return out
+
+
+_MISSING: Any = object()
+# Named maps a user's file states whole (moa_config.py apply_user_moa_presets): never stripped, never merged.
+NO_STRIP = frozenset({"moa.presets"})
+# apps/desktop/src/app/settings/constants.ts ENUM_OPTIONS choices the server's select options lack.
+DESKTOP_ENUM_EXTRAS = {"terminal.backend": ("singularity",), "context.engine": ("compressor",)}
+
+
+def explicit_paths(config: dict[str, Any], prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    for key, value in config.items():
+        path = f"{prefix}.{key}" if prefix else key
+        paths.add(path)
+        if isinstance(value, dict):
+            paths |= explicit_paths(value, path)
+    return paths
+
+
+# hermes_cli/config.py _SECRET_CONFIG_KEYS / _SECRET_CONFIG_KEY_SUFFIXES: config keys whose value is a credential.
+SECRET_CONFIG_KEYS = frozenset({"api_key", "apikey", "key", "token", "access_token", "refresh_token", "id_token",
+                                "secret", "client_secret", "password", "passwd", "authorization", "private_key",
+                                "bearer", "jwt"})
+SECRET_CONFIG_SUFFIXES = ("_api_key", "_token", "_secret", "_password", "_key", "_access_key")
+
+
+def shown(path: str, value: Any) -> str:
+    """A config value for an error message: credentials only as their length."""
+    leaf = path.rsplit(".", 1)[-1].lower()
+    if leaf in SECRET_CONFIG_KEYS or leaf.endswith(SECRET_CONFIG_SUFFIXES):
+        return f"<{len(json.dumps(value))} chars>"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def mask_secret(value: str) -> str:
+    """agent/redact.py mask_secret: ``abcd...7890``; shorter than 12 -> ``***``."""
+    return "***" if len(value) < 12 else f"{value[:4]}...{value[-4:]}"
+
+
+def credential_preview(value: str | None) -> str | None:
+    """_common.py redacted_credential_preview: a display-only sentinel that can never be written back."""
+    return f"«redacted:{mask_secret(value)}»" if value else None
+
+
+def is_credential_preview(value: Any) -> bool:
+    text = str(value or "")
+    return text.startswith("«redacted") or text == "***" or LEGACY_MASK.fullmatch(text) is not None
+
+
+def format_money(value: Decimal | None) -> str:
+    """agent/billing_view.py format_money: ``$X`` for whole dollars, ``$X.YY`` otherwise."""
+    if value is None:
+        return "—"
+    if value == value.to_integral_value():
+        return f"${format(value.to_integral_value(), 'f')}"
+    return f"${format(value.quantize(Decimal('0.01')), 'f')}"
+
+
+def normalize_origin(value: str) -> str:
+    """agent/vault_store.py normalize_origin: ``scheme://host[:port]``, default ports dropped."""
+    value = (value or "").strip()
+    if not value:
+        raise RpcError(VAULT_ERROR, "origin is required")
+    if "://" not in value:
+        raise RpcError(VAULT_ERROR, f"origin must include a scheme (got {value!r})")
+    parts = urlsplit(value)
+    scheme, host = (parts.scheme or "").lower(), (parts.hostname or "").lower()
+    if not scheme or not host:
+        raise RpcError(VAULT_ERROR, f"could not parse origin from {value!r}")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise RpcError(VAULT_ERROR, f"invalid port in origin {value!r}") from exc
+    return f"{scheme}://{host}" if port is None or port == {"http": 80, "https": 443}.get(scheme) \
+        else f"{scheme}://{host}:{port}"
+
+
+def env_entry(description: str, prompt: str, category: str, *, url: str | None = None, password: bool | None = None,
+              advanced: bool = False, tools: list[str] | None = None) -> dict[str, Any]:
+    """config_defaults_env.py _category entries: password/advanced defaults per category."""
+    entry: dict[str, Any] = {"description": description, "prompt": prompt}
+    if url is not None:
+        entry["url"] = url
+    if tools is not None:
+        entry["tools"] = tools
+    if password is None:
+        password = category in ("provider", "tool", "skill")
+    entry["password"] = password
+    entry["category"] = category
+    if advanced:
+        entry["advanced"] = True
+    return entry
+
+
+# A slice of config_defaults.py OPTIONAL_ENV_VARS.
+OPTIONAL_ENV_VARS = {
+    "OPENROUTER_API_KEY": env_entry("OpenRouter API key (for vision, web scraping helpers, and MoA)",
+                                    "OpenRouter API key", "provider", url="https://openrouter.ai/keys",
+                                    tools=["vision_analyze"], advanced=True),
+    "GEMINI_API_KEY": env_entry("Google AI Studio API key (alias for GOOGLE_API_KEY)", "Gemini API key", "provider",
+                                url="https://aistudio.google.com/app/apikey", advanced=True),
+    "XAI_API_KEY": env_entry("xAI API key", "xAI API key", "provider", url="https://console.x.ai/", advanced=True),
+    "XAI_BASE_URL": env_entry("xAI base URL override", "xAI base URL (leave empty for default)", "provider",
+                              password=False, advanced=True),
+    "DEEPSEEK_API_KEY": env_entry("DeepSeek API key for direct DeepSeek access", "DeepSeek API Key", "provider",
+                                  url="https://platform.deepseek.com/api_keys"),
+    "EXA_API_KEY": env_entry("Exa API key for AI-native web search and contents", "Exa API key", "tool",
+                             url="https://exa.ai/", tools=["web_search", "web_extract"]),
+    "FIRECRAWL_API_KEY": env_entry("Firecrawl API key for web search and scraping", "Firecrawl API key", "tool",
+                                   url="https://firecrawl.dev/", tools=["web_search", "web_extract"]),
+    "FIRECRAWL_API_URL": env_entry("Firecrawl API URL for self-hosted instances (optional)",
+                                   "Firecrawl API URL (leave empty for cloud)", "tool", password=False, advanced=True),
+    "BROWSERBASE_API_KEY": env_entry("Browserbase API key for cloud browser (optional — local browser works without "
+                                     "this)", "Browserbase API key", "tool", url="https://browserbase.com/",
+                                     tools=["browser_exec"]),
+    "FAL_KEY": env_entry("FAL API key for image and video generation", "FAL API key", "tool", url="https://fal.ai/",
+                         tools=["image_generate", "video_generate"]),
+    "ELEVENLABS_API_KEY": env_entry("ElevenLabs API key for premium text-to-speech voices and Scribe transcription",
+                                    "ElevenLabs API key", "tool", url="https://elevenlabs.io/",
+                                    tools=["elevenlabs_tts", "voice_transcription"]),
+    "GITHUB_TOKEN": env_entry("GitHub token for Skills Hub (higher API rate limits, skill publish)", "GitHub Token",
+                              "tool", url="https://github.com/settings/tokens"),
+    "NOTION_API_KEY": env_entry("Notion integration token (used by the `notion` skill)", "Notion API key", "skill",
+                                url="https://www.notion.so/my-integrations", advanced=True),
+    "TELEGRAM_BOT_TOKEN": env_entry("Complete Telegram bot token created by @BotFather (numeric bot ID followed by a "
+                                    "colon and secret)", "Telegram bot token", "messaging",
+                                    url="https://t.me/BotFather", password=True),
+    "SUDO_PASSWORD": env_entry("Sudo password for terminal commands requiring root access; set to an explicit empty "
+                               "string to try empty without prompting", "Sudo password", "setting", password=True),
+}
+# config_env.py _catalog_provider_env_metadata for the same keys plus the catalog-only ones (provider_catalog()).
+CATALOG_ENV = {
+    "OPENROUTER_API_KEY": ("openrouter", "OpenRouter", "https://openrouter.ai/keys", True),
+    "GEMINI_API_KEY": ("gemini", "Google AI Studio", "https://aistudio.google.com/app/apikey", False),
+    "XAI_API_KEY": ("xai", "xAI", "https://console.x.ai/", True),
+    "DEEPSEEK_API_KEY": ("deepseek", "DeepSeek", "https://platform.deepseek.com/api_keys", True),
+    "OPENAI_API_KEY": ("openai", "OpenAI", "https://platform.openai.com/api-keys", True),
+    "ECHO_CLOUD_API_KEY": ("echo-cloud", "Echo Cloud", None, True),
+}
+CHANNEL_MANAGED_ENV = frozenset({"TELEGRAM_BOT_TOKEN"})
+# A declared memory provider (plugins/memory/config_schema.py fields): its config lands in <home>/<name>/config.json.
+MEMORY_PROVIDERS = {FAKE_MEMORY_PROVIDER: {
+    "label": "Fake Recall", "docs_url": "https://example.com/fake-recall", "description": "Fake vector memory",
+    "fields": (
+        {"key": "api_key", "label": "API key", "kind": "secret", "env_key": "FAKE_RECALL_API_KEY",
+         "description": "Key for the fake recall service", "placeholder": "fr-…"},
+        {"key": "region", "label": "Region", "kind": "select", "default": "eu",
+         "options": ({"value": "eu", "label": "Europe"}, {"value": "us", "label": "United States"})},
+        {"key": "top_k", "label": "Results per query", "kind": "number", "default": "5"},
+        {"key": "rerank", "label": "Rerank results", "kind": "bool", "default": "false"},
+        {"key": "namespace", "label": "Namespace", "kind": "text", "default": "", "placeholder": "default"},
+    )}}
+
+
+class HttpError(Exception):
+    """A FastAPI HTTPException: ``{"detail": detail}`` with ``status``."""
+
+    def __init__(self, status: int, detail: Any) -> None:
+        super().__init__(str(detail))
+        self.status = status
+        self.detail = detail
+
+
+def body_error(field_name: str, kind: str = "missing") -> HttpError:
+    """FastAPI's 422 for a request model field (``missing`` or ``string_type``/``bool_type``/…)."""
+    message = {"missing": "Field required", "string_type": "Input should be a valid string",
+               "bool_type": "Input should be a valid boolean", "dict_type": "Input should be a valid dictionary",
+               "list_type": "Input should be a valid list"}.get(kind, "Invalid input")
+    return HttpError(422, [{"type": kind, "loc": ["body", field_name], "msg": message}])
+
+
+def body_field(body: dict[str, Any], name: str, kind: type, *, required: bool = True, default: Any = None) -> Any:
+    if name not in body:
+        if required:
+            raise body_error(name)
+        return default
+    value = body[name]
+    if value is None and not required:
+        return default
+    if not isinstance(value, kind):  # bool is not an int here: no int field is read this way
+        raise body_error(name, {str: "string_type", bool: "bool_type", dict: "dict_type", list: "list_type"}[kind])
+    return value
+
+
+@dataclass
+class FakeProfile:
+    """One Hermes home: config.yaml (sparse, as on disk), .env, SOUL.md, profile.yaml metadata, auth store, vault."""
+
+    name: str
+    path: str
+    config: dict[str, Any] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+    soul: str | None = DEFAULT_SOUL
+    description: str = ""
+    description_auto: bool = False
+    display_name: str = ""
+    skill_count: int = 0
+    # OAuth status cards by provider id (logged in only), the local vault items (with their secrets), the
+    # password managers unlocked this session, and declared memory-provider config files.
+    oauth: dict[str, dict[str, Any]] = field(default_factory=dict)
+    vault: list[dict[str, Any]] = field(default_factory=list)
+    unlocked: set[str] = field(default_factory=set)
+    memory_files: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def is_default(self) -> bool:
+        return self.name == "default"
+
+    def loaded(self) -> dict[str, Any]:
+        """load_config(): the defaults with the file over them (a file's MoA preset map replaces the defaults').
+        A fresh copy: a route that edits the record and saves it must never change the defaults themselves."""
+        merged = deep_merge(copy.deepcopy(DEFAULT_CONFIG), self.config)
+        moa = self.config.get("moa")
+        if isinstance(moa, dict) and isinstance(moa.get("presets"), dict):
+            merged["moa"]["presets"] = copy.deepcopy(moa["presets"])
+        return merged
+
+    def main_model(self) -> tuple[str, str]:
+        model = self.loaded().get("model")
+        if isinstance(model, dict):
+            return str(model.get("default") or model.get("name") or ""), str(model.get("provider") or "")
+        return str(model or ""), ""
+
+    def save(self, merged: dict[str, Any]) -> None:
+        """save_config: write ``merged`` with the defaults stripped (what the user set before stays)."""
+        keep = explicit_paths(self.config)
+        self.config = strip_defaults(merged, DEFAULT_CONFIG, keep)
+
+
+def normalize_moa_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] | None:
+    """moa_config.py _clean_slot."""
+    if moa_slot_problem(slot) is not None:
+        return None
+    clean: dict[str, Any] = {"provider": str(slot["provider"]).strip(), "model": str(slot["model"]).strip()}
+    effort = str(slot.get("reasoning_effort") or "").strip().lower()
+    if effort in REASONING_LEVELS:
+        clean["reasoning_effort"] = effort
+    if include_enabled:
+        enabled = slot.get("enabled")
+        clean["enabled"] = True if enabled is None else bool(enabled)
+    return clean
+
+
+def moa_slot_problem(slot: Any) -> str | None:
+    """moa_config.py _slot_problem."""
+    if not isinstance(slot, dict):
+        return "must be an object with 'provider' and 'model'"
+    provider, model = str(slot.get("provider") or "").strip(), str(slot.get("model") or "").strip()
+    if not provider and not model:
+        return "provider and model are required"
+    if not provider:
+        return "provider is required"
+    if not model:
+        return f"model is required (provider '{provider}' has no model selected)"
+    if provider.lower() == "moa":
+        return "the Mixture of Agents provider cannot be used inside a preset (recursive MoA)"
+    return None
+
+
+def validate_moa(raw: dict[str, Any]) -> list[str]:
+    """moa_config.py validate_moa_payload: what normalize would silently replace."""
+    presets_raw = raw.get("presets")
+    presets = presets_raw if isinstance(presets_raw, dict) and presets_raw else {"default": raw}
+    problems: list[str] = []
+    for name, preset in presets.items():
+        label = str(name or "").strip() or "(unnamed)"
+        if not isinstance(preset, dict):
+            problems.append(f"preset '{label}': must be an object")
+            continue
+        refs = preset.get("reference_models")
+        refs = refs if isinstance(refs, list) else [refs] if isinstance(refs, dict) else []
+        issues = [(index, moa_slot_problem(slot)) for index, slot in enumerate(refs)]
+        problems += [f"preset '{label}' reference {index + 1}: {issue}" for index, issue in issues if issue]
+        if all(issue for _, issue in issues):
+            problems.append(f"preset '{label}': needs at least one complete reference model")
+        if agg := moa_slot_problem(preset.get("aggregator")):
+            problems.append(f"preset '{label}' aggregator: {agg}")
+    return problems
+
+
+def normalize_moa_preset(raw: Any) -> dict[str, Any]:
+    """moa_config.py _normalize_preset."""
+    raw = raw if isinstance(raw, dict) else {}
+    refs_raw = raw.get("reference_models")
+    refs_raw = refs_raw if isinstance(refs_raw, list) else [refs_raw] if isinstance(refs_raw, dict) else []
+    refs = [slot for slot in (normalize_moa_slot(item, include_enabled=True) for item in refs_raw) if slot]
+    defaults = DEFAULT_CONFIG["moa"]["presets"]["default"]
+    policy = str(raw.get("degraded_reference_policy") or "loud").strip().lower()
+
+    def number(value: Any) -> float | None:
+        try:
+            return None if value in (None, "") or isinstance(value, bool) else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    timeout = number(raw.get("reference_timeout"))
+    fanout = str(raw.get("fanout") or "").strip().lower()
+    if not (fanout in ("per_iteration", "user_turn") or re.fullmatch(r"every_n:([2-9]|\d{2,})", fanout)):
+        fanout = "user_turn"
+    enabled = raw.get("enabled")
+    return {
+        "enabled": True if enabled is None else bool(enabled),
+        "reference_models": refs or [{**slot, "enabled": True} for slot in defaults["reference_models"]],
+        "aggregator": normalize_moa_slot(raw.get("aggregator")) or dict(defaults["aggregator"]),
+        "reference_temperature": number(raw.get("reference_temperature")),
+        "aggregator_temperature": number(raw.get("aggregator_temperature")),
+        "reference_timeout": timeout if timeout and timeout > 0 else None,
+        "degraded_reference_policy": policy if policy in ("loud", "silent") else "loud",
+        "fanout": fanout}
+
+
+def normalize_moa(raw: Any) -> dict[str, Any]:
+    """moa_config.py normalize_moa_config: named presets plus the flattened default preset."""
+    raw = raw if isinstance(raw, dict) else {}
+    presets = {str(name).strip(): normalize_moa_preset(preset) for name, preset in (raw.get("presets") or {}).items()
+               if str(name or "").strip()} if isinstance(raw.get("presets"), dict) else {}
+    if not presets:
+        presets["default"] = normalize_moa_preset(raw)
+    default_name = str(raw.get("default_preset") or "").strip()
+    if default_name not in presets:
+        default_name = next(iter(presets))
+    active = str(raw.get("active_preset") or "").strip()
+    privacy = raw.get("privacy_filter")
+    privacy = "full" if privacy is True else str(privacy or "").strip().lower()
+    return {"default_preset": default_name, "active_preset": active if active in presets else "", "presets": presets,
+            **copy.deepcopy(presets[default_name]),
+            "privacy_filter": privacy if privacy in ("display", "full") else ""}
+
+
+def alert_preferences(value: Any) -> tuple[dict[str, bool], str | None]:
+    """The device registration's ``alerts`` as the plugin reads it (``push.py::_alert_choices``): the named
+    kinds' booleans, ``{}`` when not sent; a kind it doesn't know is ignored."""
+    if value is None:
+        return {}, None
+    if not isinstance(value, dict) or any(not isinstance(flag, bool) for flag in value.values()):
+        return {}, f"alerts must map {', '.join(ALERT_KINDS)} to true or false"
+    return {kind: value[kind] for kind in ALERT_KINDS if kind in value}, None
+
+
+class AlertVoicePlugin(FakeVoicePlugin):
+    """The fake hermes_voice plugin plus the alert half of ``POST /devices``: ``alert_token`` with the ``alerts``
+    the user opted into (kept per device, listed by ``GET /status``), and ``GET /debug/alerts``: the alert pushes
+    the plugin would have sent (approval / clarify waiting, turn done) and to which alert tokens.
+
+    Registering again works as the plugin's ``DeviceStore.register`` with ``kept_fields``: a body that doesn't
+    name ``alert_token`` keeps the stored one (an explicit null clears it), and the alert choices merge kind by
+    kind over the stored ones, so a body with ``alerts`` but no ``alert_token`` (iOS has no alert token yet) is
+    fine."""
+
+    def routes(self) -> list[BaseRoute]:
+        return [*super().routes(), Route(f"{PLUGIN_PREFIX}/debug/alerts", self.debug_alerts, methods=["GET"])]
+
+    async def register_device(self, request: Request) -> Response:
+        if (denied := self.gate(request, post=True)) is not None:
+            return denied
+        body = await self.json_body(request) or {}
+        if not isinstance(body, dict):
+            body = {}
+        alerts, problem = alert_preferences(body.get("alerts"))
+        if problem is not None:
+            self.log(f"http POST {PLUGIN_PREFIX}/devices -> 422 ({problem})")
+            return JSONResponse({"detail": problem}, status_code=422)
+        voip = body.get("voip_token")
+        alert = body.get("alert_token")
+        earlier = self.devices.get(voip) if isinstance(voip, str) else None
+        if earlier is None and alert:
+            # The same phone with a new VoIP token: found by its alert token, one entry.
+            earlier = next((d for d in self.devices.values() if d.get("alert_token") == alert), None)
+        response = await super().register_device(request)
+        if response.status_code == 200:
+            for other, device in list(self.devices.items()):
+                if other != voip and device is earlier:
+                    del self.devices[other]
+            device = self.devices[voip]
+            if earlier is not None and "alert_token" not in body:
+                device["alert_token"] = earlier.get("alert_token")
+            device["alerts"] = {**(earlier or {}).get("alerts", {}), **alerts}
+            if device.get("alert_token"):
+                chosen = self.alerts_of(device)
+                shown = ", ".join(k for k, on in chosen.items() if on) or "no alerts"
+                self.log(f"device {voip[:8]}… alert token {device['alert_token'][:8]}… ({shown})")
+        return response
+
+    async def status(self, request: Request) -> Response:
+        response = await super().status(request)
+        if response.status_code != 200:
+            return response
+        payload = json.loads(bytes(response.body))
+        payload["devices"] = [{"voip_token": voip, **device, "alerts": self.alerts_of(device)}
+                              for voip, device in self.devices.items()]
+        return JSONResponse(payload)
+
+    @staticmethod
+    def alerts_of(device: dict[str, Any]) -> dict[str, bool]:
+        """What a device gets: its opt-ins, on for a kind it never named, nothing without an alert token."""
+        if not device.get("alert_token"):
+            return {kind: False for kind in ALERT_KINDS}
+        chosen = device.get("alerts") or {}
+        return {kind: chosen.get(kind, ALERT_DEFAULTS[kind]) is not False for kind in ALERT_KINDS}
+
+    def alert_targets(self, kind: str) -> list[str]:
+        return [device["alert_token"] for device in self.devices.values() if self.alerts_of(device).get(kind)]
+
+    async def debug_alerts(self, request: Request) -> Response:
+        """``?session_id=`` (stored or runtime id; omitted: every session) and ``?kind=``: the latest alert as
+        ``alert`` ({aps, hermes}, the notification's userInfo), with ``sent_to`` and the whole history."""
+        if (denied := self.gate(request, post=False)) is not None:
+            return denied
+        q = request.query_params
+        key = None
+        if q.get("session_id"):
+            key = self.resolve_key(q["session_id"])
+            if key is None:
+                return JSONResponse({"detail": "Session not found"}, status_code=404)
+        kind = q.get("kind") or None
+        if kind is not None and kind not in ALERT_KINDS:
+            return JSONResponse({"detail": f"kind must be one of {list(ALERT_KINDS)}"}, status_code=422)
+        history = [entry for entry in self.fake.alerts if (key is None or entry["session_id"] == key)
+                   and (kind is None or entry["kind"] == kind)]
+        last = history[-1] if history else None
+        return JSONResponse({"session_id": key, "alert": last["payload"] if last else None,
+                             "kind": last["kind"] if last else None, "sent_to": last["sent_to"] if last else [],
+                             "alerts": history})
+
+
+class SettingsFeatures:
+    """M3: the settings REST routes (config + schema, models, memory providers, .env keys, OAuth providers, profiles
+    and SOUL.md, status), the vault.* and billing.* RPCs, and the alert pushes the voice plugin would send. Mixed
+    into FakeHermes, whose sessions, runtimes and logging it uses."""
+
+    sessions: dict[str, StoredSession]
+    runtimes: dict[str, Runtime]
+    voice_plugin: AlertVoicePlugin
+
+    def _init_settings(self, args: argparse.Namespace) -> None:
+        self.profiles: dict[str, FakeProfile] = {}
+        for demo in DEMO_PROFILES:
+            self.profiles[demo["name"]] = FakeProfile(name=demo["name"], path=demo["path"],
+                                                      description=demo["description"], skill_count=demo["skill_count"])
+        default, research = self.profiles["default"], self.profiles["research"]
+        default.config = {"model": {"default": "fake-hermes", "provider": "fake"}}
+        default.env = {"OPENROUTER_API_KEY": "or-demo-fake-0000000000000000", "MY_CUSTOM_TOKEN": "custom-demo"}
+        default.oauth["openai-codex"] = {"logged_in": True, "source": "hermes-auth-store",
+                                         "source_label": f"{DEMO_HERMES_HOME}/auth.json", "token_preview": "…f4k3",
+                                         "expires_at": None, "has_refresh_token": True}
+        default.vault.append({"id": "vault_" + secrets.token_hex(6), "kind": "login", "label": "Example site",
+                              "origin": "https://example.com", "created_at": "2026-09-01T09:00:00+00:00",
+                              "identifier": "demo@example.com", "identifier_type": "email",
+                              "secret": {"password": "demo-password"}})
+        research.config = {"model": {"default": "echo-1", "provider": "echo-cloud"}}
+        research.soul = "You read papers and write short, sourced summaries. (Fake Hermes research SOUL.md)"
+        self.sticky_profile = "default"
+        self.profile_archives: dict[str, dict[str, Any]] = {}
+        self.oauth_sessions: dict[str, dict[str, Any]] = {}
+        self.oauth_approve_after = float(getattr(args, "oauth_approve_after", 2.0))
+        self.reveals: deque[float] = deque()
+        # billing.* (one Nous Portal account): balance, the billing:manage scope, charges by id and key.
+        self.billing = {"balance": Decimal("12.34"), "scope": False, "auto_reload": False,
+                        "threshold": Decimal("5"), "reload_to": Decimal("25"), "keep_going": False}
+        self.charges: dict[str, dict[str, Any]] = {}
+        self.charge_keys: dict[str, str] = {}
+        self.charge_settle_after = 0.3
+        self.alerts: deque[dict[str, Any]] = deque(maxlen=ALERT_MEMORY)
+
+    # ── plumbing ──────────────────────────────────────────────────────────────────────────────────
+
+    def settings_routes(self) -> list[Route]:
+        r = self.rest
+        return [
+            Route("/api/status", self.get_status, methods=["GET"]),
+            Route("/api/config", r(self.get_config), methods=["GET"]),
+            Route("/api/config", r(self.put_config), methods=["PUT"]),
+            # Public like dashboard_auth/public_paths.py PUBLIC_API_PATHS (with /api/status).
+            Route("/api/config/schema", r(self.get_schema, public=True), methods=["GET"]),
+            Route("/api/config/defaults", r(lambda request, body: copy.deepcopy(DEFAULT_CONFIG), public=True),
+                  methods=["GET"]),
+            Route("/api/model/info", r(self.model_info, public=True), methods=["GET"]),
+            Route("/api/model/options", r(self.rest_model_options), methods=["GET"]),
+            Route("/api/model/recommended-default", r(self.recommended_default), methods=["GET"]),
+            Route("/api/model/auxiliary", r(self.auxiliary_models), methods=["GET"]),
+            Route("/api/model/moa", r(self.get_moa), methods=["GET"]),
+            Route("/api/model/moa", r(self.put_moa), methods=["PUT"]),
+            Route("/api/model/set", r(self.set_model_assignment), methods=["POST"]),
+            Route("/api/delegation/routing", r(self.delegation_routing), methods=["GET"]),
+            Route("/api/delegation/backend", r(self.select_delegation_backend), methods=["PUT"]),
+            Route("/api/memory", r(self.memory_status), methods=["GET"]),
+            Route("/api/memory/providers/{name}/config", r(self.memory_provider_config), methods=["GET"]),
+            Route("/api/memory/providers/{name}/config", r(self.put_memory_provider_config), methods=["PUT"]),
+            Route("/api/env", r(self.get_env), methods=["GET"]),
+            Route("/api/env", r(self.put_env), methods=["PUT"]),
+            Route("/api/env", r(self.delete_env), methods=["DELETE"]),
+            Route("/api/env/reveal", r(self.reveal_env), methods=["POST"]),
+            Route("/api/providers/validate", r(self.validate_credential), methods=["POST"]),
+            Route("/api/providers/oauth", r(self.oauth_providers), methods=["GET"]),
+            Route("/api/providers/oauth/sessions/{session_id}", r(self.cancel_oauth), methods=["DELETE"]),
+            Route("/api/providers/oauth/{provider_id}", r(self.disconnect_oauth), methods=["DELETE"]),
+            Route("/api/providers/oauth/{provider_id}/start", r(self.start_oauth), methods=["POST"]),
+            Route("/api/providers/oauth/{provider_id}/submit", r(self.submit_oauth), methods=["POST"]),
+            Route("/api/providers/oauth/{provider_id}/poll/{session_id}", r(self.poll_oauth), methods=["GET"]),
+            Route("/api/profiles", r(self.create_profile), methods=["POST"]),
+            Route("/api/profiles/active", r(self.active_profile), methods=["GET"]),
+            Route("/api/profiles/active", r(self.set_active_profile), methods=["POST"]),
+            Route("/api/profiles/import", r(self.import_profile), methods=["POST"]),
+            Route("/api/profiles/{name}", r(self.rename_profile), methods=["PATCH"]),
+            Route("/api/profiles/{name}", r(self.delete_profile), methods=["DELETE"]),
+            Route("/api/profiles/{name}/soul", r(self.get_soul), methods=["GET"]),
+            Route("/api/profiles/{name}/soul", r(self.put_soul), methods=["PUT"]),
+            Route("/api/profiles/{name}/description", r(self.put_description), methods=["PUT"]),
+            Route("/api/profiles/{name}/model", r(self.put_profile_model), methods=["PUT"]),
+            Route("/api/profiles/{name}/setup-command", r(self.setup_command), methods=["GET"]),
+            Route("/api/profiles/{name}/export", r(self.export_profile), methods=["POST"]),
+        ]
+
+    def rest(self, handler: Callable[[Request, dict[str, Any]], Any],
+             public: bool = False) -> Callable[[Request], Awaitable[Response]]:
+        """Sign-in (unless ``public``) and same-origin checks, the JSON body, HttpError -> ``{"detail"}``, and one log
+        line per call (never with a value: bodies here carry API keys)."""
+        async def endpoint(request: Request) -> Response:
+            name = f"{request.method} {request.url.path}"
+            if not public and not self.authed(request):
+                log(f"http {name} -> 401")
+                return self.unauthorized(request)
+            if request.method != "GET" and (problem := self.origin_problem(request)):
+                log(f"http {name} -> 403", problem)
+                return JSONResponse({"detail": problem}, status_code=403)
+            body: dict[str, Any] = {}
+            if request.method != "GET":
+                raw = await request.body()
+                if raw.strip():
+                    try:
+                        parsed = json.loads(raw)
+                    except ValueError:
+                        log(f"http {name} -> 422 (body is not JSON)")
+                        return JSONResponse({"detail": [{"type": "json_invalid", "loc": ["body"],
+                                                         "msg": "JSON decode error"}]}, status_code=422)
+                    if not isinstance(parsed, dict):
+                        log(f"http {name} -> 422 (body is not an object)")
+                        return JSONResponse({"detail": [{"type": "model_attributes_type", "loc": ["body"],
+                                                         "msg": "Input should be a valid dictionary"}]},
+                                            status_code=422)
+                    body = parsed
+            try:
+                result = handler(request, body)
+                if inspect.isawaitable(result):
+                    result = await result
+            except HttpError as exc:
+                log(f"http {name} -> {exc.status} {short(exc.detail, 160)}")
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status)
+            if isinstance(result, Response):
+                return result
+            log(f"http {name} -> 200")
+            return JSONResponse(result)
+        return endpoint
+
+    def profile_named(self, name: str) -> FakeProfile:
+        """web_server_profiles.py _resolve_profile_dir: the name as given (no lowercasing) must be a valid id, else
+        400; a missing profile is 404."""
+        if name != "default":
+            if not PROFILE_ID.match(name):
+                raise HttpError(400, self.invalid_name(name))
+            if name in RESERVED_PROFILE_NAMES:
+                raise HttpError(400, f"Profile name {name!r} is reserved — it collides with either the Hermes "
+                                     "installation itself or a common system binary.  Pick a different name.")
+        if name not in self.profiles:
+            raise HttpError(404, f"Profile '{name}' does not exist.")
+        return self.profiles[name]
+
+    def scoped(self, request: Request, body: dict[str, Any] | None = None) -> FakeProfile:
+        """``?profile=`` (or the body's ``profile``, which wins): None, "" and "current" are the dashboard's own."""
+        name = str((body or {}).get("profile") or request.query_params.get("profile") or "").strip()
+        return self.profiles["default"] if not name or name.lower() == "current" else self.profile_named(name)
+
+    @staticmethod
+    def invalid_name(name: str) -> str:
+        suggestion = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-_")[:64]
+        suggestion = suggestion if PROFILE_ID.match(suggestion) else "my-work"
+        return (f"{name!r} is not a valid profile name. {PROFILE_NAME_RULE} (for example: {suggestion}). Then run "
+                f"`hermes profile create {suggestion}`.")
+
+    def canonical_name(self, name: Any) -> str:
+        """profiles.py _canon_valid: normalize then validate (ValueError -> 400)."""
+        if not isinstance(name, str) or not name.strip():
+            raise HttpError(400, "profile name cannot be empty")
+        canon = "default" if name.strip().casefold() == "default" else name.strip().lower()
+        if canon == "default":
+            return canon
+        if not PROFILE_ID.match(canon):
+            raise HttpError(400, self.invalid_name(canon))
+        if canon in RESERVED_PROFILE_NAMES:
+            raise HttpError(400, f"Profile name {canon!r} is reserved — it collides with either the Hermes "
+                                 "installation itself or a common system binary.  Pick a different name.")
+        return canon
+
+    # ── status ────────────────────────────────────────────────────────────────────────────────────
+
+    async def get_status(self, request: Request) -> Response:
+        """status.py /api/status: the public liveness probe (no sign-in), on a gated bind (no paths)."""
+        requested = (request.query_params.get("profile") or "").strip()
+        if requested and requested.lower() != "current":
+            try:
+                self.profile_named(requested)
+            except HttpError as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status)
+        active = sum(1 for rt in self.runtimes.values() if rt.running)
+        components = {"gateway": {"status": "ok", "state": "running"},
+                      "dashboard": {"status": "ok"}, "storage": {"status": "ok"},
+                      "platforms": {"status": "ok", "configured": 0, "connected": 0}}
+        log("http GET /api/status -> 200")
+        return JSONResponse({
+            "version": FAKE_VERSION, "release_date": FAKE_RELEASE_DATE, "config_version": CONFIG_VERSION,
+            "latest_config_version": CONFIG_VERSION, "can_update_hermes": False, "gateway_running": True,
+            "gateway_state": "running", "gateway_platforms": {}, "gateway_exit_reason": None,
+            "gateway_updated_at": datetime.now(timezone.utc).isoformat(), "gateway_heartbeat_stale_s": None,
+            "gateway_shared_with": None, "active_agents": active, "gateway_busy": active > 0,
+            "gateway_drainable": True, "restart_drain_timeout": 60, "active_sessions": len(self.runtimes),
+            "auth_required": True, "auth_providers": ["basic"], "auth_flows": ["cookie", "native_pkce"],
+            "nous_session_valid": "unknown", "shared_profile_warning": False, "components": components,
+            "overall": "ok", "memory": {"pressure": "ok"}, "disk": {"pressure": "ok"},
+            "profiles": list(self.profiles), "parked_profiles": [], "gateway_mode": "single",
+            "multiplex_standalone_reason": None})
+
+    # ── config ────────────────────────────────────────────────────────────────────────────────────
+
+    def get_config(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """config_env.py GET /api/config: load_config() (or the raw file with include_defaults=false), the model
+        flattened to its string plus model_context_length, ``_`` keys dropped."""
+        profile = self.scoped(request)
+        include = request.query_params.get("include_defaults", "true").lower() not in ("false", "0", "no")
+        config = copy.deepcopy(profile.loaded() if include else profile.config)
+        model = config.get("model")
+        if isinstance(model, dict):
+            context = model.get("context_length", 0)
+            config["model"] = model.get("default", model.get("name", ""))
+            config["model_context_length"] = context if isinstance(context, int) else 0
+        else:
+            config["model_context_length"] = 0
+        return {key: value for key, value in config.items() if not key.startswith("_")}
+
+    def get_schema(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        self.scoped(request)
+        return {"fields": CONFIG_SCHEMA, "category_order": CATEGORY_ORDER}
+
+    def put_config(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """config_env.py PUT /api/config {config, profile?}: deep-merged over the file. The fake also checks each
+        schema field's value against its type (the real server saves whatever comes)."""
+        config = body_field(body, "config", dict)
+        profile = self.scoped(request, body)
+        current = profile.loaded()
+        if problem := self.config_problem(config, flatten(current)):
+            raise HttpError(400, problem)
+        incoming = self.denormalize(profile, config)
+        profile.save(deep_merge(profile.config, incoming))
+        return {"ok": True}
+
+    @staticmethod
+    def config_problem(config: dict[str, Any], current: dict[str, Any], prefix: str = "") -> str | None:
+        for key, value in config.items():
+            path = f"{prefix}.{key}" if prefix else key
+            spec = CONFIG_SCHEMA.get(path)
+            if path in ("_model_meta", "model") and (path == "_model_meta" or isinstance(value, (dict, str))):
+                continue
+            if spec is None:
+                if isinstance(value, dict):
+                    if problem := SettingsFeatures.config_problem(value, current, path):
+                        return problem
+                elif value is not None and any(name.startswith(path + ".") for name in CONFIG_SCHEMA):
+                    return f"{path} is a section: send its fields, not {shown(path, value)}"
+                continue
+            if DEFAULT_FLAT.get(path, _MISSING) is None and not isinstance(value, (dict, list)):
+                continue  # a field whose default is null takes any scalar (its schema type is only a guess)
+            kind = spec["type"]
+            expected = {"boolean": (bool,), "number": (int, float), "string": (str,), "list": (list,),
+                        "object": (dict,), "select": (str,)}.get(kind, (object,))
+            if not isinstance(value, expected) or kind == "number" and isinstance(value, bool):
+                return f"Invalid value for {path}: expected a {kind}, got {shown(path, value)}"
+            allowed = (*spec.get("options", ()), *DESKTOP_ENUM_EXTRAS.get(path, ()), current.get(path),
+                       DEFAULT_FLAT.get(path), *(("",) if spec.get("clearable") else ()))
+            if kind == "select" and value not in allowed:
+                return f"Invalid value for {path}: {shown(path, value)} is not one of {spec['options']}"
+        return None
+
+    def denormalize(self, profile: FakeProfile, config: dict[str, Any]) -> dict[str, Any]:
+        """web_server_config.py _denormalize_config_from_web: the flat model string and context override go back
+        into the ``model`` dict; a model another provider serves switches the provider."""
+        config = dict(config)
+        config.pop("_model_meta", None)
+        context_sent = "model_context_length" in config
+        context = config.pop("model_context_length", 0)
+        try:
+            context = int(context) if not isinstance(context, bool) else 0
+        except (TypeError, ValueError):
+            context = 0
+        model_value = config.get("model")
+        has_model = isinstance(model_value, str) and bool(model_value)
+        if not (has_model or context_sent):
+            return config
+        disk_model = copy.deepcopy(profile.loaded().get("model"))
+        if isinstance(disk_model, dict):
+            if has_model:
+                previous, provider = str(disk_model.get("default") or ""), str(disk_model.get("provider") or "")
+                if model_value != previous and provider:
+                    serving = self.provider_of(model_value)
+                    if serving and serving != provider:
+                        disk_model["provider"] = serving
+                disk_model["default"] = model_value
+            if context_sent:
+                if context > 0:
+                    disk_model["context_length"] = context
+                else:
+                    disk_model.pop("context_length", None)
+            config["model"] = disk_model
+        elif context_sent and context > 0:
+            default = model_value if has_model else disk_model if isinstance(disk_model, str) else ""
+            config["model"] = {"default": default, "context_length": context}
+        return config
+
+    # ── models ────────────────────────────────────────────────────────────────────────────────────
+
+    def model_info(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """models.py GET /api/model/info: detected vs configured context window and models.dev capabilities."""
+        profile = self.scoped(request)
+        model, provider = profile.main_model()
+        if not model:
+            return {"model": "", "provider": provider, "auto_context_length": 0, "config_context_length": 0,
+                    "effective_context_length": 0, "capabilities": {}}
+        model_cfg = profile.loaded().get("model")
+        configured = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
+        configured = configured if isinstance(configured, int) and configured > 0 else 0
+        auto = DEMO_CONTEXT.get(model, 0)
+        caps = {}
+        if self.provider_of(model):
+            fast, reasoning = self.capabilities(model)
+            caps = {"supports_tools": True, "supports_vision": model != "fake-hermes-mini",
+                    "supports_reasoning": reasoning, "context_window": auto, "max_output_tokens": 32_000,
+                    "model_family": model.split("-")[0]}
+        return {"model": model, "provider": provider, "auto_context_length": auto, "config_context_length": configured,
+                "effective_context_length": configured or auto, "capabilities": caps}
+
+    def rest_model_options(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """models.py GET /api/model/options: the model.options RPC's shape, current = the profile's main model."""
+        model, provider = self.scoped(request).main_model()
+        options = self.model_options({})
+        for row in options["providers"]:
+            row["is_current"] = row["slug"] == provider
+        return {**options, "model": model, "provider": provider}
+
+    def recommended_default(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        slug = (request.query_params.get("provider") or "").strip().lower()
+        self.scoped(request)
+        models = next((list(m) for s, _n, m in DEMO_PROVIDERS if s == slug), [])
+        model = next((m for m in models if m not in EXPENSIVE_MODELS), models[0] if models else "")
+        return {"provider": slug, "model": model, "free_tier": None}
+
+    def auxiliary_models(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """models.py GET /api/model/auxiliary: every slot's own stored provider/model, and the main model."""
+        profile = self.scoped(request)
+        aux = profile.loaded().get("auxiliary") or {}
+
+        def row(slot: str) -> dict[str, Any]:
+            block = aux.get(slot) if isinstance(aux.get(slot), dict) else {}
+            base_url = str(block.get("base_url") or "")
+            return {"task": slot, "provider": str(block.get("provider") or "auto"),
+                    "model": str(block.get("model") or ""), "base_url": base_url,
+                    "reasoning_effort": str(block.get("reasoning_effort") or "") or None,
+                    "local_endpoint": base_url.startswith(("http://localhost", "http://127.0.0.1"))}
+
+        model, provider = profile.main_model()
+        return {"tasks": [row(slot) for slot in AUX_TASK_SLOTS], "main": {"provider": provider, "model": model}}
+
+    # The fake host has the Advanced Delegation plugin installed and on: its two backends can run.
+    DELEGATION_BACKENDS = (
+        ("default", "Default", "Every subagent runs on the subagent model.", True),
+        ("model_map", "Model routes", "Name a few models. The agent picks one for each subagent.", False),
+        ("profile_routes", "Profile routes", "Subagents run as one of your profiles.", False),
+    )
+
+    def delegation_routing(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """delegation.py GET /api/delegation/routing: the saved backend, the registered ones, both route blocks."""
+        profile = self.scoped(request)
+        delegation = profile.loaded().get("delegation") or {}
+        configured = str(delegation.get("backend") or "default").strip().lower() or "default"
+        names = [name for name, *_ in self.DELEGATION_BACKENDS]
+        blocks = delegation.get("backends") if isinstance(delegation.get("backends"), dict) else {}
+        model_map = blocks.get("model_map") if isinstance(blocks.get("model_map"), dict) else {}
+        routes = blocks.get("profile_routes") if isinstance(blocks.get("profile_routes"), dict) else {}
+        return {"configured": configured,
+                "blocked_reason": None if configured in names else f"No delegation backend named {configured!r}.",
+                "backends": [{"name": n, "label": label, "description": text, "available": True, "reason": "",
+                              "builtin": builtin} for n, label, text, builtin in self.DELEGATION_BACKENDS],
+                "model_map": {"options": [o for o in model_map.get("options") or [] if isinstance(o, dict)],
+                              "default": model_map.get("default") or None},
+                "profile_routes": {"profiles": [p for p in routes.get("profiles") or [] if isinstance(p, dict)],
+                                   "default": routes.get("default") or None},
+                "profiles": sorted(self.profiles)}
+
+    def select_delegation_backend(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """delegation.py PUT /api/delegation/backend {backend}: only a registered backend (400 otherwise)."""
+        profile = self.scoped(request, body)
+        name = str(body.get("backend") or "").strip().lower() or "default"
+        if name not in [n for n, *_ in self.DELEGATION_BACKENDS]:
+            raise HttpError(400, f"Unknown delegation backend: {name}")
+        config = profile.loaded()
+        config.setdefault("delegation", {})["backend"] = name
+        profile.save(config)
+        return {"ok": True, "backend": name}
+
+    def get_moa(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return normalize_moa(self.scoped(request).loaded().get("moa"))
+
+    def put_moa(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """models.py PUT /api/model/moa: incomplete slots are refused (422), the submitted preset map is
+        authoritative, privacy_filter survives a round trip."""
+        profile = self.scoped(request, body)
+        presets = body.get("presets") if isinstance(body.get("presets"), dict) else {}
+        controls = ("reference_models", "aggregator", "reference_temperature", "aggregator_temperature",
+                    "reference_timeout", "degraded_reference_policy", "fanout", "enabled")
+        if presets:
+            raw: dict[str, Any] = {"default_preset": body.get("default_preset") or "default",
+                                   "active_preset": body.get("active_preset") or "",
+                                   "presets": {name: {k: p.get(k) for k in controls if k in p}
+                                               for name, p in presets.items() if isinstance(p, dict)}}
+            bad = [name for name, p in presets.items() if not isinstance(p, dict)]
+            if bad:
+                raise HttpError(422, [{"type": "model_type", "loc": ["body", "presets", bad[0]],
+                                       "msg": "Input should be a valid dictionary"}])
+        else:
+            raw = {k: body.get(k) for k in controls if k in body}
+        if problems := validate_moa(raw):
+            raise HttpError(422, "Invalid MoA config: " + "; ".join(problems))
+        existing = profile.config.get("moa")
+        if isinstance(existing, dict) and "privacy_filter" in existing:
+            raw["privacy_filter"] = existing["privacy_filter"]
+        normalized = normalize_moa(raw)
+        stored = {k: normalized[k] for k in ("default_preset", "active_preset", "presets", "privacy_filter")}
+        merged = profile.loaded()
+        merged["moa"] = {**{k: v for k, v in (merged.get("moa") or {}).items() if k not in stored}, **stored}
+        profile.save(merged)
+        return {"ok": True, **normalized}
+
+    def set_model_assignment(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """models.py POST /api/model/set {scope, provider, model, task?, reasoning_effort?, base_url?, api_key?,
+        confirm_expensive_model?}."""
+        scope = body_field(body, "scope", str).strip().lower()
+        provider, model = body_field(body, "provider", str).strip(), body_field(body, "model", str).strip()
+        task = str(body.get("task") or "").strip().lower()
+        base_url, api_key = str(body.get("base_url") or "").strip(), str(body.get("api_key") or "").strip()
+        if scope not in ("main", "auxiliary"):
+            raise HttpError(400, "scope must be 'main' or 'auxiliary'")
+        profile = self.scoped(request, body)
+        if model and not body.get("confirm_expensive_model") and model in EXPENSIVE_MODELS:
+            return {"ok": False, "scope": scope, "provider": provider, "model": model, "confirm_required": True,
+                    "confirm_message": f"{model} costs $15.00/M input and $75.00/M output tokens. Use it anyway?"}
+        config = profile.loaded()
+        if scope == "main":
+            if not provider or not model:
+                raise HttpError(400, "provider and model required for main")
+            if provider not in ("custom", "local") and self.provider_of(model) != provider:
+                known = next((list(m) for s, _n, m in DEMO_PROVIDERS if s == provider), None)
+                raise HttpError(400, f"Unknown provider '{provider}'." if known is None else
+                                f"Model '{model}' is not available from {provider}. Available: {', '.join(known)}")
+            block = config.get("model") if isinstance(config.get("model"), dict) else {}
+            block = {k: v for k, v in block.items() if k not in ("base_url", "api_key", "api_mode")} \
+                if block.get("provider") != provider else dict(block)
+            block.update(default=model, provider=provider)
+            if base_url:
+                block["base_url"] = base_url
+            if api_key:
+                block["api_key"] = api_key
+            config["model"] = block
+            profile.save(config)
+            aux = config.get("auxiliary") or {}
+            stale = [{"task": slot, "provider": str(aux[slot].get("provider")),
+                      "model": str(aux[slot].get("model") or "")}
+                     for slot in AUX_TASK_SLOTS if isinstance(aux.get(slot), dict)
+                     and str(aux[slot].get("provider") or "").lower() not in ("", "auto", "main", provider)]
+            return {"ok": True, "scope": "main", "provider": provider, "model": model,
+                    "base_url": block.get("base_url", ""), "gateway_tools": [], "stale_aux": stale}
+        effort: Any = _MISSING
+        if "reasoning_effort" in body:
+            effort = body["reasoning_effort"]
+            if effort is not None:
+                effort = str(effort).strip().lower()
+                effort = {"off": "none", "disabled": "none"}.get(effort, effort)
+                if effort not in REASONING_LEVELS:
+                    raise HttpError(400, "reasoning_effort must be one of: none, " + ", ".join(REASONING_LEVELS[1:]))
+        aux = config.setdefault("auxiliary", {})
+        if task == "__reset__":
+            for slot in AUX_TASK_SLOTS:
+                block = aux.setdefault(slot, {})
+                block.update(provider="auto", model="")
+                for key in ("reasoning_effort", "base_url", "api_key"):
+                    block.pop(key, None)
+            profile.save(config)
+            return {"ok": True, "scope": "auxiliary", "reset": True}
+        if not provider:
+            raise HttpError(400, "provider required for auxiliary")
+        targets = [task] if task else list(AUX_TASK_SLOTS)
+        for slot in targets:
+            if slot not in AUX_TASK_SLOTS:
+                raise HttpError(400, f"unknown auxiliary task: {slot}")
+            block = aux.setdefault(slot, {})
+            previous = str(block.get("provider") or "").lower()
+            block.update(provider=provider, model=model)
+            if base_url:
+                block["base_url"] = base_url
+                if api_key:
+                    block["api_key"] = api_key
+            elif provider.lower() != previous and provider.lower() != "custom":
+                block.pop("base_url", None)
+                block.pop("api_key", None)
+            if effort is None:
+                if DEFAULT_CONFIG["auxiliary"].get(slot, {}).get("reasoning_effort"):
+                    block["reasoning_effort"] = ""
+                else:
+                    block.pop("reasoning_effort", None)
+            elif effort is not _MISSING:
+                block["reasoning_effort"] = effort
+        profile.save(config)
+        result = {"ok": True, "scope": "auxiliary", "tasks": targets, "provider": provider, "model": model}
+        if effort is not _MISSING:
+            result["reasoning_effort"] = effort
+        return result
+
+    # ── memory providers ──────────────────────────────────────────────────────────────────────────
+
+    def memory_status(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py GET /api/memory: the active provider, every discovered one, the built-in files' sizes."""
+        profile = self.scoped(request)
+        active = str((profile.loaded().get("memory") or {}).get("provider") or "")
+        providers = []
+        for name, spec in MEMORY_PROVIDERS.items():
+            configured = bool(profile.env.get("FAKE_RECALL_API_KEY")) or name in profile.memory_files
+            providers.append({"name": name, "description": spec["description"], "available": True,
+                              "configured": configured, "status": "ready" if configured else "needs_config",
+                              "setup": {"pip_dependencies": [], "python_dependencies_declared": True,
+                                        "external_dependencies": [], "required_env": ["FAKE_RECALL_API_KEY"],
+                                        "dependencies_installed": True}})
+        return {"active": active, "providers": providers, "builtin_files": {"memory": 812, "user": 245}}
+
+    def memory_provider_config(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """memory_providers.py GET .../config?surface=declared: the declared fields with their values (secrets
+        only as is_set)."""
+        name = request.path_params["name"]
+        self.check_memory_name(name)
+        profile = self.scoped(request)
+        spec = MEMORY_PROVIDERS.get(name)
+        if spec is None:
+            return {"name": name, "label": name, "docs_url": "", "fields": []}
+        stored = profile.memory_files.get(name, {})
+        fields = []
+        for f in spec["fields"]:
+            entry = {"key": f["key"], "label": f["label"], "kind": f["kind"], "description": f.get("description", ""),
+                     "info": "", "placeholder": f.get("placeholder", ""), "inline": False, "group": "",
+                     "options": [{"value": o["value"], "label": o["label"], "description": ""}
+                                 for o in f.get("options", ())]}
+            if f["kind"] == "secret":
+                entry.update(value="", is_set=bool(profile.env.get(f["env_key"])))
+            else:
+                native = stored.get(f["key"])
+                value = ("true" if native else "false") if f["kind"] == "bool" and native is not None else \
+                    json.dumps(native) if isinstance(native, (dict, list)) else \
+                    str(native) if native is not None else f.get("default", "")
+                entry.update(value=value, is_set=bool(value))
+            fields.append(entry)
+        return {"name": name, "label": spec["label"], "docs_url": spec["docs_url"], "fields": fields}
+
+    def put_memory_provider_config(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """memory_providers.py PUT .../config?surface=declared {values}: secrets to .env, the rest coerced into
+        the provider's config.json; memory.provider becomes this provider."""
+        name = request.path_params["name"]
+        self.check_memory_name(name)
+        profile = self.scoped(request)
+        spec = MEMORY_PROVIDERS.get(name)
+        if spec is None:
+            raise HttpError(404, f"Unknown memory provider: {name}")
+        values = body.get("values") or {}
+        if not isinstance(values, dict):
+            raise body_error("values", "dict_type")
+        text = {k: "" if v is None else ("true" if v else "false") if isinstance(v, bool) else
+                json.dumps(v) if isinstance(v, (dict, list)) else str(v) for k, v in values.items()}
+        stored = dict(profile.memory_files.get(name, {}))
+        for f in spec["fields"]:
+            if f["key"] not in text:
+                continue
+            value = text[f["key"]].strip()
+            if f["kind"] == "secret":
+                if value:
+                    profile.env[f["env_key"]] = value
+                continue
+            if f["kind"] == "select":
+                value = value or f.get("default", "")
+                if value not in [o["value"] for o in f["options"]]:
+                    raise HttpError(400, f"Invalid value for '{f['key']}'")
+                stored[f["key"]] = value
+            elif f["kind"] == "bool":
+                stored[f["key"]] = value.lower() in ("1", "true", "yes", "on")
+            elif not value:
+                stored.pop(f["key"], None)
+            elif f["kind"] == "number":
+                try:
+                    number = float(value)
+                except ValueError:
+                    raise HttpError(400, f"Invalid number for '{f['key']}'") from None
+                stored[f["key"]] = int(number) if number.is_integer() else number
+            else:
+                stored[f["key"]] = value
+        profile.memory_files[name] = stored
+        config = profile.loaded()
+        if (config.get("memory") or {}).get("provider") != name:
+            config.setdefault("memory", {})["provider"] = name
+            profile.save(config)
+        return {"ok": True}
+
+    @staticmethod
+    def check_memory_name(name: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name or ""):
+            raise HttpError(404, f"Unknown memory provider: {name}")
+
+    # ── .env keys ─────────────────────────────────────────────────────────────────────────────────
+
+    def get_env(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """config_env.py GET /api/env: every known variable (OPTIONAL_ENV_VARS, then catalog providers, then the
+        .env's own keys as custom secrets), values only as redacted previews."""
+        profile = self.scoped(request)
+
+        def row(name: str, info: dict[str, Any], custom: bool = False) -> dict[str, Any]:
+            value = profile.env.get(name)
+            catalog = CATALOG_ENV.get(name)
+            return {
+                "is_set": bool(value), "redacted_value": credential_preview(value),
+                "description": info.get("description") or (f"{catalog[1]} API key" if catalog else ""),
+                "url": info["url"] if info.get("url") is not None else (catalog[2] if catalog else None),
+                "category": info.get("category") or ("provider" if catalog else ""),
+                "is_password": info.get("password", bool(catalog)), "tools": info.get("tools", []),
+                "advanced": info.get("advanced", False), "channel_managed": name in CHANNEL_MANAGED_ENV,
+                "provider": catalog[0] if catalog else "", "provider_label": catalog[1] if catalog else "",
+                "provider_profiles": [], "provider_primary": bool(catalog and catalog[3]), "custom": custom}
+
+        result = {name: row(name, info) for name, info in OPTIONAL_ENV_VARS.items()}
+        result.update({name: row(name, {}) for name in CATALOG_ENV if name not in result})
+        for name in profile.env:
+            if name not in result and name not in CHANNEL_MANAGED_ENV:
+                result[name] = {**row(name, {}, custom=True), "category": "custom", "is_password": True}
+        return result
+
+    def put_env(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """config_env.py PUT /api/env {key, value, profile?, provider_setup?}: never a redacted preview."""
+        key, value = body_field(body, "key", str), body_field(body, "value", str)
+        if is_credential_preview(value):
+            raise HttpError(400, REDACTED_WRITE_DETAIL)
+        profile = self.scoped(request, body)
+        self.check_env_name(key)
+        profile.env[key] = value
+        log(f"env {key} set for profile {profile.name} ({len(value)} characters)")
+        return {"ok": True, "key": key, "config_updates": []}
+
+    def delete_env(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """config_env.py DELETE /api/env {key, profile?}: 404 when nothing held it."""
+        key = body_field(body, "key", str)
+        profile = self.scoped(request, body)
+        self.check_env_name(key)
+        if profile.env.pop(key, None) is None:
+            raise HttpError(404, f"{key} not found in .env")
+        provider = CATALOG_ENV.get(key, ("",))[0]
+        return {"ok": True, "key": key, "removed": True, "pool_pruned": 0, "providers": [provider] if provider else [],
+                "config_scrubbed": [], "found": True}
+
+    def reveal_env(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """config_env.py POST /api/env/reveal {key}: at most 5 per 30 s."""
+        key = body_field(body, "key", str)
+        profile = self.scoped(request, body)
+        now = time.time()
+        while self.reveals and self.reveals[0] <= now - REVEAL_WINDOW:
+            self.reveals.popleft()
+        if len(self.reveals) >= REVEAL_MAX:
+            raise HttpError(429, "Too many reveal requests. Try again shortly.")
+        self.reveals.append(now)
+        if key not in profile.env:
+            raise HttpError(404, f"{key} not found in .env")
+        return {"key": key, "value": profile.env[key]}
+
+    @staticmethod
+    def check_env_name(key: str) -> None:
+        if not ENV_NAME.match(key):
+            raise HttpError(400, f"Invalid environment variable name: {key!r}")
+        if key.upper() in ENV_DENYLIST or key.upper().startswith(ENV_DENY_PREFIXES):
+            raise HttpError(400, f"Environment variable {key!r} is on the writer denylist. Names that influence "
+                                 "subprocess execution (LD_PRELOAD, PYTHONPATH, PATH, EDITOR, ...) or Hermes runtime "
+                                 "location and security policy (HERMES_HOME, HERMES_YOLO_MODE, ...) cannot be "
+                                 "persisted via the env writer. If you really need this, edit ~/.hermes/.env "
+                                 "directly.")
+
+    def validate_credential(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """config_env.py POST /api/providers/validate {key, value}: the fake never calls a provider. A probed
+        key starting with "bad" (or shorter than 8) is rejected, one containing "offline" can't be checked."""
+        key, value = body_field(body, "key", str).strip(), body_field(body, "value", str).strip()
+        if not value:
+            return {"ok": False, "reachable": True, "message": "Enter a value first."}
+        if key == "OPENAI_BASE_URL":
+            url = value.rstrip("/") + ("" if value.rstrip("/").endswith("/v1") else "/v1")
+            return {"ok": False, "reachable": False, "message": f"Could not reach {url}/models."}
+        if key not in CREDENTIAL_PROBES:
+            return {"ok": True, "reachable": False, "message": ""}
+        if "offline" in value.lower():
+            return {"ok": False, "reachable": False, "message": "Could not reach the provider to verify the key."}
+        if value.lower().startswith("bad") or len(value) < 8:
+            return {"ok": False, "reachable": True,
+                    "message": "That API key was rejected. Double-check it and try again."}
+        return {"ok": True, "reachable": True, "message": ""}
+
+    # ── OAuth providers ───────────────────────────────────────────────────────────────────────────
+
+    def oauth_status(self, profile: FakeProfile, provider_id: str) -> dict[str, Any]:
+        return dict(profile.oauth.get(provider_id) or {"logged_in": False})
+
+    def oauth_providers(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """oauth.py GET /api/providers/oauth: the catalog with each provider's status (token preview only)."""
+        profile = self.scoped(request)
+        rows = []
+        for p in OAUTH_PROVIDERS:
+            status = self.oauth_status(profile, p["id"])
+            hint = self.disconnect_hint(p, status)
+            rows.append({"id": p["id"], "name": p["name"], "flow": p["flow"], "cli_command": p["cli_command"],
+                         "docs_url": p["docs_url"], "disconnect_hint": hint, "disconnect_command": None,
+                         "disconnectable": hint is None, "status": status})
+        return {"providers": rows}
+
+    @staticmethod
+    def disconnect_hint(provider: dict[str, Any], status: dict[str, Any]) -> str | None:
+        if provider["flow"] == "external" and provider["id"] != "anthropic":
+            return "Managed by that provider's CLI; remove it there."
+        if status.get("source") == "env_var":
+            return "Remove the API key from Settings → Keys instead."
+        return None
+
+    def oauth_profile(self, request: Request) -> str | None:
+        name = (request.query_params.get("profile") or "").strip()
+        if not name or name.lower() == "current":
+            return None
+        self.profile_named(name)
+        return name
+
+    def start_oauth(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """oauth.py POST .../{provider}/start: a device-code session the fake approves after
+        ``oauth_approve_after`` seconds (a user code starting "DENY" is denied instead)."""
+        provider_id = request.path_params["provider_id"]
+        profile_name = self.oauth_profile(request)
+        now = time.time()
+        for sid in [s for s, sess in self.oauth_sessions.items() if sess["created_at"] < now - OAUTH_SESSION_TTL]:
+            self.oauth_sessions.pop(sid, None)
+        entry = next((p for p in OAUTH_PROVIDERS if p["id"] == provider_id), None)
+        if entry is None:
+            raise HttpError(400, f"Unknown provider {provider_id}")
+        if entry["flow"] == "external":
+            raise HttpError(400, f"{provider_id} uses an external CLI; run `{entry['cli_command']}` manually")
+        sid = secrets.token_urlsafe(16)
+        code = f"{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
+        self.oauth_sessions[sid] = {"session_id": sid, "provider": provider_id, "flow": "device_code",
+                                    "profile": profile_name, "created_at": now, "status": "pending",
+                                    "error_message": None, "user_code": code, "expires_at": now + OAUTH_SESSION_TTL}
+        return {"session_id": sid, "flow": "device_code", "user_code": code,
+                "verification_url": f"{OAUTH_VERIFICATION_URL}?code={code}", "expires_in": OAUTH_SESSION_TTL,
+                "poll_interval": 1}
+
+    def submit_oauth(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        body_field(body, "session_id", str)
+        body_field(body, "code", str)
+        raise HttpError(400, f"submit not supported for {request.path_params['provider_id']}")
+
+    async def poll_oauth(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """oauth.py GET .../poll/{session_id}?wait=: long-polls (25 s cap) until the session leaves pending."""
+        provider_id, sid = request.path_params["provider_id"], request.path_params["session_id"]
+        profile_name = self.oauth_profile(request)
+        sess = self.oauth_sessions.get(sid)
+        if sess is None:
+            raise HttpError(404, "Session not found or expired")
+        if sess["provider"] != provider_id:
+            raise HttpError(400, "Provider mismatch for session")
+        if sess["profile"] != profile_name:
+            raise HttpError(400, "OAuth session profile mismatch")
+        try:
+            wait = min(max(float(request.query_params.get("wait") or 0), 0.0), 25.0)
+        except ValueError:
+            wait = 0.0
+        deadline = time.monotonic() + wait
+        while self.settle_oauth(sess) == "pending" and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        return {"session_id": sid, "status": sess["status"], "error_message": sess["error_message"],
+                "expires_at": sess["expires_at"], "reason": sess.get("reason"),
+                "account_email": sess.get("account_email"), "model": None, "handoff": None, "handoff_status": None,
+                "retryable": sess.get("retryable"), "retry_after": None}
+
+    def settle_oauth(self, sess: dict[str, Any]) -> str:
+        if sess["status"] != "pending" or sess.get("cancelled"):
+            return "cancelled" if sess.get("cancelled") else sess["status"]
+        if time.time() >= sess["expires_at"]:
+            sess.update(status="expired", error_message="The code expired before it was approved.")
+        elif time.time() - sess["created_at"] >= self.oauth_approve_after:
+            if sess["user_code"].startswith("DENY"):
+                sess.update(status="denied", error_message="Access was denied.", reason="denied", retryable=True)
+            else:
+                profile = self.profiles.get(sess["profile"] or "default")
+                if profile is not None:
+                    profile.oauth[sess["provider"]] = {
+                        "logged_in": True, "source": "hermes-auth-store", "source_label": f"{profile.path}/auth.json",
+                        "token_preview": "…" + secrets.token_hex(2), "expires_at": None, "has_refresh_token": True}
+                sess.update(status="approved", account_email="demo@example.com")
+            log(f"oauth {sess['provider']} session {sess['session_id'][:8]}… {sess['status']}")
+        return sess["status"]
+
+    def cancel_oauth(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        sid = request.path_params["session_id"]
+        profile_name = self.oauth_profile(request)
+        sess = self.oauth_sessions.get(sid)
+        if sess is None:
+            return {"ok": False, "message": "session not found"}
+        if sess["profile"] != profile_name:
+            raise HttpError(400, "OAuth session profile mismatch")
+        sess["cancelled"] = True
+        self.oauth_sessions.pop(sid, None)
+        return {"ok": True, "session_id": sid}
+
+    def disconnect_oauth(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """oauth.py DELETE .../{provider}: 400 for CLI-managed providers, 409 when nothing was stored."""
+        provider_id = request.path_params["provider_id"]
+        profile = self.scoped(request)
+        entry = next((p for p in OAUTH_PROVIDERS if p["id"] == provider_id), None)
+        if entry is None:
+            raise HttpError(400, f"Unknown provider: {provider_id}. Available: "
+                                 f"{', '.join(sorted(p['id'] for p in OAUTH_PROVIDERS))}")
+        if hint := self.disconnect_hint(entry, self.oauth_status(profile, provider_id)):
+            raise HttpError(400, f"{entry['name']} cannot be disconnected automatically. {hint}")
+        if profile.oauth.pop(provider_id, None) is None:
+            raise HttpError(409, f"No stored credentials were removed for {entry['name']}.")
+        return {"ok": True, "provider": provider_id}
+
+    # ── profiles ──────────────────────────────────────────────────────────────────────────────────
+
+    def profile_row(self, profile: FakeProfile) -> dict[str, Any]:
+        """profiles.py _profile_to_dict."""
+        model, provider = profile.main_model()
+        return {"name": profile.name, "path": profile.path, "is_default": profile.is_default, "model": model or None,
+                "provider": provider or None, "has_env": bool(profile.env), "skill_count": profile.skill_count,
+                "gateway_running": False, "description": profile.description,
+                "description_auto": profile.description_auto, "display_name": profile.display_name, "bot_title": "",
+                "distribution_name": None, "distribution_version": None, "distribution_source": None,
+                "has_alias": not profile.is_default, "role": None}
+
+    def create_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """profiles.py POST /api/profiles {name, soul?, clone_from?, clone_all?, description?, provider?, model?}:
+        a fresh profile gets the default SOUL.md and an empty config; a clone copies the source's config, .env
+        and SOUL.md (the soul in the request wins)."""
+        raw_name = body_field(body, "name", str)
+        soul = body_field(body, "soul", str, required=False)
+        source_name = str(body.get("clone_from") or "").strip()
+        if not source_name and (body.get("clone_all") or body.get("clone_from_default")):
+            source_name = "default"
+        if body.get("no_skills") and source_name:
+            raise HttpError(400, "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
+                                 "(cloning explicitly copies skills from the source profile).")
+        canon = self.canonical_name(raw_name)
+        if canon == "default":
+            raise HttpError(400, "Cannot create a profile named 'default' — it is the built-in profile (~/.hermes).")
+        if canon in self.profiles:
+            raise HttpError(400, f"A profile named '{canon}' already exists. Switch to it with `hermes profile use "
+                                 f"{canon}`, see all profiles with `hermes profile list`, or choose a different name.")
+        profile = FakeProfile(name=canon, path=f"{DEMO_HERMES_HOME}/profiles/{canon}",
+                              description=str(body.get("description") or "").strip())
+        if source_name:
+            source = self.profiles.get(self.canonical_name(source_name))
+            if source is None:
+                raise HttpError(400, f"Profile '{source_name}' does not exist. Create it with: hermes profile create "
+                                     f"{source_name}")
+            profile.config, profile.env = copy.deepcopy(source.config), dict(source.env)
+            profile.soul, profile.skill_count = source.soul, source.skill_count
+        else:
+            profile.skill_count = 0 if body.get("no_skills") else 12
+        if soul is not None:
+            profile.soul = soul
+        model_set, model_error = False, ""
+        provider, model = str(body.get("provider") or "").strip(), str(body.get("model") or "").strip()
+        if provider and model:
+            if self.provider_of(model) == provider:
+                profile.config = deep_merge(profile.config, {"model": {"default": model, "provider": provider}})
+                model_set = True
+            else:
+                model_error = f"Model '{model}' is not available from {provider}."
+        self.profiles[canon] = profile
+        return {"ok": True, "name": raw_name, "path": profile.path, "model_set": model_set, "model_error": model_error,
+                "mcp_written": 0, "skills_disabled": 0, "hub_installs": [], "soul_set": soul is not None}
+
+    def active_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return {"active": self.sticky_profile, "current": "default"}
+
+    def set_active_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        canon = self.canonical_name(body_field(body, "name", str))
+        if canon not in self.profiles:
+            raise HttpError(404, f"Profile '{canon}' does not exist. Create it with: hermes profile create {canon}")
+        self.sticky_profile = canon
+        return {"ok": True, "active": canon}
+
+    def rename_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """profiles.py PATCH /api/profiles/{name} {new_name}: the default profile only gets a display name."""
+        new_name = body_field(body, "new_name", str)
+        old = self.canonical_name(request.path_params["name"])
+        if old == "default":
+            if not new_name.strip():
+                raise HttpError(400, "Display name cannot be empty.")
+            self.profiles["default"].display_name = new_name.strip()
+            return {"ok": True, "name": "default", "display_name": new_name.strip(),
+                    "path": self.profiles["default"].path}
+        new = self.canonical_name(new_name)
+        if new == "default":
+            raise HttpError(400, "Cannot rename to 'default' — it is reserved.")
+        if old not in self.profiles:
+            raise HttpError(404, f"No profile named '{old}'. See your profiles with: hermes profile list")
+        if new in self.profiles:
+            raise HttpError(400, f"A profile named '{new}' already exists. Switch to it with `hermes profile use "
+                                 f"{new}`, see all profiles with `hermes profile list`, or choose a different name.")
+        profile = self.profiles.pop(old)
+        profile.name, profile.path = new, f"{DEMO_HERMES_HOME}/profiles/{new}"
+        self.profiles[new] = profile
+        for stored in self.sessions.values():
+            if stored.profile == old:
+                stored.profile = new
+        if self.sticky_profile == old:
+            self.sticky_profile = new
+        return {"ok": True, "name": new, "path": profile.path}
+
+    def delete_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        canon = self.canonical_name(request.path_params["name"])
+        if canon == "default":
+            raise HttpError(400, "Cannot delete the default profile (~/.hermes).\nTo remove everything, use: "
+                                 "hermes uninstall")
+        profile = self.profiles.pop(canon, None)
+        if profile is None:
+            raise HttpError(404, f"No profile named '{canon}'. See your profiles with: hermes profile list")
+        if self.sticky_profile == canon:
+            self.sticky_profile = "default"
+        return {"ok": True, "path": profile.path}
+
+    def get_soul(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile = self.profile_named(request.path_params["name"])
+        return {"content": profile.soul or "", "exists": profile.soul is not None}
+
+    def put_soul(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile = self.profile_named(request.path_params["name"])
+        profile.soul = body_field(body, "content", str)
+        log(f"SOUL.md of {profile.name} saved ({len(profile.soul)} characters)")
+        return {"ok": True}
+
+    def put_description(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile = self.profile_named(request.path_params["name"])
+        profile.description, profile.description_auto = str(body.get("description") or "").strip(), False
+        return {"ok": True, "description": profile.description, "description_auto": False}
+
+    def put_profile_model(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile = self.profile_named(request.path_params["name"])
+        provider, model = body_field(body, "provider", str).strip(), body_field(body, "model", str).strip()
+        if not provider or not model:
+            raise HttpError(400, "provider and model are required")
+        if self.provider_of(model) != provider:
+            raise HttpError(400, f"Model '{model}' is not available from {provider}.")
+        config = profile.loaded()
+        block = config["model"] if isinstance(config.get("model"), dict) else {}
+        config["model"] = {**block, "default": model, "provider": provider}
+        profile.save(config)
+        return {"ok": True, "provider": provider, "model": model}
+
+    def setup_command(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile = self.profile_named(request.path_params["name"])
+        return {"command": "hermes setup" if profile.is_default else f"{profile.name} setup"}
+
+    def export_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """profiles.py POST .../export {extra_files?, output?}: an archive path on the host (credentials and the
+        .env stay out). The fake keeps the archive in memory for POST /api/profiles/import."""
+        extra = body.get("extra_files") or {}
+        if not isinstance(extra, dict) or any(not isinstance(v, str) for v in extra.values()):
+            raise body_error("extra_files", "dict_type")
+        canon = self.canonical_name(request.path_params["name"])
+        if canon not in self.profiles:
+            raise HttpError(404, f"No profile named '{canon}'. See your profiles with: hermes profile list")
+        profile = self.profiles[canon]
+        output = str(body.get("output") or "").strip()
+        archive = output if output.endswith((".tar.gz", ".tgz")) else (output + ".tar.gz") if output else \
+            f"{DEMO_HERMES_HOME}/profile-exports/{canon}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+        self.profile_archives[archive] = {
+            "root": canon, "config": copy.deepcopy(profile.config), "soul": profile.soul,
+            "description": profile.description, "skill_count": profile.skill_count, "extra_files": dict(extra)}
+        return {"ok": True, "archive": archive}
+
+    def import_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        archive = body_field(body, "archive", str).strip()
+        if not archive:
+            raise HttpError(400, "archive path is required")
+        snapshot = self.profile_archives.get(archive)
+        if snapshot is None:
+            raise HttpError(404, f"Archive not found: {archive}")
+        canon = self.canonical_name(str(body.get("name") or "").strip() or snapshot["root"])
+        if canon == "default":
+            raise HttpError(400, "Cannot import as 'default' — that is the built-in root profile (~/.hermes). Specify "
+                                 "a different name: hermes profile import <archive> --name <name>")
+        if canon in self.profiles:
+            raise HttpError(400, f"A profile named '{canon}' already exists. Switch to it with `hermes profile use "
+                                 f"{canon}`, see all profiles with `hermes profile list`, or choose a different name.")
+        profile = FakeProfile(name=canon, path=f"{DEMO_HERMES_HOME}/profiles/{canon}",
+                              config=copy.deepcopy(snapshot["config"]), soul=snapshot["soul"],
+                              description=snapshot["description"], skill_count=snapshot["skill_count"])
+        self.profiles[canon] = profile
+        return {"ok": True, "name": canon, "path": profile.path, "desktop": None}
+
+    # ── vault.* and billing.* RPCs ────────────────────────────────────────────────────────────────
+
+    def settings_methods(self, conn: Conn, params: dict[str, Any]) -> dict[str, Callable[[], Any]]:
+        return {
+            "vault.list": lambda: self.vault_list(params),
+            "vault.sources": lambda: self.vault_sources(params),
+            "vault.source.set": lambda: self.vault_source_set(params),
+            "vault.unlock": lambda: self.vault_unlock(params),
+            "vault.lock": lambda: self.vault_lock(params),
+            "vault.add": lambda: self.vault_add(params),
+            "vault.remove": lambda: self.vault_remove(params),
+            "billing.state": lambda: self.billing_state(params),
+            "billing.charge": lambda: self.billing_charge(params),
+            "billing.charge_status": lambda: self.billing_charge_status(params),
+            "billing.auto_reload": lambda: self.billing_auto_reload(params),
+            "billing.keep_going_on_credits": lambda: self.billing_keep_going(params),
+            "billing.step_up": lambda: self.billing_step_up(conn, params),
+            "shared_metrics.status": lambda: self.shared_metrics_status(params),
+            "shared_metrics.set": lambda: self.shared_metrics_set(params),
+        }
+
+    @staticmethod
+    def consent_state(profile: FakeProfile) -> dict[str, Any]:
+        """shared_metrics_consent.py consent_state over the profile's raw telemetry.shared_metrics."""
+        section = ((profile.config.get("telemetry") or {}).get("shared_metrics") or {})
+        enabled = section.get("enabled") is True
+        return {"enabled": enabled, "send": enabled and section.get("send") is True,
+                "decided": "enabled" in section or "send" in section}
+
+    def shared_metrics_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self.consent_state(self.rpc_profile(params))
+
+    def shared_metrics_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        """shared_metrics.set {enabled, send?}: send is forced off without enabled."""
+        profile = self.rpc_profile(params)
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            raise RpcError(4002, "enabled must be a boolean")
+        send = bool(params.get("send")) and enabled
+        profile.config.setdefault("telemetry", {})["shared_metrics"] = {"enabled": enabled, "send": send}
+        log(f"shared_metrics.set profile={profile.name} enabled={enabled} send={send}")
+        return self.consent_state(profile)
+
+    def rpc_profile(self, params: dict[str, Any]) -> FakeProfile:
+        name = str(params.get("profile") or "").strip()
+        if not name or name.lower() == "current":
+            return self.profiles["default"]
+        try:
+            return self.profile_named(name)
+        except HttpError as exc:
+            raise RpcError(4004, str(exc.detail)) from None
+
+    def manager_enabled(self, profile: FakeProfile, name: str) -> bool:
+        installed = dict((n, i) for n, _d, i in PASSWORD_MANAGERS).get(name, False)
+        return installed and (profile.loaded().get("vault") or {}).get(name, {}).get("enabled") is not False
+
+    def vault_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Metadata only, across the local vault and the unlocked password managers."""
+        profile = self.rpc_profile(params)
+        items = [{**{k: v for k, v in item.items() if k != "secret" and v is not None}, "backend": "local"}
+                 for item in profile.vault]
+        if "onepassword" in profile.unlocked and self.manager_enabled(profile, "onepassword"):
+            items.append({"id": "op_fake0001", "kind": "login", "label": "Example forum (1Password)",
+                          "origin": "https://forum.example.com", "created_at": "2026-08-12T10:00:00+00:00",
+                          "identifier": "demo", "identifier_type": "username", "backend": "onepassword"})
+        return {"items": items}
+
+    def vault_sources(self, params: dict[str, Any]) -> dict[str, Any]:
+        profile = self.rpc_profile(params)
+        rows = [{"name": "local", "display_name": "Hermes vault", "enabled": True, "needs_unlock": False,
+                 "unlocked": True, "installed": True}]
+        for name, display, installed in PASSWORD_MANAGERS:
+            enabled = self.manager_enabled(profile, name)
+            rows.append({"name": name, "display_name": display, "enabled": enabled, "needs_unlock": True,
+                         "unlocked": enabled and name in profile.unlocked, "installed": installed})
+        return {"sources": rows}
+
+    def vault_source_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        profile = self.rpc_profile(params)
+        name = str(params.get("name") or "")
+        if name not in {n for n, _d, _i in PASSWORD_MANAGERS}:
+            raise RpcError(VAULT_ERROR, f"unknown vault source: {name}")
+        enabled = bool(params.get("enabled"))
+        config = profile.loaded()
+        section = config.setdefault("vault", {}).setdefault(name, {})
+        if enabled:
+            section.pop("enabled", None)
+            profile.config.get("vault", {}).get(name, {}).pop("enabled", None)
+        else:
+            section["enabled"] = False
+            profile.unlocked.discard(name)
+        profile.save(config)
+        return {"name": name, "enabled": enabled}
+
+    def vault_unlock(self, params: dict[str, Any]) -> dict[str, Any]:
+        profile = self.rpc_profile(params)
+        name, password = str(params.get("name") or ""), str(params.get("password") or "")
+        if not self.manager_enabled(profile, name):
+            raise RpcError(VAULT_ERROR, f"{name} is not an enabled password manager")
+        if not password:
+            raise RpcError(VAULT_ERROR, "master password is required")
+        if password == "wrong":
+            raise RpcError(VAULT_ERROR, "[ERROR] invalid master password")
+        profile.unlocked.add(name)
+        return {"name": name, "unlocked": True}
+
+    def vault_lock(self, params: dict[str, Any]) -> dict[str, Any]:
+        profile = self.rpc_profile(params)
+        name = params.get("name")
+        if name:
+            profile.unlocked.discard(str(name))
+        else:
+            profile.unlocked.clear()
+        return {"locked": True}
+
+    def vault_add(self, params: dict[str, Any]) -> dict[str, Any]:
+        """agent/vault_store.py add_item: login = origin + identifier_type/identifier (metadata) + password."""
+        profile = self.rpc_profile(params)
+        secret = params.get("secret")
+        if not isinstance(secret, dict) or not secret:
+            raise RpcError(VAULT_ERROR, "secret payload is required")
+        kind, label = str(params.get("kind") or ""), str(params.get("label") or "").strip()
+        if kind not in VAULT_KINDS:
+            raise RpcError(VAULT_ERROR, f"unknown vault kind {kind!r} (expected one of {VAULT_KINDS})")
+        if not label:
+            raise RpcError(VAULT_ERROR, "label is required")
+        item: dict[str, Any] = {"id": f"vault_{uuid.uuid4().hex[:12]}", "kind": kind, "label": label, "origin": None,
+                                "created_at": datetime.now(timezone.utc).isoformat()}
+        secret = dict(secret)
+        if kind == "login":
+            if not params.get("origin"):
+                raise RpcError(VAULT_ERROR, "origin is required for login items")
+            item["origin"] = normalize_origin(str(params["origin"]))
+            id_type = secret.pop("identifier_type", None)
+            if id_type not in LOGIN_IDENTIFIER_TYPES:
+                raise RpcError(VAULT_ERROR, f"identifier_type must be one of {LOGIN_IDENTIFIER_TYPES}")
+            identifier = str(secret.pop("identifier", "") or "").strip()
+            if not identifier or not secret.get("password"):
+                raise RpcError(VAULT_ERROR, "login items require identifier and password")
+            item.update(identifier=identifier, identifier_type=id_type)
+            if otp := str(secret.get("otp_secret") or "").replace(" ", ""):
+                item["has_otp"] = True
+            secret = {"password": str(secret["password"]), **({"otp_secret": otp} if otp else {})}
+        else:
+            secret = {k: str(v) for k, v in secret.items() if k in VAULT_FIELDS[kind] and str(v or "").strip()}
+            if missing := [f for f in VAULT_REQUIRED[kind] if f not in secret]:
+                raise RpcError(VAULT_ERROR, f"{kind} items require {', '.join(missing)}")
+            if params.get("origin"):
+                item["origin"] = normalize_origin(str(params["origin"]))
+        item["secret"] = secret
+        profile.vault.append(item)
+        return {"id": item["id"]}
+
+    def vault_remove(self, params: dict[str, Any]) -> dict[str, Any]:
+        profile = self.rpc_profile(params)
+        item_id = str(params.get("id") or "")
+        if not item_id:
+            raise RpcError(VAULT_ERROR, "id is required")
+        before = len(profile.vault)
+        profile.vault[:] = [item for item in profile.vault if item["id"] != item_id]
+        return {"removed": len(profile.vault) < before}
+
+    def billing_state(self, params: dict[str, Any]) -> dict[str, Any]:
+        """billing_view.py _serialize_billing_state (the contract's fields) for a signed-in Nous Portal account."""
+        self.rpc_profile(params)
+        b = self.billing
+        presets = [Decimal("10"), Decimal("25"), Decimal("50")]
+        return {
+            "ok": True, "logged_in": True, "free_tier_account": False, "free_tier_model": None,
+            "org_name": "Fake Org", "org_slug": "fake-org", "role": "owner", "is_admin": True,
+            "can_change_plan": True, "can_charge": True, "balance_usd": str(b["balance"]),
+            "balance_display": format_money(b["balance"]), "cli_billing_enabled": True,
+            "charge_presets": [str(p) for p in presets], "charge_presets_display": [format_money(p) for p in presets],
+            "min_usd": "5", "max_usd": "500",
+            "card": {"brand": "visa", "last4": "4242", "masked": "•••• 4242", "display": "Visa •••• 4242",
+                     "resolved_via": None},
+            "payment_method": {"kind": "card", "brand": "visa", "last4": "4242", "wallet": None, "resolved_via": None},
+            "monthly_cap": {"limit_usd": "200", "limit_display": "$200", "spent_this_month_usd": "37.5",
+                            "spent_display": "$37.50", "is_default_ceiling": True},
+            "auto_reload": {"enabled": b["auto_reload"], "threshold_usd": str(b["threshold"]),
+                            "threshold_display": format_money(b["threshold"]), "reload_to_usd": str(b["reload_to"]),
+                            "reload_to_display": format_money(b["reload_to"]), "card": {"kind": "canonical"}},
+            "portal_url": "https://example.com/fake-portal/billing", "error": None, "usage": None}
+
+    def billing_denied(self, extra: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """billing:manage routes before billing.step_up: the insufficient_scope envelope."""
+        if self.billing["scope"]:
+            return None
+        return {"ok": False, "error": "insufficient_scope", "message": BILLING_SCOPE_MESSAGE, "portal_url": None,
+                "retry_after": None, "payload": {}, "actor": None, "code": None, "recovery": None, **(extra or {})}
+
+    def billing_charge(self, params: dict[str, Any]) -> dict[str, Any]:
+        """billing.charge {amount_usd, idempotency_key?}: pending until charge_settle_after, then settled."""
+        self.rpc_profile(params)
+        if params.get("amount_usd") is None:
+            return {"ok": False, "error": "invalid_request", "message": "amount_usd is required"}
+        key = str(params.get("idempotency_key") or uuid.uuid4().hex)
+        if denied := self.billing_denied({"idempotency_key": key}):
+            return denied
+        if key in self.charge_keys:
+            return {"ok": True, "charge_id": self.charge_keys[key], "idempotency_key": key}
+        try:
+            amount = Decimal(str(params["amount_usd"]))
+        except ArithmeticError:
+            amount = Decimal("-1")
+        if not Decimal("5") <= amount <= Decimal("500"):
+            return {"ok": False, "error": "invalid_amount", "message": "Choose an amount between $5 and $500.",
+                    "portal_url": None, "retry_after": None, "payload": {}, "actor": None, "code": None,
+                    "recovery": None, "idempotency_key": key}
+        charge_id = "ch_" + secrets.token_hex(8)
+        self.charges[charge_id] = {"amount": amount, "created": time.time(), "settled_at": None}
+        self.charge_keys[key] = charge_id
+        return {"ok": True, "charge_id": charge_id, "idempotency_key": key}
+
+    def billing_charge_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.rpc_profile(params)
+        charge_id = str(params.get("charge_id") or "")
+        if not charge_id:
+            return {"ok": False, "error": "invalid_charge_id", "message": "charge_id is required"}
+        charge = self.charges.get(charge_id)
+        if charge is None:
+            return {"ok": False, "error": "not_found", "message": f"No charge {charge_id}."}
+        if charge["settled_at"] is None and time.time() - charge["created"] >= self.charge_settle_after:
+            charge["settled_at"] = datetime.now(timezone.utc).isoformat()
+            self.billing["balance"] += charge["amount"]
+        return {"ok": True, "status": "settled" if charge["settled_at"] else "pending",
+                "amount_usd": str(charge["amount"]), "settled_at": charge["settled_at"], "reason": None}
+
+    def billing_auto_reload(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.rpc_profile(params)
+        if params.get("threshold") is None or params.get("top_up_amount") is None:
+            return {"ok": False, "error": "invalid_request", "message": "threshold and top_up_amount are required"}
+        if denied := self.billing_denied():
+            return denied
+        try:
+            threshold, reload_to = Decimal(str(params["threshold"])), Decimal(str(params["top_up_amount"]))
+        except ArithmeticError:
+            return {"ok": False, "error": "invalid_request", "message": "threshold and top_up_amount must be numbers"}
+        self.billing.update(auto_reload=bool(params.get("enabled")), threshold=threshold, reload_to=reload_to)
+        return {"ok": True}
+
+    def billing_keep_going(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.rpc_profile(params)
+        if not isinstance(params.get("enabled"), bool):
+            return {"ok": False, "error": "invalid_request", "message": "enabled (bool) is required"}
+        if denied := self.billing_denied():
+            return denied
+        self.billing["keep_going"] = params["enabled"]
+        return {"ok": True}
+
+    async def billing_step_up(self, conn: Conn, params: dict[str, Any]) -> dict[str, Any]:
+        """billing.step_up: the device-flow URL and code go out as billing.step_up.verification (to the session,
+        or to this connection), then the fake grants billing:manage."""
+        self.rpc_profile(params)
+        sid = str(params.get("session_id") or "")
+        payload = {"verification_url": f"{OAUTH_VERIFICATION_URL}?scope=billing", "user_code": "BILL-1234"}
+        if sid in self.runtimes:
+            await self.emit_to(sid, "billing.step_up.verification", payload)
+        else:
+            await conn.send({"jsonrpc": "2.0", "method": "event", "params": {
+                "type": "billing.step_up.verification", "session_id": sid, "payload": payload}})
+        await asyncio.sleep(0.1)
+        self.billing["scope"] = True
+        return {"ok": True, "granted": True}
+
+    # ── alert pushes ──────────────────────────────────────────────────────────────────────────────
+
+    def note_alert(self, stored: StoredSession, kind: str, body: str, *, request: ServerRequest | None = None) -> None:
+        """Record the alert push the hermes_voice plugin would send for ``stored`` (``GET /debug/alerts``), and the
+        alert tokens that opted into ``kind``. The payload is the notification's userInfo."""
+        hermes: dict[str, Any] = {"kind": kind, "session_id": stored.key, "profile": stored.profile}
+        if request is not None:
+            hermes["request_id"] = request.id
+        if kind == "approval" and request is not None:
+            hermes["choices"] = list(request.params.get("choices") or ["once", "session", "always", "deny"])
+        if kind == "clarify" and request is not None:
+            keys = ("qid", "question", "choices", "multi_select")
+            hermes["questions"] = [{k: q[k] for k in keys if q.get(k) is not None}
+                                   for q in request.params.get("questions") or [] if q.get("qid") not in request.locked]
+        titles = {"approval": "Approval needed", "clarify": "Hermes has a question"}
+        title = titles.get(kind) or stored.title or "Hermes"
+        payload = {"aps": {"alert": {"title": title, "body": body}, "category": ALERT_CATEGORIES[kind],
+                           "thread-id": stored.key, "sound": "default"}, "hermes": hermes}
+        sent_to = self.voice_plugin.alert_targets(kind)
+        self.alerts.append({"at": time.time(), "session_id": stored.key, "kind": kind, "payload": payload,
+                            "sent_to": sent_to})
+        log(f"alert {kind} for {stored.key} "
+            + (f"-> {len(sent_to)} device(s)" if sent_to else "(no device opted in)"))
+
+    def note_request_alert(self, rt: Runtime, req: ServerRequest) -> None:
+        stored = self.sessions.get(rt.key)
+        if stored is None or req.method not in ("approval", "clarify"):
+            return
+        if req.method == "approval":
+            command = str(req.params.get("command") or "")
+            description = str(req.params.get("description") or "")
+            body = f"Run {command}?" + (f" ({description})" if description else "") if command else description
+        else:
+            first = next(iter(req.params.get("questions") or []), {})
+            body = str(first.get("question") or "")
+            if first.get("choices"):
+                body += "\n" + " · ".join(first["choices"])
+        self.note_alert(stored, req.method, body or "Hermes is waiting for you.", request=req)
+
+    def note_turn_done(self, rt: Runtime, text: str, status: str) -> None:
+        stored = self.sessions.get(rt.key)
+        if stored is None:
+            return
+        body = text.strip().replace("\n", " ")
+        if status == "error":
+            body = "The turn failed: " + body
+        self.note_alert(stored, "turn_done", body[:177] + "…" if len(body) > 178 else body or "Done.")
+
+
+class FakeHermes(ChatFeatures, SettingsFeatures):
     def __init__(self, args: argparse.Namespace) -> None:
         self.username = args.username
         self.password = args.password
@@ -1757,7 +3800,8 @@ class FakeHermes(ChatFeatures):
         self.next_seq: dict[str, int] = {}
         self.rings: OrderedDict[str, deque[tuple[int, dict[str, Any]]]] = OrderedDict()
         self.evicted_through: dict[str, int] = {}
-        self.voice_plugin = FakeVoicePlugin(self, args)
+        self.voice_plugin = AlertVoicePlugin(self, args)
+        self._init_settings(args)
         self._init_chat(args)
         self._seed()
         if self.seed_mode == "demo":
@@ -1945,8 +3989,8 @@ class FakeHermes(ChatFeatures):
         key = "last_active" if order == "recent" else "started_at"
         rows.sort(key=lambda r: r[key], reverse=True)
         window = pinned_window(rows, offset, limit)
-        totals = {p["name"]: sum(r["profile"] == p["name"] for r in rows) for p in DEMO_PROFILES
-                  if profile == "all" or p["name"] == profile}
+        totals = {name: sum(r["profile"] == name for r in rows) for name in self.profiles
+                  if profile == "all" or name == profile}
         log(f"http GET /api/profiles/sessions -> 200 ({len(window)} of {len(rows)})")
         return JSONResponse({"sessions": window, "total": len(rows), "profile_totals": totals,
                              "limit": limit, "offset": offset, "errors": [], "storage": {}})
@@ -2048,6 +4092,8 @@ class FakeHermes(ChatFeatures):
         if method == "request.answer" and (req := self.requests.get(str(params.get("id")))) is not None \
                 and req.method in SECRET_REQUESTS:
             return {**params, "result": redacted(params.get("result"))}
+        if method in ("vault.add", "vault.unlock"):
+            return {k: f"<{len(json.dumps(v))} chars>" if k in ("secret", "password") else v for k, v in params.items()}
         return params
 
     async def dispatch(self, conn: Conn, rid: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -2064,7 +4110,7 @@ class FakeHermes(ChatFeatures):
             "approval.respond": lambda: self.approval_respond(params),
             "request.answer": lambda: self.request_answer(params),
             "clarify.lock": lambda: self.clarify_lock(params),
-        }.get(method) or self.chat_methods(conn, params).get(method)
+        }.get(method) or self.chat_methods(conn, params).get(method) or self.settings_methods(conn, params).get(method)
         if handler is None:
             return _err(rid, -32601, f"unknown method: {method} — the client and the Hermes backend are out of sync "
                         "(different versions); run `hermes update` and restart both")
@@ -2366,6 +4412,7 @@ class FakeHermes(ChatFeatures):
 
     async def register(self, rt: Runtime, req: ServerRequest) -> None:
         self.requests[req.id] = req
+        self.note_request_alert(rt, req)  # M3: the alert push the voice plugin would send
         targets = self.live(rt)
         log(f"srq -> {req.method} id={req.id} sid={rt.sid} params={short(req.params, 120)}"
             + ("" if targets else " (no client attached: waits in open_requests)"))
@@ -2624,6 +4671,7 @@ class FakeHermes(ChatFeatures):
             if stored.title is None:
                 stored.title = title_for(text)
                 await self.emit(rt, "session.title", {"session_id": stored.key, "title": stored.title})
+            self.note_turn_done(rt, final, "error" if rt.notes.error is not None else "complete")
         except asyncio.CancelledError:
             log(f"turn on {rt.sid} interrupted")
             if streamed:
@@ -2883,6 +4931,8 @@ def build_app(fake: FakeHermes) -> Starlette:
         Route("/api/sessions/search", fake.search_sessions, methods=["GET"]),
         Route("/api/sessions/{session_id}", fake.manage_session, methods=["PATCH", "DELETE"]),
         Route("/api/media", fake.get_media, methods=["GET"]),
+        # M3: settings, profiles, providers.
+        *fake.settings_routes(),
     ])
 
 
@@ -2901,6 +4951,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract", default=str(DEFAULT_CONTRACT),
                         help="OpenRPC contract whose param schemas reject unknown keys ('' = no check)")
     FakeVoicePlugin.add_arguments(parser)
+    parser.add_argument("--oauth-approve-after", type=float, default=2.0,
+                        help="seconds before a provider sign-in (device code) started from Settings is approved")
     parser.add_argument("--seed", choices=("demo", "minimal"), default="demo",
                         help="stored chats at start: demo (two projects, two profiles, pinned/archived/unread, cron "
                              "and Telegram chats) or minimal (only the welcome chat)")

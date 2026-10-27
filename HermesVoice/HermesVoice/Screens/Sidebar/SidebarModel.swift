@@ -91,6 +91,9 @@ final class SidebarModel: ObservableObject {
     }
     /// A new chat that hasn't shown up in the list yet.
     @Published private(set) var draft: ChatModel?
+    /// Bumped when a session opens from outside the sidebar (a tapped notification), so the sheets over it close.
+    /// A selection change alone doesn't: a draft settling into its listed row changes it too.
+    @Published private(set) var externalOpens = 0
     @Published private(set) var options: SidebarOptions
 
     /// Stored ids whose turn is running, and those waiting on an answer.
@@ -163,6 +166,11 @@ final class SidebarModel: ObservableObject {
         app.calls.$active
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.watch() }
+            .store(in: &subscriptions)
+        // Profiles created, renamed or deleted in Profiles: the switcher, tags and lists follow.
+        NotificationCenter.default.publisher(for: .hermesProfilesDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in Task { await self?.refresh() } }
             .store(in: &subscriptions)
     }
 
@@ -513,6 +521,17 @@ final class SidebarModel: ObservableObject {
             if row(id) == nil { opened[id] = SessionInfo(id: id, title: chat.title, profile: chat.profile) }
             selection = .session(id)
         }
+        watch()
+    }
+
+    /// Opens a stored session by id (a tapped notification), even one the lists don't hold: a listed row whose
+    /// compression chain holds the id opens as that row.
+    func open(sessionID id: String, profile: String?) {
+        let listed = (recents + messaging + archived).first { $0.allIDs.contains(id) }
+        let target = listed?.id ?? id
+        if row(target) == nil { opened[target] = SessionInfo(id: target, profile: profile) }
+        selection = .session(target)
+        externalOpens += 1
         watch()
     }
 
