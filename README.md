@@ -271,9 +271,11 @@ These follow the desktop app's screens and sit where the desktop puts them, adap
 
 - **Files and Review** (the desktop's right sidebar) open from the chat's header button: beside the chat on iPad,
   as a sheet on iPhone. Files browses the session's folder on the host, previews text, markdown and images, adds
-  `@file:` references to the composer, uploads, makes folders and deletes (after asking). Review shows the git
-  changes (uncommitted, branch, last turn) with diffs, stage, unstage and revert, commits and pushes, and opens pull
-  requests through `gh` on the host. The desktop's terminal tab isn't ported.
+  `@file:` references to the composer, copies paths and downloads files. Like the desktop on a remote backend, it
+  doesn't rename, delete or upload: Hermes' file-write routes act on the dashboard's own disk, not on the profile's
+  workspace (which can be an SSH machine). Review shows the git changes (uncommitted, branch, last turn) with diffs,
+  stage, unstage and revert, commits and pushes, and opens pull requests through `gh` on the host. The desktop's
+  terminal tab isn't ported.
 - **Messaging** is a sidebar row: platform status, setup fields (tokens go only to your own dashboard and are never
   kept or logged by the app), Telegram and WhatsApp setup, pairing requests and approved users, the connection test.
 - **Kanban** is a sidebar row while the host serves the kanban plugin: boards, cards with drag and drop, the task

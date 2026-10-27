@@ -32,7 +32,6 @@ struct WorkspacePanel: View {
         .onChange(of: model.quickLook) { old, new in
             if let old, new == nil { DashboardClient.removeTemporaryFile(old) }
         }
-        .modifier(WorkspaceFileInputs(model: model))
         .onAppear { model.update(context) }
         .onChange(of: context.cwd) { model.update(context) }
         .onChange(of: context.runtimeSessionID) { model.update(context) }
@@ -210,52 +209,6 @@ final class WorkspacePanelModel: ObservableObject {
         }
     }
 
-    /// Creates `name` in `folder`; the name is one path component.
-    func makeFolder(named name: String, in folder: String) async {
-        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let path = WorkspacePath.join(folder, name) else {
-            failure = "Enter a single folder name, without slashes."
-            return
-        }
-        do {
-            _ = try await client.workspaceMakeDirectory(path)
-            files.invalidate(folder)
-            await files.load(folder, force: true)
-            notice = OpsNotice(title: "Folder created", message: name)
-        } catch {
-            if !error.isCancellation { failure = "Could not create the folder. \(error.dashboardMessage)" }
-        }
-    }
-
-    /// Uploads a file picked on the phone into `folder`; `overwrite` replaces one of the same name.
-    func upload(_ file: URL, to folder: String, overwrite: Bool = false) async {
-        let name = file.lastPathComponent
-        guard let target = WorkspacePath.join(folder, name) else {
-            failure = "\(name) can't be uploaded under that name."
-            return
-        }
-        let scoped = file.startAccessingSecurityScopedResource()
-        defer { if scoped { file.stopAccessingSecurityScopedResource() } }
-        do {
-            _ = try await client.workspaceUpload(file, to: target, overwrite: overwrite)
-            files.invalidate(folder)
-            await files.load(folder, force: true)
-            await files.refreshChanges()
-            notice = OpsNotice(title: "Uploaded", message: name)
-        } catch DashboardError.http(409, _) where !overwrite {
-            pendingReplace = PendingUpload(file: file, folder: folder)
-        } catch {
-            if !error.isCancellation { failure = "Could not upload \(name). \(error.dashboardMessage)" }
-        }
-    }
-
-    /// An upload whose name is taken, waiting for "Replace".
-    @Published var pendingReplace: PendingUpload?
-    /// The folder the New folder prompt creates in.
-    @Published var newFolderTarget: String?
-    /// The folder the file picker uploads into.
-    @Published var uploadTarget: String?
-
     // MARK: Actions
 
     func request(_ action: WorkspaceAction) {
@@ -292,21 +245,6 @@ final class WorkspacePanelModel: ObservableObject {
                 } else {
                     notice = OpsNotice(title: "Pull request created")
                 }
-            case let .deleteEntry(path, isDirectory):
-                try await client.workspaceDelete(path, recursive: isDirectory)
-                route.removeAll { route in
-                    switch route {
-                    case let .folder(folder): return WorkspacePath.isUnder(path, folder)
-                    case let .file(entry): return WorkspacePath.isUnder(path, entry.path)
-                    default: return false
-                    }
-                }
-                if let parent = WorkspacePath.parent(path) {
-                    files.invalidate(parent)
-                    await files.load(parent, force: true)
-                }
-                await files.refreshChanges()
-                notice = OpsNotice(title: "Deleted", message: WorkspacePath.name(path))
             case let .switchBranch(branch):
                 try await review.switchBranch(branch)
                 await files.refresh(visibleFolders)
@@ -383,13 +321,6 @@ final class WorkspacePanelModel: ObservableObject {
             notice = OpsNotice(title: "Worktree ready", message: result.branch)
         }
     }
-}
-
-/// A picked file whose name is already taken in the folder.
-struct PendingUpload: Identifiable {
-    let id = UUID()
-    var file: URL
-    var folder: String
 }
 
 /// Opens the new-worktree sheet, optionally on a base branch ("New branch from main").

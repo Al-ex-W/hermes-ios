@@ -171,10 +171,6 @@ struct WorkspaceFilePreview: View {
                     Button { model.copy(text, label: "Copied") } label: { Label("Copy content", systemImage: "doc.on.doc") }
                 }
                 Button { Task { await model.openQuickLook(entry.path) } } label: { Label("Open in Quick Look", systemImage: "eye") }
-                Divider()
-                Button(role: .destructive) {
-                    model.request(.deleteEntry(path: entry.path, isDirectory: false))
-                } label: { Label("Delete", systemImage: Theme.Icon.delete) }
             } label: {
                 Image(systemName: Theme.Icon.more)
             }

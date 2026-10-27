@@ -3,7 +3,9 @@ import UniformTypeIdentifiers
 
 // The Files tab (`right-sidebar/index.tsx`, `files/tree.tsx`, `file-actions.tsx`): the session's folder as a
 // drill-down list with breadcrumbs. Folders push, files open a preview. Each row's menu adds it to the chat, copies
-// its path, shares it, or deletes it (asking first).
+// its path or downloads it. The desktop hides reveal, rename and delete on a remote backend, which the phone always
+// is, and its tree has no upload: the host's `/api/files` writes act on the dashboard's own disk, not the profile's
+// workspace (an SSH backend's files live on another machine), so the tab doesn't write either.
 
 /// The Files tab's root: the session's folder, or "No project open".
 struct WorkspaceFilesRoot: View {
@@ -155,11 +157,6 @@ struct WorkspaceEntryRow: View {
             }
         }
         .contextMenu { WorkspaceEntryMenu(model: model, entry: entry) }
-        .swipeActions(edge: .trailing) {
-            Button(role: .destructive) {
-                model.request(.deleteEntry(path: entry.path, isDirectory: entry.isDirectory))
-            } label: { Label("Delete", systemImage: Theme.Icon.delete) }
-        }
         .swipeActions(edge: .leading) {
             Button { model.addToChat(path: entry.path, isDirectory: entry.isDirectory) } label: {
                 Label("Add to chat", systemImage: "text.badge.plus")
@@ -180,7 +177,7 @@ struct WorkspaceEntryRow: View {
     }
 }
 
-/// The desktop's file menu: add to chat, copy path, copy relative path, share (download), delete.
+/// The desktop's file menu on a remote backend: add to chat, copy path, copy relative path, download (files).
 struct WorkspaceEntryMenu: View {
     @ObservedObject var model: WorkspacePanelModel
     let entry: WorkspaceEntry
@@ -200,14 +197,10 @@ struct WorkspaceEntryMenu: View {
                 Label("Download", systemImage: "square.and.arrow.down")
             }
         }
-        Divider()
-        Button(role: .destructive) {
-            model.request(.deleteEntry(path: entry.path, isDirectory: entry.isDirectory))
-        } label: { Label("Delete", systemImage: Theme.Icon.delete) }
     }
 }
 
-/// A folder's header actions: show or hide gitignored files, refresh, and the + menu (new folder, upload).
+/// A folder's header actions: show or hide gitignored files, refresh, add the folder to the chat, copy its path.
 struct WorkspaceFilesToolbar: ToolbarContent {
     let model: WorkspacePanelModel
     let files: WorkspaceFilesModel
@@ -216,13 +209,6 @@ struct WorkspaceFilesToolbar: ToolbarContent {
     var body: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
             if let folder {
-                Menu {
-                    Button { model.newFolderTarget = folder } label: { Label("New folder", systemImage: "folder.badge.plus") }
-                    Button { model.uploadTarget = folder } label: { Label("Upload file", systemImage: "square.and.arrow.up") }
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .accessibilityLabel("Add")
                 Menu {
                     Button {
                         Task { await files.setShowIgnored(!files.showIgnored) }
@@ -244,53 +230,6 @@ struct WorkspaceFilesToolbar: ToolbarContent {
                 .accessibilityLabel("Folder actions")
             }
         }
-    }
-}
-
-/// The New folder prompt, the file picker for uploads and the replace question, for every folder on the stack.
-struct WorkspaceFileInputs: ViewModifier {
-    @ObservedObject var model: WorkspacePanelModel
-    @State private var folderName = ""
-
-    func body(content: Content) -> some View {
-        content
-            .alert("New folder", isPresented: Binding(get: { model.newFolderTarget != nil },
-                                                      set: { if !$0 { model.newFolderTarget = nil } })) {
-                TextField("Folder name", text: $folderName)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Button("Create folder") {
-                    let target = model.newFolderTarget
-                    let name = folderName
-                    folderName = ""
-                    if let target { Task { await model.makeFolder(named: name, in: target) } }
-                }
-                Button("Cancel", role: .cancel) { folderName = "" }
-            } message: {
-                Text("Enter a single folder name, without slashes.")
-            }
-            .fileImporter(isPresented: Binding(get: { model.uploadTarget != nil }, set: { if !$0 { model.uploadTarget = nil } }),
-                          allowedContentTypes: [.item]) { result in
-                guard let folder = model.uploadTarget else { return }
-                model.uploadTarget = nil
-                switch result {
-                case let .success(file):
-                    Task { await model.upload(file, to: folder) }
-                case let .failure(error):
-                    model.failure = error.localizedDescription
-                }
-            }
-            .alert("Replace \(model.pendingReplace?.file.lastPathComponent ?? "")?",
-                   isPresented: Binding(get: { model.pendingReplace != nil }, set: { if !$0 { model.pendingReplace = nil } }),
-                   presenting: model.pendingReplace) { pending in
-                Button("Replace", role: .destructive) {
-                    model.pendingReplace = nil
-                    Task { await model.upload(pending.file, to: pending.folder, overwrite: true) }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: { _ in
-                Text("A file with that name is already in the folder. Replacing it can't be undone.")
-            }
     }
 }
 

@@ -251,38 +251,6 @@ final class WorkspaceTests: XCTestCase {
                        #"{"existingBranch":"origin\/feat","path":"\/r"}"#)
     }
 
-    func testFileMutationBodies() {
-        let mkdir = WorkspaceCalls.makeDirectory("/r/new")
-        XCTAssertEqual(mkdir.method, "POST")
-        XCTAssertEqual(mkdir.route, "/api/files/mkdir")
-        XCTAssertEqual(mkdir.bodyText, #"{"path":"\/r\/new"}"#)
-        let delete = WorkspaceCalls.delete("/r/old", recursive: true)
-        XCTAssertEqual(delete.method, "DELETE")
-        XCTAssertEqual(delete.route, "/api/files")
-        XCTAssertEqual(delete.bodyText, #"{"path":"\/r\/old","recursive":true}"#)
-        XCTAssertEqual(WorkspaceCalls.uploadStream().route, "/api/files/upload-stream")
-    }
-
-    func testMultipartUpload() throws {
-        let head = MultipartBody.head(fields: [("path", "/r/a b.txt"), ("overwrite", "false")], fileField: "file",
-                                      fileName: "a\"b.txt", contentType: "text/plain", boundary: "B")
-        XCTAssertEqual(head, "--B\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/r/a b.txt\r\n"
-            + "--B\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\nfalse\r\n"
-            + "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a%22b.txt\"\r\nContent-Type: text/plain\r\n\r\n")
-        XCTAssertEqual(MultipartBody.tail(boundary: "B"), "\r\n--B--\r\n")
-        XCTAssertEqual(MultipartBody.contentType("x.png"), "image/png")
-        XCTAssertEqual(MultipartBody.contentType("x.unknownext"), "application/octet-stream")
-
-        let source = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-test-\(UUID().uuidString).txt")
-        try Data("hello".utf8).write(to: source)
-        defer { try? FileManager.default.removeItem(at: source) }
-        let body = try MultipartBody.write(file: source, fields: [("path", "/r/x.txt")], fileField: "file", fileName: "x.txt", boundary: "Z")
-        defer { try? FileManager.default.removeItem(at: body) }
-        let text = String(decoding: try Data(contentsOf: body), as: UTF8.self)
-        XCTAssertTrue(text.hasSuffix("\r\n\r\nhello\r\n--Z--\r\n"))
-        XCTAssertTrue(text.hasPrefix("--Z\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/r/x.txt\r\n"))
-    }
-
     func testCommitMessageRequest() throws {
         let context = CommitContext(response: ["diff": "diff --git a b", "recent": "feat: one\nfix: two"])
         let params = WorkspaceReviewModel.commitMessageParams(context, previous: "old", profile: "work", sessionID: "rt1")
@@ -498,8 +466,8 @@ final class WorkspaceTests: XCTestCase {
 
     func testDestructiveActionsAskFirst() {
         let asks: [WorkspaceAction] = [.revert(file: "a.ts"), .revert(file: nil), .commit(message: "m", push: true, branch: "x"),
-                                       .push(branch: "x"), .createPR(branch: nil), .deleteEntry(path: "/r/a", isDirectory: false),
-                                       .switchBranch("main"), .removeWorktree(path: "/r/.worktrees/x", force: false),
+                                       .push(branch: "x"), .createPR(branch: nil), .switchBranch("main"),
+                                       .removeWorktree(path: "/r/.worktrees/x", force: false),
                                        .removeWorktree(path: "/r/.worktrees/x", force: true)]
         for action in asks { XCTAssertNotNil(action.confirmation, "\(action) asks first") }
         let runs: [WorkspaceAction] = [.stage(file: nil), .stage(file: "a"), .unstage(file: "a"), .commit(message: "m", push: false, branch: nil)]
@@ -510,8 +478,6 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertTrue(WorkspaceAction.revert(file: nil).confirmation!.destructive)
         XCTAssertFalse(WorkspaceAction.createPR(branch: "f").confirmation!.destructive)
         XCTAssertTrue(WorkspaceAction.createPR(branch: "f").confirmation!.message.contains("“f”"))
-        XCTAssertTrue(WorkspaceAction.deleteEntry(path: "/r/dir", isDirectory: true).confirmation!.message.contains("everything in it"))
-        XCTAssertEqual(WorkspaceAction.deleteEntry(path: "/r/dir", isDirectory: true).confirmation?.title, "Delete dir?")
         XCTAssertEqual(WorkspaceAction.removeWorktree(path: "/w", force: true).confirmation?.confirmLabel, "Force remove")
     }
 

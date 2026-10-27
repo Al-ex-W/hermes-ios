@@ -1,8 +1,8 @@
 import Foundation
-import UniformTypeIdentifiers
 
-// The workspace's file routes: `/api/fs/*` (the session's folder on the host, profile- and SSH-aware, the desktop's
-// remote file tree) and `/api/files/*` (folder, upload and delete on the host's managed files surface).
+// The workspace's file routes: `/api/fs/*`, the session's folder on the host (profile- and SSH-aware, the desktop's
+// remote file tree). The `/api/files/*` writes (new folder, upload, delete) aren't used: they act on the dashboard's
+// own disk whatever the profile's backend, and the desktop offers none of them on a remote backend.
 
 // MARK: - Transport
 
@@ -124,88 +124,10 @@ extension DashboardClient {
         try FileManager.default.moveItem(at: file, to: target)
         return target
     }
-
-    /// Uploads a local file to `remotePath` on the host (`POST /api/files/upload-stream`, multipart, streamed from
-    /// disk). `overwrite: false` makes the host answer 409 when the name is taken.
-    func workspaceUpload(_ file: URL, to remotePath: String, overwrite: Bool) async throws -> String {
-        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        guard size <= WorkspaceLimits.uploadBytes else {
-            throw DashboardError.rpc("\(file.lastPathComponent) is \(ByteSize.format(Double(size))). Hermes takes files up to "
-                + "\(ByteSize.format(Double(WorkspaceLimits.uploadBytes))).")
-        }
-        let boundary = "HermesWorkspace-\(UUID().uuidString)"
-        let body = try MultipartBody.write(file: file, fields: [("path", remotePath), ("overwrite", overwrite ? "true" : "false")],
-                                           fileField: "file", fileName: WorkspacePath.name(remotePath), boundary: boundary)
-        defer { try? FileManager.default.removeItem(at: body) }
-        guard let url = WorkspaceCalls.uploadStream().url(base: base) else { throw DashboardError.badURL }
-        for attempt in 0..<2 {
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.timeoutInterval = 600
-            request.setValue("application/json", forHTTPHeaderField: "Accept")
-            request.setValue(Self.origin(of: base), forHTTPHeaderField: "Origin")
-            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            let (data, response) = try await session.upload(for: request, fromFile: body)
-            let http = response as? HTTPURLResponse
-            let code = http?.statusCode ?? 0
-            if code == 401 || isSignInRedirect(http, for: request) {
-                if attempt == 0 { try await signIn(); continue }
-                throw DashboardError.signedOut
-            }
-            guard (200..<300).contains(code) else { throw DashboardError.http(code, String(decoding: data, as: UTF8.self)) }
-            let result = (try? JSONSerialization.jsonObject(with: data)) as? JSON
-            return LenientField.text(result?["path"]) ?? remotePath
-        }
-        throw DashboardError.signedOut
-    }
-}
-
-/// A multipart/form-data body written to a temporary file, the file part copied in chunks.
-enum MultipartBody {
-    static func write(file: URL, fields: [(String, String)], fileField: String, fileName: String, boundary: String) throws -> URL {
-        let target = FileManager.default.temporaryDirectory.appendingPathComponent("hermes-upload-\(UUID().uuidString)")
-        FileManager.default.createFile(atPath: target.path, contents: nil)
-        let output = try FileHandle(forWritingTo: target)
-        defer { try? output.close() }
-        try output.write(contentsOf: Data(head(fields: fields, fileField: fileField, fileName: fileName,
-                                               contentType: contentType(fileName), boundary: boundary).utf8))
-        let input = try FileHandle(forReadingFrom: file)
-        defer { try? input.close() }
-        while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
-            try output.write(contentsOf: chunk)
-        }
-        try output.write(contentsOf: Data(tail(boundary: boundary).utf8))
-        return target
-    }
-
-    /// Everything before the file's bytes: the form fields, then the file part's headers.
-    static func head(fields: [(String, String)], fileField: String, fileName: String, contentType: String, boundary: String) -> String {
-        var text = ""
-        for (name, value) in fields {
-            text += "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(quoted(name))\"\r\n\r\n\(value)\r\n"
-        }
-        text += "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(quoted(fileField))\"; filename=\"\(quoted(fileName))\"\r\n"
-        text += "Content-Type: \(contentType)\r\n\r\n"
-        return text
-    }
-
-    static func tail(boundary: String) -> String { "\r\n--\(boundary)--\r\n" }
-
-    /// A header parameter value: quotes and line breaks would end it early.
-    static func quoted(_ value: String) -> String {
-        value.replacingOccurrences(of: "\"", with: "%22").replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
-    }
-
-    static func contentType(_ fileName: String) -> String {
-        let ext = (fileName as NSString).pathExtension
-        return UTType(filenameExtension: ext)?.preferredMIMEType ?? "application/octet-stream"
-    }
 }
 
 /// The host's caps, mirrored so the phone says so before sending.
 enum WorkspaceLimits {
-    /// `_MANAGED_FILE_MAX_BYTES`: the largest upload `/api/files/upload-stream` takes.
-    static let uploadBytes = 100 * 1024 * 1024
     /// `_FS_TEXT_PREVIEW_MAX_BYTES`: `/api/fs/read-text` sends at most this much of a file.
     static let previewBytes = 512 * 1024
     /// `_FS_DATA_URL_MAX_BYTES` (`WEBAPP_ATTACHMENT_MAX_BYTES`): the largest image `/api/fs/read-data-url` sends.
@@ -254,20 +176,6 @@ enum WorkspaceCalls {
     /// The folder a new session of the profile starts in, and its branch (`GET /api/fs/default-cwd`).
     static func defaultCwd(profile: String?) -> WorkspaceCall {
         WorkspaceCall(route: "/api/fs/default-cwd", query: profiled([], profile: profile))
-    }
-
-    /// `POST /api/files/mkdir`: creates the folder (and missing parents).
-    static func makeDirectory(_ path: String) -> WorkspaceCall {
-        WorkspaceCall(method: "POST", route: "/api/files/mkdir", body: ["path": path])
-    }
-
-    /// `DELETE /api/files`: removes a file, or a folder (`recursive` removes what is inside too). Not undoable.
-    static func delete(_ path: String, recursive: Bool) -> WorkspaceCall {
-        WorkspaceCall(method: "DELETE", route: "/api/files", body: ["path": path, "recursive": recursive])
-    }
-
-    static func uploadStream() -> WorkspaceCall {
-        WorkspaceCall(method: "POST", route: "/api/files/upload-stream", timeout: 600)
     }
 }
 
@@ -384,15 +292,6 @@ extension DashboardClient {
 
     func workspaceDefaultCwd(profile: String?) async throws -> WorkspaceDefaultCwd? {
         WorkspaceDefaultCwd(response: try await workspace(WorkspaceCalls.defaultCwd(profile: profile)) as? JSON ?? [:])
-    }
-
-    /// Creates `path` and answers the folder the host made.
-    func workspaceMakeDirectory(_ path: String) async throws -> String {
-        LenientField.text((try await workspace(WorkspaceCalls.makeDirectory(path)) as? JSON)?["path"]) ?? path
-    }
-
-    func workspaceDelete(_ path: String, recursive: Bool) async throws {
-        _ = try await workspace(WorkspaceCalls.delete(path, recursive: recursive))
     }
 }
 

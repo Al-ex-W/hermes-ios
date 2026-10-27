@@ -1,8 +1,8 @@
 import Foundation
 import SwiftUI
 
-/// What the panel can change on the host. The destructive and outward-facing ones ask first: revert, delete,
-/// push (also Commit & Push), create PR, branch switch, worktree removal.
+/// What the panel can change on the host. The destructive and outward-facing ones ask first: revert, push (also
+/// Commit & Push), create PR, branch switch, worktree removal.
 enum WorkspaceAction: Hashable {
     case stage(file: String?)
     case unstage(file: String?)
@@ -11,7 +11,6 @@ enum WorkspaceAction: Hashable {
     case commit(message: String, push: Bool, branch: String?)
     case push(branch: String?)
     case createPR(branch: String?)
-    case deleteEntry(path: String, isDirectory: Bool)
     case switchBranch(String)
     case removeWorktree(path: String, force: Bool)
 
@@ -46,13 +45,6 @@ enum WorkspaceAction: Hashable {
                 message: "Push \(Self.branchName(branch)) and open a pull request on GitHub with gh, titled and described from "
                     + "its commits?",
                 confirmLabel: "Create PR", destructive: false)
-        case let .deleteEntry(path, isDirectory):
-            return WorkspaceConfirmation(
-                title: "Delete \(WorkspacePath.name(path))?",
-                message: isDirectory
-                    ? "The folder and everything in it are deleted from the host. There's no Trash to restore them from."
-                    : "The file is deleted from the host. There's no Trash to restore it from.",
-                confirmLabel: "Delete")
         case let .switchBranch(branch):
             return WorkspaceConfirmation(
                 title: "Switch to \(branch)?",
