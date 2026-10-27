@@ -232,12 +232,12 @@ final class ComposerModel: ObservableObject {
         attachments = []
     }
 
-    /// The user agreed to drop the turns after the edited prompt: the edit goes out.
-    func confirmDeepEdit() async {
-        guard let message = deepEditConfirmation, editingMessage?.id == message.id else {
-            deepEditConfirmation = nil
-            return
-        }
+    /// The user agreed to drop the turns after the edited prompt: the edit goes out. `message` is the prompt the
+    /// question was about, captured when the button was tapped: the dialog has already cleared
+    /// `deepEditConfirmation` by the time this runs.
+    func confirmDeepEdit(_ message: UserMessage?) async {
+        deepEditConfirmation = nil
+        guard let message, editingMessage?.id == message.id else { return }
         await sendEdit(of: message, confirmed: true)
     }
 

@@ -471,10 +471,32 @@ final class FollowUpsTests: XCTestCase {
         XCTAssertTrue(rewound.isEmpty, "nothing is cut before the user agrees")
         XCTAssertEqual(composer.draft, "fix the other bug")
 
-        await composer.confirmDeepEdit()
+        // What the dialog does: its binding clears the question as it closes, before the button's Task runs.
+        let asked = composer.deepEditConfirmation
+        composer.deepEditConfirmation = nil
+        await composer.confirmDeepEdit(asked)
         XCTAssertEqual(rewound, ["fix the other bug"])
         XCTAssertNil(composer.deepEditConfirmation)
         XCTAssertNil(composer.editingMessage)
+    }
+
+    func testAConfirmationForAnotherPromptSendsNothing() async {
+        let scripted = ScriptedGateway()
+        let composer = ComposerModel(sender: SendController(chat: IdleChat()), connection: scripted.connection(), profile: nil)
+        var rewound = 0
+        composer.rewind = { _, _ in
+            rewound += 1
+            return true
+        }
+        composer.promptsAfter = { _ in 1 }
+        composer.editMessage(UserMessage(id: "row-3", text: "fix the bug", rowID: 3))
+        composer.draft = "fix the other bug"
+        await composer.send()
+        composer.deepEditConfirmation = nil
+        await composer.confirmDeepEdit(UserMessage(id: "row-9", text: "something else", rowID: 9))
+        await composer.confirmDeepEdit(nil)
+        XCTAssertEqual(rewound, 0)
+        XCTAssertEqual(composer.editingMessage?.id, "row-3", "the edit stays in the composer")
     }
 }
 

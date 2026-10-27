@@ -71,13 +71,16 @@ struct ComposerView: View {
             if id != nil { focused = true }
         }
         // An edit of an older prompt drops the turns after it: the desktop's checkpoint question first.
+        // The dialog clears `deepEditConfirmation` as it closes, before the button's Task runs, so the prompt it
+        // asked about is handed to the buttons (`presenting:`) and passed on.
         .confirmationDialog(UserBubble.restoreTitle,
                             isPresented: Binding(get: { composer.deepEditConfirmation != nil },
                                                  set: { if !$0 { composer.deepEditConfirmation = nil } }),
-                            titleVisibility: .visible) {
-            Button(UserBubble.restoreConfirm, role: .destructive) { Task { await composer.confirmDeepEdit() } }
+                            titleVisibility: .visible,
+                            presenting: composer.deepEditConfirmation) { message in
+            Button(UserBubble.restoreConfirm, role: .destructive) { Task { await composer.confirmDeepEdit(message) } }
             Button("Cancel", role: .cancel) { composer.deepEditConfirmation = nil }
-        } message: {
+        } message: { _ in
             Text(UserBubble.restoreBody)
         }
         .alert("Hermes", isPresented: Binding(get: { composer.notice != nil }, set: { if !$0 { composer.notice = nil } })) {
