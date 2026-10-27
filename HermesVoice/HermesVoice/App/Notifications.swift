@@ -169,8 +169,11 @@ enum AlertIntent: Equatable {
     /// Open its session (a tap, or the Open action).
     case open
     case answer(AlertReply)
-    /// The action can't answer this alert (why); the alert is posted again with that note.
-    case unanswerable(String)
+    /// The action can't answer this alert (why); the alert is posted again with that note, with its actions only
+    /// when another try could work (`retry`: another approval choice, a reply that isn't empty). An alert that
+    /// names no request, or a clarify that carries no questions (the host keeps previews off, or the questions
+    /// didn't fit APNs' 4 KB), can only open the session.
+    case unanswerable(String, retry: Bool)
     case ignore
 
     static func of(action: String, text: String?, push: AlertPush) -> AlertIntent {
@@ -180,18 +183,19 @@ enum AlertIntent: Equatable {
         case AlertAction.run, AlertAction.allowSession, AlertAction.reject:
             guard push.kind == .approval else { return .ignore }
             let choice: ApprovalChoice = action == AlertAction.run ? .once : action == AlertAction.allowSession ? .session : .deny
-            guard push.requestID != nil else { return .unanswerable("Open Hermes to answer this approval.") }
+            guard push.requestID != nil else { return .unanswerable("Open Hermes to answer this approval.", retry: false) }
             guard push.choices.contains(choice) else {
-                return .unanswerable("Hermes doesn't offer “\(choice == .session ? "Allow for session" : "Run")” for this command. Open Hermes to answer.")
+                return .unanswerable("Hermes doesn't offer “\(choice == .session ? "Allow for session" : "Run")” for this command. Open Hermes to answer.",
+                                     retry: true)
             }
             return .answer(.approval(choice))
         case AlertAction.reply:
             guard push.kind == .clarify else { return .ignore }
             guard push.requestID != nil, let question = push.questions.first else {
-                return .unanswerable("Open Hermes to answer this question.")
+                return .unanswerable("Open Hermes to answer this question.", retry: false)
             }
             let answer = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !answer.isEmpty else { return .unanswerable("The reply was empty.") }
+            guard !answer.isEmpty else { return .unanswerable("The reply was empty.", retry: true) }
             return .answer(.clarify(qid: question.qid, text: answer))
         default:
             return .ignore
@@ -291,6 +295,8 @@ final class AlertNotifications: NSObject, ObservableObject {
     private weak var model: AppModel?
     /// The chat on screen, set by the detail column.
     private weak var visibleChat: ChatModel?
+    /// A sheet (Settings, Profiles) covers the detail column: the chat there isn't on screen.
+    var covered = false
     private var observers: [NSObjectProtocol] = []
     private var subscriptions: Set<AnyCancellable> = []
     private var started = false
@@ -371,8 +377,44 @@ final class AlertNotifications: NSObject, ObservableObject {
     }
 
     private func isOnScreen(_ sessionID: String) -> Bool {
-        guard UIApplication.shared.applicationState == .active, let chat = visibleChat else { return false }
+        Self.onScreen(sessionID, chat: visibleChat, active: UIApplication.shared.applicationState == .active, covered: covered)
+    }
+
+    /// Whether `sessionID` is the chat on screen: the app is in front, no sheet covers the chat, and it's that one.
+    static func onScreen(_ sessionID: String, chat: ChatModel?, active: Bool, covered: Bool) -> Bool {
+        guard active, !covered, let chat else { return false }
         return chat.storedID == sessionID || chat.sessionIDs.contains(sessionID)
+    }
+
+    // MARK: Signing out and testing
+
+    /// Signed out: the alerts already shown can't be answered any more (their command and question text goes too).
+    func signedOut() {
+        center.removeAllDeliveredNotifications()
+    }
+
+    /// Settings > Notifications' test: a local notification now, asking for permission first if iOS never asked.
+    /// Nil when it went out, else why not.
+    func sendTest() async -> String? {
+        var status = await center.notificationSettings().authorizationStatus
+        if status == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound])
+            status = await center.notificationSettings().authorizationStatus
+        }
+        await sync(asking: false)
+        guard Self.registered(.defaults, status: status).anyEnabled else {
+            return "Notifications are off for this app in iOS Settings."
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Hermes"
+        content.body = "Notifications from Hermes reach this iPhone."
+        content.sound = .default
+        do {
+            try await center.add(UNNotificationRequest(identifier: "hermes-test", content: content, trigger: nil))
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 
     // MARK: Actions
@@ -384,8 +426,8 @@ final class AlertNotifications: NSObject, ObservableObject {
             return
         case .open:
             open(push)
-        case let .unanswerable(reason):
-            post(push, note: reason, actions: true)
+        case let .unanswerable(reason, retry):
+            post(push, note: reason, actions: retry)
         case let .answer(reply):
             await answer(push, reply)
         }

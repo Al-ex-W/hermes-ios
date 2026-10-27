@@ -34,15 +34,8 @@ enum VoicePluginAPI {
         return VoicePluginStatus(object)
     }
 
-    /// `POST /devices`: where the plugin sends the VoIP pushes that ring this phone.
-    static func registerDevice(_ client: DashboardClient, voipToken: String, environment: String, bundleID: String) async throws {
-        _ = try await call(client, "POST", "/devices", body: [
-            "voip_token": voipToken, "environment": environment, "bundle_id": bundleID,
-        ])
-    }
-
-    /// `POST /devices` with a whole body: the VoIP token, and the alert token with the alerts this phone takes
-    /// (`PushRegistration.deviceBody`).
+    /// `POST /devices`: where the plugin sends the VoIP pushes that ring this phone, and the alert token with the
+    /// alerts it takes (`PushRegistration.deviceBody`).
     static func registerDevice(_ client: DashboardClient, body: JSON) async throws {
         _ = try await call(client, "POST", "/devices", body: body)
     }

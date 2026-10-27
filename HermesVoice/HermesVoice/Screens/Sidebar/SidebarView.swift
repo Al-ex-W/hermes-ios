@@ -6,6 +6,7 @@ import UIKit
 struct SidebarView: View {
     @ObservedObject var sidebar: SidebarModel
     @EnvironmentObject private var calls: CallController
+    @EnvironmentObject private var model: AppModel
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var showSettings = false
     @State private var showProfiles = false
@@ -67,10 +68,15 @@ struct SidebarView: View {
         .sheet(isPresented: $showSettings) {
             NavigationStack { SettingsView() }
         }
-        // A session opened from elsewhere (a tapped notification) shows above any open sheet.
-        .onChange(of: sidebar.selection) {
+        // A session opened from elsewhere (a tapped notification) shows above any open sheet. Only that: the
+        // selection also changes when a sent draft settles into its listed row, which must not close a sheet.
+        .onChange(of: sidebar.externalOpens) {
             showSettings = false
             showProfiles = false
+        }
+        // A sheet covers the chat beside the sidebar: its alerts show as banners meanwhile.
+        .onChange(of: showSettings || showProfiles, initial: true) { _, covered in
+            model.notifications.covered = covered
         }
         .sheet(isPresented: $showProfiles) {
             NavigationStack {

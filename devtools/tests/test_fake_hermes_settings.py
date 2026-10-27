@@ -544,13 +544,16 @@ def test_alert_registration_and_the_alerts_a_backgrounded_app_would_get():
                           "bundle_id": "com.example.hermesvoice"}
                 bad = {name: (await http.post(f"{PREFIX}/devices", json={**device, **extra})).status_code
                        for name, extra in {"not bool": {"alerts": {"approval": "yes"}},
-                                           "unknown kind": {"alerts": {"turnDone": True}},
                                            "not an object": {"alerts": ["approval"]}}.items()}
+                # As the plugin: a kind it doesn't know is ignored, and a kind never named is on.
+                unknown_kind = await http.post(f"{PREFIX}/devices", json={**device, "alerts": {"turnDone": False}})
+                fresh = (await http.get(f"{PREFIX}/status")).json()["devices"][0]["alerts"]
+                registered = await http.post(f"{PREFIX}/devices", json={
+                    **device, "alerts": {"approval": True, "clarify": False, "turn_done": True}})
+                # What the app sends before iOS hands it an alert token: the stored one stays, the named kinds merge.
                 no_alert_token = await http.post(f"{PREFIX}/devices", json={
                     "voip_token": VOIP, "environment": "sandbox", "bundle_id": "com.example.hermesvoice",
                     "alerts": {"approval": True}})
-                registered = await http.post(f"{PREFIX}/devices", json={
-                    **device, "alerts": {"approval": True, "clarify": False, "turn_done": True}})
                 status = (await http.get(f"{PREFIX}/status")).json()
 
                 gateway = await Gateway.connect(base, http)
@@ -578,15 +581,20 @@ def test_alert_registration_and_the_alerts_a_backgrounded_app_would_get():
                 unknown = await http.get(f"{PREFIX}/debug/alerts", params={"session_id": "nope"})
                 bad_kind = await http.get(f"{PREFIX}/debug/alerts", params={"kind": "ring"})
                 await answering.close()
+                # An explicit null clears the alert token: no alerts reach the phone, VoIP still rings it.
+                cleared = await http.post(f"{PREFIX}/devices", json={**device, "alert_token": None})
+                after_clear = (await http.get(f"{PREFIX}/status")).json()["devices"]
             async with httpx.AsyncClient(base_url=f"http://{base}") as anonymous:
                 anonymous_alerts = (await anonymous.get(f"{PREFIX}/debug/alerts")).status_code
-        return (bad, no_alert_token, registered, status, key, request, approval, answered, done, clarify,
-                everything, unknown, bad_kind, anonymous_alerts)
+        return (bad, unknown_kind, fresh, no_alert_token, registered, status, key, request, approval, answered, done,
+                clarify, everything, unknown, bad_kind, cleared, after_clear, anonymous_alerts)
 
-    (bad, no_alert_token, registered, status, key, request, approval, answered, done, clarify, everything, unknown,
-     bad_kind, anonymous_alerts) = asyncio.run(scenario())
-    assert bad == {"not bool": 422, "unknown kind": 422, "not an object": 422}
-    assert no_alert_token.json() == {"detail": "alerts needs an alert_token"}
+    (bad, unknown_kind, fresh, no_alert_token, registered, status, key, request, approval, answered, done, clarify,
+     everything, unknown, bad_kind, cleared, after_clear, anonymous_alerts) = asyncio.run(scenario())
+    assert bad == {"not bool": 422, "not an object": 422}
+    assert unknown_kind.json() == {"ok": True}
+    assert fresh == {"approval": True, "clarify": True, "turn_done": True}
+    assert no_alert_token.json() == {"ok": True}
     assert registered.json() == {"ok": True}
     [listed] = status["devices"]
     assert listed["voip_token"] == VOIP and listed["alert_token"] == ALERT
@@ -607,3 +615,6 @@ def test_alert_registration_and_the_alerts_a_backgrounded_app_would_get():
     assert clarify["alert"]["aps"]["alert"]["body"].startswith("Which color should the demo use?\nBlue")
     assert [a["kind"] for a in everything["alerts"]] == ["approval", "turn_done", "clarify", "turn_done"]
     assert unknown.status_code == 404 and bad_kind.status_code == 422 and anonymous_alerts == 401
+    assert cleared.json() == {"ok": True}
+    assert [(d["voip_token"], d["alert_token"]) for d in after_clear] == [(VOIP, None)]
+    assert after_clear[0]["alerts"] == {"approval": False, "clarify": False, "turn_done": False}

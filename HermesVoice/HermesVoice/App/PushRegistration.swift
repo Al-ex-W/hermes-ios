@@ -109,6 +109,15 @@ final class PushRegistration: NSObject, ObservableObject {
         pushLog.error("No APNs alert token: \(error.localizedDescription, privacy: .public)")
     }
 
+    #if DEBUG
+    /// Tests: the tokens PushKit and APNs would hand over (neither does in the Simulator's test host).
+    func useTokens(voip: String?, alert: String?) {
+        token = voip
+        alertToken = alert
+        upload = .notSent
+    }
+    #endif
+
     nonisolated static func hex(_ token: Data) -> String {
         token.map { String(format: "%02x", $0) }.joined()
     }

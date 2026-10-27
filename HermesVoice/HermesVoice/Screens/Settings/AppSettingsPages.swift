@@ -114,6 +114,8 @@ struct NotificationsSettingsView: View {
     @EnvironmentObject private var notifications: AlertNotifications
     let anchor: String?
     @State private var preferences = NotificationPreferences.load()
+    @State private var testing = false
+    @State private var testResult: String?
 
     private var blocked: Bool { notifications.authorization == .denied }
 
@@ -142,14 +144,35 @@ struct NotificationsSettingsView: View {
                 }
             }
             .hermesFormRows()
+            Section {
+                Button {
+                    Task {
+                        testing = true
+                        testResult = await notifications.sendTest() ?? "Sent. It shows as a banner in a moment."
+                        testing = false
+                    }
+                } label: {
+                    HStack {
+                        Text("Send test notification")
+                        Spacer()
+                        if testing { ProgressView() }
+                    }
+                }
+                .disabled(testing || blocked)
+                .id("notifications.test")
+            } footer: {
+                FormNote(testResult ?? "Checks that iOS lets Hermes notify this iPhone.")
+            }
+            .hermesFormRows()
         }
         .hermesForm()
         .settingsAnchor(anchor)
     }
 
+    /// A switch shows on only while iOS lets the app notify: blocked, the plugin is registered with none.
     private func toggle(_ title: String, _ description: String, _ path: WritableKeyPath<NotificationPreferences, Bool>) -> some View {
         SettingsRow(title: title, description: description) {
-            Toggle(title, isOn: Binding(get: { preferences[keyPath: path] }, set: { on in
+            Toggle(title, isOn: Binding(get: { !blocked && preferences[keyPath: path] }, set: { on in
                 preferences[keyPath: path] = on
                 preferences.save()
             }))

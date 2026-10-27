@@ -91,6 +91,9 @@ final class SidebarModel: ObservableObject {
     }
     /// A new chat that hasn't shown up in the list yet.
     @Published private(set) var draft: ChatModel?
+    /// Bumped when a session opens from outside the sidebar (a tapped notification), so the sheets over it close.
+    /// A selection change alone doesn't: a draft settling into its listed row changes it too.
+    @Published private(set) var externalOpens = 0
     @Published private(set) var options: SidebarOptions
 
     /// Stored ids whose turn is running, and those waiting on an answer.
@@ -528,6 +531,7 @@ final class SidebarModel: ObservableObject {
         let target = listed?.id ?? id
         if row(target) == nil { opened[target] = SessionInfo(id: target, profile: profile) }
         selection = .session(target)
+        externalOpens += 1
         watch()
     }
 

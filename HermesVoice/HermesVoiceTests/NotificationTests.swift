@@ -148,12 +148,14 @@ final class NotificationTests: XCTestCase {
 
     func testApprovalActionHermesDoesNotOfferIsNotSent() {
         let push = approval(choices: [.once, .deny])
-        guard case .unanswerable = AlertIntent.of(action: AlertAction.allowSession, text: nil, push: push) else {
+        // Another choice can still answer it: the alert comes back with its actions.
+        guard case .unanswerable(_, retry: true) = AlertIntent.of(action: AlertAction.allowSession, text: nil, push: push) else {
             return XCTFail("a session approval Hermes doesn't offer went out")
         }
         XCTAssertEqual(AlertIntent.of(action: AlertAction.reject, text: nil, push: push), .answer(.approval(.deny)))
-        guard case .unanswerable = AlertIntent.of(action: AlertAction.run, text: nil, push: approval(requestID: nil)) else {
-            return XCTFail("an approval without its request was answered")
+        // No action can answer an alert that names no request: it comes back only to open the session.
+        guard case .unanswerable(_, retry: false) = AlertIntent.of(action: AlertAction.run, text: nil, push: approval(requestID: nil)) else {
+            return XCTFail("an approval without its request was answered, or offered again")
         }
     }
 
@@ -163,9 +165,11 @@ final class NotificationTests: XCTestCase {
                        .answer(.clarify(qid: "q1", text: "dev")))
         XCTAssertEqual(AlertIntent.of(action: AlertAction.open, text: nil, push: push), .open)
         XCTAssertEqual(AlertIntent.of(action: AlertAction.run, text: nil, push: push), .ignore)
-        for (text, push) in [("   ", push), ("dev", clarify([])), ("dev", clarify([q1], requestID: nil))] {
-            guard case .unanswerable = AlertIntent.of(action: AlertAction.reply, text: text, push: push) else {
-                return XCTFail("\(text) was sent for \(push)")
+        // An empty reply can be typed again; a clarify without its questions (previews off, or cut to fit APNs'
+        // 4 KB) or its request can't take any reply, so its Reply action isn't offered again.
+        for (text, push, retry) in [("   ", push, true), ("dev", clarify([]), false), ("dev", clarify([q1], requestID: nil), false)] {
+            guard case let .unanswerable(_, again) = AlertIntent.of(action: AlertAction.reply, text: text, push: push), again == retry else {
+                return XCTFail("\(text) was sent for \(push), or offered again wrongly")
             }
         }
         let done = AlertPush(kind: .turnDone, sessionID: "s1")
@@ -384,5 +388,34 @@ final class NotificationTests: XCTestCase {
         XCTAssertEqual(AlertNotifications.presentation(for: push, sessionOnScreen: true), [])
         XCTAssertEqual(AlertNotifications.presentation(for: push, sessionOnScreen: false), [.banner, .list, .sound])
         XCTAssertEqual(AlertNotifications.presentation(for: nil, sessionOnScreen: true), [.banner, .list, .sound])
+    }
+
+    func testChatUnderASheetIsNotOnScreen() throws {
+        let client = try DashboardClient(settings: ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "test",
+                                                                      password: "test"))
+        let chat = ChatModel(client: client, connection: GatewayConnection(client: client),
+                             summary: SessionSummary(id: "s1", title: "Demo", lastActive: nil, profile: nil))
+        XCTAssertTrue(AlertNotifications.onScreen("s1", chat: chat, active: true, covered: false))
+        // Settings or Profiles over the chat (iPad): its approval gets a banner, the card is hidden.
+        XCTAssertFalse(AlertNotifications.onScreen("s1", chat: chat, active: true, covered: true))
+        XCTAssertFalse(AlertNotifications.onScreen("s1", chat: chat, active: false, covered: false))
+        XCTAssertFalse(AlertNotifications.onScreen("s2", chat: chat, active: true, covered: false))
+        XCTAssertFalse(AlertNotifications.onScreen("s1", chat: nil, active: true, covered: false))
+    }
+
+    // MARK: Signing out
+
+    func testSignOutStopsWaitingForASlowWithdrawal() async {
+        // The withdrawal of the alerts can't hold up the logout for long.
+        let started = Date()
+        var finished = false
+        await AppModel.waiting(atMost: 0.2) {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            finished = true
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        XCTAssertFalse(finished)
+        await AppModel.waiting(atMost: 5) { finished = true }
+        XCTAssertTrue(finished)
     }
 }

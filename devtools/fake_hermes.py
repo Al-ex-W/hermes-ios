@@ -1825,7 +1825,8 @@ PASSWORD_MANAGERS = (("onepassword", "1Password", True), ("bitwarden", "Bitwarde
 BILLING_SCOPE_MESSAGE = "This action needs the billing:manage scope."
 # The alert pushes the hermes_voice plugin sends beside the VoIP ones (the app's App/Notifications.swift).
 ALERT_KINDS = ("approval", "clarify", "turn_done")
-ALERT_DEFAULTS = {"approval": True, "clarify": True, "turn_done": False}
+# A kind a device never named is on (the plugin's ``Device.wants``: ``alerts.get(kind, True)``).
+ALERT_DEFAULTS = {"approval": True, "clarify": True, "turn_done": True}
 ALERT_CATEGORIES = {"approval": "HERMES_APPROVAL", "clarify": "HERMES_CLARIFY", "turn_done": "HERMES_TURN_DONE"}
 ALERT_MEMORY = 200
 
@@ -2376,24 +2377,25 @@ def normalize_moa(raw: Any) -> dict[str, Any]:
             "privacy_filter": privacy if privacy in ("display", "full") else ""}
 
 
-def alert_preferences(value: Any) -> tuple[dict[str, bool] | None, str | None]:
-    """The device registration's ``alerts``: ``{approval, clarify, turn_done}`` booleans (None: not sent)."""
+def alert_preferences(value: Any) -> tuple[dict[str, bool], str | None]:
+    """The device registration's ``alerts`` as the plugin reads it (``push.py::_alert_choices``): the named
+    kinds' booleans, ``{}`` when not sent; a kind it doesn't know is ignored."""
     if value is None:
-        return None, None
-    if not isinstance(value, dict):
-        return None, "alerts must be an object of booleans"
-    unknown = sorted(set(value) - set(ALERT_KINDS))
-    if unknown:
-        return None, f"alerts has unknown kinds {unknown}; known: {list(ALERT_KINDS)}"
-    if any(not isinstance(flag, bool) for flag in value.values()):
-        return None, "alerts values must be booleans"
-    return {kind: bool(value.get(kind, False)) for kind in ALERT_KINDS}, None
+        return {}, None
+    if not isinstance(value, dict) or any(not isinstance(flag, bool) for flag in value.values()):
+        return {}, f"alerts must map {', '.join(ALERT_KINDS)} to true or false"
+    return {kind: value[kind] for kind in ALERT_KINDS if kind in value}, None
 
 
 class AlertVoicePlugin(FakeVoicePlugin):
     """The fake hermes_voice plugin plus the alert half of ``POST /devices``: ``alert_token`` with the ``alerts``
     the user opted into (kept per device, listed by ``GET /status``), and ``GET /debug/alerts``: the alert pushes
-    the plugin would have sent (approval / clarify waiting, turn done) and to which alert tokens."""
+    the plugin would have sent (approval / clarify waiting, turn done) and to which alert tokens.
+
+    Registering again works as the plugin's ``DeviceStore.register`` with ``kept_fields``: a body that doesn't
+    name ``alert_token`` keeps the stored one (an explicit null clears it), and the alert choices merge kind by
+    kind over the stored ones, so a body with ``alerts`` but no ``alert_token`` (iOS has no alert token yet) is
+    fine."""
 
     def routes(self) -> list[BaseRoute]:
         return [*super().routes(), Route(f"{PLUGIN_PREFIX}/debug/alerts", self.debug_alerts, methods=["GET"])]
@@ -2402,20 +2404,31 @@ class AlertVoicePlugin(FakeVoicePlugin):
         if (denied := self.gate(request, post=True)) is not None:
             return denied
         body = await self.json_body(request) or {}
+        if not isinstance(body, dict):
+            body = {}
         alerts, problem = alert_preferences(body.get("alerts"))
-        if problem is None and alerts is not None and not body.get("alert_token"):
-            problem = "alerts needs an alert_token"
         if problem is not None:
             self.log(f"http POST {PLUGIN_PREFIX}/devices -> 422 ({problem})")
             return JSONResponse({"detail": problem}, status_code=422)
+        voip = body.get("voip_token")
+        alert = body.get("alert_token")
+        earlier = self.devices.get(voip) if isinstance(voip, str) else None
+        if earlier is None and alert:
+            # The same phone with a new VoIP token: found by its alert token, one entry.
+            earlier = next((d for d in self.devices.values() if d.get("alert_token") == alert), None)
         response = await super().register_device(request)
         if response.status_code == 200:
-            device = self.devices[body["voip_token"]]
-            device["alerts"] = alerts
-            shown = "default alerts" if alerts is None else \
-                ", ".join(k for k, on in alerts.items() if on) or "no alerts"
+            for other, device in list(self.devices.items()):
+                if other != voip and device is earlier:
+                    del self.devices[other]
+            device = self.devices[voip]
+            if earlier is not None and "alert_token" not in body:
+                device["alert_token"] = earlier.get("alert_token")
+            device["alerts"] = {**(earlier or {}).get("alerts", {}), **alerts}
             if device.get("alert_token"):
-                self.log(f"device {body['voip_token'][:8]}… alert token {device['alert_token'][:8]}… ({shown})")
+                chosen = self.alerts_of(device)
+                shown = ", ".join(k for k, on in chosen.items() if on) or "no alerts"
+                self.log(f"device {voip[:8]}… alert token {device['alert_token'][:8]}… ({shown})")
         return response
 
     async def status(self, request: Request) -> Response:
@@ -2429,10 +2442,11 @@ class AlertVoicePlugin(FakeVoicePlugin):
 
     @staticmethod
     def alerts_of(device: dict[str, Any]) -> dict[str, bool]:
-        """What a device gets: its opt-ins, the app's defaults when it sent none, nothing without an alert token."""
+        """What a device gets: its opt-ins, on for a kind it never named, nothing without an alert token."""
         if not device.get("alert_token"):
             return {kind: False for kind in ALERT_KINDS}
-        return device.get("alerts") or dict(ALERT_DEFAULTS)
+        chosen = device.get("alerts") or {}
+        return {kind: chosen.get(kind, ALERT_DEFAULTS[kind]) is not False for kind in ALERT_KINDS}
 
     def alert_targets(self, kind: str) -> list[str]:
         return [device["alert_token"] for device in self.devices.values() if self.alerts_of(device).get(kind)]
