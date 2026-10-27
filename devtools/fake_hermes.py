@@ -3416,7 +3416,9 @@ class SettingsFeatures:
                 "mcp_written": 0, "skills_disabled": 0, "hub_installs": [], "soul_set": soul is not None}
 
     def active_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
-        return {"active": self.sticky_profile, "current": "default"}
+        """profiles.py GET /api/profiles/active: ``current`` is get_active_profile_name(), "custom" for a dashboard
+        whose HERMES_HOME is outside ~/.hermes and its profiles/ folder (``--custom-home``)."""
+        return {"active": self.sticky_profile, "current": "custom" if self.custom_home else "default"}
 
     def set_active_profile(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         canon = self.canonical_name(body_field(body, "name", str))
@@ -5265,8 +5267,9 @@ class CapabilityFeatures:
         return state
 
     def explicit_profile(self, request: Request, route: str) -> FakeProfile:
-        """_common.py destructive_profile: this backend serves several profiles, so an unnamed target is refused."""
-        if not (request.query_params.get("profile") or "").strip():
+        """_common.py destructive_profile: this backend serves several profiles, so an unnamed target is refused.
+        A ``--custom-home`` dashboard stands for a single-profile host, where an unnamed target is its own."""
+        if not (request.query_params.get("profile") or "").strip() and not self.custom_home:
             raise HttpError(400, MULTIPLEX_DETAIL.format(route=route))
         return self.scoped(request)
 
@@ -7262,14 +7265,23 @@ class CapabilityFeatures:
 
     # ── files the Artifacts screen opens (files.py) ───────────────────────────────────────────────
 
-    def fs_target(self, request: Request) -> tuple[str, bytes]:
-        """files.py _fs_download_path + _fs_regular_file over the fake host's files."""
+    def fs_target(self, request: Request, *, session: bool = False) -> tuple[str, bytes]:
+        """files.py _fs_download_path + _fs_regular_file over the fake host's files. With ``session`` (download and
+        read-data-url), a ``session_id`` must name a stored session of the requested profile (404 "Session not found"
+        when blank or unknown, as get_session_detail), and a relative path resolves against that session's folder."""
         raw = request.query_params.get("path")
         if raw is None:
             raise HttpError(422, [{"type": "missing", "loc": ["query", "path"], "msg": "Field required"}])
-        self.scoped(request)
+        profile = self.scoped(request)
         path = raw[7:] if raw.startswith("file://") else raw
         path = DEMO_HOME + path[1:] if path.startswith("~/") else path
+        sid = request.query_params.get("session_id") if session else None
+        if sid is not None:
+            stored = self.sessions.get(sid.strip()) if sid.strip() else None
+            if stored is None or not stored.persisted or stored.profile != profile.name:
+                raise HttpError(404, "Session not found")
+            if not path.startswith("/") and stored.cwd.startswith("/"):
+                path = posixpath.join(stored.cwd, path)
         if not path.startswith("/"):
             raise HttpError(400, "Invalid path")
         path = posixpath.normpath(path)
@@ -7285,8 +7297,8 @@ class CapabilityFeatures:
         return path, data
 
     def fs_read_data_url(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
-        """files.py GET /api/fs/read-data-url?path=: ``{dataUrl}`` (413 over 25 MB)."""
-        path, data = self.fs_target(request)
+        """files.py GET /api/fs/read-data-url?path=&session_id=: ``{dataUrl}`` (413 over 25 MB)."""
+        path, data = self.fs_target(request, session=True)
         if len(data) > FS_DATA_URL_MAX:
             raise HttpError(413, "File too large")
         kind = FS_MEDIA_TYPES.get(posixpath.splitext(path)[1].lower(), "application/octet-stream")
@@ -7309,8 +7321,8 @@ class CapabilityFeatures:
                 "truncated": len(data) > FS_TEXT_PREVIEW_MAX}
 
     def fs_download(self, request: Request, body: dict[str, Any]) -> Response:
-        """files.py GET /api/fs/download?path=: the file as an attachment."""
-        path, data = self.fs_target(request)
+        """files.py GET /api/fs/download?path=&session_id=: the file as an attachment."""
+        path, data = self.fs_target(request, session=True)
         kind = FS_MEDIA_TYPES.get(posixpath.splitext(path)[1].lower(), "application/octet-stream")
         return Response(data, media_type=kind,
                         headers={"content-disposition": f'attachment; filename="{posixpath.basename(path)}"'})
@@ -7877,6 +7889,7 @@ class WorkspaceFeatures:
         self.onboarding_polls = max(1, int(getattr(args, "onboarding_polls", 3)))
         self.kanban_run_seconds = float(getattr(args, "kanban_run_seconds", 20.0))
         self.fleet_seconds = float(getattr(args, "fleet_seconds", 8.0))
+        self.custom_home = bool(getattr(args, "custom_home", False))
         gh = getattr(args, "gh", "auto")
         rich = self.seed_mode != "minimal"
         self.gh_available = gh != "missing"
@@ -8015,6 +8028,7 @@ class WorkspaceFeatures:
             Route("/api/plugins/kanban/diagnostics", k(self.kanban_diagnostics), methods=["GET"]),
             Route("/api/plugins/kanban/workers/active", k(self.kanban_workers), methods=["GET"]),
             Route("/api/plugins/kanban/runs/{run_id}", k(self.kanban_run), methods=["GET"]),
+            Route("/api/plugins/kanban/runs/{run_id}/inspect", k(self.kanban_inspect_run), methods=["GET"]),
             Route("/api/plugins/kanban/runs/{run_id}/terminate", k(self.kanban_terminate_run), methods=["POST"]),
             Route("/api/plugins/kanban/config", k(self.kanban_config), methods=["GET"]),
             Route("/api/plugins/kanban/home-channels", k(self.kanban_home_channels), methods=["GET"]),
@@ -10851,6 +10865,22 @@ class WorkspaceFeatures:
     def kanban_run(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         return {"run": dict(self.kanban_run_of(request)[1])}
 
+    def kanban_inspect_run(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """plugin_api.py GET /runs/{id}/inspect: psutil stats for a live run's worker, else ``{alive: false, reason}``
+        (404 for an unknown run). The fake's workers are imaginary, so their numbers are made up but steady."""
+        _board, run = self.kanban_run_of(request)
+        run_id = run["id"]
+        if run["ended_at"] is not None:
+            return {"run_id": run_id, "alive": False, "reason": "run already ended"}
+        pid = run.get("worker_pid")
+        if pid is None:
+            return {"run_id": run_id, "alive": False, "reason": "no worker_pid recorded"}
+        started = float(run.get("started_at") or time.time())
+        return {"run_id": run_id, "alive": True, "pid": pid, "cpu_percent": 12.5,
+                "memory_rss_bytes": 182 * 1024 * 1024, "memory_vms_bytes": 1_536 * 1024 * 1024, "num_threads": 9,
+                "num_fds": 41, "status": "running", "create_time": started,
+                "cmdline": ["python3", "-m", "hermes_cli.main", "kanban", "work", run["task_id"]]}
+
     def kanban_terminate_run(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """plugin_api.py POST /runs/{id}/terminate {reason?}: reclaim_task on the run's card (409 when it ended)."""
         board, run = self.kanban_run_of(request)
@@ -12468,6 +12498,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="status polls before a Telegram or WhatsApp QR onboarding completes")
     parser.add_argument("--fleet-seconds", type=float, default=8.0,
                         help="roughly how long the 'fleet' chat trigger's subagents run")
+    parser.add_argument("--custom-home", action="store_true",
+                        help="a single-profile dashboard whose HERMES_HOME is outside ~/.hermes: /api/profiles/active "
+                             "answers current 'custom' and destructive routes take an unnamed profile")
     parser.add_argument("--gh", choices=("auto", "ready", "signed-out", "missing"), default="auto",
                         help="the gh CLI on the fake host: ready, signed out, missing, or auto (ready unless "
                              "--seed minimal)")

@@ -185,6 +185,40 @@ def test_fs_and_managed_files_browse_read_write_upload_and_delete():
     assert out["delete_root"] == 400 and out["gone"] == {"entries": [], "error": "ENOENT"}
 
 
+def test_fs_download_and_data_url_resolve_the_session_in_its_profile():
+    async def scenario():
+        async with serving() as (fake, base):
+            q3 = next(s for s in fake.sessions.values() if s.title == "Q3 latency report")
+            readme = f"{ATLAS}/README.md"
+            async with signed_in(base) as http:
+                out: dict[str, Any] = {}
+
+                async def get(route: str, **params: str) -> httpx.Response:
+                    return await http.get(f"/api/fs/{route}", params={"path": readme, **params})
+
+                out["no_session"] = (await get("download")).status_code
+                out["session"] = (await get("download", session_id=q3.key)).content
+                relative = await http.get("/api/fs/download", params={"path": "README.md", "session_id": q3.key})
+                out["relative"] = (relative.status_code, relative.content)
+                out["relative_without"] = (await http.get("/api/fs/download", params={"path": "README.md"})).status_code
+                out["refused"] = {label: ((await get("download", **params)).status_code,
+                                          (await get("read-data-url", **params)).json().get("detail"))
+                                  for label, params in {"unknown": {"session_id": "nope"},
+                                                        "blank": {"session_id": " "},
+                                                        "other profile": {"session_id": q3.key,
+                                                                          "profile": "research"}}.items()}
+                out["data_url"] = (await get("read-data-url", session_id=q3.key)).json()["dataUrl"]
+                out["read_text_ignores"] = (await get("read-text", session_id="nope")).status_code
+        return out
+
+    out = asyncio.run(scenario())
+    assert out["no_session"] == 200 and out["session"].startswith(b"# Atlas")
+    assert out["relative"][0] == 200 and out["relative"][1].startswith(b"# Atlas"), "relative to the session's folder"
+    assert out["relative_without"] == 400
+    assert out["refused"] == {label: (404, "Session not found") for label in ("unknown", "blank", "other profile")}
+    assert out["data_url"].startswith("data:") and out["read_text_ignores"] == 200
+
+
 # ── git review ───────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -698,6 +732,27 @@ def test_webhooks_enable_create_toggle_delete(capsys):
     assert created["secret"] not in capsys.readouterr().out
 
 
+def test_a_custom_home_dashboard_names_itself_custom_and_deletes_unnamed():
+    async def scenario():
+        async with serving(custom_home=True) as (fake, base):
+            async with signed_in(base) as http:
+                out: dict[str, Any] = {}
+                out["active"] = (await http.get("/api/profiles/active")).json()
+                await http.post("/api/webhooks", json={"name": "ci"})
+                named = await http.delete("/api/webhooks/ci", params={"profile": "custom"})
+                out["named"] = (named.status_code, named.json()["detail"])
+                out["unnamed"] = (await http.delete("/api/webhooks/ci")).json()
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                out["default"] = (await http.get("/api/profiles/active")).json()
+        return out
+
+    out = asyncio.run(scenario())
+    assert out["active"]["current"] == "custom" and out["default"]["current"] == "default"
+    assert out["named"] == (404, "Profile 'custom' does not exist.")
+    assert out["unnamed"] == {"ok": True}
+
+
 # ── learning graph, plugins, session import, agents ───────────────────────────────────────────────
 
 
@@ -1159,3 +1214,22 @@ def test_kanban_boards_orchestration_and_the_events_socket_gates():
     assert out["model_options"]["providers"][0]["models"]
     assert out["unassigned"]["spawned"] == [["t_aa11bb22", "default", ATLAS]] or \
         out["unassigned"]["spawned"][0][0] == "t_aa11bb22"
+
+
+def test_kanban_run_inspect_reports_a_live_worker_an_ended_run_and_404s():
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                k = "/api/plugins/kanban"
+                return {"live": (await http.get(f"{k}/runs/1/inspect")).json(),
+                        "ended": (await http.get(f"{k}/runs/2/inspect")).json(),
+                        "unknown": (await http.get(f"{k}/runs/999/inspect")).status_code}
+
+    out = asyncio.run(scenario())
+    live = out["live"]
+    assert live["run_id"] == 1 and live["alive"] is True and live["pid"] == 41_207
+    assert set(live) == {"run_id", "alive", "pid", "cpu_percent", "memory_rss_bytes", "memory_vms_bytes",
+                         "num_threads", "num_fds", "status", "create_time", "cmdline"}
+    assert live["memory_rss_bytes"] > 0 and isinstance(live["cmdline"], list)
+    assert out["ended"] == {"run_id": 2, "alive": False, "reason": "run already ended"}
+    assert out["unknown"] == 404

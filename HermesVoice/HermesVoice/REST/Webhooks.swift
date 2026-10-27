@@ -178,15 +178,23 @@ struct WebhooksAPI: CapabilityRoutes {
     }
 
     /// Hermes refuses an unnamed profile here while it serves several (`destructive_profile`), so the dashboard's own
-    /// profile goes by name (`GET /api/profiles/active`).
+    /// profile goes by name (`GET /api/profiles/active`). A dashboard whose home is outside `~/.hermes` calls itself
+    /// "custom", a name no profile resolves to: it stays unnamed, as Hermes' own `serving_profile_name()` does.
     func delete(_ name: String) async throws {
         let path = "/api/webhooks/\(try MessagingAPI.segment(name))"
         var query = scopeQuery
         if profile == nil {
             let active = try await transport.request("GET", "/api/profiles/active", query: [:], body: nil) as? JSON
-            query["profile"] = ProfileActivity(response: active ?? [:]).current
+            if let own = Self.nameable(ProfileActivity(response: active ?? [:]).current) { query["profile"] = own }
         }
         _ = try await transport.request("DELETE", path, query: query, body: nil)
+    }
+
+    /// The dashboard's own profile as `?profile=` can name it: nil for "custom" or anything that isn't a profile id.
+    static func nameable(_ current: String) -> String? {
+        let name = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name != "custom", name == "default" || ProfileName.isValid(name) else { return nil }
+        return name
     }
 
     /// A disabled route stays on disk; the gateway rejects its events with 403 until it is enabled again.

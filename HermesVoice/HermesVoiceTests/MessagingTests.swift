@@ -752,6 +752,13 @@ final class MessagingTests: XCTestCase {
         transport.responses["GET /api/profiles/active"] = ["active": "default", "current": "ops"]
         try await WebhooksAPI(transport: transport, profile: nil).delete("hook")
         XCTAssertEqual(transport.last("DELETE", "/api/webhooks/hook")?.query, ["profile": "ops"])
+        // A dashboard home outside ~/.hermes answers "custom", which no profile resolves to: the delete stays unnamed.
+        for current in ["custom", "Not A Profile"] {
+            transport.responses["GET /api/profiles/active"] = ["active": "default", "current": current]
+            try await WebhooksAPI(transport: transport, profile: nil).delete("hook")
+            XCTAssertEqual(transport.last("DELETE", "/api/webhooks/hook")?.query, [:], current)
+        }
+        XCTAssertEqual(WebhooksAPI.nameable("default"), "default")
 
         transport.responses["POST /api/webhooks"] = ["name": "hook", "url": "u"]
         do {
