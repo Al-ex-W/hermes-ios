@@ -144,6 +144,54 @@ master password unlocks except `wrong`). The module docstring lists every route.
 passwords are never logged. Unlike Hermes, `PUT /api/config` refuses a value whose type doesn't match its schema
 field, with `400`. Custom endpoints (`/api/providers/custom-endpoints`) aren't served yet.
 
+### Capabilities, cron, command center and artifacts (M4)
+
+The M4 screens have their routes here too, each honouring `?profile=` with its own state per profile. The shapes
+come from `hermes_cli/web_routers/{skills,tools,mcp,cron,ops,status,analytics,actions,files}.py` and
+`plugins.manage` in `tui_gateway/methods_tools.py`; each handler names its source.
+
+- **Skills**: `GET /api/skills`, `PUT /api/skills/toggle`, `GET`/`PUT /api/skills/content`, `POST /api/skills`
+  (the same name, category and frontmatter checks as Hermes), plus the official hub catalog
+  (`/api/skills/hub/official`, `preview`, `install`, `uninstall`, `update`).
+- **Toolsets**: `GET /api/tools/toolsets` (the voice toolsets `tts` and `stt` are listed; the app strips them),
+  `PUT /{name}`, `/config` (providers with `ready` / `needs_keys` / `needs_auth` / `needs_setup`), `/models`,
+  `/model`, `/provider` (web picks a backend per capability), `/env` (declared keys only, into `.env`),
+  `/post-setup`, and `GET`/`PUT /api/tools/terminal/backend(s)` (writes `terminal.backend`).
+- **MCP**: `GET`/`POST`/`PUT /api/mcp/servers`, `DELETE /{name}`, `PUT /{name}/enabled`, `POST /{name}/test`
+  (an `auth: oauth` server needs a token first; a URL or command with `offline` in it fails to connect),
+  `POST /{name}/auth` + `GET`/`DELETE /api/mcp/oauth/flows/{id}`, and `GET`/`POST /api/mcp/catalog(/install)`.
+  The servers live in the profile's config (`mcp_servers` in `GET /api/config`), like in Hermes. An OAuth flow
+  approves itself after `--mcp-oauth-approve-after` seconds (default 2, `0` = never). It also completes through
+  its `authorization_url`, which is the fake's own consent page (Approve / Deny), or through the debug trigger
+  `POST /api/mcp/oauth/flows/{id}/debug {outcome: "approve" | "deny"}`.
+- **Plugins**: the gateway RPC `plugins.manage` with `list`, `toggle`, `install` (a `catalog_name` or a git
+  repo), `update` (one update asks for consent first), `remove` and `settings`. An enabled plugin can add a
+  toolset or an MCP server (`source: "plugin"`, read-only).
+- **Cron**: jobs CRUD, `runs`, `pause`, `resume`, `trigger`, `delivery-targets`, `blueprints` and
+  `blueprints/instantiate`, with the schedule parser of `cron/jobs.py` (`30m`, `every 2h`, `in 45m`,
+  `weekdays at 9am`, five-field cron, ISO time). A triggered agent job leaves a `source: cron` chat that the run
+  row points at. `POST /api/cron/fire` takes `Authorization: Bearer <--cron-fire-token>`.
+- **Command center**: `GET /api/health` (public), `/api/system/stats`, `/api/logs` (file, level, component and
+  search filters), `/api/analytics/usage` and `/models`, `/api/curator` (+ `paused`, `run`), and the maintenance
+  actions `POST /api/ops/doctor`, `security-audit`, `backup` (+ `GET /api/ops/backup/download?archive=` once it's
+  done), `debug-share`, `GET /api/ops/checkpoints` + `POST …/prune`, `POST /api/gateway/restart`, and
+  `GET /api/hermes/update/check` + `POST /api/hermes/update`. Curator runs and checkpoint prunes need an explicit
+  `?profile=` (400 otherwise), as on a multi-profile Hermes.
+- **Actions**: every background action is tailed with `GET /api/actions/{name}/status`. Each poll shows more of
+  its log, and the `--action-polls`-th poll (default 3) finishes it with its exit code. An action nobody polls
+  finishes after `--action-seconds` (default 6, `0` = only by polls). What it changes (a new skill or server, the
+  archive, pruned checkpoints, the update) happens when it finishes.
+- **Artifacts**: the screen reads chats, so `--seed full` adds chats whose messages carry an image (`MEDIA:`),
+  files (a PDF and a CSV, also in a `write_file` result) and links. `GET /api/fs/read-data-url` and
+  `/api/fs/download` serve those files, and `GET /api/media/proxy` serves the one remote image (from memory; the
+  fake never goes online).
+
+`--seed` picks the data: `full` (the default) is `demo` plus the artifact chats and one chat per past cron run.
+`demo` seeds both profiles with skills, MCP servers, plugins, cron jobs (one paused, one failing), checkpoints
+and 90 days of usage, without new chats. `minimal` has none of it, to see the empty states. `/api/audio/*` is
+never served. Keys and tokens typed into these routes go to the profile's `.env` or config only and are never
+logged.
+
 ### Detached sessions
 
 When the last socket of a session closes, the session keeps running with nobody attached, and its turn
@@ -178,7 +226,8 @@ cd hermes-voice-mcp
 uv run pytest -q ../devtools/tests
 ```
 
-The tests start the fake in-process and cover sign-in and streaming, reconnect plus replay (also truncated),
+The tests start the fake in-process. `test_fake_hermes_m4.py` covers the M4 routes and `plugins.manage`; the
+others cover sign-in and streaming, reconnect plus replay (also truncated),
 reaping and `session.activate` after a reap, resuming a reaped draft, approvals across a reconnect,
 `approval.respond`, 4404 declines, clients that can't answer, clarify locks, secrets, interrupt and timeout
 cancels, and the speak demo against an in-process voice server. One test checks every result, event and request

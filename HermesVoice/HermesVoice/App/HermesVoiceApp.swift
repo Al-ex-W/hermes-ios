@@ -55,7 +55,11 @@ struct RootView: View {
         .tint(Theme.primary)
         .hermesAppearance()
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { model.didBecomeActive() }
+            switch phase {
+            case .active: model.didBecomeActive()
+            case .background: model.didEnterBackground()
+            default: break
+            }
         }
         #if DEBUG
         .onOpenURL { url in model.push.deliverDebugPush(url) }

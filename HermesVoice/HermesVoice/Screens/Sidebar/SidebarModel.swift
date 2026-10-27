@@ -8,6 +8,9 @@ enum SidebarDestination: Hashable {
     /// A stored session, by id.
     case session(String)
     case capabilities, messaging, artifacts, scheduledJobs
+    /// The Command Center: the desktop's overlay route, opened from its statusbar button (here, the sidebar's
+    /// toolbar), not a navigation row.
+    case commandCenter
 }
 
 /// How the sidebar lists sessions (the desktop's `store/layout.ts` view atoms), remembered on this device.
@@ -136,6 +139,8 @@ final class SidebarModel: ObservableObject {
     }
 
     private var edits: [String: Edit] = [:]
+    /// What the detail column showed when the Command Center opened.
+    private var beforeCommandCenter: SidebarDestination?
     /// Sessions marked unread while open; they aren't marked read again until left.
     private var keptUnread: Set<String> = []
     /// Rows as they were when opened, so the detail can still name one that left its list.
@@ -535,6 +540,17 @@ final class SidebarModel: ObservableObject {
         watch()
     }
 
+    /// Opens the Command Center over what the detail column shows; again, it goes back there (the desktop's
+    /// `toggleCommandCenter`, which returns to the route under the overlay).
+    func toggleCommandCenter() {
+        if selection == .commandCenter {
+            selection = beforeCommandCenter
+        } else {
+            beforeCommandCenter = selection
+            selection = .commandCenter
+        }
+    }
+
     /// The detail column shows `chat`.
     func show(_ chat: ChatModel) {
         guard openChat !== chat else { return }
@@ -678,6 +694,26 @@ final class SidebarModel: ObservableObject {
         case .branched:
             scheduleRefresh()
         }
+    }
+
+    // MARK: Actions from other screens
+
+    // The Command Center's Sessions list acts on rows the sidebar may not hold. These do what the row menu does,
+    // keep the lists in step, and throw a failure to the screen that asked instead of showing it here.
+
+    func trySetPinned(_ session: SessionInfo, _ pinned: Bool) async throws {
+        try await actions.setPinned(target(session), pinned)
+        await applied(.pinned(pinned), to: session.id)
+    }
+
+    /// Deletes the session, stopping and closing the live session a chat here holds for it first.
+    func tryDelete(_ session: SessionInfo) async throws {
+        try await actions.delete(target(session))
+        await applied(.deleted, to: session.id)
+    }
+
+    func tryExport(_ session: SessionInfo) async throws -> URL {
+        try await actions.export(target(session))
     }
 
     func markAllRead() async {

@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// Call controls inside the chat that owns the call: answer or decline while Hermes rings, then mute, speaker
-/// and hang up, with what Hermes says and what is heard.
+/// and hang up, with what Hermes says and what is heard. A call without a chat (its session is one the app can't
+/// open, such as a messaging chat) shows the same panel in the sidebar, under the title Hermes rang with.
 struct CallPanel: View {
     @ObservedObject var call: VoiceCall
     @EnvironmentObject private var calls: CallController
@@ -11,6 +12,12 @@ struct CallPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if call.chat == nil {
+                Label(call.title, systemImage: "phone.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .accessibilityLabel("Call from \(call.title)")
+            }
             HStack(spacing: 6) {
                 Circle().fill(statusColor).frame(width: 8, height: 8)
                 Text(status).font(.subheadline.weight(.medium))

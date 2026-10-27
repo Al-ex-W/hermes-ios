@@ -66,6 +66,20 @@ struct ComposerView: View {
             }
         }
         .task { await composer.refreshModel() }
+        // Edit on a bubble opens the prompt here, ready to type.
+        .onChange(of: composer.editingMessage?.id) { _, id in
+            if id != nil { focused = true }
+        }
+        // An edit of an older prompt drops the turns after it: the desktop's checkpoint question first.
+        .confirmationDialog(UserBubble.restoreTitle,
+                            isPresented: Binding(get: { composer.deepEditConfirmation != nil },
+                                                 set: { if !$0 { composer.deepEditConfirmation = nil } }),
+                            titleVisibility: .visible) {
+            Button(UserBubble.restoreConfirm, role: .destructive) { Task { await composer.confirmDeepEdit() } }
+            Button("Cancel", role: .cancel) { composer.deepEditConfirmation = nil }
+        } message: {
+            Text(UserBubble.restoreBody)
+        }
         .alert("Hermes", isPresented: Binding(get: { composer.notice != nil }, set: { if !$0 { composer.notice = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {

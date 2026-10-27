@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 @MainActor
@@ -25,8 +26,16 @@ final class AppModel: ObservableObject {
     private var generation = 0
     /// The launch sign-in, shared by the window and a VoIP push that launched the app.
     private var restoring: Task<Void, Never>?
+    /// Closes the gateway connection while the app is in the background with no call, so alerts are pushed.
+    let lifecycle: GatewayLifecycle
+    private var subscriptions: Set<AnyCancellable> = []
 
-    init() {
+    /// `phase`: where the app starts (tests); by default what iOS reports (a VoIP push launches it in the background).
+    init(phase: GatewayLifecycle.Phase? = nil) {
+        lifecycle = GatewayLifecycle(phase: phase ?? GatewayLifecycle.currentPhase)
+        calls.$inCall.removeDuplicates().sink { [weak self] inCall in
+            self?.lifecycle.setCallActive(inCall)
+        }.store(in: &subscriptions)
         push.onToken = { [weak self] _ in self?.sendPushToken() }
         notifications.attach(to: self)
         push.onIncoming = { [weak self] call, completion in
@@ -64,6 +73,7 @@ final class AppModel: ObservableObject {
             self.client = client
             let connection = GatewayConnection(client: client)
             self.connection = connection
+            lifecycle.use(connection)
             prompts = PromptCenter(connection: connection)
             chats.removeAll()
             generation += 1
@@ -91,6 +101,7 @@ final class AppModel: ObservableObject {
         }
         notifications.signedOut()
         connection = nil
+        lifecycle.use(nil)
         prompts = nil
         client = nil
         chats.removeAll()
@@ -101,12 +112,22 @@ final class AppModel: ObservableObject {
         signedIn = false
     }
 
-    /// The app is back in the foreground: check the gateway connection and catch up the chats in use.
+    /// The app is back in the foreground: the gateway connection reopens (re-attaching and catching up the chats
+    /// in use), or is checked if it stayed open.
     func didBecomeActive() {
+        lifecycle.setPhase(.foreground)
         guard signedIn else { return }
         connection?.probe()
         for chat in chats.values { chat.wake() }
-        calls.active?.chat.wake()
+        calls.active?.chat?.wake()
+    }
+
+    /// The app went to the background: without a call the gateway connection closes, so Hermes sees no client here
+    /// and alerts this phone by push instead.
+    func didEnterBackground() {
+        let wasPaused = lifecycle.paused
+        lifecycle.setPhase(.background)
+        if lifecycle.paused, !wasPaused, connection != nil { GatewayLifecycle.lingerForClose() }
     }
 
     /// The chat for a stored session (always the same model for one session), or a new chat in `profile` when
@@ -182,13 +203,26 @@ final class AppModel: ObservableObject {
         Task { await push.send(to: client) }
     }
 
-    /// The call a VoIP push rang: its chat, signing in first when the push launched the app.
+    /// The call a VoIP push rang, signing in first when the push launched the app: in its session's chat when the
+    /// app can open that session, else on its own (`PushedCallRouter`).
     private func incomingCall(_ call: CallPush) async throws -> VoiceCall {
         if !signedIn { await restore() }
-        guard signedIn, let client else { throw DashboardError.signedOut }
-        let summary = call.sessionID.map { SessionSummary(id: $0, title: call.title ?? "Hermes", lastActive: nil, profile: call.profile) }
-        guard let chat = chat(for: summary) else { throw DashboardError.signedOut }
-        return VoiceCall(chat: chat, settings: callSettings, initiatedBy: .push, callID: call.callID, push: call,
-                         environment: .live(client: client, settings: callSettings))
+        guard signedIn, let client, let connection else { throw DashboardError.signedOut }
+        let environment = VoiceCall.Environment.live(client: client, settings: callSettings)
+        let router = PushedCallRouter.live(client: client, connection: connection) { [weak self] id in
+            self?.existingChat(id).map { SessionSummary(id: id, title: $0.title, lastActive: nil, profile: $0.profile) }
+        }
+        let route = await router.route(call)
+        // Signed out (or in again) while looking: this sign-in's chats are gone.
+        guard self.client === client else { throw DashboardError.signedOut }
+        switch route {
+        case let .chat(summary):
+            guard let chat = chat(for: summary) else { throw DashboardError.signedOut }
+            return VoiceCall(chat: chat, settings: callSettings, initiatedBy: .push, callID: call.callID, push: call,
+                             environment: environment)
+        case .standalone:
+            return VoiceCall(chat: nil, settings: callSettings, initiatedBy: .push, callID: call.callID, push: call,
+                             environment: environment)
+        }
     }
 }

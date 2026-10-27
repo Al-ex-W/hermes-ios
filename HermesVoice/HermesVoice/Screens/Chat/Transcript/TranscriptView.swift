@@ -12,6 +12,8 @@ struct TranscriptActions {
     var edit: ((UserMessage) -> Void)?
     /// Re-runs the conversation from a prompt as it was (the desktop's Restore checkpoint).
     var restore: ((UserMessage) -> Void)?
+    /// Stops the running turn (the Stop on its prompt's bubble), as the composer's Stop does.
+    var stop: (() -> Void)?
     /// Runs the prompt before a reply again in its place.
     var regenerate: ((AssistantText) -> Void)?
     /// Continues the conversation up to a reply in a new session.
@@ -81,13 +83,15 @@ extension EnvironmentValues {
 struct TranscriptList: View {
     let items: [TranscriptItem]
     var display = TranscriptDisplay()
+    /// The prompt whose turn runs: its bubble offers Stop.
+    var stopID: String?
 
     var body: some View {
         let items = items.compactMap(display.shown).filter(\.isDrawn)
         let replies = Self.turnReplies(items)
         LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                TranscriptRow(item: item, actionBar: replies.contains(item.id))
+                TranscriptRow(item: item, actionBar: replies.contains(item.id), stoppable: item.id == stopID)
                     .equatable()
                     .padding(.top, index == 0 ? 0 : Self.gap(items[index - 1], item))
                     .id(item.id)
@@ -147,11 +151,13 @@ extension TranscriptItem {
 struct TranscriptRow: View, Equatable {
     let item: TranscriptItem
     var actionBar = false
+    /// A prompt whose turn runs (Stop on its bubble).
+    var stoppable = false
 
     var body: some View {
         switch item {
         case let .user(message):
-            UserBubble(message: message)
+            UserBubble(message: message, stoppable: stoppable)
         case let .assistant(text):
             VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                 AssistantMarkdown(text: text)

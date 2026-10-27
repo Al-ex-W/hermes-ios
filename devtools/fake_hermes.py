@@ -44,9 +44,9 @@ Chat screens (M2). More trigger words, combinable in one prompt, each turn endin
 RPCs: commands.catalog, complete.slash/path, slash.exec, command.dispatch, model.options, config.set,
 image.attach_bytes, file.attach, process.list/kill/stop, subagent.list, session.usage, session.context_breakdown,
 session.workspace.move, session.branch, projects.list. REST: GET /api/profiles, /api/profiles/sessions/sidebar,
-/api/sessions/search, /api/media; PATCH and DELETE /api/sessions/{id}. ``--seed demo`` (the default) adds chats
-across two projects, two profiles and several days (one pinned, one archived, one unread, a cron and a Telegram
-one); ``--seed minimal`` keeps only the welcome chat.
+/api/sessions/search, /api/media; PATCH and DELETE /api/sessions/{id}. ``--seed demo`` adds chats across two
+projects, two profiles and several days (one pinned, one archived, one unread, a cron and a Telegram one);
+``--seed minimal`` keeps only the welcome chat; ``--seed full`` (the default) is demo plus the M4 chats below.
 
 Settings screens (M3), from hermes_cli/web_routers/{config_env,models,memory_providers,oauth,profiles,status}.py
 and tui_gateway/{methods_vault,methods_session}.py. Every route honours ``?profile=`` (each profile has its own
@@ -69,6 +69,18 @@ RPCs vault.* (a local vault plus a fake 1Password; unlock with any master passwo
 (a Nous Portal account; money routes need billing.step_up first), and shared_metrics.status / .set (the
 profile's telemetry.shared_metrics consent). Values typed into these routes (API keys,
 passwords, vault secrets) are never logged.
+Capabilities, cron, command center and artifacts (M4), from hermes_cli/web_routers/{skills,tools,mcp,cron,ops,
+status,analytics,actions,files}.py and tui_gateway/methods_tools.py (plugins.manage); every route honours
+``?profile=`` with per-profile state (the section comment above ``class CapabilityFeatures`` has the details):
+  /api/skills (+ toggle, content, hub/official|preview|install|uninstall|update), /api/tools/toolsets (+ /{name},
+  config, models, model, provider, env, post-setup), /api/tools/terminal/backend(s), /api/mcp/servers (+ /{name},
+  enabled, test, auth), /api/mcp/oauth/flows/{id} (+ /debug), /api/mcp/oauth/callback/{server}, /api/mcp/catalog
+  (+ install), /api/cron/jobs (+ /{id}, runs, pause, resume, trigger), /api/cron/{delivery-targets,blueprints,
+  blueprints/instantiate,fire}, /api/health, /api/system/stats, /api/logs, /api/analytics/{usage,models},
+  /api/curator (+ paused, run), /api/ops/{doctor,security-audit,backup,backup/download,debug-share,checkpoints,
+  checkpoints/prune}, /api/gateway/restart, /api/hermes/update (+ check), /api/actions/{name}/status (a
+  background action shows more log per poll and ends on the ``--action-polls``-th), /api/fs/read-data-url,
+  /api/fs/download, /api/media/proxy, and the RPC plugins.manage. /api/audio/* is never served.
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
 the plugin would send ({aps, hermes}: approval or clarify waiting, turn done) and the alert tokens they go to.
@@ -85,26 +97,33 @@ import asyncio
 import base64
 import binascii
 import copy
+import hashlib
+import html
 import inspect
+import io
 import json
+import math
 import os
 import posixpath
+import random
 import re
 import secrets
 import struct
 import time
 import uuid
+import zipfile
 import zlib
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import httpx2  # the mcp SDK's streamable HTTP client takes an httpx2.AsyncClient
 import uvicorn
+import yaml
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from starlette.applications import Starlette
@@ -3776,7 +3795,3036 @@ class SettingsFeatures:
         self.note_alert(stored, "turn_done", body[:177] + "…" if len(body) > 178 else body or "Done.")
 
 
-class FakeHermes(ChatFeatures, SettingsFeatures):
+# ── M4: capabilities, cron, command center, artifacts ─────────────────────────────────────────────────────
+# Everything from here to ``class FakeHermes`` is the M4 slice. Shapes come from hermes_cli/web_routers/
+# {skills,tools,mcp,cron,ops,status,analytics,actions,files}.py, hermes_cli/{web_models,web_server_mcp,
+# web_server_cron,web_server_gateway,web_server_profiles,tools_config,mcp_catalog,plugins_cmd}.py,
+# cron/{jobs,blueprint_catalog,scheduler_delivery,executions}.py, tools/{skill_manager_tool,mcp_dashboard_oauth}.py
+# and tui_gateway/methods_tools.py (plugins.manage); each handler names its source. Each profile keeps its own
+# state (``FakeProfile.caps``), and its MCP servers live in its config.yaml (``mcp_servers``) as in Hermes.
+# ``--seed minimal`` leaves every profile without skills, servers, user plugins, jobs, checkpoints or usage (the
+# empty states); ``demo`` and ``full`` seed both profiles, and ``full`` also adds chats whose messages carry
+# artifacts. Background actions (doctor, backup, installs, update, …) reveal their log one step per
+# GET /api/actions/{name}/status and finish on the ``--action-polls``-th poll (or after ``--action-seconds``).
+# Never served: /api/audio/*. Values typed for MCP env/headers, toolset keys and catalog env go to the
+# profile's .env / config only and are never logged.
+
+# web_server_gateway.py _ACTION_LOG_FILES (the fixed names; hub/MCP installs add per-entry names).
+ACTION_NAMES = ("gateway-restart", "gateway-start", "gateway-stop", "gateway-migrate", "hermes-update", "doctor",
+                "security-audit", "backup", "import", "checkpoints-prune", "skills-install", "skills-uninstall",
+                "skills-update", "curator-run", "prompt-size", "dump", "config-migrate", "tools-post-setup")
+ACTION_POLLS = 3
+ACTION_SECONDS = 6.0
+FAKE_COMMIT = "4f3c2a1d9e8b"
+UPDATE_VERSION = "0.43.0"
+UPDATE_COMMITS = (("9d2e41a", "Cron: blueprint gallery groups by category", "hermes-bot"),
+                  ("51c07fe", "MCP: catalog install shows post-install notes", "hermes-bot"),
+                  ("0be93c2", "Fix the curator skipping archived skills", "hermes-bot"))
+CRON_FIRE_TOKEN = "fake-chronos-fire-token"
+HERMES_INSTALL = f"{DEMO_HOME}/.hermes/hermes-agent"
+MCP_OAUTH_FLOW_TTL = 15 * 60  # mcp.py _MCP_DASHBOARD_OAUTH_TTL
+MCP_OAUTH_MAX_FLOWS = 8  # mcp.py _MAX_PENDING_MCP_OAUTH_FLOWS
+MULTIPLEX_DETAIL = ("{route} requires an explicit profile: this backend serves several profiles, so an unnamed "
+                    "target would act on the wrong profile's data.")  # _common.py destructive_profile
+
+
+def now_iso() -> str:
+    """hermes_time.now().isoformat(): aware, in the host's zone."""
+    return datetime.now().astimezone().isoformat()
+
+
+def iso_at(ts: float) -> str:
+    return datetime.fromtimestamp(ts).astimezone().isoformat()
+
+
+def epoch_of(text: Any) -> float | None:
+    try:
+        return datetime.fromisoformat(str(text)).timestamp() if text else None
+    except ValueError:
+        return None
+
+
+def per_entry_action(prefix: str, key: str, fallback: str) -> str:
+    """web_server_profiles.py _hub_action_name / mcp.py _mcp_install_action_name: ``<prefix>-<slug>-<sha1[:8]>``."""
+    slug = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")[:48] or fallback
+    return f"{prefix}-{slug}-{hashlib.sha1(key.encode()).hexdigest()[:8]}"
+
+
+def query_int(request: Request, name: str, default: int, *, ge: int | None = None, le: int | None = None) -> int:
+    """A FastAPI ``int`` query parameter: unparsable or out of a ``Query(ge, le)`` range -> its 422."""
+    raw = request.query_params.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        detail = [{"type": "int_parsing", "loc": ["query", name], "input": raw,
+                   "msg": "Input should be a valid integer, unable to parse string as an integer"}]
+        raise HttpError(422, detail) from None
+    if ge is not None and value < ge:
+        raise HttpError(422, [{"type": "greater_than_equal", "loc": ["query", name], "input": raw, "ctx": {"ge": ge},
+                               "msg": f"Input should be greater than or equal to {ge}"}])
+    if le is not None and value > le:
+        raise HttpError(422, [{"type": "less_than_equal", "loc": ["query", name], "input": raw, "ctx": {"le": le},
+                               "msg": f"Input should be less than or equal to {le}"}])
+    return value
+
+
+def demo_zip(entries: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, text in entries.items():
+            archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+# ── skills (tools/skills_tool.py find_all_skills, tools/skill_manager_tool.py) ──
+
+SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")  # skill_manager_tool.py VALID_NAME_RE
+SKILL_NAME_RULE = "Use lowercase letters, numbers, hyphens, dots, and underscores."
+SKILL_NAME_MAX, SKILL_DESCRIPTION_MAX, SKILL_CONTENT_MAX = 64, 1024, 100_000
+FRONTMATTER_END = re.compile(r"\n---\s*\n")
+
+
+def skill_document(name: str, description: str, body: str) -> str:
+    return f"---\nname: {name}\ndescription: {description}\n---\n\n{body.strip()}\n"
+
+
+# (name, category, provenance, usage, description, body). Provenance as in skills.py get_skills: hub > bundled >
+# external > agent.
+SKILL_SEEDS: dict[str, tuple[tuple[str, str, str, int, str, str], ...]] = {
+    "default": (
+        ("google-workspace", "productivity", "bundled", 14,
+         "Gmail, Calendar and Drive through the Google Workspace APIs: daily briefs, inbox triage, meeting prep.",
+         "# Google Workspace\n\n1. Read today's calendar window.\n2. Flag conflicts and prep notes.\n"
+         "3. Summarize mail that needs a reply today."),
+        ("github-pr-review", "software-development", "bundled", 9,
+         "Review a GitHub pull request: diff, checks, open comments and a short verdict.",
+         "# PR review\n\nRead the diff file by file, check CI, then give a verdict: approve, comment or "
+         "request changes."),
+        ("arxiv", "research", "bundled", 3, "Search arXiv and fetch abstracts and PDFs of papers.",
+         "# arXiv\n\nSearch by title, author or id. Prefer the abstract page over the PDF."),
+        ("weekly-review-planning", "productivity", "hub", 2,
+         "Weekly review across calendar, tasks and notes, with a capacity-aware plan for next week.",
+         "# Weekly review\n\nSeven sections: done, open, waiting, stalled, upcoming, plan, risks."),
+        ("release-notes", "writing", "agent", 7, "Draft release notes from the commits since the last tag.",
+         "# Release notes\n\n`git log <last-tag>..HEAD`, group by area, one line per change."),
+        ("deploy-checklist", "devops", "agent", 0,
+         "Pre-deploy checklist for the Beacon server: migrations, feature flags, rollback plan.",
+         "# Deploy checklist\n\n- [ ] Migrations reviewed\n- [ ] Flags default off\n- [ ] Rollback tested"),
+        ("brand-voice", "writing", "external", 1, "House style for public writing: tone, banned words, formatting.",
+         "# Brand voice\n\nShort sentences. No jargon. Sentence-case headings."),
+    ),
+    "research": (
+        ("arxiv", "research", "bundled", 11, "Search arXiv and fetch abstracts and PDFs of papers.",
+         "# arXiv\n\nSearch by title, author or id. Prefer the abstract page over the PDF."),
+        ("paper-summary", "research", "agent", 5, "Summarize a paper in three sentences with a citation.",
+         "# Paper summary\n\nProblem, method, result. End with the citation."),
+        ("citation-check", "research", "hub", 1, "Check that every claim in a draft has a source.",
+         "# Citation check\n\nList each claim, then its source or `MISSING`."),
+    ),
+}
+SKILL_DISABLED_SEEDS = {"default": {"deploy-checklist"}}
+# tools/skills_hub_official.py: the optional-skills catalog (identifier official/<category>/<name>).
+OFFICIAL_SKILLS = (
+    ("weekly-review-planning", "productivity",
+     "Weekly review across calendar, tasks and notes, with a capacity-aware plan for next week.",
+     ("planning", "weekly")),
+    ("citation-check", "research", "Check that every claim in a draft has a source.", ("research", "writing")),
+    ("home-assistant", "smart-home", "Control lights, scenes and sensors through Home Assistant.", ("home", "iot")),
+    ("blender", "creative", "Build and render 3D scenes with Blender's Python API.", ("3d", "rendering")),
+    ("invoice-extractor", "finance", "Pull totals, dates and line items out of PDF invoices.", ("pdf", "finance")),
+)
+
+
+def skill_problem(content: str) -> str | None:
+    """skill_manager_tool.py _validate_frontmatter + _validate_content_size."""
+    if not content.strip():
+        return "Content cannot be empty."
+    content = content.lstrip("﻿")
+    if not content.startswith("---"):
+        return "SKILL.md must start with YAML frontmatter (---). See existing skills for format."
+    end = FRONTMATTER_END.search(content[3:])
+    if not end:
+        return "SKILL.md frontmatter is not closed. Ensure you have a closing '---' line."
+    try:
+        parsed = yaml.safe_load(content[3:end.start() + 3])
+    except yaml.YAMLError as exc:
+        return f"YAML frontmatter parse error: {exc}"
+    if not isinstance(parsed, dict):
+        return "Frontmatter must be a YAML mapping (key: value pairs)."
+    for key in ("name", "description"):
+        if key not in parsed:
+            return f"Frontmatter must include '{key}' field."
+    if len(str(parsed["description"])) > SKILL_DESCRIPTION_MAX:
+        return f"Description exceeds {SKILL_DESCRIPTION_MAX} characters."
+    if not content[end.end() + 3:].strip():
+        return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
+    if len(content) > SKILL_CONTENT_MAX:
+        return f"Content exceeds {SKILL_CONTENT_MAX:,} characters."
+    return None
+
+
+def skill_description(content: str) -> str:
+    """skill_manager_tool.py _description_preview without the 120-character cut (the list shows it whole)."""
+    try:
+        end = FRONTMATTER_END.search(content[3:])
+        meta = yaml.safe_load(content[3:end.start() + 3]) if end else None
+        return str(meta.get("description", "")) if isinstance(meta, dict) else ""
+    except yaml.YAMLError:
+        return ""
+
+
+def identifier_problem(value: str, label: str, invalid: str) -> str | None:
+    """skill_manager_tool.py _check_identifier."""
+    if len(value) > SKILL_NAME_MAX:
+        return f"{label} exceeds {SKILL_NAME_MAX} characters."
+    return None if SKILL_NAME.match(value) else invalid
+
+
+# ── toolsets (hermes_cli/tools_config.py CONFIGURABLE_TOOLSETS, TOOL_CATEGORIES; toolsets.py) ──
+
+# (key, label through gui_toolset_label, description, tools). Order as in CONFIGURABLE_TOOLSETS.
+M4_TOOLSETS = (
+    ("web", "Web Search & Scraping", "web_search, web_extract", ("web_extract", "web_search")),
+    ("browser", "Browser Automation", "navigate, click, type, scroll",
+     ("browser_back", "browser_click", "browser_navigate", "browser_scroll", "browser_snapshot", "browser_type")),
+    ("terminal", "Terminal & Processes", "terminal, process", ("process", "terminal")),
+    ("file", "File Operations", "read, write, patch, search", ("patch", "read_file", "search_files", "write_file")),
+    ("code_execution", "Code Execution", "execute_code", ("execute_code",)),
+    ("vision", "Vision / Image Analysis", "vision_analyze", ("vision_analyze",)),
+    ("video", "Video Analysis", "video_analyze (requires video-capable model)", ("video_analyze",)),
+    ("image_gen", "Image Generation", "image_generate", ("image_generate",)),
+    ("video_gen", "Video Generation", "video_generate (text/image/reference)", ("video_generate",)),
+    ("x_search", "X (Twitter) Search", "x_search (requires xAI OAuth or XAI_API_KEY)", ("x_search",)),
+    ("tts", "Text-to-Speech", "text_to_speech", ("text_to_speech",)),
+    ("stt", "Speech-to-Text", "voice transcription (gateway voice messages + voice mode)", ()),
+    ("skills", "Skills", "list, view, manage", ("skill_manage", "skill_view", "skills_list")),
+    ("todo", "Task Planning", "todo_list", ("todo",)),
+    ("kanban", "Kanban", "opt-in task board tools for this platform", ("kanban_board", "kanban_update")),
+    ("memory", "Memory", "persistent memory across sessions", ("memory",)),
+    ("context_engine", "Context Engine", "runtime tools from the active context engine", ()),
+    ("session_search", "Session Search", "search past conversations", ("session_search",)),
+    ("connections", "Connections", "remote connector tools and account authorization",
+     ("connections_authorize", "connections_list")),
+    ("clarify", "Clarifying Questions", "clarify", ("clarify",)),
+    ("delegation", "Task Delegation", "delegate_task", ("delegate_task",)),
+    ("cronjob", "Cron Jobs", "create/list/update/pause/resume/run, with optional attached skills", ("cronjob",)),
+    ("discord", "Discord (read/participate)", "fetch messages, search members, create thread",
+     ("discord_fetch_messages", "discord_search_members")),
+    ("discord_admin", "Discord Server Admin", "list channels/roles, pin, assign roles",
+     ("discord_list_channels", "discord_pin_message")),
+    ("yuanbao", "Yuanbao", "group info, member queries, DM", ("yuanbao_group_info",)),
+    ("computer_use", "Computer Use (macOS/Windows/Linux)", "background desktop control via cua-driver",
+     ("computer_use",)),
+)
+DEFAULT_OFF_TOOLSETS = frozenset({"discord", "discord_admin", "video", "video_gen", "x_search", "kanban"})
+CONFIG_ONLY_TOOLSETS = frozenset({"stt"})  # tools_config.py _CONFIG_ONLY_TOOLSETS: their switch is <name>.enabled
+TOOLSET_PLATFORMS = {"discord": "discord", "discord_admin": "discord"}  # toolset_scope.py restrictions
+PLATFORM_LABELS = {"cli": "CLI", "discord": "Discord"}  # platforms.py, emoji stripped
+MODEL_CATALOG_TOOLSETS = {"image_gen": "image_gen", "video_gen": "video_gen"}  # tools.py _MODEL_CATALOG_TOOLSETS
+POST_SETUP_KEYS = frozenset({"playwright", "faster_whisper", "xai_grok", "cua_driver", "kittentts", "piper"})
+POST_SETUP_PREINSTALLED = frozenset({"playwright", "faster_whisper"})
+
+
+def env_var(key: str, prompt: str, url: str | None = None, default: str | None = None) -> dict[str, Any]:
+    return {"key": key, "prompt": prompt, "url": url, "default": default}
+
+
+def provider_row(name: str, badge: str, tag: str, *env: dict[str, Any], post_setup: str | None = None,
+                 nous: bool = False, managed: str | None = None, **extra: Any) -> dict[str, Any]:
+    """One TOOL_CATEGORIES picker row (tools_config.py _row)."""
+    return {"name": name, "badge": badge, "tag": tag, "env_vars": list(env), "post_setup": post_setup,
+            "requires_nous_auth": nous, "managed_nous_feature": managed, **extra}
+
+
+TOOLSET_PROVIDERS: dict[str, list[dict[str, Any]]] = {
+    "web": [
+        provider_row("Nous Subscription", "subscription", "Managed web search and extract billed to your subscription",
+                     nous=True, managed="web", web_backend="firecrawl"),
+        provider_row("Firecrawl Self-Hosted", "free · self-hosted", "Run your own Firecrawl instance (Docker)",
+                     env_var("FIRECRAWL_API_URL", "Your Firecrawl instance URL (e.g., http://localhost:3002)"),
+                     web_backend="firecrawl"),
+        provider_row("Tavily", "paid", "Search and extract built for agents",
+                     env_var("TAVILY_API_KEY", "Tavily API key", "https://app.tavily.com/"), web_backend="tavily"),
+        provider_row("DuckDuckGo", "free", "Search only, no API key", web_backend="ddgs"),
+    ],
+    "browser": [
+        provider_row("Local Chromium", "★ recommended · free", "Headless Chromium on this machine",
+                     post_setup="playwright"),
+        provider_row("Browserbase", "paid", "Cloud browsers with stealth and session recording",
+                     env_var("BROWSERBASE_API_KEY", "Browserbase API key", "https://browserbase.com/"),
+                     env_var("BROWSERBASE_PROJECT_ID", "Browserbase project id")),
+    ],
+    "image_gen": [
+        provider_row("Nous Subscription", "subscription",
+                     "Managed image generation (FAL, Krea 3 and Krea 2, Nous Portal models) billed to your "
+                     "subscription",
+                     nous=True, managed="image_gen", imagegen_backend="nous"),
+        provider_row("FAL", "paid", "FLUX, Recraft and Ideogram through fal.ai",
+                     env_var("FAL_KEY", "FAL API key", "https://fal.ai/dashboard/keys"), image_gen_plugin_name="fal"),
+        provider_row("OpenAI", "paid", "gpt-image-1",
+                     env_var("OPENAI_API_KEY", "OpenAI API key", "https://platform.openai.com/api-keys"),
+                     image_gen_plugin_name="openai"),
+    ],
+    "video_gen": [
+        provider_row("Nous Subscription", "subscription", "Managed FAL video generation billed to your subscription",
+                     nous=True, managed="video_gen", video_gen_plugin_name="fal"),
+        provider_row("FAL", "paid", "Kling and Veo through fal.ai",
+                     env_var("FAL_KEY", "FAL API key", "https://fal.ai/dashboard/keys"), video_gen_plugin_name="fal"),
+    ],
+    "x_search": [
+        provider_row("xAI Grok OAuth (SuperGrok / Premium+)", "subscription",
+                     "Browser login at accounts.x.ai — no API key required", post_setup="xai_grok"),
+        provider_row("xAI API key", "paid", "Direct xAI API billing via XAI_API_KEY",
+                     env_var("XAI_API_KEY", "xAI API key", "https://console.x.ai/")),
+    ],
+    "tts": [
+        provider_row("Microsoft Edge TTS", "★ recommended · free", "Good quality, no API key needed",
+                     tts_provider="edge"),
+        provider_row("OpenAI TTS", "paid", "High quality voices",
+                     env_var("VOICE_TOOLS_OPENAI_KEY", "OpenAI API key for voice tools"), tts_provider="openai"),
+        provider_row("ElevenLabs", "paid", "Most natural voices",
+                     env_var("ELEVENLABS_API_KEY", "ElevenLabs API key"), tts_provider="elevenlabs"),
+    ],
+    "stt": [
+        provider_row("Local Whisper", "★ recommended · free", "faster-whisper on-device, no API key",
+                     post_setup="faster_whisper", stt_provider="local"),
+        provider_row("OpenAI", "paid", "whisper-1, gpt-4o-transcribe, gpt-transcribe",
+                     env_var("VOICE_TOOLS_OPENAI_KEY", "OpenAI API key for voice tools"), stt_provider="openai"),
+    ],
+    "computer_use": [
+        provider_row("cua-driver", "local · free", "Background desktop control on the Hermes host",
+                     post_setup="cua_driver"),
+    ],
+}
+DEFAULT_TOOLSET_PROVIDER = {"web": "DuckDuckGo", "browser": "Local Chromium", "image_gen": "FAL",
+                            "tts": "Microsoft Edge TTS", "stt": "Local Whisper", "computer_use": "cua-driver"}
+WEB_CAPABILITIES = {"firecrawl": ["search", "extract"], "tavily": ["search", "extract"], "ddgs": ["search"]}
+# (toolset, plugin) -> (catalog, default model): tools_config.py IMAGEGEN_BACKENDS + plugin catalogs.
+TOOLSET_MODEL_CATALOGS: dict[tuple[str, str], tuple[dict[str, dict[str, str]], str]] = {
+    ("image_gen", "fal"): ({
+        "fal-ai/flux-2-pro": {"display": "FLUX.2 Pro", "speed": "~6s", "strengths": "Photoreal, typography",
+                              "price": "$0.05/image"},
+        "fal-ai/recraft-v3": {"display": "Recraft V3", "speed": "~8s", "strengths": "Vector and brand styles",
+                              "price": "$0.04/image"},
+        "fal-ai/ideogram-v3": {"display": "Ideogram 3", "speed": "~10s", "strengths": "Text in images",
+                               "price": "$0.06/image"}}, "fal-ai/flux-2-pro"),
+    ("image_gen", "openai"): ({
+        "gpt-image-1": {"display": "GPT Image 1", "speed": "~15s", "strengths": "Instruction following",
+                        "price": "$0.04/image"},
+        "gpt-image-1-mini": {"display": "GPT Image 1 mini", "speed": "~8s", "strengths": "Cheap drafts",
+                             "price": "$0.01/image"}}, "gpt-image-1"),
+    ("image_gen", "nous"): ({
+        "fal-ai/flux-2-pro": {"display": "FLUX.2 Pro", "speed": "~6s", "strengths": "Photoreal, typography",
+                              "price": "subscription"},
+        "krea-3": {"display": "Krea 3", "speed": "~5s", "strengths": "Aesthetic photography",
+                   "price": "subscription"}}, "fal-ai/flux-2-pro"),
+    ("video_gen", "fal"): ({
+        "fal-ai/kling-video/v2.5": {"display": "Kling 2.5", "speed": "~90s", "strengths": "Motion, people",
+                                    "price": "$0.35/5s"},
+        "fal-ai/veo3": {"display": "Veo 3", "speed": "~120s", "strengths": "Sound, long shots",
+                        "price": "$0.75/5s"}}, "fal-ai/kling-video/v2.5"),
+}
+# web_server_profiles.py _TERMINAL_BACKENDS.
+TERMINAL_BACKENDS = (
+    ("local", "Local", "Run commands directly on this machine. No isolation."),
+    ("docker", "Docker / Podman",
+     "Run commands in an isolated Docker or Podman container with a persistent workspace."),
+    ("modal", "Modal", "Run commands in a Modal cloud sandbox."),
+    ("daytona", "Daytona", "Run commands in a Daytona cloud sandbox."),
+    ("ssh", "SSH", "Run commands on a remote host over SSH."),
+)
+
+
+# ── MCP (hermes_cli/web_server_mcp.py, mcp_catalog.py, optional-mcps/*/manifest.yaml) ──
+
+MCP_SERVER_SEEDS: dict[str, dict[str, dict[str, Any]]] = {
+    "default": {
+        "github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+                   "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "fake-github-token-0000000000"}},
+        "linear": {"url": "https://mcp.linear.app/mcp", "auth": "oauth"},
+        "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem",
+                                                   f"{DEMO_HOME}/projects"], "enabled": False},
+        "internal-docs": {"url": "https://docs.example.com/mcp",
+                          "headers": {"Authorization": "Bearer ${MCP_INTERNAL_DOCS_API_KEY}"},
+                          "tools": {"include": ["search_docs", "get_page"]}},
+    },
+    "research": {
+        "context7": {"url": "https://mcp.context7.com/mcp"},
+        "zotero": {"command": "uvx", "args": ["zotero-mcp"], "env": {"ZOTERO_API_KEY": "fake-zotero-key-000000"}},
+    },
+}
+# What a probe lists per server: (tool, description, schema chars).
+MCP_TOOL_SEEDS: dict[str, tuple[tuple[str, str, int], ...]] = {
+    "github": (("create_issue", "Create a new issue in a GitHub repository", 812),
+               ("get_pull_request", "Get the details of a pull request", 640),
+               ("list_commits", "List the commits of a branch", 590),
+               ("search_code", "Search code across GitHub repositories", 705)),
+    "linear": (("create_issue", "Create a Linear issue", 930), ("list_issues", "List issues with filters", 1104),
+               ("update_issue", "Update an issue's state, assignee or labels", 1012)),
+    "filesystem": (("read_file", "Read a file under the allowed folders", 410),
+                   ("list_directory", "List a folder", 380), ("write_file", "Write a file", 455)),
+    "internal-docs": (("search_docs", "Search the internal docs", 520), ("get_page", "Fetch one docs page", 300),
+                      ("list_spaces", "List the docs spaces", 210)),
+    "context7": (("resolve-library-id", "Resolve a package name to a Context7 library id", 640),
+                 ("get-library-docs", "Fetch up-to-date docs for a library", 980)),
+    "zotero": (("search_items", "Search the Zotero library", 610), ("get_item", "Get one item with notes", 420),
+               ("add_note", "Attach a note to an item", 390)),
+    "notion": (("search", "Search pages and databases", 700), ("fetch", "Fetch a page", 520)),
+    "sentry": (("list_issues", "List unresolved issues", 680), ("get_issue", "Get an issue with its stack trace",
+                                                                  740)),
+    "weather": (("forecast", "Seven-day forecast for a place", 330),),
+    "browser-tools": (("screenshot", "Screenshot a URL", 290), ("pdf", "Print a URL to PDF", 270)),
+}
+MCP_DEFAULT_TOOLS = (("echo", "Echo the input back", 120), ("ping", "Check the server answers", 80))
+SHELL_INTERPRETERS = frozenset({"bash", "sh", "zsh", "dash", "fish", "cmd", "cmd.exe", "powershell", "pwsh"})
+SHELL_EGRESS = re.compile(r"\b(curl|wget|nc|ncat|socat)\b")
+
+
+def catalog_entry(name: str, description: str, *, transport: str, auth: str = "none", command: str | None = None,
+                  args: tuple[str, ...] = (), url: str | None = None, env: tuple[tuple[str, str, bool, bool], ...] = (),
+                  install: tuple[str, str, tuple[str, ...]] | None = None, slug: str | None = None,
+                  keywords: tuple[str, ...] = (), hosts: tuple[str, ...] = (),
+                  post_install: str = "") -> dict[str, Any]:
+    """One optional-mcps manifest, as mcp.py _catalog_entry_json shows it (plus the fake's secret flags)."""
+    return {"name": name, "description": description, "connector_slug": slug, "source": f"https://{name}.example.com",
+            "transport": transport, "auth_type": auth,
+            "required_env": [{"name": n, "prompt": p, "required": r} for n, p, r, _secret in env],
+            "command": command, "args": list(args), "url": url,
+            "install_url": install[0] if install else None, "install_ref": install[1] if install else None,
+            "bootstrap": list(install[2]) if install else [], "default_enabled": None, "post_install": post_install,
+            "suggest": {"keywords": list(keywords), "hosts": list(hosts), "applications": [], "examples": [],
+                        "requires_app": False} if keywords else None,
+            "needs_install": install is not None, "_secret_env": {n for n, _p, _r, secret in env if secret}}
+
+
+MCP_CATALOG = (
+    catalog_entry("context7", "Up-to-date, version-specific library docs and code examples.", transport="http",
+                  url="https://mcp.context7.com/mcp", keywords=("context7", "library docs"), hosts=("context7.com",),
+                  post_install="No account or credentials needed — tools are available as soon as the session "
+                               "restarts."),
+    catalog_entry("linear", "Find, create, and update Linear issues, projects, and comments.", transport="http",
+                  auth="oauth", url="https://mcp.linear.app/mcp", slug="linear", keywords=("linear",),
+                  hosts=("linear.app",),
+                  post_install="On first connection, Hermes will open a browser to authenticate with Linear."),
+    catalog_entry("notion", "Pages and databases from your Notion workspace.", transport="http", auth="oauth",
+                  url="https://mcp.notion.com/mcp", slug="notion", keywords=("notion",), hosts=("notion.so",),
+                  post_install="On first connection Hermes opens a browser to authorize with Notion."),
+    catalog_entry("sentry", "Issues, stack traces, and error context from Sentry.", transport="http", auth="oauth",
+                  url="https://mcp.sentry.dev/mcp", slug="sentry_mcp", keywords=("sentry", "stack trace"),
+                  hosts=("sentry.io",),
+                  post_install="On first connection Hermes opens a browser to authorize with Sentry."),
+    catalog_entry("github", "Repositories, issues and pull requests on GitHub.", transport="stdio", auth="env",
+                  command="npx", args=("-y", "@modelcontextprotocol/server-github"),
+                  env=(("GITHUB_PERSONAL_ACCESS_TOKEN", "GitHub personal access token (repo scope)", True, True),),
+                  keywords=("github", "pull request"), hosts=("github.com",),
+                  post_install="Restart the session so the GitHub tools load."),
+    catalog_entry("browser-tools", "Screenshots and PDFs of web pages from a headless browser.", transport="stdio",
+                  command="node", args=("dist/index.js",),
+                  install=("https://github.com/example/browser-tools-mcp", "v1.4.0", ("npm ci", "npm run build")),
+                  env=(("BROWSER_TOOLS_REGION", "Region for the browser pool (e.g. eu-west)", False, False),),
+                  post_install="Built from source; the first start downloads Chromium."),
+)
+MCP_CATALOG_BY_NAME = {entry["name"]: entry for entry in MCP_CATALOG}
+
+
+def mcp_env_key(name: str) -> str:
+    """mcp_config.py _env_key_for_server."""
+    return "MCP_" + re.sub(r"[^A-Za-z0-9_]", "_", name.upper()).strip("_") + "_API_KEY"
+
+
+def mcp_enabled(cfg: dict[str, Any]) -> bool:
+    """mcp_tool_common.py mcp_server_enabled: absent, null or unparseable is on."""
+    value = cfg.get("enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return value is not False and value != 0
+
+
+def mcp_summary(name: str, cfg: dict[str, Any], plugin: str | None = None) -> dict[str, Any]:
+    """web_server_mcp.py _mcp_server_summary (env values masked like _redact_mcp_env)."""
+    auth = cfg.get("auth")
+    headers = cfg.get("headers") or {}
+    if not auth and isinstance(headers, dict) and any(str(key).lower() == "authorization" for key in headers):
+        auth = "header"
+    return {"name": name, "transport": "http" if cfg.get("url") else ("stdio" if cfg.get("command") else "unknown"),
+            "url": cfg.get("url"), "command": cfg.get("command"), "args": list(cfg.get("args") or []),
+            "env": {str(k): mask_secret(str(v)) if v else "" for k, v in (cfg.get("env") or {}).items()},
+            "auth": auth, "enabled": mcp_enabled(cfg), "tools": cfg.get("tools"),
+            "source": "plugin" if plugin is not None else "config", "plugin": plugin}
+
+
+def mcp_problems(name: str, cfg: dict[str, Any]) -> list[str]:
+    """mcp_security.py validate_mcp_server_entry, the egress shape only."""
+    command = posixpath.basename(str(cfg.get("command") or ""))
+    script = " ".join(str(arg) for arg in cfg.get("args") or [])
+    if command in SHELL_INTERPRETERS and SHELL_EGRESS.search(script):
+        return [f"MCP server '{name}' uses shell interpreter '{command}' with network egress in args"]
+    return []
+
+
+# ── plugins (tui_gateway/methods_tools.py _plugin_rows; hermes_cli/plugins_cmd*.py) ──
+
+def plugin_record(name: str, key: str, version: str, description: str, source: str, status: str, install_dir: str,
+                  **extra: Any) -> dict[str, Any]:
+    record = {"name": name, "key": key, "version": version, "description": description, "source": source,
+              "status": status, "portable": False, "install_dir": install_dir, "has_desktop_half": False,
+              "servers": [], "settings_schema": [], "settings": {}, "toolset": None, "mcp_server": None,
+              "catalog": None, "pinned_sha": None, "update_available": None}
+    record.update(extra)
+    return record
+
+
+def bundled_plugins() -> list[dict[str, Any]]:
+    root = f"{HERMES_INSTALL}/plugins"
+    return [
+        plugin_record("kanban", "kanban", "1.0.0", "Task boards the agent can plan and track work on", "bundled",
+                      "not enabled", f"{root}/kanban"),
+        plugin_record("fal", "image_gen/fal", "1.2.0", "FAL image and video generation backend", "bundled",
+                      "enabled", f"{root}/image_gen/fal"),
+        plugin_record("tavily", "web/tavily", "1.0.3", "Tavily web search and extract backend", "bundled", "enabled",
+                      f"{root}/web/tavily"),
+        plugin_record("spotify", "spotify", "0.9.1", "Play, queue and search music on Spotify", "bundled",
+                      "not enabled", f"{root}/spotify"),
+    ]
+
+
+# hermes_cli/plugins_cmd_catalog.py: curated plugins installable by ``catalog_name`` at a pinned sha.
+PLUGIN_CATALOG = {
+    "linear-sync": {"repo": "https://github.com/example/hermes-plugin-linear-sync", "version": "1.3.0",
+                    "sha": "5d6e7f8a9b0c", "tier": "verified",
+                    "description": "Two-way sync between Linear issues and Hermes tasks"},
+    "weather-briefing": {"repo": "https://github.com/example/hermes-plugin-weather", "version": "0.4.2",
+                         "sha": "c0ffee123456", "tier": "community",
+                         "description": "Weather in briefings and a weather MCP server"},
+    "notion-digest": {"repo": "https://github.com/example/hermes-plugin-notion-digest", "version": "2.0.1",
+                      "sha": "a1b2c3d4e5f6", "tier": "verified",
+                      "description": "A weekly digest of edited Notion pages"},
+}
+
+
+def user_plugins(profile: FakeProfile) -> list[dict[str, Any]]:
+    root = f"{profile.path}/plugins"
+    linear = PLUGIN_CATALOG["linear-sync"]
+    weather = PLUGIN_CATALOG["weather-briefing"]
+    return [
+        plugin_record("hermes_voice", "hermes_voice", "0.6.0", "Phone calls with Hermes from the HermesVoice app",
+                      "user", "enabled", f"{root}/hermes_voice"),
+        plugin_record(
+            "linear-sync", "linear-sync", "1.2.0", linear["description"], "user", "enabled", f"{root}/linear-sync",
+            portable=True, servers=[{"name": "linear-sync", "state": "connected", "sentence": "Connected — 2 tools"}],
+            settings_schema=[
+                {"key": "team", "type": "string", "label": "Team key", "description": "Linear team to sync, e.g. ENG",
+                 "required": True},
+                {"key": "interval_minutes", "type": "number", "label": "Sync every (minutes)",
+                 "description": "How often to pull changes", "required": False, "default": 15},
+                {"key": "api_key", "type": "secret", "label": "Linear API key", "description": "Personal API key",
+                 "required": True, "env": "LINEAR_SYNC_API_KEY"}],
+            settings={"team": "ENG"},
+            toolset=("linear_sync", "Linear Sync", "issues and cycles from Linear",
+                     ("linear_create_issue", "linear_search")),
+            catalog={"name": "linear-sync", "tier": linear["tier"], "sha": "1a2b3c4d5e6f",
+                     "catalog_sha": linear["sha"], "catalog_version": linear["version"]},
+            update_available=True),
+        plugin_record(
+            "weather-briefing", "weather-briefing", weather["version"], weather["description"], "user", "disabled",
+            f"{root}/weather-briefing", mcp_server=("weather", {"command": "uvx", "args": ["weather-mcp"]}),
+            catalog={"name": "weather-briefing", "tier": weather["tier"], "sha": weather["sha"],
+                     "catalog_sha": weather["sha"], "catalog_version": weather["version"]}),
+    ]
+
+
+# ── cron (cron/jobs.py, cron/blueprint_catalog.py, cron/scheduler_delivery.py) ──
+
+WEEKDAY_TO_DOW = {"sunday": "0", "sun": "0", "monday": "1", "mon": "1", "tuesday": "2", "tue": "2", "tues": "2",
+                  "wednesday": "3", "wed": "3", "weds": "3", "thursday": "4", "thu": "4", "thur": "4", "thurs": "4",
+                  "friday": "5", "fri": "5", "saturday": "6", "sat": "6"}  # cron/jobs.py _WEEKDAY_TO_CRON_DOW
+DAYSPEC_TO_DOW = {"day": "*", "daily": "*", "everyday": "*", "weekday": "1-5", "weekdays": "1-5", "weekend": "0,6",
+                  "weekends": "0,6"}  # cron/jobs.py _DAYSPEC_TO_CRON_DOW
+WEEKDAY_PRESETS = {"everyday": "*", "weekdays": "1-5", "weekends": "0,6"}  # blueprint_catalog.py
+CLOCK = re.compile(r"^(\d{1,2})(?::(\d{2}))?(am|pm)?$")
+CRON_FIELD = re.compile(r"^[A-Za-z\d\*\-,/]+$")
+DURATION = re.compile(r"^(\d*)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$")
+SCHEDULE_HELP = ("Use:\n  - Interval: '30m', 'every 30m', 'every 2h' (recurring)\n"
+                 "  - One-shot delay: 'in 30m', 'in 2h' (fires once)\n"
+                 "  - Weekly/daily: 'every monday 9am', 'weekdays at 9am' (recurring)\n"
+                 "  - Cron: '0 9 * * *' (cron expression)\n"
+                 "  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)")
+BOT_CHAT_PLATFORM = "bot-chat"  # cron/scheduler_delivery.py
+# Configured gateway platforms per profile: (id, home env var, home channel set).
+DELIVERY_PLATFORMS = {"default": (("telegram", "TELEGRAM_HOME_CHANNEL", True),
+                                  ("discord", "DISCORD_HOME_CHANNEL", False))}
+
+
+def parse_duration(text: str) -> int:
+    """cron/jobs.py parse_duration: minutes ("30m", "2h", "1d", a bare "hour")."""
+    text = text.strip().lower()
+    match = DURATION.match(text)
+    if not match:
+        raise ValueError(f"Invalid duration: '{text}'. Use format like '30m', '2h', '1d', or a bare unit like 'hour' "
+                         "(defaults to 1).")
+    return (int(match.group(1)) if match.group(1) else 1) * {"m": 1, "h": 60, "d": 1440}[match.group(2)[0]]
+
+
+def clock_time(text: str) -> tuple[int, int] | None:
+    """cron/jobs.py _parse_clock_time."""
+    text = text.strip().lower().replace(" ", "")
+    if text in ("noon", "midday"):
+        return (12, 0)
+    if text == "midnight":
+        return (0, 0)
+    match = CLOCK.match(text)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2) or 0)
+    if match.group(3):
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if match.group(3) == "pm" else 0)
+    return (hour, minute) if hour <= 23 and minute <= 59 else None
+
+
+def natural_cron(rest: str) -> str | None:
+    """cron/jobs.py _natural_every_to_cron: ``<when> [at] <time>`` ("monday 9am", "weekdays at 9am")."""
+    tokens = rest.lower().replace(",", " ").split()
+    if not tokens:
+        return None
+    dow, index = DAYSPEC_TO_DOW.get(tokens[0]), 1
+    if dow is None:
+        days, index = [], len(tokens)
+        for i, token in enumerate(tokens):
+            if token == "and":
+                continue
+            mapped = WEEKDAY_TO_DOW.get(token)
+            if mapped is None:
+                index = i
+                break
+            if mapped not in days:
+                days.append(mapped)
+        if not days:
+            return None
+        dow = ",".join(days)
+    time_tokens = tokens[index:]
+    if time_tokens and time_tokens[0] == "at":
+        time_tokens = time_tokens[1:]
+    parsed = clock_time(" ".join(time_tokens)) if time_tokens else None
+    return None if parsed is None else f"{parsed[1]} {parsed[0]} * * {dow}"
+
+
+def cron_field_values(field_text: str, low: int, high: int) -> set[int] | None:
+    values: set[int] = set()
+    for part in field_text.split(","):
+        step = 1
+        if "/" in part:
+            part, step_text = part.split("/", 1)
+            if not step_text.isdigit() or int(step_text) == 0:
+                return None
+            step = int(step_text)
+        if part == "*":
+            start, end = low, high
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            if not (a.isdigit() and b.isdigit()):
+                return None
+            start, end = int(a), int(b)
+        elif part.isdigit():
+            start = end = int(part)
+            if "/" in field_text:
+                end = high
+        else:
+            return None
+        if start < low or end > high or start > end:
+            return None
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def cron_fields(expr: str) -> list[set[int]] | None:
+    parts = expr.split()
+    if len(parts) != 5:
+        return None
+    ranges = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+    fields = [cron_field_values(p, lo, hi) for p, (lo, hi) in zip(parts, ranges, strict=True)]
+    if any(f is None for f in fields):
+        return None
+    if 7 in fields[4]:
+        fields[4] = (fields[4] - {7}) | {0}
+    return fields  # type: ignore[return-value]
+
+
+def parse_schedule(schedule: str) -> dict[str, Any]:
+    """cron/jobs.py parse_schedule (croniter's validation reduced to plain five-field expressions)."""
+    original = schedule.strip()
+    lower = original.lower()
+    is_every = lower.startswith("every ")
+    rest = original[6:].strip() if is_every else lower
+    expr = natural_cron(rest)
+    if expr is not None:
+        return {"kind": "cron", "expr": expr, "display": original}
+    if is_every:
+        minutes = parse_duration(rest)
+        return {"kind": "interval", "minutes": minutes, "display": f"every {minutes}m"}
+    parts = original.split()
+    if len(parts) >= 5 and all(CRON_FIELD.match(p) for p in parts[:5]):
+        if cron_fields(" ".join(parts[:5])) is None:
+            raise ValueError(f"Invalid cron expression '{original}': not a valid five-field expression")
+        return {"kind": "cron", "expr": original, "display": original}
+    if "T" in original or re.match(r"^\d{4}-\d{2}-\d{2}", original):
+        try:
+            moment = datetime.fromisoformat(original)
+        except ValueError as exc:
+            raise ValueError(f"Invalid timestamp '{original}': {exc}") from None
+        if moment.tzinfo is None:
+            moment = moment.astimezone()
+        return {"kind": "once", "run_at": moment.isoformat(), "display": f"once at {moment.strftime('%Y-%m-%d %H:%M')}"}
+    if lower.startswith("in "):
+        duration = original[3:].strip()
+        try:
+            minutes = parse_duration(duration)
+        except ValueError:
+            raise ValueError(f"Invalid duration '{duration}' after 'in '. Use e.g. 'in 30m', 'in 2h'.") from None
+        run_at = datetime.now().astimezone() + timedelta(minutes=minutes)
+        return {"kind": "once", "run_at": run_at.isoformat(), "display": f"once in {duration}"}
+    try:
+        minutes = parse_duration(original)
+        return {"kind": "interval", "minutes": minutes, "display": f"every {minutes}m"}
+    except ValueError:
+        pass
+    raise ValueError(f"Invalid schedule '{original}'. {SCHEDULE_HELP}")
+
+
+def next_run(schedule: dict[str, Any], after: float | None = None) -> str | None:
+    """The next instant a schedule fires after ``after`` (cron/jobs.py compute_next_run)."""
+    base = datetime.fromtimestamp(after if after is not None else time.time()).astimezone()
+    if schedule["kind"] == "interval":
+        return (base + timedelta(minutes=schedule["minutes"])).isoformat()
+    if schedule["kind"] == "once":
+        run_at = epoch_of(schedule.get("run_at"))
+        return schedule["run_at"] if run_at is not None and run_at > base.timestamp() else None
+    fields = cron_fields(schedule["expr"])
+    if fields is None:
+        return None
+    minutes, hours, days, months, weekdays = fields
+    moment = base.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(366 * 24 * 60):
+        if (moment.minute in minutes and moment.hour in hours and moment.day in days and moment.month in months
+                and (moment.isoweekday() % 7) in weekdays):
+            return moment.isoformat()
+        moment += timedelta(minutes=1)
+    return None
+
+
+def blueprint_slot(name: str, kind: str, label: str, default: Any = None, options: tuple[str, ...] = (),
+                   optional: bool = False, help_text: str = "", strict: bool = True) -> dict[str, Any]:
+    return {"name": name, "type": kind, "label": label, "default": default, "options": list(options),
+            "optional": optional, "strict": strict, "help": help_text}
+
+
+def time_slot(default: str) -> dict[str, Any]:
+    return blueprint_slot("time", "time", "What time?", default, help_text="24h local time, e.g. 08:00")
+
+
+DELIVER_SLOT = blueprint_slot(
+    "deliver", "enum", "Where to deliver?", "origin", ("origin", "local", "telegram", "discord", "email"),
+    strict=False, help_text="origin = the chat you set this up from (or your configured home channel when created "
+                            "from the dashboard); local = save only, no message; or any connected platform name")
+# cron/blueprint_catalog.py CATALOG, the first four: (key, title, description, category, schedule template, prompt
+# template, slots, skills, tags).
+BLUEPRINTS = (
+    ("morning-brief", "Morning briefing",
+     "A short daily briefing: today's calendar, weather, and anything urgent waiting on you.", "daily",
+     "{minute} {hour} * * *",
+     "Produce a concise morning briefing for the user: today's calendar events, the local weather, and any urgent "
+     "items. Keep it short and scannable.", (time_slot("08:00"), DELIVER_SLOT), ("google-workspace",),
+     ("daily", "briefing")),
+    ("important-mail", "Important-mail monitor",
+     "Check your inbox periodically and ping you ONLY about mail that actually needs attention.", "email",
+     "*/{interval_min} * * * *",
+     "Check the user's inbox for new messages since the last run. Surface ONLY mail matching: {criteria}. If nothing "
+     "clears the bar, respond with [SILENT].",
+     (blueprint_slot("interval_min", "enum", "How often?", "30", ("15", "30", "60"),
+                     help_text="minutes between checks"),
+      blueprint_slot("criteria", "text", "Only notify me if the mail…",
+                     "needs a reply today, is from my manager or family, or mentions a deadline"), DELIVER_SLOT),
+     (), ("email", "monitor")),
+    ("weekly-review", "Weekly review", "A weekly recap: what got done, what's still open, and what's coming up.",
+     "weekly", "{minute} {hour} * * {dow}",
+     "Run the weekly-review-planning skill's procedure for the user and keep the output in its seven-section shape.",
+     (time_slot("18:00"), blueprint_slot("day", "enum", "Which day?", "sunday",
+                                         ("sunday", "monday", "friday", "saturday")), DELIVER_SLOT),
+     ("weekly-review-planning",), ("weekly", "review")),
+    ("workday-start", "Workday start reminder", "A weekday nudge with your agenda and top priorities.", "daily",
+     "{minute} {hour} * * 1-5",
+     "Give the user a brief weekday start-of-day nudge: today's calendar and the 1-3 highest-priority things to "
+     "focus on.", (time_slot("09:00"), DELIVER_SLOT), (), ("daily", "focus")),
+)
+BLUEPRINTS_BY_KEY = {row[0]: row for row in BLUEPRINTS}
+
+
+def humanize_blueprint(template: str, slots: tuple[dict[str, Any], ...]) -> str:
+    """blueprint_catalog.py _humanize_schedule."""
+    defaults = {slot["name"]: slot["default"] for slot in slots}
+    if template.startswith("*/"):
+        return f"every {defaults.get('interval_min') or template.split('/')[1].split()[0]} minutes"
+    when = defaults.get("time")
+    if "* * 1-5" in template:
+        return f"weekdays at {when}" if when else "every weekday"
+    if "{dow}" in template:
+        scope = defaults.get("day") or defaults.get("recurrence") or ""
+        return f"{scope} at {when}" if scope and when else (f"at {when}" if when else "on a schedule")
+    return f"daily at {when}" if when else "on a schedule"
+
+
+def blueprint_entry(row: tuple[Any, ...], deliver_options: list[str]) -> dict[str, Any]:
+    """blueprint_catalog.py blueprint_catalog_entry (deliver options rewritten as cron.py _blueprint_catalog_sync)."""
+    key, title, description, category, template, _prompt, slots, _skills, tags = row
+    fields = [dict(slot, options=list(deliver_options)) if slot["name"] == "deliver" else dict(slot) for slot in slots]
+    command = [f"/blueprint {key}"]
+    for slot in slots:
+        value = "" if slot["default"] is None else str(slot["default"])
+        command.append(f'{slot["name"]}="{value}"' if slot["type"] == "text" or " " in value
+                       else f'{slot["name"]}={value}')
+    query = urlencode({s["name"]: str(s["default"]) for s in slots if s["default"] not in (None, "")})
+    return {"key": key, "title": title, "description": description, "category": category, "tags": list(tags),
+            "fields": fields, "source": "builtin", "plugin": None, "schedule": template,
+            "scheduleHuman": humanize_blueprint(template, slots), "command": " ".join(command),
+            "appUrl": f"hermes://blueprint/{quote(key)}" + (f"?{query}" if query else "")}
+
+
+def fill_blueprint(row: tuple[Any, ...], values: dict[str, Any]) -> dict[str, Any]:
+    """blueprint_catalog.py fill_blueprint + _resolve_schedule -> create_job kwargs (ValueError: BlueprintFillError)."""
+    key, title, _d, _c, template, prompt_template, slots, skills, _tags = row
+    known = [slot["name"] for slot in slots]
+    unknown = sorted(set(values) - set(known))
+    if unknown:
+        raise ValueError(f"unknown slot{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)} — valid: "
+                         f"{', '.join(known)}")
+    resolved: dict[str, Any] = {}
+    for slot in slots:
+        raw = values.get(slot["name"], slot["default"])
+        if raw in (None, ""):
+            if slot["optional"]:
+                continue
+            raise ValueError(f"missing required value: {slot['name']} ({slot['label']})")
+        if slot["type"] == "enum" and slot["strict"] and slot["options"] and str(raw) not in slot["options"]:
+            raise ValueError(f"{slot['name']}={raw!r} not allowed — one of {', '.join(slot['options'])}")
+        resolved[slot["name"]] = raw
+    repl: dict[str, str] = {}
+    if "{minute}" in template or "{hour}" in template:
+        match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", str(resolved.get("time") or "").strip())
+        if not match:
+            raise ValueError(f"invalid time {resolved.get('time')!r} — use HH:MM (24h)")
+        repl.update(hour=str(int(match.group(1))), minute=str(int(match.group(2))))
+    if "{dow}" in template:
+        day = str(resolved.get("day", "")).lower()
+        if "day" in resolved and day not in WEEKDAY_TO_DOW:
+            raise ValueError(f"unknown day {day!r}")
+        repl["dow"] = WEEKDAY_TO_DOW.get(day, "*")
+    if "{interval_min}" in template:
+        interval = str(resolved.get("interval_min", "")).strip()
+        if not interval.isdigit() or int(interval) <= 0:
+            raise ValueError(f"invalid interval {interval!r} — minutes as a positive integer")
+        repl["interval_min"] = interval
+    spec = {"prompt": prompt_template.format(**resolved), "schedule": template.format(**repl), "name": title,
+            "deliver": resolved.get("deliver", "origin")}
+    if skills:
+        spec["skills"] = list(skills)
+    return spec
+
+
+# ── command center (hermes_cli/logs.py, hermes_logging.py, analytics.py) ──
+
+LOG_FILES = {"agent": "agent.log", "errors": "errors.log", "gateway": "gateway.log", "gui": "gui.log",
+             "desktop": "desktop.log", "update": "update.log", "handoff": "desktop-update-handoff.log",
+             "mcp": "mcp-stderr.log"}
+LOG_COMPONENTS = {"gateway": ("gateway", "hermes_plugins", "plugins.platforms", "agent.memory_caller_scope"),
+                  "agent": ("agent", "run_agent", "model_tools", "batch_runner"), "tools": ("tools",),
+                  "cli": ("hermes_cli", "cli"), "cron": ("cron",),
+                  "gui": ("hermes_cli.web_server", "hermes_cli.pty_bridge", "hermes_cli.desktop", "tui_gateway",
+                          "uvicorn")}
+LOG_LEVELS = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
+LOG_LINE = re.compile(r"\s(DEBUG|INFO|WARNING|ERROR|CRITICAL)(?:\s+\[.*?\])?\s+(\S+):")
+# (file, level, logger, message): one demo session's worth of log, timestamped back from now.
+LOG_SEEDS = (
+    ("agent", "INFO", "run_agent", "Turn started (model fake-hermes, 14 tools)"),
+    ("agent", "INFO", "tools.terminal_tool", "terminal: pytest -q tests/test_auth.py (exit 1, 0.4s)"),
+    ("agent", "WARNING", "agent.context_compressor", "Context at 71% of 200,000 tokens; compressing the middle"),
+    ("agent", "INFO", "tools.patch_tool", "patch: src/atlas/auth.py (+2 -1)"),
+    ("agent", "INFO", "run_agent", "Turn finished in 38.2s (7 API calls)"),
+    ("agent", "ERROR", "tools.web_tools", "web_search failed: HTTP 429 from the search backend, retry in 20s"),
+    ("agent", "DEBUG", "model_tools", "Resolved 14 tools for platform cli"),
+    ("agent", "INFO", "cron.scheduler", "Fired job 'Daily digest' (deliver local)"),
+    ("gateway", "INFO", "gateway.run", "Gateway started (platforms: telegram)"),
+    ("gateway", "INFO", "gateway.platforms.telegram", "Connected as @fake_hermes_bot"),
+    ("gateway", "WARNING", "gateway.platforms.discord", "Discord home channel not set (DISCORD_HOME_CHANNEL)"),
+    ("gateway", "INFO", "hermes_plugins.hermes_voice", "Phone hub listening on /api/plugins/hermes_voice/phone"),
+    ("errors", "ERROR", "tools.web_tools", "web_search failed: HTTP 429 from the search backend, retry in 20s"),
+    ("gui", "INFO", "hermes_cli.web_server", "Dashboard listening (auth: basic)"),
+    ("gui", "INFO", "uvicorn", "Application startup complete."),
+    ("mcp", "INFO", "tools.mcp_tool", "[github] server started (npx -y @modelcontextprotocol/server-github)"),
+    ("mcp", "WARNING", "tools.mcp_tool", "[linear] OAuth token missing; run `hermes mcp login linear`"),
+)
+# (model, provider, $ per 1M input, $ per 1M output) for the usage history.
+USAGE_MODELS = (("fake-hermes", "fake", 1.0, 4.0), ("fake-hermes-mini", "fake", 0.0, 0.0),
+                ("echo-2-pro", "echo-cloud", 3.0, 12.0))
+USAGE_TOOLS = ("terminal", "read_file", "search_files", "patch", "web_search", "write_file", "delegate_task")
+USAGE_AUX_TASKS = (("compression", "fake-hermes-mini"), ("title_generation", "fake-hermes-mini"),
+                   ("vision", "fake-hermes"))
+
+
+# ── artifacts (apps/desktop/src/app/artifacts/artifact-utils.ts; files.py /api/fs/*) ──
+
+ARTIFACT_DIR = f"{project_path('atlas')}/reports"
+ARTIFACT_IMAGE = f"{DEMO_IMAGES}/latency-chart.png"
+ARTIFACT_PDF = f"{ARTIFACT_DIR}/q3-latency.pdf"
+ARTIFACT_CSV = f"{ARTIFACT_DIR}/q3-latency.csv"
+ARTIFACT_RESEARCH_IMAGE = f"{DEMO_HERMES_HOME}/profiles/research/images/attention-heads.png"
+ARTIFACT_LINK_HOST = "images.example.com"  # the one host /api/media/proxy fetches (from memory)
+FS_DATA_URL_MAX = 25 * 1024 * 1024  # web_server.py _FS_DATA_URL_MAX_BYTES
+FS_MEDIA_TYPES = {".pdf": "application/pdf", ".csv": "text/csv", ".md": "text/markdown", ".txt": "text/plain",
+                  ".json": "application/json", ".py": "text/x-python", ".zip": "application/zip", **MEDIA_TYPES}
+
+
+def demo_pdf(title: str) -> bytes:
+    """A one-page PDF with ``title`` on it."""
+    text = title.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 18 Tf 72 720 Td ({text}) Tj ET".encode()
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+               b"/Resources << /Font << /F1 5 0 R >> >> >>",
+               b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    return bytes(out)
+
+
+@dataclass
+class Caps:
+    """One profile's M4 state (its MCP servers sit in its config.yaml instead): skills and the disabled set,
+    toolset switches and provider/model picks, post-setup installs, MCP OAuth tokens, agent plugins, cron jobs with
+    their run history, /rollback checkpoints, backups, the curator, and usage history for analytics."""
+
+    skills: dict[str, dict[str, Any]] = field(default_factory=dict)
+    disabled_skills: set[str] = field(default_factory=set)
+    toolsets: dict[str, bool] = field(default_factory=dict)
+    providers: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TOOLSET_PROVIDER))
+    web_backends: dict[str, str] = field(default_factory=dict)
+    toolset_models: dict[str, str] = field(default_factory=dict)
+    post_setup: set[str] = field(default_factory=lambda: set(POST_SETUP_PREINSTALLED))
+    mcp_tokens: set[str] = field(default_factory=set)
+    plugins: dict[str, dict[str, Any]] = field(default_factory=dict)
+    jobs: list[dict[str, Any]] = field(default_factory=list)
+    executions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    backups: dict[str, bytes] = field(default_factory=dict)
+    curator: dict[str, Any] = field(default_factory=lambda: {"enabled": True, "paused": False, "interval_hours": 24,
+                                                             "last_run_at": None, "min_idle_hours": 2,
+                                                             "stale_after_days": 30, "archive_after_days": 90})
+    usage: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class FakeAction:
+    """One spawned ``hermes <argv>`` (web_server_gateway.py _spawn_hermes_action): its scripted log lines, shown one
+    step per status poll, and what finishing changes."""
+
+    name: str
+    pid: int
+    lines: list[str]
+    exit_code: int
+    started: float = field(default_factory=time.time)
+    polls: int = 0
+    shown: int = 0
+    done: bool = False
+    on_done: Callable[[], None] | None = None
+    action_id: str | None = None
+    finished_at: str | None = None
+
+
+class CapabilityFeatures:
+    """M4: the Capabilities REST routes (skills, toolsets, terminal backends, MCP servers + OAuth + catalog), the
+    plugins.manage RPC, cron (jobs, runs, delivery targets, blueprints, the Chronos fire hook), the command center
+    (status extras, logs, analytics, maintenance actions with /api/actions/{name}/status) and the files the
+    Artifacts screen opens. Mixed into FakeHermes; uses SettingsFeatures' profiles, ``rest`` and ``scoped``."""
+
+    profiles: dict[str, FakeProfile]
+    sessions: dict[str, StoredSession]
+    seed_mode: str
+    media: dict[str, bytes]
+    files: dict[str, bytes]
+    dirs: set[str]
+    rest: Callable[..., Callable[[Request], Awaitable[Response]]]
+    scoped: Callable[..., FakeProfile]
+    profile_named: Callable[[str], FakeProfile]
+    canonical_name: Callable[[Any], str]
+    rpc_profile: Callable[[dict[str, Any]], FakeProfile]
+    seed_chat: Callable[..., StoredSession]
+    check_env_name: Callable[[str], None]
+
+    def _init_capabilities(self, args: argparse.Namespace) -> None:
+        self.action_polls = max(1, int(getattr(args, "action_polls", ACTION_POLLS)))
+        self.action_seconds = float(getattr(args, "action_seconds", ACTION_SECONDS))
+        self.mcp_oauth_approve_after = float(getattr(args, "mcp_oauth_approve_after", 2.0))
+        self.cron_fire_token = str(getattr(args, "cron_fire_token", CRON_FIRE_TOKEN))
+        self.actions: dict[str, FakeAction] = {}
+        self.action_logs: dict[str, list[str]] = {}
+        self.action_names: set[str] = set(ACTION_NAMES)
+        self.mcp_flows: dict[str, dict[str, Any]] = {}
+        self.update_behind = len(UPDATE_COMMITS)
+        self.update_receipt: dict[str, Any] | None = None
+        self.artifact_files: dict[str, bytes] = {}
+        self.remote_images: dict[str, bytes] = {}
+        self.started_at = time.time()
+        for profile in self.profiles.values():
+            self.caps(profile)
+        if self.seed_mode != "minimal":
+            for profile in (self.profiles["default"], self.profiles["research"]):
+                self.seed_caps(profile)
+        if self.seed_mode == "full":
+            self.seed_artifact_chats()
+
+    # ── plumbing ──────────────────────────────────────────────────────────────────────────────────
+
+    def capabilities_routes(self) -> list[Route]:
+        def r(handler: Callable[[Request, dict[str, Any]], Any], public: bool = False) -> Callable[..., Any]:
+            def settled(request: Request, body: dict[str, Any]) -> Any:
+                self.settle_actions()
+                return handler(request, body)
+            return self.rest(settled, public=public)
+        return [
+            # skills.py
+            Route("/api/skills", r(self.list_skills), methods=["GET"]),
+            Route("/api/skills", r(self.create_skill), methods=["POST"]),
+            Route("/api/skills/toggle", r(self.toggle_skill), methods=["PUT"]),
+            Route("/api/skills/content", r(self.skill_content), methods=["GET"]),
+            Route("/api/skills/content", r(self.update_skill_content), methods=["PUT"]),
+            Route("/api/skills/hub/official", r(self.official_skills), methods=["GET"]),
+            Route("/api/skills/hub/preview", r(self.preview_hub_skill), methods=["GET"]),
+            Route("/api/skills/hub/install", r(self.install_hub_skill), methods=["POST"]),
+            Route("/api/skills/hub/uninstall", r(self.uninstall_hub_skill), methods=["POST"]),
+            Route("/api/skills/hub/update", r(self.update_hub_skills), methods=["POST"]),
+            # tools.py
+            Route("/api/tools/toolsets", r(self.list_toolsets), methods=["GET"]),
+            Route("/api/tools/toolsets/{name}", r(self.toggle_toolset), methods=["PUT"]),
+            Route("/api/tools/toolsets/{name}/config", r(self.toolset_config), methods=["GET"]),
+            Route("/api/tools/toolsets/{name}/models", r(self.toolset_models), methods=["GET"]),
+            Route("/api/tools/toolsets/{name}/model", r(self.select_toolset_model), methods=["PUT"]),
+            Route("/api/tools/toolsets/{name}/provider", r(self.select_toolset_provider), methods=["PUT"]),
+            Route("/api/tools/toolsets/{name}/env", r(self.save_toolset_env), methods=["PUT"]),
+            Route("/api/tools/toolsets/{name}/post-setup", r(self.toolset_post_setup), methods=["POST"]),
+            Route("/api/tools/terminal/backends", r(self.terminal_backends), methods=["GET"]),
+            Route("/api/tools/terminal/backend", r(self.select_terminal_backend), methods=["PUT"]),
+            # mcp.py
+            Route("/api/mcp/servers", r(self.list_mcp_servers), methods=["GET"]),
+            Route("/api/mcp/servers", r(self.add_mcp_server), methods=["POST"]),
+            Route("/api/mcp/servers", r(self.replace_mcp_servers), methods=["PUT"]),
+            Route("/api/mcp/servers/{name}", r(self.remove_mcp_server), methods=["DELETE"]),
+            Route("/api/mcp/servers/{name}/test", r(self.test_mcp_server), methods=["POST"]),
+            Route("/api/mcp/servers/{name}/auth", r(self.start_mcp_oauth), methods=["POST"]),
+            Route("/api/mcp/servers/{name}/enabled", r(self.set_mcp_enabled), methods=["PUT"]),
+            Route("/api/mcp/oauth/flows/{flow_id}", r(self.mcp_oauth_flow), methods=["GET"]),
+            Route("/api/mcp/oauth/flows/{flow_id}", r(self.cancel_mcp_oauth_flow), methods=["DELETE"]),
+            Route("/api/mcp/oauth/flows/{flow_id}/debug", r(self.debug_mcp_oauth_flow), methods=["POST"]),
+            Route("/api/mcp/oauth/callback/{server_name:path}", self.mcp_oauth_callback, methods=["GET"]),
+            Route("/fake-oauth/authorize", self.fake_oauth_page, methods=["GET"]),
+            Route("/api/mcp/catalog", r(self.mcp_catalog), methods=["GET"]),
+            Route("/api/mcp/catalog/install", r(self.install_mcp_catalog_entry), methods=["POST"]),
+            # cron.py
+            Route("/api/cron/jobs", r(self.list_cron_jobs), methods=["GET"]),
+            Route("/api/cron/jobs", r(self.create_cron_job), methods=["POST"]),
+            Route("/api/cron/delivery-targets", r(self.cron_delivery_targets), methods=["GET"]),
+            Route("/api/cron/blueprints", r(self.cron_blueprints), methods=["GET"]),
+            Route("/api/cron/blueprints/instantiate", r(self.instantiate_blueprint), methods=["POST"]),
+            Route("/api/cron/fire", self.cron_fire, methods=["POST"]),
+            Route("/api/cron/jobs/{job_id}", r(self.get_cron_job), methods=["GET"]),
+            Route("/api/cron/jobs/{job_id}", r(self.update_cron_job), methods=["PUT"]),
+            Route("/api/cron/jobs/{job_id}", r(self.delete_cron_job), methods=["DELETE"]),
+            Route("/api/cron/jobs/{job_id}/runs", r(self.cron_job_runs), methods=["GET"]),
+            Route("/api/cron/jobs/{job_id}/pause", r(self.pause_cron_job), methods=["POST"]),
+            Route("/api/cron/jobs/{job_id}/resume", r(self.resume_cron_job), methods=["POST"]),
+            Route("/api/cron/jobs/{job_id}/trigger", r(self.trigger_cron_job), methods=["POST"]),
+            # status.py, analytics.py
+            Route("/api/health", r(self.health, public=True), methods=["GET"]),
+            Route("/api/system/stats", r(self.system_stats), methods=["GET"]),
+            Route("/api/logs", r(self.get_logs), methods=["GET"]),
+            Route("/api/analytics/usage", r(self.usage_analytics), methods=["GET"]),
+            Route("/api/analytics/models", r(self.models_analytics), methods=["GET"]),
+            Route("/api/curator", r(self.curator_status), methods=["GET"]),
+            Route("/api/curator/paused", r(self.set_curator_paused), methods=["PUT"]),
+            Route("/api/curator/run", r(self.run_curator), methods=["POST"]),
+            Route("/api/ops/debug-share", r(self.debug_share), methods=["POST"]),
+            # ops.py
+            Route("/api/ops/doctor", r(self.run_doctor), methods=["POST"]),
+            Route("/api/ops/security-audit", r(self.run_security_audit), methods=["POST"]),
+            Route("/api/ops/backup", r(self.run_backup), methods=["POST"]),
+            Route("/api/ops/backup/download", r(self.download_backup), methods=["GET"]),
+            Route("/api/ops/checkpoints", r(self.list_checkpoints), methods=["GET"]),
+            Route("/api/ops/checkpoints/prune", r(self.prune_checkpoints), methods=["POST"]),
+            # actions.py
+            Route("/api/gateway/restart", r(self.restart_gateway), methods=["POST"]),
+            Route("/api/hermes/update", r(self.update_hermes), methods=["POST"]),
+            Route("/api/hermes/update/check", r(self.check_update), methods=["GET"]),
+            Route("/api/actions/{name}/status", r(self.action_status), methods=["GET"]),
+            # files.py (what the Artifacts screen opens)
+            Route("/api/fs/read-data-url", r(self.fs_read_data_url), methods=["GET"]),
+            Route("/api/fs/download", r(self.fs_download), methods=["GET"]),
+            Route("/api/media/proxy", r(self.media_proxy), methods=["GET"]),
+        ]
+
+    def capability_methods(self, conn: "Conn", params: dict[str, Any]) -> dict[str, Callable[[], Any]]:
+        return {"plugins.manage": lambda: self.plugins_manage(params),
+                "plugins.list": lambda: self.plugins_list_legacy(params)}
+
+    def caps(self, profile: FakeProfile) -> Caps:
+        """The profile's M4 state, created on first use (a new profile starts with only the bundled plugins)."""
+        state = getattr(profile, "caps", None)
+        if state is None:
+            state = Caps(plugins={plugin["key"]: plugin for plugin in bundled_plugins()})
+            profile.caps = state  # type: ignore[attr-defined]
+        return state
+
+    def explicit_profile(self, request: Request, route: str) -> FakeProfile:
+        """_common.py destructive_profile: this backend serves several profiles, so an unnamed target is refused."""
+        if not (request.query_params.get("profile") or "").strip():
+            raise HttpError(400, MULTIPLEX_DETAIL.format(route=route))
+        return self.scoped(request)
+
+    # ── seed ──────────────────────────────────────────────────────────────────────────────────────
+
+    def seed_caps(self, profile: FakeProfile) -> None:
+        caps, now = self.caps(profile), time.time()
+        for name, category, provenance, usage, description, body in SKILL_SEEDS.get(profile.name, ()):
+            caps.skills[name] = {"name": name, "category": category, "provenance": provenance, "usage": usage,
+                                 "content": skill_document(name, description, body),
+                                 "identifier": f"official/{category}/{name}" if provenance == "hub" else None}
+        caps.disabled_skills |= SKILL_DISABLED_SEEDS.get(profile.name, set())
+        if servers := copy.deepcopy(MCP_SERVER_SEEDS.get(profile.name)):
+            profile.config["mcp_servers"] = servers
+        if profile.name == "default":
+            for plugin in user_plugins(profile):
+                caps.plugins[plugin["key"]] = plugin
+            caps.toolsets["kanban"] = True
+        else:
+            caps.providers["web"] = "Tavily"  # no TAVILY_API_KEY in this profile: the row needs keys
+            caps.mcp_tokens.add("context7")
+        stamp = datetime.fromtimestamp
+        caps.checkpoints = [
+            {"session": stamp(now - 12 * DAY).strftime("%Y%m%d_%H%M%S_") + "4e1f0a", "files": 38,
+             "bytes": 2_621_440, "stale": True},
+            {"session": stamp(now - 9 * DAY).strftime("%Y%m%d_%H%M%S_") + "b7c2d9", "files": 12, "bytes": 486_400,
+             "stale": True},
+            {"session": stamp(now - 2 * HOUR).strftime("%Y%m%d_%H%M%S_") + "0d93ae", "files": 6, "bytes": 81_920,
+             "stale": False}] if profile.name == "default" else [
+            {"session": stamp(now - 2 * DAY).strftime("%Y%m%d_%H%M%S_") + "5a6b7c", "files": 3, "bytes": 24_576,
+             "stale": False}]
+        caps.curator["last_run_at"] = iso_at(now - 26 * HOUR)
+        caps.usage = self.usage_history(profile.name)
+        self.seed_jobs(profile)
+
+    def seed_jobs(self, profile: FakeProfile) -> None:
+        """Jobs with some history. ``--seed demo`` writes no new chats (its chat list is fixed), so there a past
+        agent run is only its ledger row, as when its session was pruned; ``full`` gives each run its chat."""
+        caps, now = self.caps(profile), time.time()
+        chats = self.seed_mode == "full"
+        if profile.name == "research":
+            job = self.new_job(prompt="List new arXiv papers on retrieval-augmented generation with one line each.",
+                               schedule="0 7 * * 1-5", name="arXiv watch", skills=["arxiv"])
+            self.record_run(profile, job, now - DAY - 3 * HOUR, "Three new papers on RAG evaluation.", chat=chats)
+            caps.jobs.append(job)
+            return
+        briefing = self.new_job(prompt=BLUEPRINTS_BY_KEY["morning-brief"][5], schedule="0 8 * * *",
+                                name="Morning briefing", deliver="telegram", skills=["google-workspace"])
+        self.record_run(profile, briefing, now - 20 * HOUR, "Two meetings today; the 14:00 overlaps the dentist.",
+                        chat=chats)
+        digest = self.new_job(prompt="Summarize what changed in the watched folders today.", schedule="0 18 * * *",
+                              name="Daily digest")
+        stored = next((s for s in self.sessions.values() if s.title == "Daily digest" and s.source == "cron"), None)
+        if stored is not None:  # the demo's cron chat is this job's last run
+            self.add_execution(caps, digest["id"], stored.started_at, "completed", session=stored.key)
+            self.mark_ran(digest, stored.started_at, "ok")
+        disk = self.new_job(prompt="", schedule="every 60m", name="Disk check", script="check_disk.sh",
+                            no_agent=True)
+        for hours_ago, used in ((5, 58), (4, 59), (3, 61)):
+            self.record_run(profile, disk, now - hours_ago * HOUR, f"Disk usage: {used}% of 460 GB used.")
+        self.pause(disk, "Paused from the dashboard")
+        weekly = self.new_job(prompt=BLUEPRINTS_BY_KEY["weekly-review"][5], schedule="0 18 * * 0",
+                              name="Weekly review", deliver="discord", skills=["weekly-review-planning"])
+        error = "Discord home channel is not set (DISCORD_HOME_CHANNEL)"
+        self.add_execution(caps, weekly["id"], now - 3 * DAY, "failed", error=error)
+        self.mark_ran(weekly, now - 3 * DAY, "error", error)
+        caps.jobs += [briefing, digest, disk, weekly]
+
+    def usage_history(self, profile_name: str) -> list[dict[str, Any]]:
+        """Deterministic past sessions (the analytics sources besides the stored chats): one to three a day."""
+        rng = random.Random(f"fake-hermes-usage-{profile_name}")
+        rows, now = [], time.time()
+        for day in range(1, 90):
+            for _ in range(rng.randint(0 if profile_name == "research" else 1, 3)):
+                model, provider, price_in, price_out = rng.choice(USAGE_MODELS)
+                tokens_in, tokens_out = rng.randint(2_000, 60_000), rng.randint(300, 6_000)
+                cost = round((tokens_in * price_in + tokens_out * price_out) / 1_000_000, 4)
+                rows.append({
+                    "started_at": now - day * DAY - rng.randint(0, 20 * 3600), "model": model, "provider": provider,
+                    "input_tokens": tokens_in, "output_tokens": tokens_out,
+                    "cache_read_tokens": tokens_in // rng.randint(2, 6), "reasoning_tokens": tokens_out // 4,
+                    "estimated_cost": cost, "actual_cost": cost if provider == "echo-cloud" else 0.0,
+                    "api_calls": rng.randint(1, 12),
+                    "tools": {tool: rng.randint(0, 6) for tool in rng.sample(USAGE_TOOLS, 3)},
+                    "skills": {skill: (rng.randint(0, 3), rng.randint(0, 1)) for skill in rng.sample(
+                        [s[0] for s in SKILL_SEEDS.get(profile_name, ())] or ["arxiv"], 1)},
+                    "aux": [(task, aux_model, rng.randint(200, 4_000), rng.randint(20, 400))
+                            for task, aux_model in USAGE_AUX_TASKS if rng.random() < 0.4]})
+        return rows
+
+    def seed_artifact_chats(self) -> None:
+        """``--seed full``: chats whose messages carry what the Artifacts screen lists (an image, files, links)."""
+        self.media[ARTIFACT_IMAGE] = demo_png(320, 180, (0x4A, 0x84, 0xFE))
+        self.media[ARTIFACT_RESEARCH_IMAGE] = demo_png(240, 240, (0xC2, 0x41, 0x0C))
+        self.artifact_files[ARTIFACT_PDF] = demo_pdf("Atlas - Q3 latency report")
+        self.artifact_files[ARTIFACT_CSV] = ("week,p50_ms,p99_ms\n2026-W27,88,412\n2026-W31,81,355\n"
+                                             "2026-W35,76,301\n2026-W39,74,268\n").encode()
+        self.remote_images[f"https://{ARTIFACT_LINK_HOST}/fake-hermes/logo-draft.png"] = demo_png(128, 128,
+                                                                                                  (0x07, 0x16, 0x2C))
+        self.dirs.add(ARTIFACT_DIR)
+        call = "call_" + secrets.token_hex(6)
+        self.seed_chat("Q3 latency report", age=7 * HOUR, cwd=project_path("atlas"), usage=(9300, 1200, 4), turns=[
+            ("user", "Make a latency report for Q3: a chart, the data as CSV and a PDF.", {}),
+            *tool_rows(call, "write_file", {"path": ARTIFACT_CSV, "content": "week,p50_ms,p99_ms\n…"},
+                       {"success": True, "file_path": ARTIFACT_CSV, "bytes": len(self.artifact_files[ARTIFACT_CSV])}),
+            *tool_rows("call_" + secrets.token_hex(6), "terminal",
+                       {"command": f"python scripts/render_report.py --out {ARTIFACT_PDF}"},
+                       {"output": f"Saved {ARTIFACT_PDF}\nSaved {ARTIFACT_IMAGE}", "exit_code": 0, "error": None}),
+            ("assistant", f"MEDIA:{ARTIFACT_IMAGE}\n\nThe Q3 latency report is ready:\n\n- PDF: `{ARTIFACT_PDF}`\n"
+                          f"- Data: [q3-latency.csv]({ARTIFACT_CSV})\n"
+                          "- Live dashboard: https://grafana.example.com/d/atlas-latency\n\n"
+                          "The p99 dropped from 412 ms to 268 ms after the cache change.", {"finish_reason": "stop"})])
+        self.seed_chat("Logo ideas", age=30 * HOUR, usage=(2100, 380, 1), turns=[
+            ("user", "Sketch a logo for Beacon.", {}),
+            ("assistant", f"Here is a first draft:\n\n![Beacon logo draft](https://{ARTIFACT_LINK_HOST}/fake-hermes/"
+                          "logo-draft.png)\n\nThe working file is on https://www.figma.com/file/fake-beacon-logo",
+             {"finish_reason": "stop"})])
+        self.seed_chat("Attention heads figure", age=4 * DAY, profile="research", usage=(4100, 600, 2), turns=[
+            ("user", "Plot what the attention heads in layer 5 attend to.", {}),
+            ("assistant", f"MEDIA:{ARTIFACT_RESEARCH_IMAGE}\n\nFrom the paper https://arxiv.org/abs/1706.03762: "
+                          "heads 2 and 7 track the previous token.", {"finish_reason": "stop"})])
+
+    # ── actions (web_server_gateway.py _spawn_hermes_action, actions.py get_action_status) ──────────
+
+    def spawn(self, name: str, lines: list[str], *, exit_code: int = 0, on_done: Callable[[], None] | None = None,
+              action_id: str | None = None) -> FakeAction:
+        self.action_names.add(name)
+        action = FakeAction(name=name, pid=20_000 + secrets.randbelow(40_000), lines=list(lines), exit_code=exit_code,
+                            on_done=on_done, action_id=action_id)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S") + (f" {action_id}" if action_id else "")
+        self.action_logs.setdefault(name, []).extend(["", f"=== {name} started {stamp} ==="])
+        self.actions[name] = action
+        log(f"action {name} started (pid {action.pid}, {len(lines)} lines, exit {exit_code})")
+        return action
+
+    def spawned(self, action: FakeAction, **extra: Any) -> dict[str, Any]:
+        return {"ok": True, "pid": action.pid, "name": action.name, **extra}
+
+    def advance(self, action: FakeAction) -> None:
+        """One status poll: the next slice of the log; the ``action_polls``-th poll finishes the action."""
+        if action.done:
+            return
+        action.polls += 1
+        if action.polls >= self.action_polls:
+            self.finish(action)
+            return
+        target = math.ceil(len(action.lines) * action.polls / self.action_polls)
+        self.action_logs[action.name].extend(action.lines[action.shown:target])
+        action.shown = max(action.shown, target)
+
+    def finish(self, action: FakeAction) -> None:
+        if action.done:
+            return
+        self.action_logs[action.name].extend(action.lines[action.shown:])
+        action.shown, action.done, action.finished_at = len(action.lines), True, now_iso()
+        if action.on_done is not None and action.exit_code == 0:
+            action.on_done()
+        if action.name == "hermes-update" and action.exit_code == 0:
+            self.action_logs[action.name].append(f"=== hermes-update completed {action.action_id} ===")
+        log(f"action {action.name} finished (exit {action.exit_code})")
+
+    def settle_actions(self) -> None:
+        if self.action_seconds <= 0:
+            return
+        for action in list(self.actions.values()):
+            if not action.done and time.time() - action.started >= self.action_seconds:
+                self.finish(action)
+
+    def action_status(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """actions.py GET /api/actions/{name}/status?lines=: tail of the action log and whether it still runs."""
+        name = request.path_params["name"]
+        if name not in self.action_names:
+            raise HttpError(404, f"Unknown action: {name}")
+        lines = min(max(query_int(request, "lines", 200), 1), 2000)
+        action = self.actions.get(name)
+        if action is not None:
+            self.advance(action)
+        tail = self.action_logs.get(name, [])[-lines:]
+        response: dict[str, Any] = {"name": name, "running": action is not None and not action.done,
+                                    "exit_code": action.exit_code if action is not None and action.done else None,
+                                    "pid": action.pid if action is not None else None, "lines": tail}
+        if name == "hermes-update" and action is not None:
+            if action.done and action.exit_code == 0:
+                response["action_id"] = action.action_id
+            response["receipt"] = self.update_summary(action)
+        return response
+
+    def update_summary(self, action: FakeAction) -> dict[str, Any]:
+        """actions.py _latest_update_receipt_summary for the update this dashboard started."""
+        success = action.done and action.exit_code == 0
+        return {"outcome": "success" if success else ("failed" if action.done else "running"),
+                "started_at": iso_at(action.started), "finished_at": action.finished_at,
+                "action_id": action.action_id, "pre_sha": FAKE_COMMIT,
+                "post_sha": UPDATE_COMMITS[0][0] if success else None,
+                "post_version": UPDATE_VERSION if success else None,
+                "fleet_states": ["restarted"] if success else [], "followups": [], "user_action": None}
+
+    # ── skills (skills.py) ────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def skill_path(profile: FakeProfile, skill: dict[str, Any]) -> str:
+        """The skill's folder: the profile's skills/<category>/<name>, or skills.external_dirs for an external one."""
+        if skill["provenance"] == "external":
+            return f"{DEMO_HOME}/shared-skills/{skill['name']}"
+        return f"{profile.path}/skills/{skill['category']}/{skill['name']}"
+
+    def list_skills(self, request: Request, body: dict[str, Any]) -> list[dict[str, Any]]:
+        """skills.py GET /api/skills: find_all_skills + enabled, usage and provenance (sorted by category, name)."""
+        caps = self.caps(self.scoped(request))
+        skills = sorted(caps.skills.values(), key=lambda s: (s["category"], s["name"]))
+        return [{"name": s["name"], "description": skill_description(s["content"]), "category": s["category"],
+                 "enabled": s["name"] not in caps.disabled_skills, "usage": s["usage"],
+                 "provenance": s["provenance"]} for s in skills]
+
+    def toggle_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py PUT /api/skills/toggle {name, enabled, profile?}: writes skills.disabled (any name)."""
+        name, enabled = body_field(body, "name", str), body_field(body, "enabled", bool)
+        caps = self.caps(self.scoped(request, body))
+        (caps.disabled_skills.discard if enabled else caps.disabled_skills.add)(name)
+        return {"ok": True, "name": name, "enabled": enabled}
+
+    def skill_content(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py GET /api/skills/content?name=: the raw SKILL.md (frontmatter included)."""
+        name = request.query_params.get("name")
+        if name is None:
+            raise HttpError(422, [{"type": "missing", "loc": ["query", "name"], "msg": "Field required"}])
+        profile = self.scoped(request)
+        skill = self.caps(profile).skills.get(name)
+        if skill is None:
+            raise HttpError(404, f"Skill '{name}' not found.")
+        return {"name": name, "content": skill["content"], "path": f"{self.skill_path(profile, skill)}/SKILL.md"}
+
+    def create_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py POST /api/skills {name, content, category?, profile?} -> skill_manager_tool.py _create_skill."""
+        name, content = body_field(body, "name", str), body_field(body, "content", str)
+        category = body_field(body, "category", str, required=False)
+        profile = self.scoped(request, body)
+        caps = self.caps(profile)
+        clean_category = (category or "").strip() or None
+        problem = ("Skill name is required." if not name else identifier_problem(
+            name, "Skill name", f"Invalid skill name '{name}'. {SKILL_NAME_RULE} Must start with a letter or digit."))
+        if problem is None and clean_category is not None:
+            invalid = (f"Invalid category '{clean_category}'. {SKILL_NAME_RULE} Categories must be a single directory "
+                       "name.")
+            problem = invalid if "/" in clean_category or "\\" in clean_category else identifier_problem(
+                clean_category, "Category", invalid)
+        problem = problem or skill_problem(content)
+        if problem is None and name in caps.skills:
+            problem = (f"A skill named '{name}' already exists at "
+                       f"{self.skill_path(profile, caps.skills[name])}.")
+        if problem:
+            raise HttpError(400, problem)
+        skill = {"name": name, "category": clean_category or "general", "provenance": "agent", "usage": 0,
+                 "content": content, "identifier": None}
+        caps.skills[name] = skill
+        relative = f"{clean_category}/{name}" if clean_category else name
+        return {"success": True, "message": f"Skill '{name}' created.", "path": relative,
+                "skill_md": f"{self.skill_path(profile, skill)}/SKILL.md",
+                "_change": {"description": skill_description(content)[:120]},
+                **({"category": clean_category} if clean_category else {}),
+                "hint": "To add reference files, templates, or scripts, use skill_manage(action='write_file', "
+                        f"name='{name}', file_path='references/example.md', file_content='...')"}
+
+    def update_skill_content(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py PUT /api/skills/content {name, content, profile?} -> skill_manager_tool.py _edit_skill."""
+        name, content = body_field(body, "name", str), body_field(body, "content", str)
+        profile = self.scoped(request, body)
+        if problem := skill_problem(content):
+            raise HttpError(400, problem)
+        skill = self.caps(profile).skills.get(name)
+        if skill is None:
+            raise HttpError(404, f"Skill '{name}' not found in active profile '{profile.name}'.")
+        skill["content"] = content
+        return {"success": True, "message": f"Skill '{name}' updated (full rewrite).",
+                "path": self.skill_path(profile, skill), "_change": {"description": skill_description(content)[:120]}}
+
+    def hub_installed(self, caps: Caps) -> dict[str, dict[str, Any]]:
+        """web_server_profiles.py _installed_hub_identifiers: identifier -> its lock entry."""
+        return {s["identifier"]: {"name": s["name"], "trust_level": "builtin", "scan_verdict": "safe"}
+                for s in caps.skills.values() if s["provenance"] == "hub" and s.get("identifier")}
+
+    def official_skills(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py GET /api/skills/hub/official: the whole optional catalog, marked installed for the profile."""
+        installed = self.hub_installed(self.caps(self.scoped(request)))
+        return {"skills": [{"name": name, "description": description, "source": "official",
+                            "identifier": f"official/{category}/{name}", "trust_level": "builtin", "repo": None,
+                            "tags": list(tags), "category": category,
+                            "installed": f"official/{category}/{name}" in installed}
+                           for name, category, description, tags in OFFICIAL_SKILLS]}
+
+    def official_skill(self, identifier: str) -> tuple[str, str, str, tuple[str, ...]] | None:
+        return next((row for row in OFFICIAL_SKILLS if f"official/{row[1]}/{row[0]}" == identifier), None)
+
+    def preview_hub_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py GET /api/skills/hub/preview?identifier=: SKILL.md + manifest without installing."""
+        identifier = (request.query_params.get("identifier") or "").strip()
+        if not identifier:
+            raise HttpError(400, "identifier is required")
+        self.scoped(request)
+        row = self.official_skill(identifier)
+        if row is None:
+            raise HttpError(404, f"Skill not found: {identifier}")
+        name, category, description, tags = row
+        return {"name": name, "description": description, "source": "official", "identifier": identifier,
+                "trust_level": "builtin", "repo": None, "tags": list(tags),
+                "skill_md": skill_document(name, description, f"# {name}\n\nInstall to read the full procedure."),
+                "files": ["SKILL.md", "references/overview.md"]}
+
+    def install_hub_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py POST /api/skills/hub/install {identifier, profile?}: ``hermes skills install`` in the background
+        (skills-install-<slug>-<hash>); an identifier the hub can't resolve fails in the log, exit 1."""
+        identifier = str(body_field(body, "identifier", str)).strip()
+        if not identifier:
+            raise HttpError(400, "identifier is required")
+        profile = self.scoped(request, body)
+        caps, row = self.caps(profile), self.official_skill(identifier)
+        name = per_entry_action("skills-install", identifier, "skill")
+        if row is None:
+            action = self.spawn(name, [f"Resolving {identifier}…", f"Error: skill not found: {identifier}"],
+                                exit_code=1)
+            return self.spawned(action)
+        skill_name, category, description, _tags = row
+
+        def installed() -> None:
+            caps.skills[skill_name] = {"name": skill_name, "category": category, "provenance": "hub", "usage": 0,
+                                       "content": skill_document(skill_name, description, f"# {skill_name}\n\n"
+                                                                 "Installed from the official catalog."),
+                                       "identifier": identifier}
+            caps.disabled_skills.discard(skill_name)
+        action = self.spawn(name, [f"Resolving {identifier}…", "Downloading 2 files…",
+                                   "Security scan: safe (0 findings)",
+                                   f"Installed {skill_name} to skills/{category}/{skill_name}"], on_done=installed)
+        return self.spawned(action)
+
+    def uninstall_hub_skill(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py POST /api/skills/hub/uninstall {name, profile?}: ``hermes skills uninstall`` in the background."""
+        name = str(body_field(body, "name", str)).strip()
+        if not name:
+            raise HttpError(400, "name is required")
+        caps = self.caps(self.scoped(request, body))
+        skill = caps.skills.get(name)
+        action_name = per_entry_action("skills-uninstall", name, "skill")
+        if skill is None or skill["provenance"] != "hub":
+            action = self.spawn(action_name, [f"Error: '{name}' is not a hub-installed skill"], exit_code=1)
+        else:
+            action = self.spawn(action_name, [f"Removing skills/{skill['category']}/{name}…", f"Uninstalled {name}"],
+                                on_done=lambda: caps.skills.pop(name, None))
+        return self.spawned(action)
+
+    def update_hub_skills(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """skills.py POST /api/skills/hub/update: ``hermes skills update`` as the "skills-update" action."""
+        caps = self.caps(self.scoped(request, body))
+        hub = sorted(s["name"] for s in caps.skills.values() if s["provenance"] == "hub")
+        action = self.spawn("skills-update", [f"Checking {len(hub)} hub skills…",
+                                              *(f"{name}: up to date" for name in hub), "All skills are up to date."])
+        return self.spawned(action)
+
+    # ── toolsets (tools.py) ───────────────────────────────────────────────────────────────────────
+
+    def toolset_rows(self, profile: FakeProfile) -> list[tuple[str, str, str, tuple[str, ...]]]:
+        """tools_config.py _get_effective_configurable_toolsets: the built-ins, then enabled plugins' toolsets."""
+        rows = list(M4_TOOLSETS)
+        for plugin in self.caps(profile).plugins.values():
+            if plugin["toolset"] and plugin["status"] == "enabled":
+                rows.append(plugin["toolset"])
+        return rows
+
+    def known_toolset(self, profile: FakeProfile, name: str) -> tuple[str, str, str, tuple[str, ...]]:
+        """tools.py _require_known_toolset."""
+        row = next((row for row in self.toolset_rows(profile) if row[0] == name), None)
+        if row is None:
+            raise HttpError(400, f"Unknown toolset: {name}")
+        return row
+
+    def toolset_enabled(self, profile: FakeProfile, name: str) -> bool:
+        if name in CONFIG_ONLY_TOOLSETS:
+            section = profile.loaded().get(name)
+            return not (isinstance(section, dict) and section.get("enabled") is False)
+        return self.caps(profile).toolsets.get(name, name not in DEFAULT_OFF_TOOLSETS)
+
+    def provider_status(self, profile: FakeProfile, row: dict[str, Any]) -> str:
+        """tools_config.py provider_readiness_status: Nous entitlement, then keys, then the post-setup install."""
+        if row["requires_nous_auth"] and "nous" not in profile.oauth:
+            return "needs_auth"
+        if any(not profile.env.get(e["key"]) and not e["default"] for e in row["env_vars"]):
+            return "needs_keys"
+        if row["post_setup"] and row["post_setup"] not in self.caps(profile).post_setup:
+            return "needs_setup"
+        return "ready"
+
+    def toolset_configured(self, profile: FakeProfile, name: str) -> bool:
+        """tools_config.py _toolset_has_keys: no provider matrix, or a provider that is ready."""
+        rows = TOOLSET_PROVIDERS.get(name)
+        return not rows or any(self.provider_status(profile, row) == "ready" for row in rows)
+
+    def list_toolsets(self, request: Request, body: dict[str, Any]) -> list[dict[str, Any]]:
+        """tools.py GET /api/tools/toolsets (voice toolsets tts/stt included: the app strips them)."""
+        profile = self.scoped(request)
+        out = []
+        for name, label, description, tools in self.toolset_rows(profile):
+            platform = TOOLSET_PLATFORMS.get(name, "cli")
+            enabled = self.toolset_enabled(profile, name)
+            out.append({"name": name, "label": label, "description": description, "platform": platform,
+                        "platform_label": PLATFORM_LABELS.get(platform, platform), "enabled": enabled,
+                        "available": enabled, "configured": self.toolset_configured(profile, name),
+                        "tools": sorted(tools)})
+        return out
+
+    def toggle_toolset(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py PUT /api/tools/toolsets/{name} {enabled}: stt writes stt.enabled; enabling a toolset whose
+        provider still needs its post-setup install starts it (tools-post-setup)."""
+        name = request.path_params["name"]
+        enabled = body_field(body, "enabled", bool)
+        profile = self.scoped(request, body)
+        self.known_toolset(profile, name)
+        platform = TOOLSET_PLATFORMS.get(name, "cli")
+        if name in CONFIG_ONLY_TOOLSETS:
+            profile.save(deep_merge(profile.config, {name: {"enabled": enabled}}))
+            return {"ok": True, "name": name, "platform": platform, "enabled": enabled, "post_setup_started": None}
+        caps = self.caps(profile)
+        caps.toolsets[name] = enabled
+        started = None
+        if enabled:
+            pending = next((row["post_setup"] for row in TOOLSET_PROVIDERS.get(name, ())
+                            if row["post_setup"] and row["post_setup"] not in caps.post_setup), None)
+            if pending:
+                self.spawn_post_setup(caps, pending)
+                started = pending
+        return {"ok": True, "name": name, "platform": platform, "enabled": enabled, "post_setup_started": started}
+
+    def spawn_post_setup(self, caps: Caps, key: str) -> FakeAction:
+        return self.spawn("tools-post-setup", [f"Installing {key}…", "Downloading packages…", f"{key} installed."],
+                          on_done=lambda: caps.post_setup.add(key))
+
+    def active_provider(self, profile: FakeProfile, name: str) -> str | None:
+        selected = self.caps(profile).providers.get(name)
+        return selected if any(row["name"] == selected for row in TOOLSET_PROVIDERS.get(name, ())) else None
+
+    def toolset_config(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py GET /api/tools/toolsets/{name}/config: the provider matrix with each key's ``is_set``."""
+        name = request.path_params["name"]
+        profile = self.scoped(request)
+        self.known_toolset(profile, name)
+        rows, active = TOOLSET_PROVIDERS.get(name), self.active_provider(profile, name)
+        providers = []
+        for row in rows or ():
+            out = {"name": row["name"], "badge": row["badge"], "tag": row["tag"],
+                   "env_vars": [{**e, "is_set": bool(profile.env.get(e["key"]))} for e in row["env_vars"]],
+                   "post_setup": row["post_setup"], "requires_nous_auth": row["requires_nous_auth"],
+                   "managed_nous_feature": row["managed_nous_feature"], "is_active": row["name"] == active,
+                   "status": self.provider_status(profile, row)}
+            if name == "web" and row.get("web_backend"):
+                out["web_backend"] = row["web_backend"]
+                out["capabilities"] = WEB_CAPABILITIES.get(row["web_backend"], ["search"])
+            if name == "tts" and row.get("tts_provider"):
+                out["tts_provider"] = row["tts_provider"]
+            providers.append(out)
+        payload: dict[str, Any] = {"name": name, "has_category": rows is not None, "providers": providers,
+                                   "active_provider": active}
+        if name == "web":
+            caps = self.caps(profile)
+            backend = next((row.get("web_backend") for row in rows or () if row["name"] == active), None)
+            search = caps.web_backends.get("search") or backend
+            extract = caps.web_backends.get("extract") or (backend if "extract" in WEB_CAPABILITIES.get(
+                backend or "", []) else None)
+            payload.update(active_search_backend=search, active_extract_backend=extract,
+                           search_via_nous=search == "nous", extract_via_nous=extract == "nous")
+        return payload
+
+    def model_row(self, profile: FakeProfile, name: str, provider: str | None) -> tuple[dict[str, Any] | None,
+                                                                                         str | None]:
+        """tools.py _find_toolset_provider_row + _resolve_toolset_model_plugin."""
+        rows = TOOLSET_PROVIDERS.get(name, [])
+        wanted = provider or self.active_provider(profile, name)
+        row = next((r for r in rows if r["name"] == wanted), None)
+        if row is None:
+            return None, None
+        plugin = (row.get("image_gen_plugin_name") or row.get("imagegen_backend") if name == "image_gen"
+                  else row.get("video_gen_plugin_name"))
+        return row, plugin
+
+    def toolset_models(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py GET /api/tools/toolsets/{name}/models?provider=: the backend's model catalog (image/video gen)."""
+        name = request.path_params["name"]
+        none = {"name": name, "has_models": False, "models": [], "current": None, "default": None}
+        if name not in MODEL_CATALOG_TOOLSETS:
+            return none
+        profile = self.scoped(request)
+        row, plugin = self.model_row(profile, name, request.query_params.get("provider"))
+        catalog = TOOLSET_MODEL_CATALOGS.get((name, plugin or ""))
+        if row is None or catalog is None:
+            return none
+        models, default = catalog
+        current = self.caps(profile).toolset_models.get(name)
+        if current not in models:
+            current = default if default in models else None
+        return {"name": name, "has_models": bool(models), "provider": row["name"], "plugin": plugin,
+                "models": [{"id": model_id, "display": meta["display"], "speed": meta["speed"],
+                            "strengths": meta["strengths"], "price": meta["price"]}
+                           for model_id, meta in models.items()],
+                "current": current, "default": default}
+
+    def select_toolset_model(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py PUT /api/tools/toolsets/{name}/model {model, provider?}: validated against the backend catalog."""
+        name = request.path_params["name"]
+        model = body_field(body, "model", str)
+        provider = body_field(body, "provider", str, required=False)
+        if name not in MODEL_CATALOG_TOOLSETS:
+            raise HttpError(400, f"Toolset has no model catalog: {name}")
+        model = model.strip()
+        if not model:
+            raise HttpError(400, "model is required")
+        profile = self.scoped(request, body)
+        row, plugin = self.model_row(profile, name, provider)
+        catalog = TOOLSET_MODEL_CATALOGS.get((name, plugin or "")) if plugin else None
+        if catalog is None:
+            raise HttpError(400, f"No model-capable backend is active for {name}")
+        if model not in catalog[0]:
+            raise HttpError(400, f"Unknown model {model!r} for backend {plugin!r}")
+        self.caps(profile).toolset_models[name] = model
+        return {"ok": True, "name": name, "model": model, "plugin": plugin}
+
+    def select_toolset_provider(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py PUT /api/tools/toolsets/{name}/provider {provider, capability?}: web may pick a backend per
+        capability; a managed Nous row without the Portal sign-in reports ``needs_nous_auth``."""
+        name = request.path_params["name"]
+        provider = body_field(body, "provider", str)
+        capability = body_field(body, "capability", str, required=False)
+        if capability is not None:
+            if name != "web":
+                raise HttpError(400, "capability selection is only supported for the web toolset")
+            if capability not in ("search", "extract"):
+                raise HttpError(400, f"Unknown capability: {capability!r} (expected 'search' or 'extract')")
+        profile = self.scoped(request, body)
+        self.known_toolset(profile, name)
+        caps = self.caps(profile)
+        row = next((r for r in TOOLSET_PROVIDERS.get(name, ()) if r["name"] == provider), None)
+        if row is None:
+            raise HttpError(400, f"Unknown provider {provider!r} for toolset {name!r}")
+        response: dict[str, Any] = {"ok": True, "name": name, "provider": provider}
+        if capability is not None:
+            backend = row.get("web_backend")
+            if not backend:
+                raise HttpError(400, f"Provider {provider!r} has no web backend key")
+            if capability not in WEB_CAPABILITIES.get(backend, []):
+                raise HttpError(400, f"{provider} does not support {capability}")
+            caps.web_backends[capability] = "nous" if row["managed_nous_feature"] else backend
+            response["capability"] = capability
+        else:
+            caps.providers[name] = provider
+            if name == "web":
+                caps.web_backends.clear()
+        if row["managed_nous_feature"] and "nous" not in profile.oauth:
+            response.update(needs_nous_auth=True, feature=row["managed_nous_feature"])
+        return response
+
+    def save_toolset_env(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py PUT /api/tools/toolsets/{name}/env {env}: the category's declared keys only, into .env; a blank
+        value leaves the key alone. Values are never logged."""
+        name = request.path_params["name"]
+        env = body_field(body, "env", dict)
+        profile = self.scoped(request, body)
+        self.known_toolset(profile, name)
+        allowed = {e["key"] for row in TOOLSET_PROVIDERS.get(name, ()) for e in row["env_vars"]}
+        if unknown := [key for key in env if key not in allowed]:
+            raise HttpError(400, f"Unknown env var(s) for toolset {name}: {', '.join(sorted(unknown))}")
+        saved, skipped = [], []
+        for key, value in env.items():
+            if isinstance(value, str) and value.strip():
+                profile.env[key] = value.strip()
+                saved.append(key)
+            else:
+                skipped.append(key)
+        return {"ok": True, "name": name, "saved": saved, "skipped": skipped,
+                "is_set": {key: bool(profile.env.get(key)) for key in sorted(allowed)}}
+
+    def toolset_post_setup(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py POST /api/tools/toolsets/{name}/post-setup {key}: ``hermes tools post-setup`` (tools-post-setup)."""
+        name = request.path_params["name"]
+        key = body_field(body, "key", str)
+        profile = self.scoped(request, body)
+        self.known_toolset(profile, name)
+        if key not in POST_SETUP_KEYS:
+            raise HttpError(400, f"Unknown post-setup key: {key}")
+        return {**self.spawned(self.spawn_post_setup(self.caps(profile), key)), "key": key}
+
+    def terminal_backends(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py GET /api/tools/terminal/backends: each backend probed (ready / needs_setup / unavailable)."""
+        profile = self.scoped(request)
+        terminal = profile.loaded().get("terminal") or {}
+        active = str(terminal.get("backend") or "local").strip().lower()
+        if active not in {row[0] for row in TERMINAL_BACKENDS}:
+            active = "local"
+        backends = []
+        for name, label, description in TERMINAL_BACKENDS:
+            status, detail = self.probe_backend(profile, name, terminal)
+            backends.append({"name": name, "label": label, "description": description, "active": name == active,
+                             "status": status, "detail": detail})
+        return {"active": active, "backends": backends}
+
+    @staticmethod
+    def probe_backend(profile: FakeProfile, name: str, terminal: dict[str, Any]) -> tuple[str, str]:
+        """tools.py _BACKEND_PROBES, answered from the profile's config and .env (no Docker on the fake host)."""
+        env = profile.env
+        if name == "local":
+            return "ready", ""
+        if name == "docker":
+            return "needs_setup", "Docker CLI not found — install Docker Desktop, docker-ce, or Podman."
+        if name == "ssh":
+            host = str(terminal.get("ssh_host") or env.get("TERMINAL_SSH_HOST") or "").strip()
+            user = str(terminal.get("ssh_user") or env.get("TERMINAL_SSH_USER") or "").strip()
+            missing = [k for k, v in (("terminal.ssh_host", host), ("terminal.ssh_user", user)) if not v]
+            if missing:
+                return "needs_setup", (f"Set {' and '.join(missing)} in config.yaml (or the matching TERMINAL_SSH_* "
+                                       "env vars).")
+            return "ready", f"{user}@{host}"
+        if name == "modal":
+            if env.get("MODAL_TOKEN_ID") and env.get("MODAL_TOKEN_SECRET"):
+                return "ready", ""
+            return "needs_setup", ("Modal credentials not found — set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (or run "
+                                   "`modal setup`).")
+        if name == "daytona":
+            return ("ready", "") if env.get("DAYTONA_API_KEY") else (
+                "needs_setup", "Set DAYTONA_API_KEY to use the Daytona backend.")
+        return "unavailable", f"Unknown backend: {name}"
+
+    def select_terminal_backend(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """tools.py PUT /api/tools/terminal/backend {backend}: writes terminal.backend (setup is not required)."""
+        raw = body_field(body, "backend", str)
+        backend = raw.strip().lower()
+        profile = self.scoped(request, body)
+        names = {row[0] for row in TERMINAL_BACKENDS}
+        if backend not in names:
+            raise HttpError(400, f"Unknown terminal backend: {raw!r}. Use one of: {', '.join(sorted(names))}")
+        profile.save(deep_merge(profile.config, {"terminal": {"backend": backend}}))
+        return {"ok": True, "backend": backend}
+
+    # ── MCP servers (mcp.py) ──────────────────────────────────────────────────────────────────────
+
+    def config_servers(self, profile: FakeProfile) -> dict[str, dict[str, Any]]:
+        servers = profile.config.get("mcp_servers")
+        return servers if isinstance(servers, dict) else {}
+
+    def plugin_servers(self, profile: FakeProfile) -> dict[str, tuple[dict[str, Any], str]]:
+        """tui_gateway/mcp_rpc_helpers.py server_configs_with_sources: servers enabled plugins provide."""
+        return {plugin["mcp_server"][0]: (plugin["mcp_server"][1], plugin["name"])
+                for plugin in self.caps(profile).plugins.values()
+                if plugin["mcp_server"] and plugin["status"] == "enabled"}
+
+    def plugin_owned(self, profile: FakeProfile, name: str) -> None:
+        if owner := self.plugin_servers(profile).get(name):
+            raise HttpError(409, f"Server '{name}' is provided by plugin '{owner[1]}' and cannot be modified")
+
+    def list_mcp_servers(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py GET /api/mcp/servers: config servers plus plugin-provided ones, sorted by name."""
+        profile = self.scoped(request)
+        rows = {name: (cfg, None) for name, cfg in self.config_servers(profile).items() if isinstance(cfg, dict)}
+        for name, (cfg, plugin) in self.plugin_servers(profile).items():
+            rows.setdefault(name, (cfg, plugin))
+        return {"servers": [mcp_summary(name, cfg, plugin) for name, (cfg, plugin) in sorted(rows.items())]}
+
+    def add_mcp_server(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py POST /api/mcp/servers {name, url | command, args, env, auth, bearer_token, profile?}
+        (web_server_mcp.py _normalize_mcp_server_create). A bearer token goes to .env as MCP_<NAME>_API_KEY and the
+        config gets the ``Authorization: Bearer ${…}`` template; env values stay in config.yaml like Hermes."""
+        name = str(body_field(body, "name", str)).strip()
+        url = str(body_field(body, "url", str, required=False) or "").strip()
+        command = str(body_field(body, "command", str, required=False) or "").strip()
+        args = body_field(body, "args", list, required=False, default=[])
+        env = body_field(body, "env", dict, required=False, default={})
+        auth = str(body_field(body, "auth", str, required=False) or "none").strip().lower()
+        token = body_field(body, "bearer_token", str, required=False)
+        problem = None
+        if not name:
+            problem = "Server name is required"
+        elif bool(url) == bool(command):
+            problem = "Provide exactly one of URL (HTTP/SSE) or command (stdio)"
+        elif auth not in {"none", "header", "oauth"}:
+            problem = f"Unsupported auth mode: {auth}"
+        cfg: dict[str, Any] = {}
+        if problem is None and url:
+            if args:
+                problem = "Arguments are only supported for stdio MCP servers"
+            elif env:
+                problem = "Environment variables are only supported for stdio MCP servers"
+            elif auth == "header":
+                clean = re.sub(r"^\s*bearer\s+", "", token or "", flags=re.IGNORECASE).strip()
+                if not clean or clean.lower() == "bearer":
+                    problem = "Bearer token is required"
+                token = clean
+            elif token is not None:
+                problem = "Bearer token requires header authentication"
+            cfg["url"] = url
+            if auth == "oauth":
+                cfg["auth"] = "oauth"
+        elif problem is None:
+            if auth != "none" or token is not None:
+                problem = "HTTP authentication is not supported for stdio MCP servers"
+            cfg["command"] = command
+            if args:
+                cfg["args"] = [str(arg) for arg in args]
+            if env:
+                cfg["env"] = {str(k): str(v) for k, v in env.items()}
+        if problem is None and (issues := mcp_problems(name, cfg)):
+            problem = f"Server '{name}' rejected: {'; '.join(issues)}"
+        if problem:
+            raise HttpError(400, problem)
+        profile = self.scoped(request, body)
+        self.plugin_owned(profile, name)
+        servers = self.config_servers(profile)
+        if name in servers:
+            raise HttpError(409, f"Server '{name}' already exists")
+        if auth == "header" and token:
+            profile.env[mcp_env_key(name)] = token
+            cfg["headers"] = {"Authorization": f"Bearer ${{{mcp_env_key(name)}}}"}
+        profile.config["mcp_servers"] = {**servers, name: cfg}
+        return mcp_summary(name, cfg)
+
+    def replace_mcp_servers(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py PUT /api/mcp/servers {servers}: the whole map is replaced (deletes and re-enables persist)."""
+        servers = body_field(body, "servers", dict, required=False, default={})
+        profile = self.scoped(request, body)
+        plugins = self.plugin_servers(profile)
+        for name, cfg in servers.items():
+            if name in plugins:
+                raise HttpError(400, f"Server '{name}' is provided by plugin '{plugins[name][1]}' and cannot be "
+                                     "modified")
+            if not isinstance(cfg, dict):
+                raise HttpError(422, [{"type": "dict_type", "loc": ["body", "servers", name],
+                                       "msg": "Input should be a valid dictionary"}])
+            if issues := mcp_problems(name, cfg):
+                raise HttpError(400, "; ".join(issues))
+        if servers:
+            profile.config["mcp_servers"] = copy.deepcopy(servers)
+        else:
+            profile.config.pop("mcp_servers", None)
+        return {"ok": True}
+
+    def remove_mcp_server(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py DELETE /api/mcp/servers/{name}."""
+        name = request.path_params["name"]
+        profile = self.scoped(request)
+        self.plugin_owned(profile, name)
+        servers = self.config_servers(profile)
+        if name not in servers:
+            raise HttpError(404, f"Server '{name}' not found")
+        profile.config["mcp_servers"] = {k: v for k, v in servers.items() if k != name}
+        self.caps(profile).mcp_tokens.discard(name)
+        return {"ok": True}
+
+    def set_mcp_enabled(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py PUT /api/mcp/servers/{name}/enabled {enabled}: kept in config so it can come back without re-entry."""
+        name = request.path_params["name"]
+        enabled = body_field(body, "enabled", bool)
+        profile = self.scoped(request, body)
+        self.plugin_owned(profile, name)
+        servers = self.config_servers(profile)
+        if name not in servers:
+            raise HttpError(404, f"Server '{name}' not found")
+        if not isinstance(servers[name], dict):
+            raise HttpError(400, "Malformed server config")
+        servers[name]["enabled"] = enabled
+        return {"ok": True, "name": name, "enabled": enabled}
+
+    def server_tools(self, name: str) -> tuple[tuple[str, str, int], ...]:
+        return MCP_TOOL_SEEDS.get(name, MCP_DEFAULT_TOOLS)
+
+    def test_mcp_server(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py POST /api/mcp/servers/{name}/test: connect, list tools, disconnect. An ``auth: oauth`` server needs
+        a token first; a URL or command containing "offline" fails to connect."""
+        name = request.path_params["name"]
+        profile = self.scoped(request)
+        servers = {**{k: v for k, (v, _p) in self.plugin_servers(profile).items()}, **self.config_servers(profile)}
+        if name not in servers:
+            raise HttpError(404, f"Server '{name}' not found")
+        cfg = servers[name]
+        target = str(cfg.get("url") or cfg.get("command") or "")
+        if "offline" in target or "offline" in " ".join(map(str, cfg.get("args") or [])):
+            what = f"connect to {cfg['url']}" if cfg.get("url") else f"start {target}"
+            return {"ok": False, "error": f"Could not {what}: connection refused", "tools": []}
+        if cfg.get("auth") == "oauth" and name not in self.caps(profile).mcp_tokens:
+            return {"ok": False, "error": "OAuth authentication required — no token found.", "tools": []}
+        tools = self.server_tools(name)
+        return {"ok": True, "tools": [{"name": t, "description": d, "schema_chars": c} for t, d, c in tools],
+                "prompts": 2 if name == "github" else 0, "resources": 1 if name == "context7" else 0}
+
+    def flow_snapshot(self, flow: dict[str, Any]) -> dict[str, Any]:
+        """tools/mcp_dashboard_oauth.py DashboardOAuthFlow.snapshot."""
+        return {key: flow[key] for key in ("flow_id", "server_name", "status", "authorization_url", "error")}
+
+    def gc_flows(self) -> None:
+        cutoff = time.time() - MCP_OAUTH_FLOW_TTL
+        for flow_id in [fid for fid, flow in self.mcp_flows.items() if flow["created_at"] < cutoff]:
+            self.mcp_flows.pop(flow_id, None)
+
+    def start_mcp_oauth(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py POST /api/mcp/servers/{name}/auth: start an OAuth flow and return its authorization URL (the fake's
+        own /fake-oauth/authorize page, whose Approve link hits the callback). Approved by itself after
+        ``--mcp-oauth-approve-after`` seconds (0 = only through the callback)."""
+        name = request.path_params["name"]
+        profile = self.scoped(request)
+        self.gc_flows()
+        servers = self.config_servers(profile)
+        if name not in servers and name not in self.plugin_servers(profile):
+            raise HttpError(404, f"Server '{name}' not found")
+        self.plugin_owned(profile, name)
+        cfg = servers[name]
+        if not cfg.get("url"):
+            raise HttpError(400, "stdio servers authenticate via env keys, not OAuth")
+        if cfg.get("headers") and cfg.get("auth") != "oauth":
+            raise HttpError(400, "This server uses header/API-key auth, not OAuth")
+        live = [flow for flow in self.mcp_flows.values() if flow["status"] == "authorization_required"]
+        if len(live) >= MCP_OAUTH_MAX_FLOWS:
+            raise HttpError(429, "Too many MCP OAuth flows are already in progress")
+        if any(flow["server_name"] == name and flow["profile"] is profile for flow in live):
+            raise HttpError(409, f"MCP OAuth for '{name}' is already in progress")
+        flow_id, state = secrets.token_urlsafe(24), secrets.token_urlsafe(16)
+        base = f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+        callback = f"{base}/api/mcp/oauth/callback/{quote(name, safe='')}"
+        flow = {"flow_id": flow_id, "server_name": name, "status": "authorization_required", "error": None,
+                "authorization_url": f"{base}/fake-oauth/authorize?" + urlencode(
+                    {"client_id": "fake-hermes", "state": state, "redirect_uri": callback, "server": name}),
+                "state": state, "profile": profile, "created_at": time.time(), "tools": None}
+        self.mcp_flows[flow_id] = flow
+        if self.mcp_oauth_approve_after > 0:
+            asyncio.get_running_loop().call_later(self.mcp_oauth_approve_after, self.settle_mcp_flow, flow, None)
+        return self.flow_snapshot(flow)
+
+    def settle_mcp_flow(self, flow: dict[str, Any], error: str | None) -> None:
+        """The worker's end: approved (the token is stored, the server marked ``auth: oauth``, its tools listed) or
+        error; the first outcome wins (mark_error / mark_approved)."""
+        if flow["status"] != "authorization_required":
+            return
+        if error:
+            flow.update(status="error", error=error)
+            log(f"mcp oauth {flow['server_name']} -> error")
+            return
+        profile: FakeProfile = flow["profile"]
+        self.caps(profile).mcp_tokens.add(flow["server_name"])
+        if isinstance(cfg := self.config_servers(profile).get(flow["server_name"]), dict):
+            cfg["auth"] = "oauth"
+        flow.update(status="approved", error=None,
+                    tools=[{"name": t, "description": d} for t, d, _c in self.server_tools(flow["server_name"])])
+        log(f"mcp oauth {flow['server_name']} -> approved")
+
+    def mcp_oauth_flow(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py GET /api/mcp/oauth/flows/{flow_id}: the snapshot plus ``tools`` (null until approved)."""
+        self.gc_flows()
+        flow = self.mcp_flows.get(request.path_params["flow_id"])
+        if flow is None:
+            raise HttpError(404, "OAuth flow not found or expired")
+        return {**self.flow_snapshot(flow), "tools": flow["tools"]}
+
+    def cancel_mcp_oauth_flow(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py DELETE /api/mcp/oauth/flows/{flow_id}: idempotent; a settled flow stays as it is."""
+        flow = self.mcp_flows.get(request.path_params["flow_id"])
+        if flow is None:
+            return {"ok": True, "status": "expired"}
+        self.settle_mcp_flow(flow, "Cancelled by user")
+        return {"ok": True, "status": flow["status"]}
+
+    def debug_mcp_oauth_flow(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """Fake-only debug trigger: settle a waiting flow without a browser, ``{outcome: "approve" | "deny"}``."""
+        outcome = body_field(body, "outcome", str, required=False, default="approve")
+        flow = self.mcp_flows.get(request.path_params["flow_id"])
+        if flow is None:
+            raise HttpError(404, "OAuth flow not found or expired")
+        if outcome not in ("approve", "deny"):
+            raise HttpError(400, "outcome must be 'approve' or 'deny'")
+        self.settle_mcp_flow(flow, None if outcome == "approve" else "OAuth authorization failed: access_denied")
+        return {**self.flow_snapshot(flow), "tools": flow["tools"]}
+
+    async def mcp_oauth_callback(self, request: Request) -> Response:
+        """mcp.py GET /api/mcp/oauth/callback/{server}?code&state&error (public): delivers the browser redirect to
+        the waiting flow whose state matches."""
+        server = request.path_params["server_name"]
+        q = request.query_params
+        self.gc_flows()
+        flow = next((f for f in self.mcp_flows.values() if f["server_name"] == server
+                     and f["status"] == "authorization_required" and q.get("state")
+                     and secrets.compare_digest(f["state"], q["state"])), None)
+        if flow is None:
+            log(f"http GET /api/mcp/oauth/callback/{server} -> 404")
+            return HTMLResponse("<h1>OAuth flow expired</h1><p>Return to Hermes and try again.</p>", status_code=404)
+        if q.get("error"):
+            self.settle_mcp_flow(flow, f"OAuth authorization failed: {q['error']}")
+            return HTMLResponse("<h1>Authorization failed</h1><p>Return to Hermes for details.</p>", status_code=400)
+        if not q.get("code"):
+            self.settle_mcp_flow(flow, "OAuth callback did not include code or error")
+            return HTMLResponse("<h1>OAuth callback rejected</h1><p>The callback was invalid or already used.</p>",
+                                status_code=400)
+        self.settle_mcp_flow(flow, None)
+        log(f"http GET /api/mcp/oauth/callback/{server} -> 200")
+        return HTMLResponse("<h1>Authorization received</h1><p>You can close this tab and return to Hermes.</p>")
+
+    async def fake_oauth_page(self, request: Request) -> Response:
+        """The fake identity provider's consent page (public): Approve / Deny redirect to the flow's callback."""
+        q = request.query_params
+        redirect, state = q.get("redirect_uri") or "", q.get("state") or ""
+        if not redirect.startswith(f"{request.url.scheme}://{request.headers.get('host', '')}/api/mcp/oauth/callback/"):
+            return HTMLResponse("<h1>Unknown client</h1>", status_code=400)
+        approve = f"{redirect}?{urlencode({'code': 'fake-' + secrets.token_hex(8), 'state': state})}"
+        deny = f"{redirect}?{urlencode({'error': 'access_denied', 'state': state})}"
+        server = html.escape(q.get("server") or "the MCP server")
+        return HTMLResponse(f"<!doctype html><meta name=viewport content='width=device-width'><title>Fake sign-in"
+                            f"</title><h1>Allow Hermes to use {server}?</h1><p><a href='{html.escape(approve)}'>"
+                            f"Approve</a> · <a href='{html.escape(deny)}'>Deny</a></p>")
+
+    def mcp_catalog(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py GET /api/mcp/catalog: each entry with installed / enabled for the profile."""
+        servers = self.config_servers(self.scoped(request))
+        entries = []
+        for entry in MCP_CATALOG:
+            cfg = servers.get(entry["name"])
+            entries.append({**{k: v for k, v in entry.items() if not k.startswith("_")},
+                            "installed": cfg is not None, "enabled": isinstance(cfg, dict) and mcp_enabled(cfg)})
+        return {"entries": entries, "diagnostics": []}
+
+    def install_mcp_catalog_entry(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """mcp.py POST /api/mcp/catalog/install {name, env, enable, profile?}: declared env only; secrets go to .env,
+        the rest into the server's config; a git-bootstrap entry installs in the background (mcp-install-…)."""
+        name = str(body_field(body, "name", str)).strip()
+        env = body_field(body, "env", dict, required=False, default={})
+        enable = body_field(body, "enable", bool, required=False, default=True)
+        entry = MCP_CATALOG_BY_NAME.get(name)
+        if entry is None:
+            raise HttpError(404, f"No catalog entry '{name}'")
+        declared = {spec["name"] for spec in entry["required_env"]}
+        if undeclared := sorted(set(env) - declared):
+            raise HttpError(400, f"Catalog entry '{name}' does not declare environment variable(s): "
+                                 f"{', '.join(undeclared)}")
+        for key in env:
+            self.check_env_name(key)
+        profile = self.scoped(request, body)
+        missing = [spec["name"] for spec in entry["required_env"]
+                   if spec["required"] and not env.get(spec["name"]) and not profile.env.get(spec["name"])]
+        for key, value in env.items():
+            if key in entry["_secret_env"] and value:
+                profile.env[key] = str(value)
+
+        def install() -> None:
+            cfg: dict[str, Any] = {"url": entry["url"]} if entry["url"] else {"command": entry["command"],
+                                                                               "args": list(entry["args"])}
+            if entry["auth_type"] == "oauth":
+                cfg["auth"] = "oauth"
+            plain = {k: str(v) for k, v in env.items() if k not in entry["_secret_env"] and v}
+            secret_refs = {k: f"${{{k}}}" for k in entry["_secret_env"] if k in env or profile.env.get(k)}
+            if plain or secret_refs:
+                cfg["env"] = {**secret_refs, **plain}
+            cfg["enabled"] = enable
+            profile.config["mcp_servers"] = {**self.config_servers(profile), name: cfg}
+        if entry["needs_install"]:
+            action = per_entry_action("mcp-install", name, "server")
+            self.spawn(action, [f"Cloning {entry['install_url']} ({entry['install_ref']})…",
+                                *(f"$ {step}" for step in entry["bootstrap"]), f"Installed MCP server '{name}'."],
+                       on_done=install)
+            return {"ok": True, "name": name, "background": True, "action": action}
+        if missing:
+            raise HttpError(400, f"Missing required environment variable(s) for '{name}': {', '.join(missing)}")
+        install()
+        return {"ok": True, "name": name, "background": False}
+
+    # ── plugins (tui_gateway/methods_tools.py plugins.manage) ─────────────────────────────────────
+
+    def plugin_row(self, profile: FakeProfile, record: dict[str, Any]) -> dict[str, Any]:
+        """methods_tools.py _plugin_rows, limited to the contract's AgentPluginRow fields."""
+        row = {key: record[key] for key in ("name", "key", "version", "description", "source", "status", "portable",
+                                            "install_dir", "has_desktop_half")}
+        row["servers"] = [dict(server) for server in record["servers"]]
+        fields = []
+        for spec in record["settings_schema"]:
+            field_row = {k: spec[k] for k in ("key", "type", "label", "description", "required")}
+            if spec["type"] == "secret":
+                field_row.update(env=spec["env"], has_value=bool(profile.env.get(spec["env"])))
+            else:
+                field_row.update(value=record["settings"].get(spec["key"]), default=spec.get("default"))
+                if spec.get("choices"):
+                    field_row["choices"] = list(spec["choices"])
+            fields.append(field_row)
+        row["settings_schema"] = fields
+        if catalog := record["catalog"]:
+            row.update(catalog_name=catalog["name"], catalog_tier=catalog["tier"], installed_sha=catalog["sha"],
+                       catalog_sha=catalog["catalog_sha"], catalog_version=catalog["catalog_version"])
+        if record["update_available"]:
+            row["update_available"] = True
+        if record["pinned_sha"]:
+            row["pinned_sha"] = record["pinned_sha"]
+        return row
+
+    def plugin_record_named(self, caps: Caps, ident: str) -> dict[str, Any] | None:
+        return caps.plugins.get(ident) or next((p for p in caps.plugins.values() if p["name"] == ident), None)
+
+    def activation(self, record: dict[str, Any]) -> dict[str, Any]:
+        """hermes_cli/plugins_activation.py summary: what is live now vs from the next session."""
+        live: dict[str, Any] = {"mcp_servers": [], "skills": []}
+        if record["mcp_server"]:
+            server = record["mcp_server"][0]
+            live["mcp_servers"].append({"name": server, "connected": True,
+                                        "tools": [t for t, _d, _c in self.server_tools(server)]})
+        return {"name": record["name"], "key": record["key"], "activated_now": {}, "live_now": live,
+                "deferred": {"tools": list(record["toolset"][3])} if record["toolset"] else {}}
+
+    def plugins_manage(self, params: dict[str, Any]) -> dict[str, Any]:
+        """plugins.manage {action: list | toggle | install | update | remove | settings, profile?, …}."""
+        profile = self.rpc_profile(params)
+        caps = self.caps(profile)
+        action = params.get("action") or "list"
+        handlers = {"list": self.plugins_list, "toggle": self.plugins_toggle, "install": self.plugins_install,
+                    "update": self.plugins_update, "remove": self.plugins_remove, "settings": self.plugins_settings,
+                    "onboarding": lambda p, c, prm: {"onboarding": []}}
+        handler = handlers.get(action)
+        if handler is None:
+            raise RpcError(4017, f"unknown plugins action: {action}")
+        return handler(profile, caps, params)
+
+    def plugins_list(self, profile: FakeProfile, caps: Caps, params: dict[str, Any]) -> dict[str, Any]:
+        rows = [self.plugin_row(profile, record) for record in sorted(
+            caps.plugins.values(), key=lambda r: (r["name"], r["version"], r["description"], r["source"]))]
+        user = sum(1 for row in rows if row["source"] != "bundled")
+        return {"plugins": rows, "user_count": user, "bundled_count": len(rows) - user}
+
+    def plugins_toggle(self, profile: FakeProfile, caps: Caps, params: dict[str, Any]) -> dict[str, Any]:
+        ident = str(params.get("key") or params.get("name") or "").strip()
+        if not ident:
+            raise RpcError(4019, "plugins.toggle requires a 'key' or 'name'")
+        record = self.plugin_record_named(caps, ident)
+        if record is None:
+            raise RpcError(5026, f"Plugin '{ident}' is not installed or bundled.")
+        enable = bool(params.get("enable"))
+        status = "enabled" if enable else "disabled"
+        changed = record["status"] != status
+        record["status"] = status
+        return {"ok": True, "unchanged": not changed, "restart_required": False, "gateway_reloaded": changed,
+                "activation": self.activation(record) if enable and changed else None, "name": record["key"],
+                "plugin": self.plugin_row(profile, record)}
+
+    def plugins_install(self, profile: FakeProfile, caps: Caps, params: dict[str, Any]) -> dict[str, Any]:
+        """plugins_cmd_install.py dashboard_install_plugin: a catalog entry at its pinned sha, or a git repo
+        (``https://…/<repo>`` or ``owner/repo``); a repo named like "missing" can't be cloned."""
+        ident = str(params.get("identifier") or params.get("repo") or "").strip()
+        catalog_name = str(params.get("catalog_name") or "").strip()
+        if not ident and not catalog_name:
+            raise RpcError(4019, "plugins.install requires 'identifier', 'repo', or 'catalog_name'")
+        enable = params.get("enable") is not False
+        entry = PLUGIN_CATALOG.get(catalog_name) if catalog_name else next(
+            ((n, e) for n, e in PLUGIN_CATALOG.items() if e["repo"] == ident.rstrip("/")), None)
+        if catalog_name and entry is None:
+            raise RpcError(5026, f"No catalog plugin named '{catalog_name}'.")
+        if isinstance(entry, tuple):
+            catalog_name, entry = entry
+        if entry is not None:
+            name, description, version = catalog_name, entry["description"], entry["version"]
+            catalog = {"name": catalog_name, "tier": entry["tier"], "sha": entry["sha"], "catalog_sha": entry["sha"],
+                       "catalog_version": entry["version"]}
+        else:
+            match = re.match(r"^(?:https://[^/\s]+/)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", ident)
+            if match is None:
+                raise RpcError(5026, f"Could not resolve '{ident}': use a git URL, owner/repo, or a catalog name.")
+            name = re.sub(r"^hermes-plugin-", "", match.group(2))
+            if "missing" in name:
+                raise RpcError(5026, f"git clone failed for {ident}: repository not found")
+            description, version, catalog = f"Installed from {ident}", "0.1.0", None
+        existing = self.plugin_record_named(caps, name)
+        if existing is not None and existing["source"] == "bundled":
+            raise RpcError(5026, f"'{name}' is a bundled plugin.")
+        if existing is not None and not params.get("force"):
+            raise RpcError(5026, f"Plugin '{name}' is already installed. Reinstall with force.")
+        record = plugin_record(name, name, version, description, "user", "enabled" if enable else "not enabled",
+                               f"{profile.path}/plugins/{name}", catalog=catalog)
+        if name == "weather-briefing":
+            record["mcp_server"] = ("weather", {"command": "uvx", "args": ["weather-mcp"]})
+        caps.plugins[record["key"]] = record
+        result = {"ok": True, "plugin_name": name, "warnings": [], "python_dependencies": [], "missing_env": [],
+                  "after_install_path": None, "enabled": enable, "known_issues": []}
+        if enable:
+            result.update(gateway_reloaded=True, activation=self.activation(record), restart_required=False)
+        return result
+
+    def plugins_update(self, profile: FakeProfile, caps: Caps, params: dict[str, Any]) -> dict[str, Any]:
+        """plugins_cmd.py dashboard_update_user_plugin: a catalog install re-pins (consent first when the new pin adds
+        tools), a git install pulls."""
+        name = str(params.get("name") or "").strip()
+        if not name:
+            raise RpcError(4019, "plugins.update requires a 'name'")
+        record = self.plugin_record_named(caps, name)
+        if record is None:
+            raise RpcError(4021, f"Plugin '{name}' is not installed.")
+        if record["source"] == "bundled":
+            raise RpcError(4021, "Bundled plugins update with Hermes (`hermes update`).")
+        if not record["update_available"]:
+            return {"ok": True, "unchanged": True, "name": record["key"], "warnings": []}
+        catalog = record["catalog"]
+        if catalog and catalog["name"] == "linear-sync" and not params.get("accept_capabilities"):
+            return {"ok": False, "name": record["key"], "sha": catalog["catalog_sha"], "consent_required": True,
+                    "error": "The new version adds capabilities; confirm to update.",
+                    "delta": {"tools": ["linear_delete_issue"]}, "delta_lines": ["New tool: linear_delete_issue"]}
+        if catalog:
+            catalog["sha"] = catalog["catalog_sha"]
+            record["version"] = catalog["catalog_version"]
+        if record["toolset"] and catalog and catalog["name"] == "linear-sync":
+            key, label, description, tools = record["toolset"]
+            record["toolset"] = (key, label, description, (*tools, "linear_delete_issue"))
+        record["update_available"] = None
+        return {"ok": True, "unchanged": False, "name": record["key"], "warnings": [],
+                "sha": catalog["sha"] if catalog else secrets.token_hex(6), "gateway_reloaded": True,
+                "restart_required": False, "activation": self.activation(record)}
+
+    def plugins_remove(self, profile: FakeProfile, caps: Caps, params: dict[str, Any]) -> dict[str, Any]:
+        """plugins_cmd_remove.py dashboard_remove_user_plugin (user installs only)."""
+        name = str(params.get("name") or "").strip()
+        if not name:
+            raise RpcError(4019, "plugins.remove requires a 'name'")
+        record = self.plugin_record_named(caps, name)
+        if record is not None and record["source"] == "bundled":
+            raise RpcError(5026, "Bundled plugins cannot be removed from the dashboard.")
+        if record is None:
+            raise RpcError(5026, f"Plugin '{name}' was not found under {profile.path}/plugins.")
+        caps.plugins.pop(record["key"], None)
+        if record["toolset"]:
+            caps.toolsets.pop(record["toolset"][0], None)
+        return {"ok": True, "name": record["name"]}
+
+    def plugins_settings(self, profile: FakeProfile, caps: Caps, params: dict[str, Any]) -> dict[str, Any]:
+        """hermes_cli/plugins_settings.py save_plugin_settings: declared, non-secret keys of the right type."""
+        key = str(params.get("key") or params.get("name") or "").strip()
+        values = params.get("values")
+        if not key or not isinstance(values, dict):
+            raise RpcError(4019, "plugins.settings requires a 'key' and a 'values' mapping")
+        record = self.plugin_record_named(caps, key)
+        if record is None:
+            raise RpcError(4020, f"plugin '{key}' not found")
+        specs = {spec["key"]: spec for spec in record["settings_schema"]}
+        for setting, value in values.items():
+            spec = specs.get(setting)
+            if spec is None:
+                raise RpcError(4021, f"'{setting}' is not a setting of plugin '{record['key']}'")
+            if spec["type"] == "secret":
+                raise RpcError(4021, f"'{setting}' is a secret: store it in the .env ({spec['env']})")
+            kinds = {"string": str, "number": (int, float), "boolean": bool, "enum": str}
+            if value is not None and spec["type"] in kinds and (not isinstance(value, kinds[spec["type"]]) or (
+                    spec["type"] == "number" and isinstance(value, bool))):
+                raise RpcError(4021, f"'{setting}' must be a {spec['type']}")
+        record["settings"].update(values)
+        return {"ok": True, "name": record["key"], "written": sorted(values),
+                "plugin": self.plugin_row(profile, record)}
+
+    def plugins_list_legacy(self, params: dict[str, Any]) -> dict[str, Any]:
+        """plugins.list: the TUI's old {name, version, enabled} rows."""
+        caps = self.caps(self.profiles["default"])
+        return {"plugins": [{"name": p["name"], "version": p["version"], "enabled": p["status"] == "enabled"}
+                            for p in sorted(caps.plugins.values(), key=lambda p: p["name"])]}
+
+    # ── cron (cron.py, web_server_cron.py, cron/jobs.py) ──────────────────────────────────────────
+
+    def new_job(self, *, prompt: str, schedule: str, name: str = "", deliver: str = "local",
+                skills: list[str] | None = None, model: str | None = None, provider: str | None = None,
+                script: str | None = None, no_agent: bool = False, repeat: Any = None, paused: bool = False,
+                paused_reason: str | None = None, workdir: str | None = None,
+                enabled_toolsets: list[str] | None = None, base_url: str | None = None,
+                context_from: list[str] | None = None) -> dict[str, Any]:
+        """cron/jobs.py create_job: the stored record (ValueError for what it refuses)."""
+        if paused_reason is not None and not paused:
+            raise ValueError("paused_reason requires paused=True.")
+        parsed = parse_schedule(schedule)
+        repeat = normalize_repeat(repeat)
+        if parsed["kind"] == "once" and repeat is None:
+            repeat = 1
+        skills = [s.strip() for s in skills or [] if isinstance(s, str) and s.strip()]
+        prompt_text = (prompt or "").strip()
+        if not prompt_text and not script and not skills:
+            raise ValueError("Cron job has nothing to run: the prompt is blank and no script or skill(s) are set. "
+                             "Provide a prompt, a script, or at least one skill.")
+        label = prompt_text or (skills[0] if skills else None) or (script if no_agent else None) or "cron job"
+        next_at = next_run(parsed)
+        if parsed["kind"] == "once" and next_at is None:
+            raise ValueError(f"Requested one-shot time {parsed['run_at']} is more than 120s in the past and cannot "
+                             "be scheduled.")
+        now = now_iso()
+        return {"id": uuid.uuid4().hex[:12], "name": name or label[:50].strip(), "prompt": prompt_text,
+                "skills": skills, "skill": skills[0] if skills else None, "model": model, "provider": provider,
+                "base_url": base_url, "script": script, "no_agent": no_agent, "monitor_script": None,
+                "monitor_url": None, "monitor_state": None, "context_from": context_from, "schedule": parsed,
+                "schedule_display": parsed.get("display", schedule), "repeat": {"times": repeat, "completed": 0},
+                "enabled": not paused, "state": "paused" if paused else "scheduled",
+                "paused_at": now if paused else None,
+                "paused_reason": ((paused_reason or "").strip() or "Created paused; awaiting operator approval.")
+                if paused else None, "created_at": now, "next_run_at": None if paused else next_at,
+                "last_run_at": None, "last_status": None, "last_error": None, "last_delivery_error": None,
+                "last_delivery_unverified": None, "last_failure": None, "failure_streak": 0, "deliver": deliver,
+                "origin": None, "enabled_toolsets": enabled_toolsets, "workdir": workdir}
+
+    @staticmethod
+    def mark_ran(job: dict[str, Any], when: float, status: str, error: str | None = None) -> None:
+        """cron/jobs.py mark_job_run (a manual run never moves next_run_at)."""
+        job.update(last_run_at=iso_at(when), last_status=status, last_error=error,
+                   failure_streak=job["failure_streak"] + 1 if status == "error" else 0)
+        job["repeat"]["completed"] += 1
+        times = job["repeat"]["times"]
+        if times is not None and job["repeat"]["completed"] >= times:
+            job.update(enabled=False, state="completed", next_run_at=None)
+
+    @staticmethod
+    def add_execution(caps: Caps, job_id: str, when: float, status: str, *, error: str | None = None,
+                      source: str = "tick", session: str | None = None, doc: str | None = None) -> None:
+        """cron/executions.py: one ledger row per fire, plus (fake-only, ``_`` keys) what it left behind: its run
+        session, or a script-only job's output doc."""
+        caps.executions.setdefault(job_id, []).append({
+            "id": uuid.uuid4().hex, "job_id": job_id, "source": source, "process_id": "fake-hermes",
+            "pid": 4242, "process_started_at": int(when) - 60, "status": status, "handoff_pending": 0,
+            "handoff_started_at": None, "claimed_at": iso_at(when), "started_at": iso_at(when),
+            "finished_at": iso_at(when + 30), "error": error, "_at": when, "_session": session, "_doc": doc})
+
+    @staticmethod
+    def pause(job: dict[str, Any], reason: str | None = None) -> None:
+        """cron/jobs.py pause_job."""
+        job.update(enabled=False, state="paused", paused_at=now_iso(), paused_reason=reason)
+
+    def record_run(self, profile: FakeProfile, job: dict[str, Any], when: float, reply: str, *,
+                   source: str = "tick", chat: bool = True) -> None:
+        """One successful fire: an agent job writes a ``source: cron`` chat (its run row; none with ``chat=False``),
+        a script-only job an output doc. Both get a ledger row."""
+        caps = self.caps(profile)
+        session = None
+        if not job["no_agent"] and chat:
+            prompt = job["prompt"] or f"Run the {', '.join(job['skills'])} skill."
+            session = self.seed_chat(job["name"], age=max(time.time() - when, 0), profile=profile.name, source="cron",
+                                     usage=(1200, 180, 2), turns=[("user", prompt, {}),
+                                                                  ("assistant", reply, {"finish_reason": "stop"})]).key
+        self.add_execution(caps, job["id"], when, "completed", source=source, session=session,
+                           doc=reply if job["no_agent"] else None)
+        self.mark_ran(job, when, "ok")
+
+    def annotate(self, profile: FakeProfile, job: dict[str, Any], *, listing: bool = False) -> dict[str, Any]:
+        """web_server_cron.py _annotate_cron_job (+ list_jobs' latest_execution)."""
+        row = {**copy.deepcopy(job), "profile": profile.name, "profile_name": profile.name,
+               "hermes_home": profile.path, "is_default_profile": profile.is_default,
+               "scheduler_heartbeat_age_s": round(time.time() % 30, 1)}
+        if listing:
+            runs = self.caps(profile).executions.get(job["id"]) or []
+            row["latest_execution"] = {k: v for k, v in runs[-1].items() if not k.startswith("_")} if runs else None
+        return row
+
+    def cron_profile(self, raw: str | None) -> FakeProfile:
+        """web_server_cron.py _cron_profile_home: normalize + validate (400), unknown (404)."""
+        name = self.canonical_name((raw or "default").strip() or "default")
+        if name not in self.profiles:
+            raise HttpError(404, f"Profile '{name}' does not exist.")
+        return self.profiles[name]
+
+    @staticmethod
+    def find_job(caps: Caps, ref: str) -> dict[str, Any] | None:
+        """cron/jobs.py resolve_job_ref: the id, then a case-insensitive name."""
+        return next((j for j in caps.jobs if j["id"] == ref), None) or next(
+            (j for j in caps.jobs if (j.get("name") or "").lower() == ref.lower()), None)
+
+    def job_owner(self, request: Request, job_id: str) -> tuple[FakeProfile, dict[str, Any]]:
+        """cron.py _job_profile: the ``?profile=`` hint when it holds the job, else whichever profile does (404)."""
+        hint = (request.query_params.get("profile") or "").strip()
+        if hint:
+            profile = self.cron_profile(hint)
+            if (job := self.find_job(self.caps(profile), job_id)) is not None:
+                return profile, job
+        for profile in self.profiles.values():
+            if (job := self.find_job(self.caps(profile), job_id)) is not None:
+                return profile, job
+        raise HttpError(404, "Job not found")
+
+    def list_cron_jobs(self, request: Request, body: dict[str, Any]) -> list[dict[str, Any]]:
+        """cron.py GET /api/cron/jobs?profile=all|<name>: every job (disabled too), annotated with its profile."""
+        requested = (request.query_params.get("profile") or "all").strip()
+        if requested.lower() != "all":
+            profile = self.cron_profile(requested)
+            return [self.annotate(profile, job, listing=True) for job in self.caps(profile).jobs]
+        by_id: dict[str, dict[str, Any]] = {}
+        for profile in self.profiles.values():
+            for job in self.caps(profile).jobs:
+                if job["id"] not in by_id or (profile.is_default and not by_id[job["id"]]["is_default_profile"]):
+                    by_id[job["id"]] = self.annotate(profile, job, listing=True)
+        return list(by_id.values())
+
+    def get_cron_job(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile, job = self.job_owner(request, request.path_params["job_id"])
+        return self.annotate(profile, job)
+
+    def create_cron_job(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """cron.py POST /api/cron/jobs (CronJobCreate) -> web_server_cron.py _create_cron_job_sync."""
+        schedule = body_field(body, "schedule", str)
+        paused = body.get("paused", False)
+        if not isinstance(paused, bool):
+            raise HttpError(422, [{"type": "bool_type", "loc": ["body", "paused"], "msg": "Input should be a valid "
+                                                                                          "boolean"}])
+        repeat = body.get("repeat")
+        if isinstance(repeat, int) and not isinstance(repeat, bool) and repeat < 1:
+            raise HttpError(400, "repeat must be a positive integer")
+        profile = self.cron_profile(request.query_params.get("profile"))
+        script = optional_text(body.get("script"))
+        no_agent = bool(body.get("no_agent"))
+        skills = string_list(body.get("skills"))
+        if no_agent and not script:
+            raise HttpError(400, "no_agent=True requires a script")
+        if not no_agent and not (optional_text(body.get("prompt")) or skills or script):
+            raise HttpError(400, "agent cron jobs require a prompt, skill, or script")
+        for ref in string_list(body.get("context_from")) or []:
+            if ref.lower() != "self" and self.find_job(self.caps(profile), ref) is None:
+                raise HttpError(400, f"context_from references unknown job '{ref}'")
+        try:
+            job = self.new_job(prompt=str(body.get("prompt") or ""), schedule=schedule,
+                               name=str(body.get("name") or ""),
+                               deliver=optional_text(body.get("deliver")) or "local", skills=skills,
+                               model=optional_text(body.get("model")), provider=optional_text(body.get("provider")),
+                               base_url=(optional_text(body.get("base_url")) or "").rstrip("/") or None,
+                               script=script, no_agent=no_agent, repeat=repeat, paused=paused,
+                               paused_reason=body.get("paused_reason"), workdir=optional_text(body.get("workdir")),
+                               enabled_toolsets=string_list(body.get("enabled_toolsets")),
+                               context_from=string_list(body.get("context_from")))
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from None
+        self.caps(profile).jobs.append(job)
+        return self.annotate(profile, job)
+
+    def update_cron_job(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """cron.py PUT /api/cron/jobs/{id} {updates} -> cron/jobs.py update_job (a schedule string is re-parsed and
+        next_run_at recomputed; enabled flips the paused state)."""
+        updates = body_field(body, "updates", dict)
+        profile, job = self.job_owner(request, request.path_params["job_id"])
+        merged = copy.deepcopy(job)
+        for key in ("model", "provider", "workdir", "script"):
+            if key in updates:
+                merged[key] = optional_text(updates[key])
+        if "deliver" in updates:
+            merged["deliver"] = optional_text(updates["deliver"]) or "local"
+        for key in ("name", "prompt"):
+            if key in updates and updates[key] is not None:
+                merged[key] = str(updates[key]).strip() if key == "prompt" else str(updates[key])
+        for key in ("context_from", "enabled_toolsets"):
+            if key in updates:
+                merged[key] = string_list(updates[key])
+        if "skills" in updates:
+            merged["skills"] = string_list(updates["skills"]) or []
+            merged["skill"] = merged["skills"][0] if merged["skills"] else None
+        if "no_agent" in updates:
+            merged["no_agent"] = bool(updates["no_agent"])
+        if {"prompt", "skill", "skills", "script", "no_agent"} & set(updates):
+            if merged["no_agent"] and not merged["script"]:
+                raise HttpError(400, "no_agent=True requires a script")
+            if not merged["no_agent"] and not (merged["prompt"] or merged["skills"] or merged["script"]):
+                raise HttpError(400, "agent cron jobs require a prompt, skill, or script")
+        try:
+            if "schedule" in updates:
+                parsed = parse_schedule(str(updates["schedule"]))
+                merged.update(schedule=parsed, schedule_display=parsed.get("display", updates["schedule"]))
+                if merged["enabled"]:
+                    merged["next_run_at"] = next_run(parsed)
+            if "repeat" in updates:
+                merged["repeat"] = {"times": normalize_repeat(updates["repeat"]),
+                                    "completed": merged["repeat"]["completed"]}
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from None
+        if "enabled" in updates:
+            if bool(updates["enabled"]):
+                merged.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None,
+                              next_run_at=next_run(merged["schedule"]))
+            else:
+                merged.update(enabled=False, state="paused", paused_at=now_iso(), next_run_at=None)
+        job.clear()
+        job.update(merged)
+        return self.annotate(profile, job)
+
+    def pause_cron_job(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile, job = self.job_owner(request, request.path_params["job_id"])
+        self.pause(job)
+        return self.annotate(profile, job)
+
+    def resume_cron_job(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """cron/jobs.py resume_job: a recurring job keeps a past next_run_at as its due instant."""
+        profile, job = self.job_owner(request, request.path_params["job_id"])
+        due = epoch_of(job.get("next_run_at"))
+        keep = job["schedule"]["kind"] in ("cron", "interval") and due is not None and due <= time.time()
+        job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None,
+                   next_run_at=job["next_run_at"] if keep else next_run(job["schedule"]))
+        return self.annotate(profile, job)
+
+    def trigger_cron_job(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """cron.py POST /api/cron/jobs/{id}/trigger: runs the job now (a paused one too) and answers when it is done:
+        an agent job leaves a new ``source: cron`` chat, a script-only job a new output doc."""
+        profile, job = self.job_owner(request, request.path_params["job_id"])
+        if job["no_agent"]:
+            reply = f"Disk usage: {60 + secrets.randbelow(10)}% of 460 GB used."
+        else:
+            reply = f"(fake run) {job['name']}: nothing urgent. Delivered to {job['deliver']}."
+        self.record_run(profile, job, time.time(), reply, source="manual")
+        return self.annotate(profile, job)
+
+    def delete_cron_job(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        profile, job = self.job_owner(request, request.path_params["job_id"])
+        caps = self.caps(profile)
+        caps.jobs.remove(job)
+        caps.executions.pop(job["id"], None)
+        return {"ok": True}
+
+    def cron_job_runs(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """cron.py GET /api/cron/jobs/{id}/runs?limit=: one row per execution, newest first
+        (_list_cron_job_runs_sync + _reconcile_cron_runs): its ``source: cron`` session, else its output doc
+        (``cron_output:<job>:<stamp>``), else the bare ledger row (``cron_output:<job>:exec:<n>``)."""
+        limit = max(1, min(query_int(request, "limit", 20), 100))
+        profile, job = self.job_owner(request, request.path_params["job_id"])
+        runs: list[dict[str, Any]] = []
+        for index, execution in enumerate(self.caps(profile).executions.get(job["id"], [])):
+            if execution["status"] not in ("completed", "failed"):
+                continue
+            when, label = execution["_at"], execution["status"].replace("_", " ").upper()
+            if execution["_session"] and (stored := self.sessions.get(execution["_session"])) is not None:
+                row = stored.row()
+                row.update(scheduler_owned=False, archived=bool(row["archived"]), profile=profile.name,
+                           cron_job_id=job["id"], cron_execution_id=execution["id"])
+                runs.append(row)
+                continue
+            if execution["_doc"] is not None:
+                preview = re.sub(r"\s+", " ", execution["_doc"]).strip()
+                preview = preview if len(preview) <= 180 else preview[:179].rstrip() + "…"
+                row_id = f"cron_output:{job['id']}:{datetime.fromtimestamp(when).strftime('%Y-%m-%d_%H-%M-%S')}"
+                fallback = preview or "Script-only run"
+            else:
+                preview, row_id, fallback = execution["error"] or "", f"cron_output:{job['id']}:exec:{index}", \
+                    "Script-only run"
+            title = f"{label} · {execution['error']}" if label == "FAILED" and execution["error"] else \
+                f"{label} · {fallback}"
+            runs.append({"id": row_id, "title": title, "preview": preview or None, "source": "cron_output",
+                         "started_at": when, "last_active": when, "ended_at": when, "input_tokens": 0,
+                         "output_tokens": 0, "message_count": 0, "tool_call_count": 0, "model": None, "cwd": None,
+                         "archived": False, "is_active": False})
+        runs.sort(key=lambda r: float(r.get("started_at") or 0), reverse=True)
+        return {"runs": runs[:limit], "limit": limit}
+
+    def delivery_targets(self, profile: FakeProfile) -> list[dict[str, Any]]:
+        """cron.py GET /api/cron/delivery-targets: local, the configured gateway platforms, a Bot Chat per profile."""
+        targets = [{"id": "local", "name": "Local (save only)", "home_target_set": True, "home_env_var": None}]
+        for platform, env_name, home_set in DELIVERY_PLATFORMS.get(profile.name, ()):
+            targets.append({"id": platform, "name": platform.replace("_", " ").title(), "home_target_set": home_set,
+                            "home_env_var": env_name})
+        targets += [{"id": f"{BOT_CHAT_PLATFORM}:{name}", "name": f"Bot Chat ({name})", "home_target_set": True,
+                     "home_env_var": None} for name in self.profiles]
+        return targets
+
+    def cron_delivery_targets(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        return {"targets": self.delivery_targets(self.scoped(request))}
+
+    def cron_blueprints(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """cron.py GET /api/cron/blueprints?profile=: built-ins as form schemas, deliver options from the profile's
+        gateways (``origin``, ``local`` and every target)."""
+        profile = self.scoped(request)
+        options = ["origin", "local", *(t["id"] for t in self.delivery_targets(profile) if t["id"] != "local")]
+        return {"blueprints": [blueprint_entry(row, options) for row in BLUEPRINTS]}
+
+    def instantiate_blueprint(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """cron.py POST /api/cron/blueprints/instantiate?profile= {blueprint, values}: 404 unknown, 422 a bad slot."""
+        key = body_field(body, "blueprint", str)
+        values = body_field(body, "values", dict, required=False, default={})
+        profile = self.cron_profile(request.query_params.get("profile") or "default")
+        row = BLUEPRINTS_BY_KEY.get(key)
+        if row is None:
+            raise HttpError(404, f"Unknown blueprint: {key}")
+        try:
+            spec = fill_blueprint(row, values)
+        except ValueError as exc:
+            raise HttpError(422, str(exc)) from None
+        try:
+            job = self.new_job(**spec)
+        except ValueError as exc:
+            raise HttpError(400, str(exc)) from None
+        self.caps(profile).jobs.append(job)
+        return self.annotate(profile, job)
+
+    async def cron_fire(self, request: Request) -> Response:
+        """cron.py POST /api/cron/fire (public, gated by the NAS-minted bearer token: here ``--cron-fire-token``):
+        forwarded to the gateway, which accepts it (202) and runs the job."""
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if not token or not secrets.compare_digest(token, self.cron_fire_token):
+            log("http POST /api/cron/fire -> 401")
+            return JSONResponse({"error": "invalid fire token"}, status_code=401)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        job_id = body.get("job_id") if isinstance(body, dict) else None
+        if not job_id:
+            return JSONResponse({"error": "missing job_id"}, status_code=400)
+        for profile in self.profiles.values():
+            if (job := self.find_job(self.caps(profile), str(job_id))) is not None:
+                self.record_run(profile, job, time.time(), f"(fake run) {job['name']}: fired by the scheduler.")
+                log(f"http POST /api/cron/fire {job_id} -> 202")
+                return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
+        return JSONResponse({"status": "gone", "job_id": job_id})
+
+    # ── status, logs, analytics (status.py, analytics.py) ─────────────────────────────────────────
+
+    def health(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py GET /api/health (public): process liveness and the commit it booted from."""
+        return {"ok": True, "version": FAKE_VERSION, "displayVersion": f"{FAKE_VERSION} ({FAKE_COMMIT[:7]})",
+                "commit": FAKE_COMMIT, "auth_required": True}
+
+    def system_stats(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py GET /api/system/stats: host identity plus psutil CPU, memory, disk, uptime and process."""
+        wobble = (time.time() % 60) / 60
+        gib = 1024 ** 3
+        return {"os": "Linux", "os_release": "6.8.0-45-generic", "os_version": "#45-Ubuntu SMP PREEMPT_DYNAMIC",
+                "platform": "Linux-6.8.0-45-generic-x86_64-with-glibc2.39", "arch": "x86_64",
+                "hostname": "fake-hermes", "python_version": "3.12.7", "python_impl": "CPython",
+                "hermes_version": FAKE_VERSION, "cpu_count": 8,
+                "memory": {"total": 32 * gib, "available": int((19 + 2 * wobble) * gib),
+                           "used": int((13 - 2 * wobble) * gib), "percent": round(40.6 - 6 * wobble, 1)},
+                "disk": {"total": 460 * gib, "used": 281 * gib, "free": 179 * gib, "percent": 61.1},
+                "cpu_percent": round(7.5 + 20 * wobble, 1), "load_avg": [1.2, 1.05, 0.98],
+                "uptime_seconds": int(3 * DAY + time.time() - self.started_at),
+                "process": {"pid": os.getpid(), "rss": 188 * 1024 * 1024, "create_time": int(self.started_at),
+                            "num_threads": 24}, "psutil": True}
+
+    def log_lines(self, profile: FakeProfile, file: str) -> list[str]:
+        """The profile's ``logs/<file>`` (hermes_logging.py _LOG_FORMAT), newest last."""
+        seeds = [s for s in LOG_SEEDS if s[0] == file]
+        if profile.name != "default":
+            seeds = [s for s in seeds if s[2] in ("run_agent", "model_tools", "hermes_cli.web_server", "uvicorn")]
+        now = time.time()
+        lines = []
+        for index, (_file, level, logger, message) in enumerate(seeds):
+            when = datetime.fromtimestamp(now - (len(seeds) - index) * 97)
+            lines.append(f"{when:%Y-%m-%d %H:%M:%S},{when.microsecond // 1000:03d} {level} {logger}: {message}\n")
+        return lines
+
+    def get_logs(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py GET /api/logs?file=&lines=&level=&component=&search=&profile=: filtered tail (lines end in
+        a newline, as hermes_cli/logs.py reads them)."""
+        file = request.query_params.get("file") or "agent"
+        lines = query_int(request, "lines", 100)
+        level = request.query_params.get("level")
+        component = request.query_params.get("component")
+        search = request.query_params.get("search")
+        if file not in LOG_FILES:
+            raise HttpError(400, f"Unknown log file: {file}")
+        profile = self.scoped(request)
+        min_level = level.upper() if level and level.upper() != "ALL" else None
+        prefixes = None
+        if component and component.lower() != "all":
+            prefixes = LOG_COMPONENTS.get(component)
+            if prefixes is None:
+                raise HttpError(400, f"Unknown component: {component}. Available: {', '.join(sorted(LOG_COMPONENTS))}")
+        out = []
+        for line in self.log_lines(profile, file):
+            match = LOG_LINE.search(line)
+            line_level, logger = (match.group(1), match.group(2)) if match else (None, "")
+            if min_level and line_level and LOG_LEVELS.get(line_level, 0) < LOG_LEVELS.get(min_level, 0):
+                continue
+            if prefixes is not None and not any(logger == p or logger.startswith(p + ".") for p in prefixes):
+                continue
+            if search and search.lower() not in line.lower():
+                continue
+            out.append(line)
+        return {"file": file, "lines": out[-max(min(lines, 500), 1):]}
+
+    def usage_rows(self, profile: FakeProfile, cutoff: float) -> list[dict[str, Any]]:
+        """The ``sessions`` rows analytics reads: the profile's stored chats plus its usage history."""
+        rows = [row for row in self.caps(profile).usage if row["started_at"] > cutoff]
+        for stored in self.sessions.values():
+            if stored.profile != profile.name or not stored.persisted or stored.started_at <= cutoff:
+                continue
+            tokens_in, tokens_out = stored.usage["input"], stored.usage["output"]
+            price_in, price_out = next(((p_in, p_out) for m, _p, p_in, p_out in USAGE_MODELS if m == stored.model),
+                                       (1.0, 4.0))
+            rows.append({"started_at": stored.started_at, "model": stored.model, "provider": stored.provider,
+                         "input_tokens": tokens_in, "output_tokens": tokens_out, "cache_read_tokens": 0,
+                         "reasoning_tokens": stored.usage.get("reasoning", 0),
+                         "estimated_cost": round((tokens_in * price_in + tokens_out * price_out) / 1_000_000, 4),
+                         "actual_cost": 0.0, "api_calls": stored.usage["calls"], "tools": {}, "skills": {}, "aux": []})
+        return rows
+
+    @staticmethod
+    def usage_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """The analytics totals query: SUM is null over no rows, COALESCE'd costs and COUNT are 0."""
+        def total(key: str) -> Any:
+            return sum(row[key] for row in rows) if rows else None
+        return {"total_input": total("input_tokens"), "total_output": total("output_tokens"),
+                "total_cache_read": total("cache_read_tokens"), "total_reasoning": total("reasoning_tokens"),
+                "total_estimated_cost": round(sum(r["estimated_cost"] for r in rows), 4),
+                "total_actual_cost": round(sum(r["actual_cost"] for r in rows), 4), "total_sessions": len(rows),
+                "total_api_calls": total("api_calls")}
+
+    def usage_analytics(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """analytics.py GET /api/analytics/usage?days= (1-365): daily, by_model, by_task, totals, skills, tools."""
+        days = query_int(request, "days", 30, ge=1, le=365)
+        rows = self.usage_rows(self.scoped(request), time.time() - days * DAY)
+        daily: dict[str, dict[str, Any]] = {}
+        models: dict[str, dict[str, Any]] = {}
+        tasks: dict[str, dict[str, Any]] = {}
+        tools: dict[str, int] = {}
+        skills: dict[str, list[Any]] = {}
+        for row in sorted(rows, key=lambda r: r["started_at"]):
+            day = daily.setdefault(datetime.fromtimestamp(row["started_at"]).strftime("%Y-%m-%d"), {
+                "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "reasoning_tokens": 0,
+                "estimated_cost": 0.0, "actual_cost": 0.0, "sessions": 0, "api_calls": 0})
+            model = models.setdefault(row["model"], {"model": row["model"], "input_tokens": 0, "output_tokens": 0,
+                                                     "estimated_cost": 0.0, "sessions": 0, "api_calls": 0})
+            for target in (day, model):
+                for key in ("input_tokens", "output_tokens", "estimated_cost", "api_calls"):
+                    target[key] += row[key]
+                target["sessions"] += 1
+            for key in ("cache_read_tokens", "reasoning_tokens", "actual_cost"):
+                day[key] += row[key]
+            for tool, count in row["tools"].items():
+                tools[tool] = tools.get(tool, 0) + count
+            for skill, (views, manages) in row["skills"].items():
+                entry = skills.setdefault(skill, [0, 0, None])
+                entry[0] += views
+                entry[1] += manages
+                entry[2] = max(entry[2] or 0, row["started_at"])
+            for task, aux_model, tokens_in, tokens_out in row["aux"]:
+                summary = tasks.setdefault(task, {"task": task, "input_tokens": 0, "output_tokens": 0,
+                                                  "estimated_cost": 0, "api_calls": 0, "models": []})
+                summary["input_tokens"] += tokens_in
+                summary["output_tokens"] += tokens_out
+                summary["api_calls"] += 1
+                if aux_model not in summary["models"]:
+                    summary["models"].append(aux_model)
+        for entry in (*daily.values(), *models.values()):
+            for key in ("estimated_cost", "actual_cost"):
+                if key in entry:
+                    entry[key] = round(entry[key], 4)
+        total_calls = sum(tools.values())
+        total_actions = sum(v + m for v, m, _ in skills.values())
+        top_skills = sorted(({"skill": name, "view_count": v, "manage_count": m, "total_count": v + m,
+                              "percentage": (v + m) / total_actions * 100 if total_actions else 0,
+                              "last_used_at": last} for name, (v, m, last) in skills.items()),
+                            key=lambda s: s["total_count"], reverse=True)
+        volume = lambda d: d["input_tokens"] + d["output_tokens"]  # noqa: E731
+        return {"daily": [{"day": day, **values} for day, values in sorted(daily.items())],
+                "by_model": sorted(models.values(), key=volume, reverse=True),
+                "by_task": sorted(tasks.values(), key=volume, reverse=True), "totals": self.usage_totals(rows),
+                "period_days": days,
+                "skills": {"summary": {"total_skill_loads": sum(v for v, _m, _l in skills.values()),
+                                       "total_skill_edits": sum(m for _v, m, _l in skills.values()),
+                                       "total_skill_actions": total_actions, "distinct_skills_used": len(skills)},
+                           "top_skills": top_skills},
+                "tools": sorted(({"tool": tool, "count": count, "percentage": count / total_calls * 100}
+                                 for tool, count in tools.items()), key=lambda t: t["count"], reverse=True)}
+
+    def models_analytics(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """analytics.py GET /api/analytics/models?days=: per (model, provider) cards with models.dev capabilities."""
+        days = query_int(request, "days", 30, ge=1, le=365)
+        rows = self.usage_rows(self.scoped(request), time.time() - days * DAY)
+        cards: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            card = cards.setdefault((row["model"], row["provider"]), {
+                "model": row["model"], "provider": row["provider"], "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "reasoning_tokens": 0, "estimated_cost": 0.0, "actual_cost": 0.0,
+                "sessions": 0, "api_calls": 0, "tool_calls": 0, "last_used_at": 0.0})
+            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens", "estimated_cost",
+                        "actual_cost", "api_calls"):
+                card[key] += row[key]
+            card["sessions"] += 1
+            card["tool_calls"] += sum(row["tools"].values())
+            card["last_used_at"] = max(card["last_used_at"], row["started_at"])
+        models = []
+        for card in sorted(cards.values(), key=lambda c: c["input_tokens"] + c["output_tokens"], reverse=True):
+            reasoning = next((flags[1] for _slug, _n, entries in DEMO_PROVIDERS
+                              for model, flags in entries.items() if model == card["model"]), False)
+            card.update(estimated_cost=round(card["estimated_cost"], 4), actual_cost=round(card["actual_cost"], 4),
+                        avg_tokens_per_session=(card["input_tokens"] + card["output_tokens"]) / card["sessions"],
+                        capabilities={"supports_tools": True, "supports_vision": not card["model"].endswith("-mini"),
+                                      "supports_reasoning": reasoning,
+                                      "context_window": DEMO_CONTEXT.get(card["model"], 128_000),
+                                      "max_output_tokens": 32_000, "model_family": card["model"].split("-")[0]})
+            models.append(card)
+        totals = self.usage_totals(rows)
+        totals["distinct_models"] = len({card["model"] for card in models})
+        return {"models": models, "totals": totals, "period_days": days}
+
+    # ── maintenance (ops.py, status.py curator + debug share, actions.py) ─────────────────────────
+
+    def curator_status(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py GET /api/curator."""
+        return dict(self.caps(self.scoped(request)).curator)
+
+    def set_curator_paused(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        paused = body_field(body, "paused", bool)
+        self.caps(self.scoped(request)).curator["paused"] = paused
+        return {"ok": True, "paused": paused}
+
+    def run_curator(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py POST /api/curator/run: ``hermes curator run`` (curator-run); needs an explicit profile."""
+        profile = self.explicit_profile(request, "POST /api/curator/run")
+        caps = self.caps(profile)
+        agent_skills = sorted(s["name"] for s in caps.skills.values() if s["provenance"] == "agent")
+        action = self.spawn("curator-run", [
+            f"Reviewing {len(caps.skills)} skills ({len(agent_skills)} agent-authored)…",
+            *(f"{name}: kept" for name in agent_skills), "Curator run complete: 0 archived, 0 rewritten."],
+            on_done=lambda: caps.curator.update(last_run_at=now_iso()))
+        return self.spawned(action)
+
+    def debug_share(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """status.py POST /api/ops/debug-share {redact, lines}: the paste URLs (debug.py build_debug_share; the fake
+        uploads nothing)."""
+        redact = body_field(body, "redact", bool, required=False, default=True)
+        lines = body.get("lines", 200)
+        if not isinstance(lines, int) or isinstance(lines, bool):
+            raise HttpError(422, [{"type": "int_type", "loc": ["body", "lines"], "msg": "Input should be a valid "
+                                                                                       "integer"}])
+        self.scoped(request)
+        paste = "https://paste.example.com/fake-hermes"
+        urls = {"Report": f"{paste}/{secrets.token_hex(4)}", "agent.log": f"{paste}/{secrets.token_hex(4)}",
+                "gateway.log": f"{paste}/{secrets.token_hex(4)}"}
+        return {"ok": True, "urls": urls, "failures": [], "redacted": redact, "auto_delete_seconds": 21600}
+
+    def run_doctor(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/ops/doctor: ``hermes doctor`` (doctor)."""
+        profile = self.scoped(request)
+        servers = self.config_servers(profile)
+        off = sum(1 for cfg in servers.values() if isinstance(cfg, dict) and not mcp_enabled(cfg))
+        action = self.spawn("doctor", [
+            f"Checking {profile.path}", "✓ Python 3.12.7", f"✓ Config version {CONFIG_VERSION} (latest)",
+            "✓ state.db integrity ok", "⚠ Docker CLI not found — the docker terminal backend is unavailable",
+            "✓ Gateway running", f"✓ {len(servers)} MCP servers configured ({off} disabled)",
+            "Summary: 5 passed, 1 warning, 0 failed"])
+        return self.spawned(action)
+
+    def run_security_audit(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/ops/security-audit: ``hermes security audit`` (security-audit)."""
+        profile = self.scoped(request)
+        mode = (profile.loaded().get("approvals") or {}).get("mode", "smart")
+        action = self.spawn("security-audit", [
+            "Hermes security audit", "[ok] Dashboard requires sign-in (basic)", "[ok] .env is mode 0600",
+            f"[warn] approvals.mode is '{mode}': risky commands may run after an automatic check",
+            "[ok] No known indicators of compromise in skills, plugins or MCP config", "1 warning, 0 critical"])
+        return self.spawned(action)
+
+    def backup_dir(self, profile: FakeProfile) -> str:
+        return f"{profile.path}/backups"
+
+    def run_backup(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/ops/backup {output?}: ``hermes backup -o …`` (backup); the default archive lands in the
+        profile's backups/ and can be downloaded once the action is done."""
+        output = str(body_field(body, "output", str, required=False) or "").strip()
+        profile = self.scoped(request)
+        caps = self.caps(profile)
+        archive = None
+        if not output:
+            stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+            archive = output = f"{self.backup_dir(profile)}/hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
+        contents = {"config.yaml": yaml.safe_dump(profile.config, sort_keys=False) or "{}\n",
+                    "SOUL.md": profile.soul or "",
+                    "skills/README.txt": f"{len(caps.skills)} skills\n"}
+        action = self.spawn("backup", [f"Backing up {profile.path}…", "Adding config.yaml, SOUL.md, skills/, "
+                                       "sessions (state.db snapshot)…", f"Wrote {output}"],
+                            on_done=lambda: caps.backups.__setitem__(output, demo_zip(contents)))
+        return self.spawned(action, **({"archive": archive} if archive else {}))
+
+    def download_backup(self, request: Request, body: dict[str, Any]) -> Response:
+        """ops.py GET /api/ops/backup/download?archive=: only a finished archive under the profile's backups/."""
+        archive = request.query_params.get("archive")
+        if archive is None:
+            raise HttpError(422, [{"type": "missing", "loc": ["query", "archive"], "msg": "Field required"}])
+        profile = self.scoped(request)
+        target = posixpath.normpath(archive.replace("~", DEMO_HOME, 1) if archive.startswith("~") else archive)
+        data = next((caps.backups[target] for p in self.profiles.values() if target in (caps := self.caps(p)).backups),
+                    None)
+        exists = data is not None or target in self.files or target in self.media or target in self.artifact_files
+        if not exists:
+            raise HttpError(404, "Backup not found")
+        if not target.startswith(self.backup_dir(profile) + "/"):
+            raise HttpError(403, "Backup is outside the dashboard backup directory")
+        if data is None:
+            raise HttpError(404, "Backup not found")
+        name = posixpath.basename(target)
+        return Response(data, media_type="application/zip",
+                        headers={"content-disposition": f'attachment; filename="{name}"'})
+
+    def list_checkpoints(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py GET /api/ops/checkpoints: /rollback shadow-store size per session."""
+        caps = self.caps(self.scoped(request))
+        sessions = [{"session": c["session"], "files": c["files"], "bytes": c["bytes"]}
+                    for c in sorted(caps.checkpoints, key=lambda c: c["session"])]
+        return {"sessions": sessions, "total_bytes": sum(c["bytes"] for c in sessions)}
+
+    def prune_checkpoints(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """ops.py POST /api/ops/checkpoints/prune: ``hermes checkpoints prune`` (checkpoints-prune); needs an explicit
+        profile. Removes the checkpoints older than the retention."""
+        profile = self.explicit_profile(request, "POST /api/ops/checkpoints/prune")
+        caps = self.caps(profile)
+        stale = [c for c in caps.checkpoints if c["stale"]]
+        freed = sum(c["bytes"] for c in stale)
+        action = self.spawn("checkpoints-prune", [
+            "Pruning checkpoints older than 7 days…",
+            *(f"Removed {c['session']} ({c['files']} files)" for c in stale),
+            f"Freed {freed / 1024 / 1024:.1f} MB"],
+            on_done=lambda: setattr(caps, "checkpoints", [c for c in caps.checkpoints if not c["stale"]]))
+        return self.spawned(action)
+
+    def restart_gateway(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """actions.py POST /api/gateway/restart: ``hermes gateway restart --interrupt`` (gateway-restart); a restart
+        still running is reused."""
+        self.scoped(request)
+        current = self.actions.get("gateway-restart")
+        if current is None or current.done:
+            current = self.spawn("gateway-restart", [
+                "Interrupting 0 running turns…", f"Stopping gateway (pid {20_000 + secrets.randbelow(40_000)})…",
+                f"Gateway started (pid {20_000 + secrets.randbelow(40_000)})", "Gateway is healthy."])
+        return {"ok": True, "pid": current.pid, "name": "gateway-restart"}
+
+    def update_hermes(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """actions.py POST /api/hermes/update: ``hermes update`` (hermes-update) with an action id; one already
+        running is reported as ``already_running``."""
+        current = self.actions.get("hermes-update")
+        if current is not None and not current.done:
+            return {"ok": True, "pid": current.pid, "name": "hermes-update", "already_running": True,
+                    "action_id": current.action_id}
+
+        def updated() -> None:
+            self.update_behind = 0
+        action_id = secrets.token_hex(16)
+        action = self.spawn("hermes-update", [
+            "Fetching origin…", f"Updating {FAKE_COMMIT[:7]}..{UPDATE_COMMITS[0][0]}", "Installing dependencies…",
+            "Migrating config (no changes)", "Restarting the gateway…", f"Updated to {UPDATE_VERSION}"],
+            on_done=updated, action_id=action_id)
+        return self.spawned(action, action_id=action_id)
+
+    def check_update(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """actions.py GET /api/hermes/update/check?force=: a git install, behind until an update finished."""
+        self.scoped(request)
+        payload: dict[str, Any] = {"install_method": "git", "current_version": FAKE_VERSION,
+                                   "behind": self.update_behind, "update_available": False, "can_apply": True,
+                                   "update_command": "hermes update", "message": None}
+        if self.update_behind == 0:
+            payload["message"] = "You're on the latest version."
+            return payload
+        now = int(time.time())
+        payload.update(update_available=True, channel="stable", branch="main", source_version=UPDATE_VERSION,
+                       commits=[{"sha": sha, "summary": summary, "author": author, "at": now - (i + 1) * 3 * HOUR}
+                                for i, (sha, summary, author) in enumerate(UPDATE_COMMITS)])
+        return payload
+
+    # ── files the Artifacts screen opens (files.py) ───────────────────────────────────────────────
+
+    def fs_target(self, request: Request) -> tuple[str, bytes]:
+        """files.py _fs_download_path + _fs_regular_file over the fake host's files."""
+        raw = request.query_params.get("path")
+        if raw is None:
+            raise HttpError(422, [{"type": "missing", "loc": ["query", "path"], "msg": "Field required"}])
+        self.scoped(request)
+        path = raw[7:] if raw.startswith("file://") else raw
+        path = DEMO_HOME + path[1:] if path.startswith("~/") else path
+        if not path.startswith("/"):
+            raise HttpError(400, "Invalid path")
+        path = posixpath.normpath(path)
+        name = posixpath.basename(path)
+        if name in (".env", "auth.json") or ".ssh" in path.split("/"):
+            raise HttpError(403, "Access to sensitive files is not allowed")
+        if path in self.dirs:
+            raise HttpError(400, "Path points to a directory")
+        stores = (self.media, self.files, self.artifact_files, *(self.caps(p).backups for p in self.profiles.values()))
+        data = next((store[path] for store in stores if path in store), None)
+        if data is None:
+            raise HttpError(404, "File not found")
+        return path, data
+
+    def fs_read_data_url(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/fs/read-data-url?path=: ``{dataUrl}`` (413 over 25 MB)."""
+        path, data = self.fs_target(request)
+        if len(data) > FS_DATA_URL_MAX:
+            raise HttpError(413, "File too large")
+        kind = FS_MEDIA_TYPES.get(posixpath.splitext(path)[1].lower(), "application/octet-stream")
+        return {"dataUrl": f"data:{kind};base64,{base64.b64encode(data).decode()}"}
+
+    def fs_download(self, request: Request, body: dict[str, Any]) -> Response:
+        """files.py GET /api/fs/download?path=: the file as an attachment."""
+        path, data = self.fs_target(request)
+        kind = FS_MEDIA_TYPES.get(posixpath.splitext(path)[1].lower(), "application/octet-stream")
+        return Response(data, media_type=kind,
+                        headers={"content-disposition": f'attachment; filename="{posixpath.basename(path)}"'})
+
+    def media_proxy(self, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+        """files.py GET /api/media/proxy?url=: a remote image the gateway can reach, as ``{data_url}``. The fake never
+        goes online: only its demo image host is allowed, served from memory."""
+        url = (request.query_params.get("url") or "").strip()
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise HttpError(400, "A remote image URL is required")
+        if parts.hostname != ARTIFACT_LINK_HOST:
+            raise HttpError(403, "Image host not allowed")
+        suffix = posixpath.splitext(parts.path)[1].lower()
+        if suffix and suffix not in MEDIA_TYPES:
+            raise HttpError(415, "Unsupported media type")
+        data = self.remote_images.get(url)
+        if data is None:
+            raise HttpError(502, "Could not fetch the image")
+        return {"data_url": f"data:{MEDIA_TYPES.get(suffix, 'image/png')};base64,{base64.b64encode(data).decode()}"}
+
+
+def optional_text(value: Any) -> str | None:
+    """web_server_cron.py _cron_optional_text."""
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def string_list(value: Any) -> list[str] | None:
+    """web_server_cron.py _cron_string_list: a string or a list of strings, blanks dropped, None when empty."""
+    if value is None:
+        return None
+    items = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple)) else []
+    out = [str(item).strip() for item in items if str(item).strip()]
+    return out or None
+
+
+def normalize_repeat(repeat: Any) -> int | None:
+    """cron/jobs.py normalize_repeat_value."""
+    if repeat is None:
+        return None
+    if isinstance(repeat, str):
+        text = repeat.strip().lower()
+        if text in ("forever", "infinite", "inf", "none", ""):
+            return None
+        if text in ("once", "one", "1x"):
+            return 1
+        try:
+            repeat = int(text)
+        except ValueError:
+            raise ValueError(f"Invalid repeat value {repeat!r}: use an integer, 'forever', or 'once'.") from None
+    if isinstance(repeat, bool) or not isinstance(repeat, int):
+        raise ValueError(f"Invalid repeat value {repeat!r}: use an integer, 'forever', or 'once'.")
+    return repeat if repeat > 0 else None
+
+
+class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
     def __init__(self, args: argparse.Namespace) -> None:
         self.username = args.username
         self.password = args.password
@@ -3804,8 +6852,9 @@ class FakeHermes(ChatFeatures, SettingsFeatures):
         self._init_settings(args)
         self._init_chat(args)
         self._seed()
-        if self.seed_mode == "demo":
+        if self.seed_mode in ("demo", "full"):
             self._seed_demo()
+        self._init_capabilities(args)
 
     # ── helpers ───────────────────────────────────────────────────────────────────────────────────
 
@@ -4110,7 +7159,8 @@ class FakeHermes(ChatFeatures, SettingsFeatures):
             "approval.respond": lambda: self.approval_respond(params),
             "request.answer": lambda: self.request_answer(params),
             "clarify.lock": lambda: self.clarify_lock(params),
-        }.get(method) or self.chat_methods(conn, params).get(method) or self.settings_methods(conn, params).get(method)
+        }.get(method) or self.chat_methods(conn, params).get(method) or self.settings_methods(conn, params).get(method) \
+            or self.capability_methods(conn, params).get(method)
         if handler is None:
             return _err(rid, -32601, f"unknown method: {method} — the client and the Hermes backend are out of sync "
                         "(different versions); run `hermes update` and restart both")
@@ -4933,6 +7983,8 @@ def build_app(fake: FakeHermes) -> Starlette:
         Route("/api/media", fake.get_media, methods=["GET"]),
         # M3: settings, profiles, providers.
         *fake.settings_routes(),
+        # M4: capabilities, cron, command center, artifacts.
+        *fake.capabilities_routes(),
     ])
 
 
@@ -4953,9 +8005,19 @@ def build_parser() -> argparse.ArgumentParser:
     FakeVoicePlugin.add_arguments(parser)
     parser.add_argument("--oauth-approve-after", type=float, default=2.0,
                         help="seconds before a provider sign-in (device code) started from Settings is approved")
-    parser.add_argument("--seed", choices=("demo", "minimal"), default="demo",
-                        help="stored chats at start: demo (two projects, two profiles, pinned/archived/unread, cron "
-                             "and Telegram chats) or minimal (only the welcome chat)")
+    parser.add_argument("--seed", choices=("full", "demo", "minimal"), default="full",
+                        help="data at start: demo (two projects, two profiles, pinned/archived/unread, cron and "
+                             "Telegram chats; skills, MCP servers, plugins, cron jobs and usage per profile), full "
+                             "(demo plus chats carrying artifacts and a chat per past cron run) or minimal (only the "
+                             "welcome chat, no M4 data: the empty states)")
+    parser.add_argument("--action-polls", type=int, default=ACTION_POLLS,
+                        help="status polls a background action (doctor, backup, installs, update…) takes to finish")
+    parser.add_argument("--action-seconds", type=float, default=ACTION_SECONDS,
+                        help="seconds after which an unpolled background action finishes anyway (0 = only by polls)")
+    parser.add_argument("--mcp-oauth-approve-after", type=float, default=2.0,
+                        help="seconds before an MCP OAuth flow approves itself (0 = only through its callback)")
+    parser.add_argument("--cron-fire-token", default=CRON_FIRE_TOKEN,
+                        help="bearer token POST /api/cron/fire accepts (stands in for the Chronos JWT)")
     return parser
 
 

@@ -11,7 +11,7 @@ struct ActiveCallBanner: View {
             Button(action: open) {
                 HStack {
                     Image(systemName: "phone.fill")
-                    Text("On a call · \(call.chat.title)").lineLimit(1)
+                    Text("On a call · \(call.title)").lineLimit(1)
                     Spacer()
                 }
                 .contentShape(Rectangle())
