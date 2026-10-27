@@ -82,7 +82,8 @@ status,analytics,actions,files}.py and tui_gateway/methods_tools.py (plugins.man
   /api/ops/{doctor,security-audit,backup,backup/download,debug-share,checkpoints,checkpoints/prune},
   /api/memory/reset, /api/gateway/restart, /api/hermes/update (+ check), /api/actions/{name}/status (a background
   action shows more log per poll and ends on the ``--action-polls``-th), /api/fs/read-data-url, /api/fs/read-text,
-  /api/fs/download, /api/media/proxy, and the RPCs plugins.manage and session.active_list (the live sessions).
+  /api/fs/download, /api/media/proxy, and the RPCs plugins.manage, session.active_list (the live sessions) and
+  reload.mcp.
   /api/audio/* is never served.
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
@@ -2423,12 +2424,42 @@ class AlertVoicePlugin(FakeVoicePlugin):
     kind over the stored ones, so a body with ``alerts`` but no ``alert_token`` (iOS has no alert token yet) is
     fine."""
 
+    # A test knob: ``POST /debug/hold-devices {hold: true}`` keeps every registration waiting until ``{hold: false}``,
+    # so an app test can make a change while one is in flight.
+    devices_gate: asyncio.Event | None = None
+    devices_held = 0
+
     def routes(self) -> list[BaseRoute]:
-        return [*super().routes(), Route(f"{PLUGIN_PREFIX}/debug/alerts", self.debug_alerts, methods=["GET"])]
+        return [*super().routes(), Route(f"{PLUGIN_PREFIX}/debug/alerts", self.debug_alerts, methods=["GET"]),
+                Route(f"{PLUGIN_PREFIX}/debug/hold-devices", self.debug_hold_devices, methods=["POST"])]
+
+    async def debug_hold_devices(self, request: Request) -> Response:
+        """{hold: true} holds every later ``POST /devices`` before it is stored; {hold: false} lets them all go.
+        Answers how many are waiting."""
+        if (denied := self.gate(request, post=True)) is not None:
+            return denied
+        hold = (await self.json_body(request) or {}).get("hold")
+        if not isinstance(hold, bool):
+            return JSONResponse({"detail": "hold must be true or false"}, status_code=422)
+        if hold:
+            self.devices_gate = self.devices_gate or asyncio.Event()
+        elif self.devices_gate is not None:
+            self.devices_gate.set()
+            self.devices_gate = None
+        waiting = self.devices_held
+        self.log(f"http POST {PLUGIN_PREFIX}/debug/hold-devices -> 200 (hold {hold}, {waiting} waiting)")
+        return JSONResponse({"ok": True, "hold": hold, "waiting": waiting})
 
     async def register_device(self, request: Request) -> Response:
         if (denied := self.gate(request, post=True)) is not None:
             return denied
+        if (gate := self.devices_gate) is not None:
+            self.devices_held += 1
+            self.log(f"http POST {PLUGIN_PREFIX}/devices held (debug/hold-devices)")
+            try:
+                await gate.wait()
+            finally:
+                self.devices_held -= 1
         body = await self.json_body(request) or {}
         if not isinstance(body, dict):
             body = {}
@@ -4937,7 +4968,20 @@ class CapabilityFeatures:
     def capability_methods(self, conn: "Conn", params: dict[str, Any]) -> dict[str, Callable[[], Any]]:
         return {"plugins.manage": lambda: self.plugins_manage(params),
                 "plugins.list": lambda: self.plugins_list_legacy(params),
-                "session.active_list": lambda: self.session_active_list(params)}
+                "session.active_list": lambda: self.session_active_list(params),
+                "reload.mcp": lambda: self.reload_mcp(params)}
+
+    def reload_mcp(self, params: dict[str, Any]) -> dict[str, Any]:
+        """methods_tools.py reload.mcp: tears down and rediscovers every live session's MCP servers. Without
+        ``confirm`` it answers confirm_required (approvals.mcp_reload_confirm defaults to on); ``mcp_reloads`` counts
+        the reloads for tests."""
+        if not params.get("confirm"):
+            return {"status": "confirm_required",
+                    "message": "⚠️  /reload-mcp invalidates the prompt cache (next message re-sends full input tokens). "
+                               "Reply `/reload-mcp now` to proceed, or `/reload-mcp always` to proceed and silence this "
+                               "prompt permanently."}
+        self.mcp_reloads += 1
+        return {"status": "reloaded"}
 
     def caps(self, profile: FakeProfile) -> Caps:
         """The profile's M4 state, created on first use (a new profile starts with only the bundled plugins)."""
@@ -7048,6 +7092,7 @@ class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
         self.voice_url = args.voice_url.rstrip("/") if args.voice_url else None
         self.voice_token = args.voice_token or os.environ.get("HERMES_VOICE_TOKEN") or ""
         self.speak_timeout = args.speak_timeout
+        self.mcp_reloads = 0  # reload.mcp calls with confirm
         self.reap_grace = args.reap_grace
         self.replay_max = args.replay_max
         self.replay_sessions_max = REPLAY_SESSIONS_MAX

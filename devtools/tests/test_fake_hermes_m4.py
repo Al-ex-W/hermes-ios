@@ -988,13 +988,20 @@ def test_memory_reset_text_previews_and_session_lookups():
                     live = await gateway.call("session.active_list", {"current_session_id": created["session_id"]})
                     other = await gateway.call("session.active_list", {})
                     draft = (await http.get(f"/api/sessions/{created['stored_session_id']}")).status_code
+                    ask = await gateway.call("reload.mcp", {})
+                    reloaded = await gateway.call("reload.mcp", {"confirm": True})
+                    reloads = fake.mcp_reloads
                 finally:
                     await gateway.close()
         return (before, unnamed, bad_target, user_only, rest, again, after, untouched, csv, notes, image, text_status,
-                default_row, research_row, stored, scoped, lookups, created, live, other, draft, gateway)
+                default_row, research_row, stored, scoped, lookups, created, live, other, draft, gateway,
+                (ask, reloaded, reloads))
 
     (before, unnamed, bad_target, user_only, rest, again, after, untouched, csv, notes, image, text_status,
-     default_row, research_row, stored, scoped, lookups, created, live, other, draft, gateway) = asyncio.run(scenario())
+     default_row, research_row, stored, scoped, lookups, created, live, other, draft, gateway,
+     (ask, reloaded, reloads)) = asyncio.run(scenario())
+    assert ask["status"] == "confirm_required" and "/reload-mcp now" in ask["message"]
+    assert reloaded == {"status": "reloaded"} and reloads == 1
     assert before == {"memory": 812, "user": 245}
     assert unnamed.status_code == 400 and "POST /api/memory/reset" in unnamed.json()["detail"]
     assert bad_target.status_code == 400 and bad_target.json()["detail"] == "target must be all, memory, or user"

@@ -80,6 +80,13 @@ final class FakeVoicePluginTests: XCTestCase {
     }
 
     /// The device the fake plugin keeps for `voip` (`GET /status` lists them, with the alerts each one gets).
+    /// The fake's test knob: hold every device registration until released. Answers how many were waiting.
+    @discardableResult
+    private func holdDevices(_ hold: Bool) async throws -> Int {
+        let result = try await client.request("POST", "\(VoicePluginAPI.path)/debug/hold-devices", body: ["hold": hold]) as? JSON
+        return (result?["waiting"] as? Int) ?? -1
+    }
+
     private func device(_ voip: String) async throws -> JSON? {
         let status = try await client.request("GET", "\(VoicePluginAPI.path)/status") as? JSON
         return (status?["devices"] as? [JSON])?.first { $0["voip_token"] as? String == voip }
@@ -118,17 +125,26 @@ final class FakeVoicePluginTests: XCTestCase {
         let push = PushRegistration()
         push.useTokens(voip: voip, alert: alert)
         push.setAlerts(.defaults)
-        // A change while the first registration is on its way goes out after it, so the last state wins.
-        let first = Task { await push.send(to: client) }
-        // Against a fake on the loopback the first upload can finish between two polls: then the change goes out
-        // after it all the same.
-        await waitUntil(timeout: 5) {
-            if case .sent = push.upload { return true }
-            return push.upload == .sending
+        // A change while the first registration is on its way goes out after it, so the last state wins. The fake
+        // holds the first upload until the change is made, so it is really in flight.
+        try await holdDevices(true)
+        addTeardownBlock { [client] in
+            _ = try? await client?.request("POST", "\(VoicePluginAPI.path)/debug/hold-devices", body: ["hold": false])
         }
+        let first = Task { await push.send(to: client) }
+        var waiting = 0
+        for _ in 0..<250 where waiting == 0 {
+            waiting = try await holdDevices(true)
+            if waiting == 0 { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        XCTAssertEqual(waiting, 1, "the first upload is held by the fake")
+        XCTAssertEqual(push.upload, .sending)
         push.setAlerts(NotificationPreferences(approval: false, clarify: true, turnDone: false))
-        await push.send(to: client)
+        let second = Task { await push.send(to: client) }
+        let held = try await holdDevices(false)
+        XCTAssertEqual(held, 1, "only the first upload was on its way; the change waits for it")
         await first.value
+        await second.value
         guard case .sent = push.upload else { return XCTFail("upload is \(push.upload)") }
         let stored = try await device(voip)
         XCTAssertEqual(stored?["alert_token"] as? String, alert)

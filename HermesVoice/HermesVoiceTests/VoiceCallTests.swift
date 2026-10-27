@@ -339,11 +339,14 @@ final class VoiceCallTests: XCTestCase {
     }
 
     func testRingTimeoutEndsUnanswered() async {
-        let call = pushCall { $0.ringTimeout = 0.2 }
+        // The ring timer counts from the push, so its budget must also cover the link's setup and `ready` on a busy
+        // main actor: a second and a half does, where 0.2 s raced it.
+        let call = pushCall { $0.ringTimeout = 1.5 }
         call.begin()
-        await waitUntil { self.links.first?.connects == 1 }
+        await waitUntil(timeout: 5) { self.links.first?.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: true))
-        await waitUntil { call.isEnded }
+        XCTAssertFalse(call.isEnded, "the link is ready before the ring times out")
+        await waitUntil(timeout: 5) { call.isEnded }
         XCTAssertEqual(ended, [.unanswered])
         XCTAssertEqual(link.closedAfter, [.bye("no_answer")])
     }
@@ -356,13 +359,15 @@ final class VoiceCallTests: XCTestCase {
     }
 
     func testAnswerStopsTheRingTimer() async {
-        let call = pushCall { $0.ringTimeout = 0.2 }
+        // As above: the budget covers the setup, so the answer comes before the ring would time out.
+        let call = pushCall { $0.ringTimeout = 1 }
         call.begin()
-        await waitUntil { self.links.first?.connects == 1 }
+        await waitUntil(timeout: 5) { self.links.first?.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: true))
+        XCTAssertFalse(call.isEnded)
         call.answer()
         call.audioDidActivate()
-        await settle(0.4)
+        await settle(1.3)
         XCTAssertEqual(call.state, .live)
         XCTAssertTrue(ended.isEmpty)
     }

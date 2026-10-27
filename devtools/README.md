@@ -135,6 +135,8 @@ inside the app; answer from the call panel). The module docstring has a curl rec
 Devices may also register an APNs `alert_token` with `alerts: {approval, clarify, turn_done}` (bad shapes get
 `422`); `GET /status` lists them, and `GET …/debug/alerts?session_id=…&kind=approval|clarify|turn_done` returns the
 `{aps, hermes}` notification the plugin would push, the alert tokens it would go to, and the history.
+`POST …/debug/hold-devices {hold: true}` keeps each later registration waiting (`{hold: false}` lets them go;
+the answer says how many wait), so a test can change the alerts while one is in flight.
 
 ### Settings screens (M3)
 
@@ -167,7 +169,9 @@ come from `hermes_cli/web_routers/{skills,tools,mcp,cron,ops,status,analytics,ac
 - **MCP**: `GET`/`POST`/`PUT /api/mcp/servers`, `DELETE /{name}`, `PUT /{name}/enabled`, `POST /{name}/test`
   (an `auth: oauth` server needs a token first; a URL or command with `offline` in it fails to connect),
   `POST /{name}/auth` + `GET`/`DELETE /api/mcp/oauth/flows/{id}`, and `GET`/`POST /api/mcp/catalog(/install)`.
-  The servers live in the profile's config (`mcp_servers` in `GET /api/config`), like in Hermes. An OAuth flow
+  The servers live in the profile's config (`mcp_servers` in `GET /api/config`), like in Hermes. The RPC
+  `reload.mcp {confirm: true}` answers `reloaded` (without `confirm`, `confirm_required`), as the app calls it
+  after each change so running chats pick it up. An OAuth flow
   approves itself after `--mcp-oauth-approve-after` seconds (default 2, `0` = never). It also completes through
   its `authorization_url`, which is the fake's own consent page (Approve / Deny), or through the debug trigger
   `POST /api/mcp/oauth/flows/{id}/debug {outcome: "approve" | "deny"}`.
