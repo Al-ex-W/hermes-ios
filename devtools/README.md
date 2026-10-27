@@ -175,6 +175,13 @@ come from `hermes_cli/web_routers/{skills,tools,mcp,cron,ops,status,analytics,ac
   approves itself after `--mcp-oauth-approve-after` seconds (default 2, `0` = never). It also completes through
   its `authorization_url`, which is the fake's own consent page (Approve / Deny), or through the debug trigger
   `POST /api/mcp/oauth/flows/{id}/debug {outcome: "approve" | "deny"}`.
+- **Managed apps**: the gateway RPCs `connectors.list` / `catalog` / `accounts` (+ `.remove`) / `policy.get` /
+  `policy.set` / `connect` / `operation.status` / `operation.wake` and `connection.respond`, as the account owner. A
+  profile only sees its apps once it is signed in to Nous (Settings ▸ Providers ▸ Nous Portal); before that
+  `connectors.policy.get` answers `NEEDS_NOUS_AUTH` in the error's `data.reason`. The default profile then has a
+  working GitHub account, an expired Google Drive one and Notion turned off for the member; the organisation turns
+  Salesforce off. A connect opens the fake's `/fake-connect/authorize` page (Approve / Deny) and approves itself
+  after `--mcp-oauth-approve-after` seconds.
 - **Plugins**: the gateway RPC `plugins.manage` with `list`, `toggle`, `install` (a `catalog_name` or a git
   repo), `update` (one update asks for consent first), `remove` and `settings`. An enabled plugin can add a
   toolset or an MCP server (`source: "plugin"`, read-only). `GET /api/dashboard/plugins/catalog` lists the

@@ -1,9 +1,11 @@
 import SwiftUI
 
 /// Capabilities › Connectors (`app/capabilities/connectors/connectors-tab.tsx` with `connectors-directory.tsx`): the
-/// MCP servers Hermes runs on its host, the catalog entries it can install, and "Add your own". `profile` is the
-/// Capabilities scope (`?profile=`; nil is the dashboard's own). The desktop's managed (Nous account) apps and its
-/// raw mcp.json editor aren't on the phone; the structured editor covers the server entry without showing secrets.
+/// managed apps of the profile's Nous account (over the gateway's `connectors.*` RPCs), the MCP servers Hermes runs
+/// on its host, the catalog entries it can install, and "Add your own", in the desktop's groups (Connected, On the
+/// Hermes host, Available, Turned off). `profile` is the Capabilities scope (`?profile=`; nil is the dashboard's
+/// own). The desktop's raw mcp.json editor isn't on the phone; the structured editor covers the server entry without
+/// showing secrets.
 struct ConnectorsScreen: View {
     let client: DashboardClient
     var profile: String?
@@ -23,7 +25,9 @@ struct ConnectorsScreen: View {
 
     var body: some View {
         // A new scope is a new page: nothing of the previous profile's servers, probes or sign-ins carries over.
-        ConnectorsDirectory(api: MCPAPI(transport: client, profile: profile), reloadSessions: gateway.map(Self.reload))
+        ConnectorsDirectory(api: MCPAPI(transport: client, profile: profile),
+                            hostedAPI: gateway.map { HostedConnectorsAPI(gateway: $0.transport, profile: profile) },
+                            reloadSessions: gateway.map(Self.reload), client: client, profile: profile)
             .id(profile ?? "")
     }
 
@@ -50,8 +54,15 @@ private struct ConnectorsDirectory: View {
     @State private var added: String?
     @State private var removing: ConnectorCard?
 
-    init(api: MCPAPI, reloadSessions: (() async throws -> Void)?) {
-        _model = StateObject(wrappedValue: ConnectorsModel(api: api, reloadSessions: reloadSessions))
+    /// For the Nous sign-in link (Settings ▸ Providers for the scoped profile).
+    let client: DashboardClient
+    let profile: String?
+
+    init(api: MCPAPI, hostedAPI: HostedConnectorsAPI?, reloadSessions: (() async throws -> Void)?,
+         client: DashboardClient, profile: String?) {
+        _model = StateObject(wrappedValue: ConnectorsModel(api: api, hostedAPI: hostedAPI, reloadSessions: reloadSessions))
+        self.client = client
+        self.profile = profile
     }
 
     var body: some View {
@@ -74,7 +85,16 @@ private struct ConnectorsDirectory: View {
             .refreshable { await model.load(force: true) }
             .onDisappear { model.stopAllAuth() }
             .sheet(item: $opened) { open in
-                ConnectorDetailSheet(model: model, cardKey: open.key)
+                if open.key.hasPrefix("hosted:") {
+                    HostedConnectorSheet(model: model, slug: String(open.key.dropFirst("hosted:".count)))
+                } else {
+                    ConnectorDetailSheet(model: model, cardKey: open.key)
+                }
+            }
+            // A sign-in started from the list opens here; with a detail open, that sheet shows it instead.
+            .sheet(item: Binding(get: { opened == nil ? model.browser : nil }, set: { model.browser = $0 }),
+                   onDismiss: { model.browserClosed() }) { page in
+                SafariSheet(url: page.url).ignoresSafeArea()
             }
             .sheet(isPresented: $adding, onDismiss: {
                 if let added { opened = OpenCard(key: ConnectorCards.key(added)) }
@@ -145,8 +165,39 @@ private struct ConnectorsDirectory: View {
         }
     }
 
+    /// Where the managed apps stand when they can't list (`signInLine`, `managedUnavailable`, `hostedFailed`).
+    @ViewBuilder private var hostedNotice: some View {
+        switch model.hostedPhase {
+        case .signedOut:
+            Section {
+                NavigationLink {
+                    ProvidersScreen(client: client, scope: profile)
+                } label: {
+                    Label("Sign in to Nous to use managed apps.", systemImage: "person.crop.circle.badge.checkmark")
+                }
+            } footer: {
+                FormNote("Nous apps follow your account, not the profile.")
+            }
+            .hermesFormRows()
+        case let .failed(message):
+            Section {
+                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                    Text("Could not reach the managed apps.").foregroundStyle(Theme.Text.primary)
+                    Text("The servers on the Hermes host are unaffected and still running. Nothing was turned off. \(message)")
+                        .hermesText(.caption)
+                        .foregroundStyle(Theme.Text.secondary)
+                }
+                Button("Retry") { Task { await model.reloadHosted() } }
+            }
+            .hermesFormRows()
+        case .unavailable, .loading, .ready:
+            EmptyView()
+        }
+    }
+
     private func list(_ page: ConnectorPage) -> some View {
         List {
+            hostedNotice
             if page.showsSegments || page.segment != segment || page.hiddenMatches > 0 {
                 Section {
                     if page.showsSegments {
@@ -221,6 +272,9 @@ private struct ConnectorsDirectory: View {
         }
         .contextMenu {
             Button("Open", systemImage: "arrow.up.right.square") { opened = OpenCard(key: card.key) }
+            if card.residency == .hosted, let verb = card.verb {
+                Button(verb.label, systemImage: "arrow.triangle.2.circlepath") { runVerb(card) }
+            }
             if card.installed, let name = card.serverName {
                 Button("Test connection", systemImage: "bolt.horizontal") { Task { await model.probe(name) } }
             }
@@ -241,6 +295,7 @@ private struct ConnectorsDirectory: View {
     /// `runVerb`: Authenticate signs in from the detail (the browser sheet lives there); an install that needs no
     /// values runs at once; everything else opens the detail.
     private func runVerb(_ card: ConnectorCard) {
+        if model.runHostedVerb(card) { return }
         switch card.verb {
         case .authenticate?:
             if let name = card.serverName { model.authenticate(name) }
@@ -322,7 +377,7 @@ struct ConnectorCardRow: View {
     }
 
     private var secondLine: String? {
-        card.reason?.text ?? card.description
+        card.secondLine
     }
 }
 
@@ -340,6 +395,12 @@ struct ConnectorTitleLine: View {
                 .foregroundStyle(Theme.Text.tertiary)
                 .lineLimit(1)
             if card.showsCatalogMark { CatalogMark() }
+            if let twin = card.twin {
+                Image(systemName: card.residency == .hosted ? "server.rack" : "cloud")
+                    .font(.system(size: Theme.IconSize.xs))
+                    .foregroundStyle(Theme.Text.tertiary)
+                    .accessibilityLabel(twin)
+            }
         }
     }
 }

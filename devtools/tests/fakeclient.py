@@ -65,6 +65,7 @@ class RpcFailure(Exception):
         super().__init__(f"{error.get('code')}: {error.get('message')}")
         self.code = error.get("code")
         self.message = error.get("message")
+        self.data = error.get("data")
 
 
 class Gateway:

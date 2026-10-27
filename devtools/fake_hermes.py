@@ -82,8 +82,8 @@ status,analytics,actions,files}.py and tui_gateway/methods_tools.py (plugins.man
   /api/ops/{doctor,security-audit,backup,backup/download,debug-share,checkpoints,checkpoints/prune},
   /api/memory/reset, /api/gateway/restart, /api/hermes/update (+ check), /api/actions/{name}/status (a background
   action shows more log per poll and ends on the ``--action-polls``-th), /api/fs/read-data-url, /api/fs/read-text,
-  /api/fs/download, /api/media/proxy, and the RPCs plugins.manage, session.active_list (the live sessions) and
-  reload.mcp.
+  /api/fs/download, /api/media/proxy, and the RPCs plugins.manage, session.active_list (the live sessions),
+  reload.mcp and the managed connectors (connectors.*, connection.respond; the consent page /fake-connect/authorize).
   /api/audio/* is never served.
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
@@ -4779,6 +4779,24 @@ def demo_pdf(title: str) -> bytes:
     return bytes(out)
 
 
+# The Nous connector catalog (``connectors.catalog``); the organisation layer turns ``salesforce`` off.
+HOSTED_CATALOG = (
+    ("github", "GitHub", "Issues, pull requests and code search in your repositories.", "Developer tools"),
+    ("google-drive", "Google Drive", "Find, read and share files in Drive.", "Files"),
+    ("slack", "Slack", "Read channels and send messages as you.", "Communication"),
+    ("notion", "Notion", "Search and edit pages and databases.", "Productivity"),
+    ("salesforce", "Salesforce", "Accounts, opportunities and reports.", "Sales"),
+)
+HOSTED_ORG_OFF = {"salesforce"}
+HOSTED_ORG_REVISION = "01JB0000000000000000000000"
+CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def fake_ulid() -> str:
+    """A ULID-shaped policy revision (``^[0-7][0-9A-HJKMNP-TV-Z]{25}$``)."""
+    return "01" + "".join(secrets.choice(CROCKFORD) for _ in range(24))
+
+
 @dataclass
 class Caps:
     """One profile's M4 state (its MCP servers sit in its config.yaml instead): skills and the disabled set,
@@ -4806,6 +4824,12 @@ class Caps:
     # back), and the built-in memory files (memories/MEMORY.md, USER.md) by key with their sizes.
     archived_skills: dict[str, dict[str, Any]] = field(default_factory=dict)
     builtin_memory: dict[str, int] = field(default_factory=lambda: {"memory": 812, "user": 245})
+    # Managed (Nous account) connectors: the account's sign-ins, the member's own switches with their policy
+    # revision, and open connect operations (tui_gateway/methods_connectors*.py over the Nous connector gateway).
+    hosted_accounts: list[dict[str, Any]] = field(default_factory=list)
+    hosted_member_off: set[str] = field(default_factory=set)
+    hosted_member_revision: str = field(default_factory=lambda: fake_ulid())
+    hosted_ops: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -4917,6 +4941,7 @@ class CapabilityFeatures:
             Route("/api/mcp/oauth/flows/{flow_id}/debug", r(self.debug_mcp_oauth_flow), methods=["POST"]),
             Route("/api/mcp/oauth/callback/{server_name:path}", self.mcp_oauth_callback, methods=["GET"]),
             Route("/fake-oauth/authorize", self.fake_oauth_page, methods=["GET"]),
+            Route("/fake-connect/authorize", self.fake_connect_page, methods=["GET"]),
             Route("/api/mcp/catalog", r(self.mcp_catalog), methods=["GET"]),
             Route("/api/mcp/catalog/install", r(self.install_mcp_catalog_entry), methods=["POST"]),
             # dashboard_ui.py
@@ -4969,7 +4994,238 @@ class CapabilityFeatures:
         return {"plugins.manage": lambda: self.plugins_manage(params),
                 "plugins.list": lambda: self.plugins_list_legacy(params),
                 "session.active_list": lambda: self.session_active_list(params),
-                "reload.mcp": lambda: self.reload_mcp(params)}
+                "reload.mcp": lambda: self.reload_mcp(params),
+                "connectors.list": lambda: self.connectors_list(params),
+                "connectors.catalog": lambda: self.connectors_catalog(params),
+                "connectors.accounts": lambda: self.connectors_accounts(params),
+                "connectors.accounts.remove": lambda: self.connectors_remove_account(params),
+                "connectors.policy.get": lambda: self.connectors_policy_get(params),
+                "connectors.policy.set": lambda: self.connectors_policy_set(params),
+                "connectors.connect": lambda: self.connectors_connect(conn, params),
+                "connectors.operation.status": lambda: self.connectors_operation(params),
+                "connectors.operation.wake": lambda: self.connectors_wake(params),
+                "connection.respond": lambda: self.connection_respond(params)}
+
+    # ── managed connectors (tui_gateway/methods_connectors.py, methods_connectors_account.py) ──────────────
+
+    @staticmethod
+    def connector_refusal(code: int, reason: str, message: str) -> RpcError:
+        """connector_refusals.py: the reason rides in the error's data."""
+        return RpcError(code, message, {"reason": reason})
+
+    def hosted_scope(self, params: dict[str, Any]) -> tuple[FakeProfile, Caps, bool]:
+        """The scoped profile, its state, and whether it is signed in to Nous (read_nous_access_token)."""
+        owner = params.get("owner")
+        if owner is not None and (not isinstance(owner, dict) or owner.get("type") != "account"):
+            raise self.connector_refusal(4001, "NOT_OWNER", "session not found or not owned by this transport")
+        profile = self.rpc_profile(params)
+        return profile, self.caps(profile), "nous" in profile.oauth
+
+    def need_nous(self, signed_in: bool) -> None:
+        if not signed_in:
+            raise self.connector_refusal(4032, "NEEDS_NOUS_AUTH", "Sign in to use connectors.")
+
+    @staticmethod
+    def hosted_account_row(account: dict[str, Any]) -> dict[str, Any]:
+        """methods_connectors_account.py _account_row (the pinned contract's ConnectorAccountRow fields)."""
+        return {key: account[key] for key in ("connection_id", "connector", "status", "status_reason", "label",
+                                              "alias", "active", "created_at", "updated_at")}
+
+    def connectors_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        """connectors.list {owner: account}: each connector's state for the account; nothing without a sign-in."""
+        _profile, caps, signed_in = self.hosted_scope(params)
+        if not signed_in:
+            return {"available": True, "connectors": []}
+        rows = []
+        for slug, *_rest in HOSTED_CATALOG:
+            mine = [a for a in caps.hosted_accounts if a["connector"] == slug]
+            account = next((a for a in mine if a["active"]), mine[0] if mine else None)
+            rows.append({"connector": slug, "enabled": slug not in caps.hosted_member_off and slug not in HOSTED_ORG_OFF,
+                         "connected": account is not None,
+                         "connection_status": account["status"] if account else None,
+                         "status_reason": account["status_reason"] if account else None,
+                         "gateway_disabled_tools": ["delete_repository"] if slug == "github" else []})
+        return {"available": True, "connectors": rows}
+
+    def connectors_catalog(self, params: dict[str, Any]) -> dict[str, Any]:
+        """connectors.catalog: the account's catalog (the public one without a sign-in: the same here)."""
+        self.hosted_scope(params)
+        return {"connectors": [{"slug": slug, "name": name, "description": description, "category": category,
+                                "logo_url": None} for slug, name, description, category in HOSTED_CATALOG]}
+
+    def connectors_accounts(self, params: dict[str, Any]) -> dict[str, Any]:
+        _profile, caps, signed_in = self.hosted_scope(params)
+        connector = params.get("connector")
+        rows = [self.hosted_account_row(a) for a in caps.hosted_accounts
+                if signed_in and (connector is None or a["connector"] == connector)]
+        return {"accounts": rows}
+
+    def connectors_remove_account(self, params: dict[str, Any]) -> dict[str, Any]:
+        _profile, caps, signed_in = self.hosted_scope(params)
+        self.need_nous(signed_in)
+        connection_id = str(params.get("connection_id") or "")
+        account = next((a for a in caps.hosted_accounts if a["connection_id"] == connection_id), None)
+        if account is None:
+            raise self.connector_refusal(4041, "CONNECTION_NOT_FOUND", "Connector account not found.")
+        caps.hosted_accounts.remove(account)
+        if account["active"]:
+            for other in caps.hosted_accounts:
+                if other["connector"] == account["connector"]:
+                    other["active"] = True
+                    break
+        return {"connection_id": connection_id, "connector": account["connector"], "status": "removed"}
+
+    def hosted_policy(self, caps: Caps) -> dict[str, Any]:
+        def layer(kind: str, revision: str, off: set[str], tools: dict[str, list[str]]) -> dict[str, Any]:
+            return {"kind": kind, "revision": revision,
+                    "body": {"mode": "deny", "disabled_connectors": sorted(off), "tools": tools}}
+        member_tools = {"github": ["delete_repository"]}
+        effective = {"version": 1, "revision": caps.hosted_member_revision, "issued_at_ms": int(time.time() * 1000),
+                     "mode": "deny", "disabled_connectors": sorted(HOSTED_ORG_OFF | caps.hosted_member_off),
+                     "tools": member_tools}
+        return {"layers": [layer("org", HOSTED_ORG_REVISION, HOSTED_ORG_OFF, {}),
+                           layer("member", caps.hosted_member_revision, caps.hosted_member_off, member_tools)],
+                "effective": effective}
+
+    def connectors_policy_get(self, params: dict[str, Any]) -> dict[str, Any]:
+        _profile, caps, signed_in = self.hosted_scope(params)
+        self.need_nous(signed_in)
+        return self.hosted_policy(caps)
+
+    def connectors_policy_set(self, params: dict[str, Any]) -> dict[str, Any]:
+        """connectors.policy.set {change: {type: connector, connector, enabled}, expected_revision}: a stale
+        revision is POLICY_CONFLICT; the organisation's lock can't be lifted here."""
+        _profile, caps, signed_in = self.hosted_scope(params)
+        self.need_nous(signed_in)
+        change = params.get("change") or {}
+        if params.get("expected_revision") != caps.hosted_member_revision:
+            raise self.connector_refusal(4090, "POLICY_CONFLICT", "The connector rules changed; reload them.")
+        if change.get("type") != "connector" or not isinstance(change.get("enabled"), bool):
+            raise self.connector_refusal(4000, "INVALID_POLICY", "Only connector switches are supported here.")
+        slug = str(change.get("connector") or "")
+        (caps.hosted_member_off.discard if change["enabled"] else caps.hosted_member_off.add)(slug)
+        caps.hosted_member_revision = fake_ulid()
+        policy = self.hosted_policy(caps)
+        return {"revision": caps.hosted_member_revision, "effective": policy["effective"]}
+
+    @staticmethod
+    def hosted_snapshot(op: dict[str, Any]) -> dict[str, Any]:
+        """methods_connectors._operation_view."""
+        return {"op_id": op["op_id"], "seq": op["seq"], "deadline_at": op["deadline_at"], "settled": op["settled"],
+                "settled_at": op["settled_at"], "settled_by": op["settled_by"],
+                "targets": [dict(target) for target in op["targets"]]}
+
+    def connectors_connect(self, conn: "Conn", params: dict[str, Any]) -> dict[str, Any]:
+        """connectors.connect {owner: account, connectors: [slug], reconnect}: opens an operation whose target
+        carries the sign-in link (the fake's /fake-connect page) and lists the new account as pending. The
+        operation connects by itself after ``--mcp-oauth-approve-after`` seconds (0 = only through the page)."""
+        profile, caps, signed_in = self.hosted_scope(params)
+        self.need_nous(signed_in)
+        connectors = params.get("connectors") or []
+        known = {slug for slug, *_rest in HOSTED_CATALOG}
+        if len(connectors) != 1 or connectors[0] not in known:
+            raise self.connector_refusal(4000, "INVALID_PARAMS", "connectors must name one catalog connector")
+        slug, reconnect = connectors[0], bool(params.get("reconnect"))
+        if slug in HOSTED_ORG_OFF:
+            raise self.connector_refusal(4030, "FORBIDDEN_SCOPE", "Connector access is not permitted for this account.")
+        now = time.time()
+        stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        repaired = next((a for a in caps.hosted_accounts if a["connector"] == slug and a["status"] != "active"),
+                        None) if reconnect else None
+        account = repaired or {"connection_id": "conn_" + secrets.token_hex(6), "connector": slug, "label": "",
+                               "alias": None, "active": not any(a["connector"] == slug for a in caps.hosted_accounts),
+                               "created_at": stamp}
+        account.update(status="pending", status_reason=None, updated_at=stamp)
+        if repaired is None:
+            caps.hosted_accounts.append(account)
+        op_id = "op_" + secrets.token_hex(8)
+        url = conn.ws.url
+        base = f"{'https' if url.scheme == 'wss' else 'http'}://{url.netloc}"
+        op = {"op_id": op_id, "seq": 1, "deadline_at": now + 600, "settled": False, "settled_at": None,
+              "settled_by": None, "profile": profile.name,
+              "targets": [{"name": slug, "kind": "connector", "action": "reconnect" if reconnect else "connect",
+                           "state": "initiated", "connect_url": f"{base}/fake-connect/authorize?"
+                           + urlencode({"op": op_id, "connector": slug}),
+                           "connection_id": account["connection_id"]}]}
+        caps.hosted_ops[op_id] = op
+        if self.mcp_oauth_approve_after > 0:
+            asyncio.get_running_loop().call_later(self.mcp_oauth_approve_after, self.settle_connect, caps, op_id, True)
+        log(f"connectors.connect {slug} ({'reconnect' if reconnect else 'connect'}) -> {op_id}")
+        return {**self.hosted_snapshot(op), "status": "initiated"}
+
+    def settle_connect(self, caps: Caps, op_id: str, approved: bool) -> None:
+        """The provider's answer: the account becomes active (labelled), or the target fails."""
+        op = caps.hosted_ops.get(op_id)
+        if op is None or op["settled"]:
+            return
+        target = op["targets"][0]
+        if target["state"] != "initiated":
+            return
+        account = next((a for a in caps.hosted_accounts if a["connection_id"] == target["connection_id"]), None)
+        stamp = datetime.now(timezone.utc).isoformat()
+        if approved:
+            target["state"] = "connected"
+            if account is not None:
+                account.update(status="active", label=account["label"] or f"demo@{target['name']}.example",
+                               updated_at=stamp)
+        else:
+            target.update(state="failed", detail="The provider refused the sign-in.")
+            if account is not None:
+                account.update(status="failed", status_reason="access_denied", updated_at=stamp)
+        target.pop("connect_url", None)
+        op["seq"] += 1
+        if approved:
+            op.update(settled=True, settled_at=time.time(), settled_by="all_resolved")
+        log(f"connector sign-in {op_id} {'approved' if approved else 'denied'}")
+
+    def hosted_op(self, params: dict[str, Any]) -> tuple[Caps, dict[str, Any]]:
+        _profile, caps, _signed_in = self.hosted_scope(params)
+        op = caps.hosted_ops.get(str(params.get("op_id") or ""))
+        if op is None:
+            raise self.connector_refusal(4004, "UNKNOWN_OPERATION", "No open connection operation.")
+        return caps, op
+
+    def connectors_operation(self, params: dict[str, Any]) -> dict[str, Any]:
+        _caps, op = self.hosted_op(params)
+        return self.hosted_snapshot(op)
+
+    def connectors_wake(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.hosted_op(params)
+        return {"status": "ok"}
+
+    def connection_respond(self, params: dict[str, Any]) -> dict[str, Any]:
+        """connection.respond {result: {settled_by: continue}}: the user stopped waiting; unconnected targets are
+        skipped and the operation settles."""
+        _caps, op = self.hosted_op(params)
+        result = params.get("result") or {}
+        if not isinstance(result, dict) or result.get("settled_by") not in (None, "continue"):
+            raise self.connector_refusal(4000, "INVALID_ANSWER", "That answer doesn't fit the operation.")
+        if result.get("settled_by") == "continue" and not op["settled"]:
+            for target in op["targets"]:
+                if target["state"] not in ("connected", "failed", "expired"):
+                    target["state"] = "skipped"
+                    target.pop("connect_url", None)
+            op.update(settled=True, settled_at=time.time(), settled_by="continue", seq=op["seq"] + 1)
+        return {"status": "ok", "settled": op["settled"]}
+
+    async def fake_connect_page(self, request: Request) -> Response:
+        """The provider's consent page for a connector sign-in (public): Approve / Deny settle the operation."""
+        q = request.query_params
+        op_id, decision = q.get("op") or "", q.get("decision")
+        caps = next((c for p in self.profiles.values() if op_id in (c := self.caps(p)).hosted_ops), None)
+        if caps is None:
+            return HTMLResponse("<h1>Unknown sign-in</h1>", status_code=404)
+        if decision in ("approve", "deny"):
+            self.settle_connect(caps, op_id, decision == "approve")
+            return HTMLResponse("<!doctype html><meta name=viewport content='width=device-width'><h1>"
+                                + ("Connected. You can close this page." if decision == "approve" else "Sign-in denied.")
+                                + "</h1>")
+        app = html.escape(q.get("connector") or "the app")
+        approve = f"?{urlencode({'op': op_id, 'decision': 'approve'})}"
+        deny = f"?{urlencode({'op': op_id, 'decision': 'deny'})}"
+        return HTMLResponse(f"<!doctype html><meta name=viewport content='width=device-width'><title>Fake sign-in"
+                            f"</title><h1>Allow Hermes to use {app}?</h1><p><a href='{html.escape(approve)}'>Approve</a>"
+                            f" · <a href='{html.escape(deny)}'>Deny</a></p>")
 
     def reload_mcp(self, params: dict[str, Any]) -> dict[str, Any]:
         """methods_tools.py reload.mcp: tears down and rediscovers every live session's MCP servers. Without
@@ -5012,6 +5268,15 @@ class CapabilityFeatures:
             for plugin in user_plugins(profile):
                 caps.plugins[plugin["key"]] = plugin
             caps.toolsets["kanban"] = True
+            # Managed apps (shown once the profile signs in to Nous): GitHub works, Google Drive needs a reconnect.
+            day = datetime.fromtimestamp(now - 20 * DAY, timezone.utc).isoformat()
+            caps.hosted_accounts = [
+                {"connection_id": "conn_github01", "connector": "github", "status": "active", "status_reason": None,
+                 "label": "demo-dev", "alias": "Work GitHub", "active": True, "created_at": day, "updated_at": day},
+                {"connection_id": "conn_gdrive01", "connector": "google-drive", "status": "expired",
+                 "status_reason": "The Google token expired.", "label": "demo@example.com", "alias": None,
+                 "active": True, "created_at": day, "updated_at": day}]
+            caps.hosted_member_off = {"notion"}
         else:
             caps.providers["web"] = "Tavily"  # no TAVILY_API_KEY in this profile: the row needs keys
             caps.mcp_tokens.add("context7")
@@ -7470,7 +7735,7 @@ class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
             if inspect.isawaitable(result):
                 result = await result
         except RpcError as exc:
-            return _err(rid, exc.code, exc.message)
+            return _err(rid, exc.code, exc.message, exc.data)
         return {"jsonrpc": "2.0", "id": rid, "result": result}
 
     def client_capabilities(self, conn: Conn, params: dict[str, Any]) -> dict[str, Any]:
@@ -8153,14 +8418,18 @@ class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures):
 
 
 class RpcError(Exception):
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, data: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.data = data
 
 
-def _err(rid: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+def _err(rid: Any, code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": rid, "error": error}
 
 
 def is_response_frame(obj: Any) -> bool:

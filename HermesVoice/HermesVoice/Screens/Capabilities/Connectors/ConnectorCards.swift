@@ -1,8 +1,9 @@
 import Foundation
 
 // The Connectors directory's model (`app/capabilities/connectors/derive.ts`, `derive-page.ts`, `data/join.ts`,
-// `connector-kind.ts`), for the servers Hermes runs on its host and the catalog entries it could install. The
-// desktop's managed (Nous account) apps aren't part of this page on the phone.
+// `connector-kind.ts`): the managed (Nous account) apps, the servers Hermes runs on its host, and the catalog
+// entries it could install. A managed app and a host server of the same app stay two cards here (the desktop
+// merges them into one card with two "ways"); each says when its twin exists.
 
 enum ConnectorState: String, Hashable {
     case available, broken, connected, connecting, expired, off, unknown
@@ -23,30 +24,41 @@ enum ConnectorState: String, Hashable {
 
 enum ConnectorVerb: String, Hashable {
     case authenticate, install, openLogs
+    // Managed apps.
+    case connect, reconnect, tryAgain, stopWaiting, turnBackOn
 
     var label: String {
         switch self {
         case .authenticate: return "Authenticate"
         case .install: return "Install"
         case .openLogs: return "Open logs"
+        case .connect: return "Connect"
+        case .reconnect: return "Reconnect"
+        case .tryAgain: return "Try again"
+        case .stopWaiting: return "Stop waiting"
+        case .turnBackOn: return "Turn back on"
         }
     }
 }
 
 enum ConnectorReason: String, Hashable {
     case serverError, serverNeedsAuth
+    // Managed apps.
+    case finishSignIn, reconnect
 
     var text: String {
         switch self {
         case .serverError: return "The server refused the connection."
         case .serverNeedsAuth: return "Sign in to let this server answer."
+        case .finishSignIn: return "Finish the sign-in in your browser."
+        case .reconnect: return "Reconnect to keep this app working."
         }
     }
 }
 
 /// The tool count a connected server's card shows instead of its state word.
 struct ConnectorFact: Hashable {
-    enum Key: Hashable { case tools, toolsOn, toolsSomeOn }
+    enum Key: Hashable { case tools, toolsOn, toolsSomeOn, toolsOff }
     var key: Key
     var count: Int
     var on = 0
@@ -56,15 +68,21 @@ struct ConnectorFact: Hashable {
         case .tools: return Self.tools(count)
         case .toolsOn: return "\(Self.tools(count)) on"
         case .toolsSomeOn: return "\(count) tools, \(on) on"
+        case .toolsOff: return "\(Self.tools(count)) off"
         }
     }
 
     static func tools(_ count: Int) -> String { "\(count) tool\(count == 1 ? "" : "s")" }
 }
 
-/// One server (or installable catalog entry) on the page.
+/// Where an app runs: a managed (Nous account) app, or a server on the Hermes host.
+enum ConnectorResidency: Hashable {
+    case hosted, local
+}
+
+/// One app on the page: a managed app, a server on the host, or a catalog entry to install.
 struct ConnectorCard: Identifiable, Hashable {
-    /// `local:<slug>`, the card's identity across reloads.
+    /// `hosted:<slug>` or `local:<name>`, the card's identity across reloads.
     var key: String
     /// The server's config key, or the catalog entry's name.
     var slug: String
@@ -84,11 +102,31 @@ struct ConnectorCard: Identifiable, Hashable {
     var needsEnv: Bool
     var target: String?
     var unused: Bool
+    var residency: ConnectorResidency = .local
+    /// A managed app's accounts, switch and locks; nil for a server on the host.
+    var hosted: HostedConnector?
+    /// A managed app's reason in its own words (the provider's status reason for a reconnect).
+    var reasonText: String?
+    var offByOrg = false
+    /// The same app also exists the other way (`twinPillOf`).
+    var twin: String?
 
     var id: String { key }
 
-    /// The state word (`LOCAL_WORDS` / `localWord`).
+    /// The state word (`HOSTED_WORDS` / `LOCAL_WORDS` / `localWord`).
     var stateWord: String {
+        if residency == .hosted {
+            if offByOrg { return "Off by your organisation" }
+            switch state {
+            case .available: return "Available"
+            case .broken: return "Could not connect"
+            case .connected: return "Connected"
+            case .connecting: return "Connecting"
+            case .expired: return "Access expired"
+            case .off: return "Off for you"
+            case .unknown: return "State unknown"
+            }
+        }
         if reason == .serverNeedsAuth { return "Needs authentication" }
         switch state {
         case .available: return "Available"
@@ -102,17 +140,21 @@ struct ConnectorCard: Identifiable, Hashable {
     /// What the card's lane says: the tool count while connected, else the state word.
     var stateLabel: String { fact?.text ?? stateWord }
 
-    /// `connectorKindWord` for a server on the host.
+    /// `connectorKindWord`.
     var kindWord: String {
+        if residency == .hosted { return "Managed" }
         if let plugin { return "MCP · Plugin \(plugin)" }
         return inCatalog ? "MCP · Catalog" : "MCP · Custom"
     }
 
     /// `showsCatalogMark`.
-    var showsCatalogMark: Bool { inCatalog && plugin == nil }
+    var showsCatalogMark: Bool { inCatalog && plugin == nil && residency == .local }
 
     /// The switch belongs to a configured server Hermes owns (a plugin's servers are the plugin's).
-    var hasSwitch: Bool { installed && plugin == nil }
+    var hasSwitch: Bool { installed && plugin == nil && residency == .local }
+
+    /// What the card's second line says: its reason, else its description.
+    var secondLine: String? { reasonText ?? reason?.text ?? description }
 }
 
 /// One configured server joined with its catalog entry, probe and usage (`LocalServerInput`).
@@ -127,6 +169,42 @@ struct ConnectorServerInput: Hashable {
 
 enum ConnectorCards {
     static func key(_ slug: String) -> String { "local:\(slug)" }
+    static func hostedKey(_ slug: String) -> String { "hosted:\(slug)" }
+
+    /// `hostedWay` + `mergeCard` for a managed app.
+    static func card(_ hosted: HostedConnector) -> ConnectorCard {
+        let way = hosted.way
+        var fact: ConnectorFact?
+        if way.state == .connected, hosted.toolsOff > 0 { fact = ConnectorFact(key: .toolsOff, count: hosted.toolsOff) }
+        let reasonText = way.reason == .reconnect ? MCPText.nonBlank(hosted.statusReason) : nil
+        return ConnectorCard(
+            key: hostedKey(hosted.slug), slug: hosted.slug, name: hosted.name, description: hosted.description,
+            inCatalog: hosted.inCatalog, plugin: nil, state: way.state, reason: way.reason, verb: way.verb, fact: fact,
+            installed: false, serverEnabled: false, serverName: nil, entryName: nil, needsEnv: false, target: nil,
+            unused: false, residency: .hosted, hosted: hosted, reasonText: reasonText, offByOrg: way.offByOrg)
+    }
+
+    /// Every card: the managed apps first, then the host's servers and catalog entries; a card whose app also
+    /// exists the other way says so (`twinPillOf`).
+    static func cards(hosted: [HostedConnector], inputs: [ConnectorServerInput], catalog: [MCPCatalogEntry]) -> [ConnectorCard] {
+        let local = cards(inputs: inputs, catalog: catalog)
+        let hostedOn = Set(hosted.filter { $0.way.state != .off }.map(\.slug))
+        let installedSlugs = Set(inputs.compactMap { $0.catalog?.connectorSlug })
+        var all = hosted.map { app -> ConnectorCard in
+            var card = card(app)
+            if installedSlugs.contains(app.slug) { card.twin = "Also runs on the Hermes host" }
+            return card
+        }
+        for var card in local {
+            let slug = card.installed ? inputs.first { $0.server.name == card.serverName }?.catalog?.connectorSlug
+                : catalog.first { $0.name == card.entryName }?.connectorSlug
+            if card.installed, let slug, hostedOn.contains(slug) { card.twin = "Managed version available" }
+            // An entry to install for an app the account already runs as a managed app is the same app twice.
+            if !card.installed, let slug, hosted.contains(where: { $0.slug == slug && $0.connected }) { continue }
+            all.append(card)
+        }
+        return all
+    }
 
     /// `joinLocalServers`: each configured server with what the probes and usage know of it.
     static func inputs(servers: [MCPServerSummary], catalog: [MCPCatalogEntry], probes: [String: MCPTestResult],
@@ -210,17 +288,24 @@ enum ConnectorCards {
 
 // MARK: - Page
 
+/// The page's groups, in the desktop's `GROUP_ORDER`.
 enum ConnectorGroup: String, CaseIterable, Hashable, Identifiable {
+    /// Managed apps with a sign-in (broken ones first).
+    case connected
     /// Servers on the Hermes host (`residencyLocal`; "On this device" on the desktop, where the host is the machine).
     case host
     case available
+    /// Managed apps turned off for you or by your organisation; their sign-ins are kept.
+    case off
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .connected: return "Connected"
         case .host: return "On the Hermes host"
         case .available: return "Available"
+        case .off: return "Turned off"
         }
     }
 }
@@ -268,8 +353,14 @@ struct ConnectorPage: Hashable {
     /// The segmented control earns its place with two or more groups.
     var showsSegments: Bool { segments.count > 2 }
 
+    /// `groupIdOf`: a host server that isn't just available sits with the host's; the rest by state.
     static func group(of card: ConnectorCard) -> ConnectorGroup {
-        card.state == .available ? .available : .host
+        if card.residency == .local, card.state != .available { return .host }
+        switch card.state {
+        case .available: return .available
+        case .off: return .off
+        case .broken, .connected, .connecting, .expired, .unknown: return .connected
+        }
     }
 
     static func matches(_ card: ConnectorCard, query: String) -> Bool {

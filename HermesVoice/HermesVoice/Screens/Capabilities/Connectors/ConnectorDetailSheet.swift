@@ -20,7 +20,7 @@ struct ConnectorDetailSheet: View {
                     }
             }
         }
-        .sheet(item: $model.browser) { page in
+        .sheet(item: $model.browser, onDismiss: { model.browserClosed() }) { page in
             SafariSheet(url: page.url).ignoresSafeArea()
         }
         .onDisappear {

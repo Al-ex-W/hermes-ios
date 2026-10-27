@@ -90,6 +90,8 @@ final class WebSocketTransport: GatewayTransport {
 struct GatewayRPCError: LocalizedError, Equatable {
     let code: Int
     let message: String
+    /// The error's `data` (the connector RPCs put their `reason` there).
+    var data: JSONValue?
 
     var errorDescription: String? { message }
 }
@@ -887,7 +889,8 @@ final class GatewayConnection: GatewayCalling, GatewayPausing {
         if let error = object["error"] {
             entry.continuation.resume(throwing: GatewayRPCError(
                 code: error["code"]?.intValue ?? 0,
-                message: error["message"]?.stringValue ?? "Hermes returned an error."
+                message: error["message"]?.stringValue ?? "Hermes returned an error.",
+                data: error["data"].flatMap { $0.isNull ? nil : $0 }
             ))
             return
         }

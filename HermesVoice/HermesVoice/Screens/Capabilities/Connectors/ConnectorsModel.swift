@@ -1,10 +1,21 @@
 import Foundation
 
-/// The Connectors page's state for one profile (`use-mcp-servers.ts`, `use-mcp-probes.ts`): the configured
-/// servers, the catalog, a probe per server, 30-day usage, and the OAuth runs.
+/// The Connectors page's state for one profile (`use-mcp-servers.ts`, `use-mcp-probes.ts`, `use-hosted-connectors`):
+/// the managed apps of the profile's Nous account, the configured servers, the catalog, a probe per server, 30-day
+/// usage, and the OAuth and connect runs.
 @MainActor
 final class ConnectorsModel: ObservableObject {
     let api: MCPAPI
+    /// The managed apps' RPCs; nil while the gateway socket isn't up.
+    let hostedAPI: HostedConnectorsAPI?
+
+    @Published private(set) var hostedPhase: HostedPhase = .loading
+    @Published private(set) var hosted: [HostedConnector] = []
+    /// The member's policy layer, for the "Hermes can use" switch.
+    @Published private(set) var hostedPolicy = HostedPolicy()
+    /// Open sign-ins by app slug.
+    @Published private(set) var operations: [String: HostedOperation] = [:]
+    private var operationPolls: [String: Task<Void, Never>] = [:]
 
     /// nil until the first read answers.
     @Published private(set) var servers: [MCPServerSummary]?
@@ -36,9 +47,11 @@ final class ConnectorsModel: ObservableObject {
     private var reloading: Task<Void, Never>?
     private var reloadAgain = false
 
-    init(api: MCPAPI, reloadSessions: (() async throws -> Void)? = nil) {
+    init(api: MCPAPI, hostedAPI: HostedConnectorsAPI? = nil, reloadSessions: (() async throws -> Void)? = nil) {
         self.api = api
+        self.hostedAPI = hostedAPI
         self.reloadSessions = reloadSessions
+        if hostedAPI == nil { hostedPhase = .unavailable }
     }
 
     /// Whether changes reach running chats on their own.
@@ -81,7 +94,12 @@ final class ConnectorsModel: ObservableObject {
 
     var cards: [ConnectorCard] {
         guard servers != nil else { return [] }
-        return ConnectorCards.cards(inputs: inputs, catalog: catalog)
+        return ConnectorCards.cards(hosted: hostedPhase == .ready ? hosted : [], inputs: inputs, catalog: catalog)
+    }
+
+    func hostedApp(_ slug: String?) -> HostedConnector? {
+        guard let slug else { return nil }
+        return hosted.first { $0.slug == slug }
     }
 
     func card(_ key: String) -> ConnectorCard? { cards.first { $0.key == key } }
@@ -106,10 +124,206 @@ final class ConnectorsModel: ObservableObject {
     func load(force: Bool = false) async {
         async let catalogRead = try? api.catalog()
         async let callsRead = api.toolCalls30d()
+        async let hostedRead: Void = reloadHosted()
         await reloadServers()
         if let catalog = await catalogRead { self.catalog = catalog.entries }
         if let calls = await callsRead { calls30d = calls }
+        await hostedRead
         probeAll(force: force)
+    }
+
+    // MARK: Managed apps
+
+    /// Reads the managed apps: list, catalog, accounts and the member's rules side by side (`useHostedConnectors`).
+    /// Not signed in to Nous, or no managed apps for the account, is a state of the page, not an error.
+    func reloadHosted() async {
+        guard let hostedAPI else { return }
+        do {
+            async let listRead = hostedAPI.list()
+            async let catalogRead = hostedAPI.catalog()
+            async let accountsRead = hostedAPI.accounts()
+            async let policyRead = hostedAPI.policy()
+            let list = try await listRead
+            guard list.available else {
+                hosted = []
+                hostedPhase = .unavailable
+                return
+            }
+            let catalog = try await catalogRead
+            let accounts = (try? await accountsRead) ?? []
+            // Without a Nous sign-in the list and catalog still answer (empty, public); the member's rules say so.
+            var policy: HostedPolicy?
+            do {
+                policy = try await policyRead
+            } catch where HostedRefusal.needsSignIn(error) {
+                throw error
+            } catch {
+                policy = nil
+            }
+            hostedPolicy = policy ?? HostedPolicy()
+            hosted = HostedConnector.join(list: list.rows, catalog: catalog, accounts: accounts, policy: hostedPolicy,
+                                          rulesReadable: policy != nil)
+            hostedPhase = .ready
+        } catch {
+            guard !error.isCancellation else { return }
+            if HostedRefusal.needsSignIn(error) {
+                hosted = []
+                hostedPhase = .signedOut
+            } else if HostedRefusal.unavailable(error) {
+                hosted = []
+                hostedPhase = .unavailable
+            } else {
+                hostedPhase = .failed(error.dashboardMessage)
+            }
+        }
+    }
+
+    /// Starts a sign-in for a managed app (or repairs one), opens its link, and follows the operation until it
+    /// settles; the browser closing wakes it.
+    func connectHosted(_ slug: String, reconnect: Bool) async {
+        guard let hostedAPI else { return }
+        let key = ConnectorCards.hostedKey(slug)
+        busy.insert(key)
+        defer { busy.remove(key) }
+        do {
+            let operation = try await hostedAPI.connect(slug, reconnect: reconnect)
+            operations[slug] = operation
+            if let url = operation.target(slug)?.connectURL {
+                browserOwner = key
+                browser = WebPage(url: url)
+            }
+            followOperation(slug)
+            await reloadHosted()
+        } catch {
+            guard !error.isCancellation else { return }
+            failure = "Couldn't connect \(hostedApp(slug)?.name ?? slug). \(error.dashboardMessage)"
+        }
+    }
+
+    /// Polls an open sign-in every two seconds until it settles or its app connects or fails.
+    private func followOperation(_ slug: String) {
+        operationPolls[slug]?.cancel()
+        operationPolls[slug] = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self, !Task.isCancelled, let open = self.operations[slug], let hostedAPI = self.hostedAPI else { return }
+                guard let next = try? await hostedAPI.operation(open.opID) else { continue }
+                guard !Task.isCancelled else { return }
+                self.operations[slug] = next
+                let target = next.target(slug)
+                if next.settled || target?.connected == true || target?.failed == true {
+                    self.operationSettled(slug, next)
+                    return
+                }
+                if let deadline = next.deadline, Date() > deadline.addingTimeInterval(5) {
+                    self.operationSettled(slug, next)
+                    return
+                }
+            }
+        }
+    }
+
+    private func operationSettled(_ slug: String, _ operation: HostedOperation) {
+        operationPolls[slug] = nil
+        if browserOwner == ConnectorCards.hostedKey(slug) {
+            browser = nil
+            browserOwner = nil
+        }
+        let target = operation.target(slug)
+        if target?.connected == true {
+            operations[slug] = nil
+        } else if target?.failed == true {
+            failure = "The sign-in did not finish.\(target?.detail.map { " \($0)" } ?? "")"
+        }
+        Task { await reloadHosted() }
+    }
+
+    /// The browser sheet closed: ask the operation now instead of at the next tick (`connectors.operation.wake`).
+    func browserClosed() {
+        guard let owner = browserOwner, owner.hasPrefix("hosted:") else { return }
+        let slug = String(owner.dropFirst("hosted:".count))
+        browserOwner = nil
+        guard let opID = operations[slug]?.opID, let hostedAPI else { return }
+        Task { try? await hostedAPI.wake(opID) }
+    }
+
+    /// "Stop waiting": settles the open sign-in as the user's Continue; a pending account it left behind goes.
+    func stopWaiting(_ slug: String) async {
+        guard let hostedAPI else { return }
+        operationPolls[slug]?.cancel()
+        operationPolls[slug] = nil
+        if browserOwner == ConnectorCards.hostedKey(slug) {
+            browser = nil
+            browserOwner = nil
+        }
+        do {
+            if let open = operations.removeValue(forKey: slug) {
+                try await hostedAPI.giveUp(open.opID)
+                for target in open.targets where !target.connected {
+                    if let id = target.connectionID { try? await hostedAPI.removeAccount(id) }
+                }
+            } else if let pending = hostedApp(slug)?.accounts.first(where: { $0.status == "pending" }) {
+                try await hostedAPI.removeAccount(pending.connectionID)
+            }
+        } catch {
+            guard !error.isCancellation else { return }
+            failure = "That change was not saved. \(error.dashboardMessage)"
+        }
+        await reloadHosted()
+    }
+
+    /// The member's "Hermes can use <app>" switch (`connectors.policy.set`). A stale revision reads the rules again.
+    func setHostedEnabled(_ slug: String, _ enabled: Bool) async {
+        guard let hostedAPI else { return }
+        let key = ConnectorCards.hostedKey(slug)
+        busy.insert(key)
+        defer { busy.remove(key) }
+        do {
+            var revision = hostedPolicy.member?.revision ?? ""
+            if revision.isEmpty, let fresh = try? await hostedAPI.policy() {
+                hostedPolicy = fresh
+                revision = fresh.member?.revision ?? ""
+            }
+            try await hostedAPI.setEnabled(slug, enabled, revision: revision)
+            reloadLiveSessions()
+        } catch {
+            guard !error.isCancellation else { return }
+            failure = "That change was not saved. \(error.dashboardMessage)"
+        }
+        await reloadHosted()
+    }
+
+    /// Removes one account of a managed app (`connectors.accounts.remove`); answers whether it went.
+    func disconnectHosted(_ account: HostedAccount) async -> Bool {
+        guard let hostedAPI else { return false }
+        let key = ConnectorCards.hostedKey(account.connector)
+        busy.insert(key)
+        defer { busy.remove(key) }
+        do {
+            try await hostedAPI.removeAccount(account.connectionID)
+            await reloadHosted()
+            return true
+        } catch {
+            guard !error.isCancellation else { return false }
+            failure = HostedRefusal.reason(error) == "CONNECTION_NOT_FOUND"
+                ? "Hermes has no account to disconnect here. Refresh the page and try again."
+                : "Nous could not remove this sign-in right now. Turn the app off with the switch instead, or try again later."
+            await reloadHosted()
+            return false
+        }
+    }
+
+    /// A managed card's verb (`runHostedVerb`); false when the verb is a host server's.
+    func runHostedVerb(_ card: ConnectorCard) -> Bool {
+        guard card.residency == .hosted else { return false }
+        switch card.verb {
+        case .connect?: Task { await connectHosted(card.slug, reconnect: false) }
+        case .reconnect?, .tryAgain?: Task { await connectHosted(card.slug, reconnect: true) }
+        case .stopWaiting?: Task { await stopWaiting(card.slug) }
+        case .turnBackOn?: Task { await setHostedEnabled(card.slug, true) }
+        default: return false
+        }
+        return true
     }
 
     func reloadServers() async {
@@ -377,8 +591,11 @@ final class ConnectorsModel: ObservableObject {
         }
     }
 
-    /// The page went away: release every flow still waiting on the host.
+    /// The page went away: release every flow still waiting on the host, and stop following sign-ins (they go on
+    /// on Nous; the page reads them again when it opens).
     func stopAllAuth() {
         for (name, machine) in auth where machine.isRunning { stopAuth(name) }
+        for poll in operationPolls.values { poll.cancel() }
+        operationPolls = [:]
     }
 }

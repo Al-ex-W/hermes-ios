@@ -1028,3 +1028,76 @@ def test_memory_reset_text_previews_and_session_lookups():
     assert all(not r["current"] for r in other["sessions"])
     assert draft == 404, "a draft has no stored row yet"
     assert not contract_problems(gateway)
+
+
+def test_managed_connectors_need_nous_then_list_switch_connect_and_disconnect():
+    async def scenario():
+        async with serving(seed="demo", mcp_oauth_approve_after=0) as (fake, base):
+            async with signed_in(base) as http:
+                gateway = await Gateway.connect(base, http)
+                owner = {"type": "account"}
+                try:
+                    signed_out_list = await gateway.call("connectors.list", {"owner": owner})
+                    signed_out_policy = await failure(gateway, "connectors.policy.get", {})
+                    catalog = await gateway.call("connectors.catalog", {})
+                    fake.profiles["default"].oauth["nous"] = {"logged_in": True}
+                    listed = await gateway.call("connectors.list", {"owner": owner})
+                    accounts = await gateway.call("connectors.accounts", {})
+                    policy = await gateway.call("connectors.policy.get", {})
+                    member = next(layer for layer in policy["layers"] if layer["kind"] == "member")
+                    stale = await failure(gateway, "connectors.policy.set", {
+                        "change": {"type": "connector", "connector": "notion", "enabled": True},
+                        "expected_revision": "01JB0000000000000000000001"})
+                    switched = await gateway.call("connectors.policy.set", {
+                        "change": {"type": "connector", "connector": "notion", "enabled": True},
+                        "expected_revision": member["revision"]})
+                    started = await gateway.call("connectors.connect", {"owner": owner, "connectors": ["slack"]})
+                    pending = await gateway.call("connectors.accounts", {"connector": "slack"})
+                    page = await http.get(started["targets"][0]["connect_url"].split(base, 1)[1])
+                    approved = await http.get("/fake-connect/authorize", params={"op": started["op_id"],
+                                                                                 "decision": "approve"})
+                    settled = await gateway.call("connectors.operation.status", {"owner": owner,
+                                                                                 "op_id": started["op_id"]})
+                    repair = await gateway.call("connectors.connect", {"owner": owner, "connectors": ["google-drive"],
+                                                                      "reconnect": True})
+                    woke = await gateway.call("connectors.operation.wake", {"owner": owner, "op_id": repair["op_id"]})
+                    gave_up = await gateway.call("connection.respond", {"owner": owner, "op_id": repair["op_id"],
+                                                                        "result": {"settled_by": "continue"}})
+                    after_give_up = await gateway.call("connectors.operation.status", {"owner": owner,
+                                                                                       "op_id": repair["op_id"]})
+                    removed = await gateway.call("connectors.accounts.remove", {"connection_id": "conn_github01"})
+                    gone = await failure(gateway, "connectors.accounts.remove", {"connection_id": "conn_github01"})
+                    unknown_op = await failure(gateway, "connectors.operation.status", {"owner": owner, "op_id": "x"})
+                    org_locked = await failure(gateway, "connectors.connect", {"owner": owner,
+                                                                              "connectors": ["salesforce"]})
+                    final = {a["connector"]: a["status"] for a in (await gateway.call("connectors.accounts", {}))["accounts"]}
+                finally:
+                    await gateway.close()
+        return locals()
+
+    r = asyncio.run(scenario())
+    assert r["signed_out_list"] == {"available": True, "connectors": []}
+    assert r["signed_out_policy"].code == 4032 and r["signed_out_policy"].data == {"reason": "NEEDS_NOUS_AUTH"}
+    assert [c["slug"] for c in r["catalog"]["connectors"]][:2] == ["github", "google-drive"]
+    rows = {row["connector"]: row for row in r["listed"]["connectors"]}
+    assert rows["github"]["connected"] and rows["github"]["connection_status"] == "active"
+    assert rows["notion"]["enabled"] is False and rows["salesforce"]["enabled"] is False
+    assert {a["connector"]: a["status"] for a in r["accounts"]["accounts"]} == {"github": "active",
+                                                                                "google-drive": "expired"}
+    assert [layer["kind"] for layer in r["policy"]["layers"]] == ["org", "member"]
+    assert r["stale"].data == {"reason": "POLICY_CONFLICT"}
+    assert r["switched"]["revision"] != r["member"]["revision"]
+    assert "notion" not in r["switched"]["effective"]["disabled_connectors"]
+    target = r["started"]["targets"][0]
+    assert target["state"] == "initiated" and "/fake-connect/authorize?" in target["connect_url"]
+    assert r["pending"]["accounts"][0]["status"] == "pending"
+    assert "Allow Hermes to use slack?" in r["page"].text and r["approved"].status_code == 200
+    assert r["settled"]["settled"] and r["settled"]["targets"][0]["state"] == "connected"
+    assert r["woke"] == {"status": "ok"} and r["gave_up"] == {"status": "ok", "settled": True}
+    assert r["after_give_up"]["settled_by"] == "continue" and r["after_give_up"]["targets"][0]["state"] == "skipped"
+    assert r["removed"] == {"connection_id": "conn_github01", "connector": "github", "status": "removed"}
+    assert r["gone"].data == {"reason": "CONNECTION_NOT_FOUND"} and r["unknown_op"].data == {
+        "reason": "UNKNOWN_OPERATION"}
+    assert r["org_locked"].data == {"reason": "FORBIDDEN_SCOPE"}
+    assert r["final"] == {"google-drive": "pending", "slack": "active"}
+    assert not contract_problems(r["gateway"])

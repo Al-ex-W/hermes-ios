@@ -814,6 +814,158 @@ final class ConnectorsTests: XCTestCase {
         XCTAssertTrue(ConnectorPage(cards: cards, query: "nothing", segment: .all).segments.isEmpty)
     }
 
+    // MARK: Managed apps
+
+    private func hostedRows() throws -> (list: [HostedListRow], catalog: [HostedCatalogRow], accounts: [HostedAccount], policy: HostedPolicy) {
+        let list = [
+            ["connector": "github", "enabled": true, "connected": true, "connection_status": "active",
+             "status_reason": NSNull(), "gateway_disabled_tools": ["delete_repository"]],
+            ["connector": "google-drive", "enabled": true, "connected": true, "connection_status": "expired",
+             "status_reason": "The Google token expired.", "gateway_disabled_tools": []],
+            ["connector": "slack", "enabled": true, "connected": false, "connection_status": NSNull(),
+             "status_reason": NSNull(), "gateway_disabled_tools": []],
+            ["connector": "linear", "enabled": true, "connected": true, "connection_status": "pending"],
+            ["connector": "notion", "enabled": false, "connected": false],
+            ["connector": "salesforce", "enabled": false, "connected": false],
+            ["bad": true],
+        ].compactMap { HostedListRow(row: $0 as JSON) }
+        let catalog = [["slug": "github", "name": "GitHub", "description": "Repos", "category": "Dev"],
+                       ["slug": "google-drive", "name": "Google Drive", "description": "Files", "category": "Files"],
+                       ["slug": "slack", "name": "Slack", "description": "Chat", "category": "Chat"],
+                       ["slug": "notion", "name": "Notion", "description": "Pages", "category": "Docs"],
+                       ["slug": "salesforce", "name": "Salesforce", "description": "CRM", "category": "Sales"]]
+            .compactMap { HostedCatalogRow(row: $0 as JSON) }
+        let accounts = [
+            ["connection_id": "c1", "connector": "github", "status": "active", "label": "dev", "alias": "Work",
+             "active": false, "created_at": "2026-10-01T00:00:00Z", "updated_at": "x"],
+            ["connection_id": "c2", "connector": "github", "status": "active", "label": "me", "active": true,
+             "created_at": "2026-09-01T00:00:00Z", "updated_at": "x"],
+            ["connection_id": "c0", "connector": "github", "status": "revoked", "label": "old", "active": false,
+             "disabled": true, "created_at": "2026-01-01T00:00:00Z", "updated_at": "x"],
+            ["connection_id": "c3", "connector": "google-drive", "status": "expired", "label": "me@example.com",
+             "active": true, "created_at": "2026-09-01T00:00:00Z", "updated_at": "x", "status_reason": "Token expired."],
+        ].compactMap { HostedAccount(row: $0 as JSON) }
+        let policy = HostedPolicy(response: try value("""
+        {"layers": [
+          {"kind": "org", "revision": "01JB0000000000000000000000", "body": {"mode": "deny", "disabled_connectors": ["salesforce"], "tools": {}}},
+          {"kind": "member", "revision": "01JB0000000000000000000009", "body": {"mode": "deny", "disabled_connectors": ["notion"],
+           "tools": {"github": ["delete_repository", "admin"]}}}],
+         "effective": {"mode": "deny"}}
+        """))
+        return (list, catalog, accounts, policy)
+    }
+
+    func testManagedAppsJoinLikeTheDesktop() throws {
+        let rows = try hostedRows()
+        XCTAssertEqual(rows.list.count, 6, "a row without a connector is dropped")
+        XCTAssertEqual(rows.policy.member?.revision, "01JB0000000000000000000009")
+        XCTAssertTrue(rows.policy.orgLocks("salesforce"))
+        XCTAssertFalse(rows.policy.memberEnables("notion"))
+        let apps = HostedConnector.join(list: rows.list, catalog: rows.catalog, accounts: rows.accounts, policy: rows.policy)
+        XCTAssertEqual(apps.map(\.slug), ["github", "google-drive", "slack", "notion", "salesforce", "linear"],
+                       "catalog order, then listed connectors the catalog lacks")
+        let byslug = Dictionary(uniqueKeysWithValues: apps.map { ($0.slug, $0) })
+        let github = try XCTUnwrap(byslug["github"])
+        XCTAssertEqual(github.accounts.map(\.connectionID), ["c2", "c1"], "active first, then newest; the retired apart")
+        XCTAssertEqual(github.retiredAccounts.map(\.connectionID), ["c0"])
+        XCTAssertEqual(github.account?.name, "me")
+        XCTAssertEqual(github.accounts[1].name, "Work", "the alias names an account")
+        XCTAssertEqual(github.toolsOff, 2, "the member's own tool rules")
+        XCTAssertEqual(HostedConnector.join(list: rows.list, catalog: rows.catalog, accounts: rows.accounts,
+                                            policy: rows.policy, rulesReadable: false).first?.toolsOff, 1,
+                       "without readable rules, the gateway's list says what is off")
+        XCTAssertEqual(byslug["linear"]?.name, "Linear")
+
+        func way(_ slug: String) -> (ConnectorState, ConnectorVerb?, ConnectorReason?) {
+            let way = byslug[slug]!.way
+            return (way.state, way.verb, way.reason)
+        }
+        XCTAssertTrue(way("github") == (.connected, nil, nil))
+        XCTAssertTrue(way("google-drive") == (.expired, .reconnect, .reconnect))
+        XCTAssertTrue(way("slack") == (.available, .connect, nil))
+        XCTAssertTrue(way("linear") == (.connecting, .stopWaiting, .finishSignIn))
+        XCTAssertTrue(way("notion") == (.off, .turnBackOn, nil), "off for you: turn back on")
+        XCTAssertTrue(way("salesforce") == (.off, nil, nil), "off by the organisation: nothing to do here")
+        XCTAssertTrue(byslug["salesforce"]!.way.offByOrg)
+
+        let cards = apps.map(ConnectorCards.card)
+        let drive = try XCTUnwrap(cards.first { $0.slug == "google-drive" })
+        XCTAssertEqual(drive.key, "hosted:google-drive")
+        XCTAssertEqual(drive.stateWord, "Access expired")
+        XCTAssertEqual(drive.secondLine, "Token expired.", "a reconnect reason says the provider's words")
+        XCTAssertEqual(drive.kindWord, "Managed")
+        XCTAssertFalse(drive.hasSwitch)
+        XCTAssertEqual(cards.first { $0.slug == "github" }?.fact?.text, "2 tools off")
+        XCTAssertEqual(cards.first { $0.slug == "salesforce" }?.stateWord, "Off by your organisation")
+        XCTAssertEqual(cards.first { $0.slug == "notion" }?.stateWord, "Off for you")
+        XCTAssertEqual(cards.first { $0.slug == "linear" }?.secondLine, "Finish the sign-in in your browser.")
+    }
+
+    func testManagedAppsGroupWithTheHostsServers() throws {
+        let rows = try hostedRows()
+        let apps = HostedConnector.join(list: rows.list, catalog: rows.catalog, accounts: rows.accounts, policy: rows.policy)
+        let catalog = [try catalogEntry("github-mcp", slug: "github"), try catalogEntry("slack-mcp", slug: "slack"),
+                       try catalogEntry("zeta")]
+        let servers = [server("github-mcp"), server("files", enabled: false)]
+        let inputs = ConnectorCards.inputs(servers: servers, catalog: catalog, probes: ["github-mcp": MCPTestResult(ok: true)],
+                                           probing: [], calls: nil)
+        let cards = ConnectorCards.cards(hosted: apps, inputs: inputs, catalog: catalog)
+        XCTAssertEqual(cards.first { $0.key == "hosted:github" }?.twin, "Also runs on the Hermes host")
+        XCTAssertEqual(cards.first { $0.key == "local:github-mcp" }?.twin, "Managed version available")
+        XCTAssertNotNil(cards.first { $0.key == "local:slack-mcp" }, "an app not yet connected keeps its local install")
+
+        let page = ConnectorPage(cards: cards, query: "", segment: .all)
+        XCTAssertEqual(page.sections.map(\.group), [.connected, .host, .available, .off], "the desktop's GROUP_ORDER")
+        XCTAssertEqual(page.sections[0].cards.map(\.slug), ["google-drive", "linear", "github"],
+                       "broken connections first")
+        XCTAssertEqual(Set(page.sections[1].cards.map(\.slug)), ["github-mcp", "files"], "the host's servers, on or off")
+        XCTAssertEqual(page.sections[3].cards.map(\.slug), ["notion", "salesforce"])
+        XCTAssertEqual(page.segments.first?.count, cards.count)
+    }
+
+    func testManagedAppRequestsAreAccountOwnedAndScoped() async throws {
+        final class Recorder: GatewayCalling {
+            var calls: [(String, JSONValue)] = []
+            var reply: (String) -> JSONValue = { _ in [:] }
+            func call(_ method: String, params: JSONValue, timeout: TimeInterval?) async throws -> JSONValue {
+                calls.append((method, params))
+                return reply(method)
+            }
+        }
+        let gateway = Recorder()
+        let api = HostedConnectorsAPI(gateway: gateway, profile: "work")
+        gateway.reply = { _ in ["available": false, "connectors": []] }
+        let listed = try await api.list()
+        XCTAssertFalse(listed.available)
+        XCTAssertEqual(gateway.calls.last?.0, "connectors.list")
+        XCTAssertEqual(gateway.calls.last?.1, ["owner": ["type": "account"], "profile": "work"])
+
+        gateway.reply = { _ in ["op_id": "op1", "seq": 1, "deadline_at": 1_900_000_000, "settled": false,
+                                "targets": [["name": "slack", "kind": "connector", "action": "connect", "state": "initiated",
+                                             "connect_url": "https://connect.example/x"]]] }
+        let operation = try await api.connect("slack", reconnect: false)
+        XCTAssertEqual(gateway.calls.last?.1, ["owner": ["type": "account"], "connectors": ["slack"], "reconnect": false,
+                                                 "profile": "work"])
+        XCTAssertEqual(operation.target("slack")?.connectURL?.host, "connect.example")
+        XCTAssertFalse(operation.settled)
+
+        gateway.reply = { _ in ["revision": "r", "effective": [:]] }
+        try await api.setEnabled("notion", true, revision: "01JB0000000000000000000009")
+        XCTAssertEqual(gateway.calls.last?.0, "connectors.policy.set")
+        XCTAssertEqual(gateway.calls.last?.1, ["change": ["type": "connector", "connector": "notion", "enabled": true],
+                                                 "expected_revision": "01JB0000000000000000000009", "profile": "work"])
+        try await api.giveUp("op1")
+        XCTAssertEqual(gateway.calls.last?.1, ["owner": ["type": "account"], "op_id": "op1",
+                                                 "result": ["settled_by": "continue"], "profile": "work"])
+        try await api.removeAccount("c1")
+        XCTAssertEqual(gateway.calls.last?.1, ["connection_id": "c1", "profile": "work"])
+
+        let refused = GatewayRPCError(code: 4032, message: "Sign in to use connectors.", data: ["reason": "NEEDS_NOUS_AUTH"])
+        XCTAssertTrue(HostedRefusal.needsSignIn(refused))
+        XCTAssertFalse(HostedRefusal.unavailable(refused))
+        XCTAssertNil(HostedRefusal.reason(DashboardError.timeout))
+    }
+
     func testTitles() {
         XCTAssertEqual(MCPText.title("github"), "GitHub")
         XCTAssertEqual(MCPText.title("my-mcp_server"), "My MCP Server")
