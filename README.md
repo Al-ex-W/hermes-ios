@@ -177,7 +177,9 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
    example `["telegram:123456789"]`), or, with no `owner_ids`, the users the gateway serves by name: its platform
    allowlist (`TELEGRAM_ALLOWED_USERS` …), `GATEWAY_ALLOWED_USERS`, or a pairing you approved. An allow-all
    switch, a `*` wildcard or a role-based grant makes nobody the owner, so set `owner_ids` then. The rate limits
-   and quiet hours count every ring on the host, whichever process it came from.
+   and quiet hours count every ring on the host, whichever process it came from. Runs nobody sits at
+   (`hermes chat -q`, `hermes -z`, `--source tool`) don't ring unless `policy.allowed_sources` adds `oneshot` /
+   `tool`, and another profile's processes only when `policy.allowed_profiles` lists it.
 
    ```yaml
    plugins:
@@ -203,8 +205,9 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
    off on the phone (approval, question, turn done) sends `POST /api/plugins/hermes_voice/devices` with
    `{"alerts": {"turn_done": false}}`, say; `alerts.devices` in the status counts the phones that take them. They
    come only for conversations the dashboard hosts while no client has them open (after `grace_s`, 5 s), use the
-   same APNs key as the calls (`apns-push-type: alert`, topic = the app's bundle id), and with
-   `alerts.previews: false` carry no conversation text. The app answers an approval or a question from the
+   same APNs key as the calls (`apns-push-type: alert`, topic = the app's bundle id), pass Hermes' secret
+   redaction, go silently during `policy.quiet_hours`, and with `alerts.previews: false` carry no conversation
+   text (nor does the call push's title). The app answers an approval or a question from the
    notification through the dashboard (`request.answer`).
 
 ### Cutover from hermes-voice-mcp

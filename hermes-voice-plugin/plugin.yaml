@@ -59,10 +59,12 @@ config_schema:
   policy:
     type: dict
     description: >-
-      Who may ring the phone: allowed_sources (default [desktop, dashboard, tui, cli, local]), allow_owner_dms
-      (true) with owner_ids (empty: the gateway's allowlist or pairing names the owner), allow_cron /
-      allow_subagents / allow_groups (false), rings_per_session (3) per session_window_s (600), rings_global (10)
-      per global_window_s (3600), quiet_hours {start: "22:00", end: "07:00", action: refuse|confirm, timezone}
+      Who may ring the phone: allowed_sources (default [desktop, dashboard, tui, cli, local]; add oneshot or tool
+      for `hermes chat -q` / `--source tool` runs), allow_owner_dms (true) with owner_ids (empty: the gateway's
+      allowlist or pairing names the owner), allowed_profiles (other profiles that may ring through this
+      dashboard; empty), allow_cron / allow_subagents / allow_groups (false), rings_per_session (3) per
+      session_window_s (600), rings_global (10) per global_window_s (3600), quiet_hours {start: "22:00", end:
+      "07:00", action: refuse|confirm, timezone} (alert pushes go silently then)
   alerts:
     type: dict
     description: >-
