@@ -400,12 +400,15 @@ private struct SidebarAgentsButton: View {
         let live = agents.roster.liveCount, failed = agents.roster.failedCount
         let showsFailure = live == 0 && failed > 0
         let open = sizeClass != .compact && sidebar.selection == .agents
+        let count = live > 0 ? "\(live) subagent\(live == 1 ? "" : "s")" : showsFailure ? "\(failed) failed" : nil
         Button { sidebar.toggleOverlay(.agents) } label: {
-            Label(live > 0 ? "\(live) subagent\(live == 1 ? "" : "s")" : showsFailure ? "\(failed) failed" : "Agents",
-                  systemImage: showsFailure ? Theme.Icon.error : Theme.Icon.agents)
-                .labelStyle(.titleAndIcon)
-                .foregroundStyle(showsFailure ? Theme.destructive : open ? Theme.primary : Theme.Text.secondary)
+            // A bar shows a label's icon only, so the count is text of its own.
+            HStack(spacing: Theme.Spacing.xs) {
+                Image(systemName: showsFailure ? Theme.Icon.error : Theme.Icon.agents)
+                if let count { Text(count).hermesText(.meta).monospacedDigit() }
+            }
         }
+        .tint(showsFailure ? Theme.destructive : nil)
         .accessibilityLabel(open ? "Close agents" : "Open agents")
         .accessibilityValue(live > 0 ? "\(live) running" : showsFailure ? "\(failed) failed" : "")
     }

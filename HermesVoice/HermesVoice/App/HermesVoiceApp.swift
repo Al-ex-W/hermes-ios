@@ -116,6 +116,15 @@ struct AppShell: View {
             }
         }
         .onChange(of: compactColumn) { _, _ in backToList() }
+        .onAppear {
+            let column = $compactColumn, model = sidebar
+            model.revealDetail = { [weak model] in
+                guard model?.compact == true, column.wrappedValue != .detail else { return false }
+                column.wrappedValue = .detail
+                return true
+            }
+        }
+        .onChange(of: sizeClass, initial: true) { _, size in sidebar.compact = size == .compact }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 Task { await sidebar.refresh() }

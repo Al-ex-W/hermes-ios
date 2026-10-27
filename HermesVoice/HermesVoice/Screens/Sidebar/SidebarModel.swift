@@ -113,6 +113,12 @@ final class SidebarModel: ObservableObject {
     @Published private(set) var options: SidebarOptions
     /// The host serves the kanban plugin (`KanbanAvailability`): its board shows as a navigation row.
     @Published private(set) var kanbanAvailable = false
+    /// Shows the detail column on iPhone, set by the shell; true when it had to be pushed. A screen opened from
+    /// outside the list (a toolbar button, a notification) is picked only once that push started: picked first, it
+    /// starts in the hidden detail column and the push cancels the loading it started on appearing.
+    var revealDetail: (() -> Bool)?
+    /// The shell is stacked (iPhone), so the detail column is pushed over the list.
+    var compact = false
 
     /// Stored ids whose turn is running, and those waiting on an answer.
     @Published private(set) var workingIDs: Set<String> = []
@@ -553,7 +559,7 @@ final class SidebarModel: ObservableObject {
             opened[target] = SessionInfo(id: target, profile: profile)
             nameUnlisted(target, profile: profile)
         }
-        selection = .session(target)
+        pick(.session(target))
         externalOpens += 1
         watch()
     }
@@ -586,8 +592,17 @@ final class SidebarModel: ObservableObject {
             selection = beforeOverlay
         } else {
             if selection?.isOverlay != true { beforeOverlay = selection }
-            selection = overlay
+            pick(overlay)
         }
+    }
+
+    /// Picks `destination` from outside the list: on iPhone the detail column is pushed first.
+    private func pick(_ destination: SidebarDestination) {
+        guard revealDetail?() == true else {
+            selection = destination
+            return
+        }
+        DispatchQueue.main.async { [weak self] in self?.selection = destination }
     }
 
     /// Starts a chat in `folder` (a new worktree's "New chat here"), for `profile`'s store.

@@ -16,14 +16,21 @@ struct ChatColumn: View {
     @State private var runtimeID: String?
 
     var body: some View {
-        NavigationStack { ChatScreen(chat: chat, sidebar: sidebar, workspaceOpen: $workspaceOpen) }
-            .inspector(isPresented: $workspaceOpen) {
-                WorkspacePanel(context: context)
-                    .inspectorColumnWidth(min: 320, ideal: 380, max: 560)
-                    .presentationDetents([.large])
+        let stack = NavigationStack { ChatScreen(chat: chat, sidebar: sidebar, workspaceOpen: $workspaceOpen) }
+        Group {
+            // Stacked, an inspector's content would be built (and its toolbar merged into the chat's) even while
+            // closed, so the phone gets a plain sheet.
+            if sizeClass == .compact {
+                stack.sheet(isPresented: $workspaceOpen) { WorkspacePanel(context: context) }
+            } else {
+                stack.inspector(isPresented: $workspaceOpen) {
+                    WorkspacePanel(context: context)
+                        .inspectorColumnWidth(min: 320, ideal: 380, max: 560)
+                }
             }
-            .onReceive(chat.$busy.removeDuplicates()) { busy = $0 }
-            .onReceive(chat.$runtimeID.removeDuplicates()) { runtimeID = $0 }
+        }
+        .onReceive(chat.$busy.removeDuplicates()) { busy = $0 }
+        .onReceive(chat.$runtimeID.removeDuplicates()) { runtimeID = $0 }
     }
 
     private var context: WorkspaceContext {

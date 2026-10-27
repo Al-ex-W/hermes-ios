@@ -195,6 +195,8 @@ struct WorkspaceDiffView: View {
             }
             .padding(.vertical, Theme.Spacing.xs)
         }
+        // A two-axis scroll view centres content smaller than itself; a short diff starts at the top.
+        .defaultScrollAnchor(.topLeading)
         .font(.system(size: Self.fontSize, design: .monospaced))
         .background(Theme.card)
         .overlay(alignment: .trailing) { OverviewRuler(lines: shown) }

@@ -21,6 +21,9 @@ struct SessionImportScreen: View {
     @StateObject private var store: SessionImportStore
     @StateObject private var profiles = ProfileScopeModel()
     @State private var query = ""
+    /// The conversation whose preview is pushed. An item destination, not a value one: this screen is itself
+    /// pushed (from the Command Center), and SwiftUI ignores value destinations declared below the stack's root.
+    @State private var previewing: ForeignSessionRow?
 
     init(context: Context) {
         self.context = context
@@ -68,7 +71,7 @@ struct SessionImportScreen: View {
             if store.rows.isEmpty, store.phase == .loading { await store.load() }
         }
         .task { await profiles.load(context.client) }
-        .navigationDestination(for: ForeignSessionRow.self) { row in
+        .navigationDestination(item: $previewing) { row in
             SessionImportPreviewScreen(store: store, row: row, openSession: context.openSession)
         }
     }
@@ -176,7 +179,16 @@ struct SessionImportScreen: View {
                 ForEach(SessionImportList.days(visible)) { day in
                     Section {
                         ForEach(day.rows) { row in
-                            NavigationLink(value: row) { SessionImportRow(row: row) }
+                            Button { previewing = row } label: {
+                                HStack {
+                                    SessionImportRow(row: row)
+                                    Image(systemName: Theme.Icon.disclosure)
+                                        .font(.system(size: Theme.IconSize.xs, weight: .semibold))
+                                        .foregroundStyle(Theme.Text.quaternary)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .foregroundStyle(Theme.Text.primary)
                         }
                     } header: {
                         Text(day.title)
