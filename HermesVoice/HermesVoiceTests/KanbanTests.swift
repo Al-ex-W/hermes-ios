@@ -37,7 +37,8 @@ private final class RecordingKanbanTransport: KanbanTransport {
     }
 
     func kanbanUpload(_ path: String, query: [String: String], filename: String, contentType: String?,
-                      data: Data, fields: [String: String]) async throws -> Any {
+                      file: URL, fields: [String: String]) async throws -> Any {
+        let data = try Data(contentsOf: file)
         uploads.append(Upload(path: path, query: query, filename: filename, contentType: contentType, data: data, fields: fields))
         return ["attachment": ["id": 9, "filename": filename, "size": data.count]]
     }
@@ -363,10 +364,25 @@ final class KanbanTests: XCTestCase {
         _ = try await api.log("t_a")
         XCTAssertEqual(transport.calls.last?.query, ["board": "ops", "tail": "16384"])
 
-        let attachment = try await api.uploadAttachment(task: "t_a", filename: "a.txt", contentType: "text/plain", data: Data("hi".utf8))
+        let small = try temporaryFile(size: 2, contents: Data("hi".utf8))
+        defer { try? FileManager.default.removeItem(at: small) }
+        let attachment = try await api.uploadAttachment(task: "t_a", filename: "a.txt", contentType: "text/plain", file: small)
         XCTAssertEqual(attachment?.id, 9)
         XCTAssertEqual(transport.uploads.last?.path, "\(root)/tasks/t_a/attachments")
         XCTAssertEqual(transport.uploads.last?.fields, ["uploaded_by": "mobile"])
+        XCTAssertEqual(transport.uploads.last?.data, Data("hi".utf8))
+
+        // Over the host's 25 MB cap: refused before anything is sent (Hermes would take it all, then answer 413).
+        let large = try temporaryFile(size: KanbanLimits.attachmentBytes + 1)
+        defer { try? FileManager.default.removeItem(at: large) }
+        do {
+            _ = try await api.uploadAttachment(task: "t_a", filename: "clip.mov", contentType: nil, file: large)
+            XCTFail("an attachment over the cap is refused")
+        } catch {
+            XCTAssertTrue(error.dashboardMessage.hasSuffix("can be up to 25 MB."), error.dashboardMessage)
+        }
+        XCTAssertEqual(transport.uploads.count, 1)
+        XCTAssertNil(KanbanLimits.refusal("a", size: KanbanLimits.attachmentBytes))
 
         let unpinned = api.on(board: nil)
         _ = try await unpinned.boards()
@@ -384,12 +400,36 @@ final class KanbanTests: XCTestCase {
                        "no cursor: the host starts at the tail instead of replaying history")
     }
 
-    func testMultipartBody() {
-        let body = String(decoding: KanbanMultipart.body(boundary: "B", filename: "a\"b.txt", contentType: nil,
-                                                         data: Data("hi".utf8), fields: ["uploaded_by": "mobile"]), as: UTF8.self)
-        XCTAssertTrue(body.contains("name=\"uploaded_by\"\r\n\r\nmobile\r\n"))
-        XCTAssertTrue(body.contains("filename=\"a%22b.txt\""), "a quote can't end the filename early")
-        XCTAssertTrue(body.contains("Content-Type: application/octet-stream\r\n\r\nhi\r\n--B--"))
+    func testMultipartBody() throws {
+        let head = MultipartBody.head(fields: [("path", "/r/a b.txt"), ("overwrite", "false")], fileField: "file",
+                                      fileName: "a\"b.txt", contentType: "text/plain", boundary: "B")
+        XCTAssertEqual(head, "--B\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/r/a b.txt\r\n"
+            + "--B\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\nfalse\r\n"
+            + "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a%22b.txt\"\r\nContent-Type: text/plain\r\n\r\n",
+                       "a quote can't end the filename early")
+        XCTAssertEqual(MultipartBody.quoted("a\\b\r\nc"), "a\\\\b  c")
+        XCTAssertEqual(MultipartBody.tail(boundary: "B"), "\r\n--B--\r\n")
+        XCTAssertEqual(MultipartBody.contentType("x.png"), "image/png")
+        XCTAssertEqual(MultipartBody.contentType("x.unknownext"), "application/octet-stream")
+
+        let source = try temporaryFile(size: 5, contents: Data("hello".utf8))
+        defer { try? FileManager.default.removeItem(at: source) }
+        let body = try MultipartBody.write(file: source, fields: [("uploaded_by", "mobile")], fileField: "file",
+                                           fileName: "x.bin", contentType: "text/plain", boundary: "Z")
+        defer { try? FileManager.default.removeItem(at: body) }
+        let text = String(decoding: try Data(contentsOf: body), as: UTF8.self)
+        XCTAssertTrue(text.hasPrefix("--Z\r\nContent-Disposition: form-data; name=\"uploaded_by\"\r\n\r\nmobile\r\n"))
+        XCTAssertTrue(text.contains("Content-Type: text/plain\r\n\r\nhello\r\n--Z--\r\n"), "the given type wins")
+    }
+
+    /// A file of `size` bytes (sparse past `contents`).
+    private func temporaryFile(size: Int, contents: Data = Data()) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("kanban-test-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: url.path, contents: contents)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(size))
+        try handle.close()
+        return url
     }
 
     // MARK: Board edits and live events

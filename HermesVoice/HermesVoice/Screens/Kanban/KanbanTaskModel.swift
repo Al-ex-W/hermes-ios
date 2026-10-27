@@ -172,9 +172,10 @@ final class KanbanTaskModel: ObservableObject {
         await write("links") { try await api.removeLink(parent: parent, child: child) }
     }
 
-    func upload(filename: String, contentType: String?, data: Data) async {
+    /// Attaches a file on the phone; one over the host's 25 MB cap is refused before anything is sent.
+    func upload(filename: String, contentType: String?, file: URL) async {
         await write("upload") {
-            _ = try await api.uploadAttachment(task: taskID, filename: filename, contentType: contentType, data: data)
+            _ = try await api.uploadAttachment(task: taskID, filename: filename, contentType: contentType, file: file)
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 // The kanban dashboard plugin's REST routes (`plugins/kanban/dashboard/plugin_api.py`, mounted at
 // `/api/plugins/kanban/`), as the desktop's native board (`apps/desktop/src/plugins/kanban/api.ts`) uses them.
@@ -10,19 +11,21 @@ import Foundation
 
 /// The REST calls the Kanban screen makes (`DashboardClient` in the app), so tests can record them.
 protocol KanbanTransport: CapabilitiesTransport {
-    /// A single-file multipart POST (`file` field plus plain form fields).
+    /// A single-file multipart POST (`file` field plus plain form fields), the file streamed from disk.
     func kanbanUpload(_ path: String, query: [String: String], filename: String, contentType: String?,
-                      data: Data, fields: [String: String]) async throws -> Any
+                      file: URL, fields: [String: String]) async throws -> Any
     /// The raw bytes of a GET (an attachment download).
     func kanbanDownload(_ path: String, query: [String: String]) async throws -> Data
 }
 
 extension DashboardClient: KanbanTransport {
     func kanbanUpload(_ path: String, query: [String: String], filename: String, contentType: String?,
-                      data: Data, fields: [String: String]) async throws -> Any {
+                      file: URL, fields: [String: String]) async throws -> Any {
         let boundary = "hermes-\(UUID().uuidString)"
-        let body = KanbanMultipart.body(boundary: boundary, filename: filename, contentType: contentType,
-                                        data: data, fields: fields)
+        // The body goes to a temporary file and uploads from there, so the attachment never sits in memory.
+        let body = try MultipartBody.write(file: file, fields: fields.sorted { $0.key < $1.key }.map { ($0.key, $0.value) },
+                                           fileField: "file", fileName: filename, contentType: contentType, boundary: boundary)
+        defer { try? FileManager.default.removeItem(at: body) }
         for attempt in 0..<2 {
             var request = URLRequest(url: url(path, query: query))
             request.httpMethod = "POST"
@@ -30,7 +33,7 @@ extension DashboardClient: KanbanTransport {
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             request.setValue(Self.origin(of: base), forHTTPHeaderField: "Origin")
             request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            let (answer, response) = try await session.upload(for: request, from: body)
+            let (answer, response) = try await session.upload(for: request, fromFile: body)
             let http = response as? HTTPURLResponse
             let code = http?.statusCode ?? 0
             if code == 401 || code == 403 || isSignInRedirect(http, for: request) {
@@ -48,34 +51,61 @@ extension DashboardClient: KanbanTransport {
     }
 }
 
-/// A `multipart/form-data` body with one file part.
-enum KanbanMultipart {
-    static func body(boundary: String, filename: String, contentType: String?, data: Data,
-                     fields: [String: String]) -> Data {
-        var body = Data()
-        func line(_ text: String) { body.append(Data((text + "\r\n").utf8)) }
-        for (name, value) in fields.sorted(by: { $0.key < $1.key }) {
-            line("--\(boundary)")
-            line("Content-Disposition: form-data; name=\"\(quoted(name))\"")
-            line("")
-            line(value)
+/// A multipart/form-data body with one file part, written to a temporary file with the file copied in chunks.
+enum MultipartBody {
+    static func write(file: URL, fields: [(String, String)], fileField: String, fileName: String,
+                      contentType: String? = nil, boundary: String) throws -> URL {
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent("hermes-upload-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: target.path, contents: nil)
+        let output = try FileHandle(forWritingTo: target)
+        defer { try? output.close() }
+        try output.write(contentsOf: Data(head(fields: fields, fileField: fileField, fileName: fileName,
+                                               contentType: contentType ?? Self.contentType(fileName), boundary: boundary).utf8))
+        let input = try FileHandle(forReadingFrom: file)
+        defer { try? input.close() }
+        while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
+            try output.write(contentsOf: chunk)
         }
-        line("--\(boundary)")
-        line("Content-Disposition: form-data; name=\"file\"; filename=\"\(quoted(filename))\"")
-        line("Content-Type: \(contentType ?? "application/octet-stream")")
-        line("")
-        body.append(data)
-        line("")
-        line("--\(boundary)--")
-        return body
+        try output.write(contentsOf: Data(tail(boundary: boundary).utf8))
+        return target
     }
 
-    /// A header parameter value: quotes and line breaks can't end it early.
+    /// Everything before the file's bytes: the form fields, then the file part's headers.
+    static func head(fields: [(String, String)], fileField: String, fileName: String, contentType: String, boundary: String) -> String {
+        var text = ""
+        for (name, value) in fields {
+            text += "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(quoted(name))\"\r\n\r\n\(value)\r\n"
+        }
+        text += "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(quoted(fileField))\"; filename=\"\(quoted(fileName))\"\r\n"
+        text += "Content-Type: \(contentType)\r\n\r\n"
+        return text
+    }
+
+    static func tail(boundary: String) -> String { "\r\n--\(boundary)--\r\n" }
+
+    /// A header parameter value: quotes, backslashes and line breaks can't end it early.
     static func quoted(_ value: String) -> String {
         value.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "%22")
             .replacingOccurrences(of: "\r", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    static func contentType(_ fileName: String) -> String {
+        let ext = (fileName as NSString).pathExtension
+        return UTType(filenameExtension: ext)?.preferredMIMEType ?? "application/octet-stream"
+    }
+}
+
+/// The host's caps, mirrored so the phone says so before sending.
+enum KanbanLimits {
+    /// `kanban_db.KANBAN_ATTACHMENT_MAX_BYTES`: larger attachments are refused with a 413 once uploaded.
+    static let attachmentBytes = 25 * 1024 * 1024
+
+    /// Why `name` (`size` bytes) can't be attached; nil when it fits.
+    static func refusal(_ name: String, size: Int) -> String? {
+        guard size > attachmentBytes else { return nil }
+        return "“\(name)” is \(ByteSize.format(Double(size))). Kanban attachments can be up to \(attachmentBytes >> 20) MB."
     }
 }
 
@@ -1486,9 +1516,12 @@ struct KanbanAPI {
         _ = try await send("DELETE", "/links", boardQuery(["parent_id": parent, "child_id": child]), body: nil)
     }
 
-    func uploadAttachment(task id: String, filename: String, contentType: String?, data: Data) async throws -> KanbanAttachment? {
+    /// Attaches `file`, refused before anything is sent when it is over the host's cap.
+    func uploadAttachment(task id: String, filename: String, contentType: String?, file: URL) async throws -> KanbanAttachment? {
+        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if let refusal = KanbanLimits.refusal(filename, size: size) { throw DashboardError.rpc(refusal) }
         let answer = try await transport.kanbanUpload(Self.root + (try taskPath(id, "/attachments")), query: boardQuery(),
-                                                      filename: filename, contentType: contentType, data: data,
+                                                      filename: filename, contentType: contentType, file: file,
                                                       fields: ["uploaded_by": "mobile"])
         return KanbanAttachment((answer as? JSON)?["attachment"])
     }

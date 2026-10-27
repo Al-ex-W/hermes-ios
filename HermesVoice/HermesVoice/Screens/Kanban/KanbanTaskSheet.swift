@@ -789,18 +789,15 @@ private struct KanbanTaskDetailView: View {
         .hermesFormRows()
     }
 
+    /// Streams a picked file from disk (the size is checked before it is read).
     private func upload(file url: URL) async {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        do {
-            let data = try Data(contentsOf: url)
-            let type = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
-            await model.upload(filename: url.lastPathComponent, contentType: type, data: data)
-        } catch {
-            model.failure = error.localizedDescription
-        }
+        let type = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+        await model.upload(filename: url.lastPathComponent, contentType: type, file: url)
     }
 
+    /// A photo arrives as data (the picker shows images only); it is size-checked, then sent from a temporary file.
     private func upload(photo item: PhotosPickerItem) async {
         do {
             guard let data = try await item.loadTransferable(type: Data.self) else { return }
@@ -809,8 +806,14 @@ private struct KanbanTaskDetailView: View {
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.dateFormat = "yyyyMMdd-HHmmss"
-            let stamp = formatter.string(from: Date())
-            await model.upload(filename: "photo-\(stamp).\(ext)", contentType: type?.preferredMIMEType, data: data)
+            let name = "photo-\(formatter.string(from: Date())).\(ext)"
+            if let refusal = KanbanLimits.refusal(name, size: data.count) {
+                model.failure = refusal
+                return
+            }
+            let file = try DashboardClient.temporaryFile(data, name: name)
+            defer { DashboardClient.removeTemporaryFile(file) }
+            await model.upload(filename: name, contentType: type?.preferredMIMEType, file: file)
         } catch {
             model.failure = error.localizedDescription
         }
