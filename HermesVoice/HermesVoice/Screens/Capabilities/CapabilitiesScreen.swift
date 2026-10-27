@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// What the Capabilities tabs talk to, for the profile they configure: the dashboard's REST routes and the
@@ -49,6 +50,55 @@ enum CapabilityTab: String, CaseIterable, Identifiable {
     }
 }
 
+/// The Skills and Tools lists of the profile the tabs configure, held by the shell as the desktop's does: the tab
+/// bar shows their counts ("Skills 12", "Tools 9") whichever tab is open, and switching tabs keeps what loaded. A
+/// new profile gets new stores, so nothing of one profile's lists or pending writes reaches another.
+@MainActor
+final class CapabilityStores: ObservableObject {
+    @Published private(set) var skillCount: Int?
+    @Published private(set) var toolCount: Int?
+    private(set) var profileKey: String?
+    private var skills: SkillsStore?
+    private var toolsets: ToolsetsStore?
+    private var subscriptions: Set<AnyCancellable> = []
+
+    /// The stores for `context`'s profile, made on first use. Counts arrive on the next run loop turn, never
+    /// during a view update.
+    func stores(for context: CapabilitiesContext) -> (skills: SkillsStore, toolsets: ToolsetsStore) {
+        let key = context.profile ?? ""
+        if profileKey == key, let skills, let toolsets { return (skills, toolsets) }
+        let skills = SkillsStore(api: context.skills, actions: context.actions)
+        let toolsets = ToolsetsStore(api: context.toolsets)
+        profileKey = key
+        self.skills = skills
+        self.toolsets = toolsets
+        subscriptions = []
+        skills.$skills.map { $0?.count }.removeDuplicates().receive(on: DispatchQueue.main)
+            .sink { [weak self] count in self?.skillCount = count }
+            .store(in: &subscriptions)
+        toolsets.$toolsets.map(ToolsetsStore.visibleCount).removeDuplicates().receive(on: DispatchQueue.main)
+            .sink { [weak self] count in self?.toolCount = count }
+            .store(in: &subscriptions)
+        return (skills, toolsets)
+    }
+
+    /// Both lists load with the page, whichever tab is open (the desktop fetches them in the shell).
+    func loadCounts(for context: CapabilitiesContext) async {
+        let (skills, toolsets) = stores(for: context)
+        async let skillList: Void = skills.loadOnce()
+        async let toolList: Void = toolsets.loadOnce()
+        _ = await (skillList, toolList)
+    }
+
+    func title(_ tab: CapabilityTab) -> String {
+        switch tab {
+        case .skills: return skillCount.map { "\(tab.title) \($0)" } ?? tab.title
+        case .tools: return toolCount.map { "\(tab.title) \($0)" } ?? tab.title
+        case .plugins, .connectors: return tab.title
+        }
+    }
+}
+
 /// Capabilities for the signed-in dashboard: an entry point that needs no client of its own. `profile` is the one
 /// the sidebar shows (nil: all profiles, so the dashboard's own). Place it inside a `NavigationStack`.
 struct CapabilitiesView: View {
@@ -77,6 +127,7 @@ struct CapabilitiesView: View {
 struct CapabilitiesScreen: View {
     let context: CapabilitiesContext
     @StateObject private var scopes = ProfileScopeModel()
+    @StateObject private var stores = CapabilityStores()
     @SceneStorage("capabilities.tab") private var tab: CapabilityTab = .skills
     /// A profile picked here; nil follows `context.profile`.
     @State private var picked: String?
@@ -98,12 +149,13 @@ struct CapabilitiesScreen: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(Theme.sidebar, for: .navigationBar)
             .task { await scopes.load(context.client) }
+            .task(id: profile ?? "") { await stores.loadCounts(for: scoped) }
     }
 
     @ViewBuilder private func tabContent(_ scoped: CapabilitiesContext) -> some View {
         switch tab {
         case .skills:
-            SkillsTab(context: scoped, query: $query)
+            SkillsTab(context: scoped, store: stores.stores(for: scoped).skills, query: $query)
         case .plugins:
             PluginsTab(context: scoped, query: $query)
         case .connectors:
@@ -113,7 +165,7 @@ struct CapabilitiesScreen: View {
             // as an environment object), owns its own search and toolbar, and pushes onto this navigation stack.
             ConnectorsScreen(context: scoped)
         case .tools:
-            ToolsetsTab(context: scoped, query: $query)
+            ToolsetsTab(context: scoped, store: stores.stores(for: scoped).toolsets, query: $query)
         }
     }
 
@@ -122,7 +174,7 @@ struct CapabilitiesScreen: View {
         VStack(spacing: Theme.Spacing.md) {
             Picker("Capabilities", selection: $tab) {
                 ForEach(CapabilityTab.allCases) { tab in
-                    Text(tab.title).tag(tab)
+                    Text(stores.title(tab)).monospacedDigit().tag(tab)
                 }
             }
             .pickerStyle(.segmented)

@@ -46,6 +46,11 @@ final class ToolsetsStore: ObservableObject {
         calls = (try? await api.toolCalls()) ?? [:]
     }
 
+    /// How many toolsets the tab lists, for its tab label (`visibleToolsetCount`); nil until loaded.
+    nonisolated static func visibleCount(_ toolsets: [CapabilityToolset]?) -> Int? {
+        toolsets.map { list in list.filter { ToolsetCuration.isVisible($0.name) }.count }
+    }
+
     /// The toolsets the tab lists (curated and stripped), filtered by `query`, most called first.
     func visible(query: String) -> [CapabilityToolset] {
         ToolsetCuration.filter(toolsets ?? [], query: query, calls: calls ?? [:])
@@ -102,18 +107,25 @@ final class ToolsetsStore: ObservableObject {
     }
 }
 
+/// The toolset whose settings sheet is open.
+private struct OpenedToolset: Identifiable {
+    let name: String
+    var id: String { name }
+}
+
 /// Capabilities ▸ Tools (`toolsets/toolsets-tab.tsx`): the feature row, then the toolsets grouped by what they
 /// let the agent do, each with its switch; a toolset's page holds its backends and keys.
 struct ToolsetsTab: View {
     let context: CapabilitiesContext
     @Binding var query: String
-    @StateObject private var store: ToolsetsStore
+    @ObservedObject private var store: ToolsetsStore
     @State private var opened: String?
 
-    init(context: CapabilitiesContext, query: Binding<String>) {
+    /// `store` is the shell's for this profile (`CapabilityStores`), so the tab bar can count the toolsets.
+    init(context: CapabilitiesContext, store: ToolsetsStore, query: Binding<String>) {
         self.context = context
         _query = query
-        _store = StateObject(wrappedValue: ToolsetsStore(api: context.toolsets))
+        self.store = store
     }
 
     var body: some View {
@@ -157,8 +169,16 @@ struct ToolsetsTab: View {
                 .accessibilityLabel("Tool actions")
             }
         }
-        .navigationDestination(item: $opened) { name in
-            ToolsetDetailScreen(store: store, context: context, name: name)
+        // The desktop opens a toolset's settings in a dialog: a sheet here, with its own stack for the pages it
+        // opens (the provider sign-in).
+        .sheet(item: Binding(get: { opened.map(OpenedToolset.init) }, set: { opened = $0?.name })) { item in
+            NavigationStack {
+                ToolsetDetailScreen(store: store, context: context, name: item.name)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) { Button("Done") { opened = nil } }
+                    }
+            }
+            .environmentObject(context)
         }
         .failureAlert($store.failure)
         .capabilityNotice($store.notice)

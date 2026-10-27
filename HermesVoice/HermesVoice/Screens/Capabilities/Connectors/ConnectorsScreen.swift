@@ -7,21 +7,30 @@ import SwiftUI
 struct ConnectorsScreen: View {
     let client: DashboardClient
     var profile: String?
+    /// The live gateway, for `reload.mcp` after each change; nil while it isn't connected.
+    var gateway: GatewayClient?
 
-    init(client: DashboardClient, profile: String? = nil) {
+    init(client: DashboardClient, profile: String? = nil, gateway: GatewayClient? = nil) {
         self.client = client
         self.profile = profile
+        self.gateway = gateway
     }
 
     /// The Capabilities tab's entry: its scoped connection and profile.
     init(context: CapabilitiesContext) {
-        self.init(client: context.client, profile: context.profile)
+        self.init(client: context.client, profile: context.profile, gateway: context.gateway)
     }
 
     var body: some View {
         // A new scope is a new page: nothing of the previous profile's servers, probes or sign-ins carries over.
-        ConnectorsDirectory(api: MCPAPI(transport: client, profile: profile))
+        ConnectorsDirectory(api: MCPAPI(transport: client, profile: profile), reloadSessions: gateway.map(Self.reload))
             .id(profile ?? "")
+    }
+
+    /// `reload.mcp` with the prompt-cache question already answered (the desktop's `silentReload`). Hermes
+    /// rediscovers every live session's servers, each profile's own; a reload can take a while.
+    static func reload(_ gateway: GatewayClient) -> () async throws -> Void {
+        { _ = try await gateway.reloadMcp(.init(confirm: true), timeout: 90) }
     }
 }
 
@@ -41,8 +50,8 @@ private struct ConnectorsDirectory: View {
     @State private var added: String?
     @State private var removing: ConnectorCard?
 
-    init(api: MCPAPI) {
-        _model = StateObject(wrappedValue: ConnectorsModel(api: api))
+    init(api: MCPAPI, reloadSessions: (() async throws -> Void)?) {
+        _model = StateObject(wrappedValue: ConnectorsModel(api: api, reloadSessions: reloadSessions))
     }
 
     var body: some View {
@@ -180,7 +189,9 @@ private struct ConnectorsDirectory: View {
             }
             Section {
             } footer: {
-                FormNote("These servers run on the Hermes host, not on this phone. Changes apply to new chats; /reload-mcp applies them to a running one.")
+                FormNote(model.reloadsLiveSessions
+                         ? "These servers run on the Hermes host, not on this phone. Changes reach new chats and running ones."
+                         : "These servers run on the Hermes host, not on this phone. Changes apply to new chats; /reload-mcp applies them to a running one.")
             }
         }
         .hermesForm()

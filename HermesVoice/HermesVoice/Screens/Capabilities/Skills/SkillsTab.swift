@@ -6,7 +6,7 @@ import SwiftUI
 struct SkillsTab: View {
     let context: CapabilitiesContext
     @Binding var query: String
-    @StateObject private var store: SkillsStore
+    @ObservedObject private var store: SkillsStore
     @State private var source: SkillProvenance?
     @State private var category: String?
     @State private var opened: String?
@@ -14,10 +14,11 @@ struct SkillsTab: View {
     @State private var creating = false
     @State private var confirmation: CapabilityConfirmation?
 
-    init(context: CapabilitiesContext, query: Binding<String>) {
+    /// `store` is the shell's for this profile (`CapabilityStores`), so the tab bar can count the skills.
+    init(context: CapabilitiesContext, store: SkillsStore, query: Binding<String>) {
         self.context = context
         _query = query
-        _store = StateObject(wrappedValue: SkillsStore(api: context.skills, actions: context.actions))
+        self.store = store
     }
 
     private var searching: Bool { !CapabilitySearch.normalize(query).isEmpty }

@@ -354,6 +354,48 @@ final class ConnectorsTests: XCTestCase {
         } catch {}
     }
 
+    @MainActor
+    func testEveryWriteReloadsTheLiveSessionsOnce() async throws {
+        let fake = FakeMCPTransport()
+        fake.responses["GET /api/mcp/servers"] = ["servers": [["name": "fs", "command": "npx", "enabled": true]]] as JSON
+        fake.responses["POST /api/mcp/servers/fs/test"] = ["ok": true, "tools": []] as JSON
+        fake.responses["GET /api/config"] = ["mcp_servers": ["fs": ["command": "npx"]]] as JSON
+        var reloads = 0
+        let model = ConnectorsModel(api: MCPAPI(transport: fake, profile: "work")) { reloads += 1 }
+        XCTAssertTrue(model.reloadsLiveSessions)
+        await model.reloadServers()
+
+        await model.setEnabled("fs", false)
+        await model.settleReload()
+        XCTAssertEqual(reloads, 1, "turning a server off reaches running chats")
+        let saved = await model.saveTools("fs", disabled: ["write"], discovered: ["read", "write"])
+        XCTAssertTrue(saved, model.failure ?? "")
+        await model.settleReload()
+        XCTAssertEqual(reloads, 2)
+        _ = await model.remove("fs")
+        await model.settleReload()
+        XCTAssertEqual(reloads, 3)
+
+        fake.errors["DELETE /api/mcp/servers/gone"] = DashboardError.http(404, "{}")
+        _ = await model.remove("gone")
+        await model.settleReload()
+        XCTAssertEqual(reloads, 3, "a failed write reloads nothing")
+
+        let offline = ConnectorsModel(api: MCPAPI(transport: fake, profile: nil))
+        XCTAssertFalse(offline.reloadsLiveSessions, "without the gateway, changes wait for new chats")
+    }
+
+    @MainActor
+    func testReloadFailureIsReported() async throws {
+        let fake = FakeMCPTransport()
+        fake.responses["GET /api/mcp/servers"] = ["servers": [["name": "fs", "command": "npx", "enabled": true]]] as JSON
+        let model = ConnectorsModel(api: MCPAPI(transport: fake, profile: nil)) { throw DashboardError.timeout }
+        await model.reloadServers()
+        await model.setEnabled("fs", false)
+        await model.settleReload()
+        XCTAssertTrue(model.failure?.hasPrefix("MCP reload failed.") == true)
+    }
+
     func testCreateWithFollowUpWritesTheWholeMap() async throws {
         let fake = FakeMCPTransport()
         fake.responses["POST /api/mcp/servers"] = ["name": "files", "transport": "stdio", "command": "npx"] as JSON

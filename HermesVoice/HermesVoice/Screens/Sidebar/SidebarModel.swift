@@ -558,6 +558,10 @@ final class SidebarModel: ObservableObject {
     /// `toggleCommandCenter`, which returns to the route under the overlay).
     func toggleCommandCenter() {
         if selection == .commandCenter {
+            // A chat that left every list meanwhile (deleted elsewhere) isn't reopened.
+            if case let .session(id)? = beforeCommandCenter, row(id) == nil, opened[id] == nil {
+                beforeCommandCenter = nil
+            }
             selection = beforeCommandCenter
         } else {
             beforeCommandCenter = selection
@@ -687,7 +691,11 @@ final class SidebarModel: ObservableObject {
 
     /// The chat's session menu already changed `id` on Hermes: the lists show it the same way at once.
     func applied(_ event: SessionMenuEvent, to id: String) async {
-        if event == .deleted { app?.forget(id) }
+        if event == .deleted {
+            app?.forget(id)
+            // The Command Center toggle must not lead back to a deleted chat.
+            if beforeCommandCenter == .session(id) { beforeCommandCenter = nil }
+        }
         guard let session = row(id) ?? opened[id] else { return scheduleRefresh() }
         switch event {
         case let .renamed(title):

@@ -152,9 +152,10 @@ private struct DetailColumn: View {
             case .draft?, nil:
                 nothingOpen
             case let destination?:
-                // Each screen starts on the sidebar's profile and is rebuilt when that changes.
+                // Each screen starts on the sidebar's profile and is rebuilt when that changes (Artifacts always
+                // spans every profile, so it stays).
                 NavigationStack { screen(destination) }
-                    .id("\(destination.title)|\(scope)")
+                    .id("\(destination.title)|\(destination == .artifacts ? "" : scope)")
             }
         }
     }
@@ -164,7 +165,8 @@ private struct DetailColumn: View {
         case .capabilities:
             CapabilitiesView(profile: scope == SidebarOptions.allProfiles ? nil : scope)
         case .artifacts:
-            ArtifactsScreen(client: client, profile: scope, openSession: openSession)
+            // The desktop indexes every profile's sessions here, whatever the sidebar shows.
+            ArtifactsScreen(client: client, profile: SidebarOptions.allProfiles, openSession: openSession)
         case .scheduledJobs:
             ScheduledJobsScreen(client: client, profileScope: scope, openSession: openSession)
         case .commandCenter:

@@ -701,6 +701,18 @@ final class CapabilitiesTests: XCTestCase {
         XCTAssertEqual(store.plugins?.first?.version, "2", "the refreshed row replaces the old one")
     }
 
+    @MainActor
+    func testTabTitlesCountSkillsAndToolsOfTheScopedProfile() throws {
+        let client = try DashboardClient(settings: ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "u", password: "p"))
+        let context = CapabilitiesContext(client: client, gateway: nil, profile: "work")
+        let stores = CapabilityStores()
+        XCTAssertEqual(stores.title(.skills), "Skills", "no count before the lists load")
+        let made = stores.stores(for: context)
+        XCTAssertTrue(made.skills === stores.stores(for: context).skills, "one store per profile, kept across tab switches")
+        XCTAssertFalse(made.skills === stores.stores(for: context.scoped(to: "home")).skills, "another profile gets its own")
+        XCTAssertEqual(stores.title(.plugins), "Plugins")
+    }
+
     // MARK: Search, filters and the strip rule
 
     func testSkillSearchAndOrder() {
@@ -725,6 +737,8 @@ final class CapabilitiesTests: XCTestCase {
                         "discord", "moa", "tts", "stt", "voice", "wake_word"].map { CapabilityToolset(name: $0, tools: ["\($0)_tool"]) }
         let visible = ToolsetCuration.filter(toolsets, query: "", calls: [:])
         XCTAssertEqual(Set(visible.map(\.name)), ["web", "browser", "file", "code_execution", "memory", "terminal", "todo", "kanban", "spotify"])
+        XCTAssertEqual(ToolsetsStore.visibleCount(toolsets), 9, "the Tools tab counts what it lists, not stripped or hidden toolsets")
+        XCTAssertNil(ToolsetsStore.visibleCount(nil), "no count before the list loads")
         XCTAssertEqual(ToolsetCuration.filter(toolsets, query: "spotify_tool", calls: [:]).map(\.name), ["spotify"], "search reads tool names")
         XCTAssertEqual(ToolsetCuration.filter(toolsets, query: "tts", calls: [:]), [], "a stripped toolset never shows, even searched for")
 

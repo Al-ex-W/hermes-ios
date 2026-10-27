@@ -28,8 +28,47 @@ final class ConnectorsModel: ObservableObject {
     private static var probeCache: [String: (at: Date, result: MCPTestResult)] = [:]
     static let probeTTL: TimeInterval = 5 * 60
 
-    init(api: MCPAPI) {
+    /// `reload.mcp`: Hermes tears down and rediscovers the MCP servers of every live session, so a change made here
+    /// reaches running chats too (the desktop's `silentReload` after each persist). nil while the gateway socket
+    /// isn't up: new chats still pick the change up.
+    let reloadSessions: (() async throws -> Void)?
+    /// A reload is going; another change waits for it and reloads once more.
+    private var reloading: Task<Void, Never>?
+    private var reloadAgain = false
+
+    init(api: MCPAPI, reloadSessions: (() async throws -> Void)? = nil) {
         self.api = api
+        self.reloadSessions = reloadSessions
+    }
+
+    /// Whether changes reach running chats on their own.
+    var reloadsLiveSessions: Bool { reloadSessions != nil }
+
+    /// Reloads the live sessions' MCP servers after a write; changes made while one runs share one more reload.
+    func reloadLiveSessions() {
+        guard let reloadSessions else { return }
+        guard reloading == nil else {
+            reloadAgain = true
+            return
+        }
+        reloading = Task { [weak self] in
+            repeat {
+                self?.reloadAgain = false
+                do {
+                    try await reloadSessions()
+                } catch {
+                    guard !error.isCancellation else { break }
+                    self?.failure = "MCP reload failed. Running chats keep their servers until they reload; new chats " +
+                        "get the change. \(error.dashboardMessage)"
+                }
+            } while self?.reloadAgain == true
+            self?.reloading = nil
+        }
+    }
+
+    /// Waits for the reload in flight (tests).
+    func settleReload() async {
+        while let reloading { await reloading.value }
     }
 
     var dashboard: URL { api.transport.dashboardBase }
@@ -124,6 +163,7 @@ final class ConnectorsModel: ObservableObject {
         servers?[index].enabled = enabled
         do {
             try await api.setEnabled(name, enabled)
+            reloadLiveSessions()
             if enabled { await probe(name) }
         } catch {
             if let index = servers?.firstIndex(where: { $0.name == name }) { servers?[index].enabled = !enabled }
@@ -135,6 +175,7 @@ final class ConnectorsModel: ObservableObject {
     func remove(_ name: String) async -> Bool {
         do {
             try await api.remove(name)
+            reloadLiveSessions()
             probes[name] = nil
             servers?.removeAll { $0.name == name }
             await reloadServers()
@@ -179,6 +220,7 @@ final class ConnectorsModel: ObservableObject {
                     if Date() > deadline { throw DashboardError.rpc("Installing \(entry.name) is taking too long. Check the host.") }
                 }
             }
+            reloadLiveSessions()
             await reloadServers()
             if let catalog = try? await api.catalog() { self.catalog = catalog.entries }
             if server(entry.name)?.enabled == true { await probe(entry.name) }
@@ -206,6 +248,7 @@ final class ConnectorsModel: ObservableObject {
             await reloadServers()
             throw error
         }
+        reloadLiveSessions()
         await reloadServers()
         await probe(MCPServerDraft.trim(draft.name))
     }
@@ -213,6 +256,7 @@ final class ConnectorsModel: ObservableObject {
     /// Saves the edit form, then probes the server again.
     func update(_ name: String, draft: MCPServerDraft) async throws {
         try await api.update(name, draft: draft)
+        reloadLiveSessions()
         await reloadServers()
         if server(name)?.enabled == true { await probe(name) }
     }
@@ -229,6 +273,7 @@ final class ConnectorsModel: ObservableObject {
     func saveTools(_ name: String, disabled: [String], discovered: [String]) async -> Bool {
         do {
             try await api.setDisabledTools(name, disabled: disabled, discovered: discovered)
+            reloadLiveSessions()
             await reloadServers()
             return true
         } catch {
@@ -325,6 +370,7 @@ final class ConnectorsModel: ObservableObject {
         polls[name] = nil
         let result = MCPTestResult(ok: true, tools: tools)
         probes[name] = result
+        reloadLiveSessions()
         Task {
             await reloadServers()
             if let server = server(name) { Self.probeCache[cacheKey(server)] = (Date(), result) }
