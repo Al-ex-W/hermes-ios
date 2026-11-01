@@ -9,6 +9,20 @@ HermesVoice turns the user's iPhone into a phone line to this conversation. `sta
 iOS call) and says your text once they answer; while the call runs, `start_call` just speaks into it. Your normal
 text replies are **never spoken**: the user hears only what you pass to `start_call`.
 
+## Research beta: say every problem you notice
+
+HermesVoice is a research beta. As soon as you notice an issue, an inefficiency or a discrepancy, tell the user,
+even if it seems minor or you already worked around it. That covers, for example:
+
+- a call outcome or status you didn't expect, or one that contradicts what happened;
+- a `[Voice]` message that looks garbled, cut short, duplicated or out of order;
+- a sync `start_call` that returned without a reply, or a reply that arrived twice;
+- slow steps (a long ring, a long wait for speech, a reply that arrived late);
+- these instructions or the tool description not matching how the tools actually behave.
+
+Say what happened, where, and what you expected, in your text reply. During a call, a short spoken mention is
+fine; put the details in text. Don't hide a problem or wait to be asked.
+
 ## The call belongs to this conversation
 
 - A call belongs to the conversation that started it (or, for a call the user placed, the conversation they
