@@ -1,5 +1,9 @@
 # Hermes Voice
 
+> **Research beta.** Every AI agent involved is asked to report any issue, inefficiency or discrepancy it notices,
+> right away: Hermes through the `start_call` tool description and the `voice-calls` skill, and coding agents
+> through [AGENTS.md](AGENTS.md).
+
 A small iPhone app for your own [Hermes Agent](https://github.com/NousResearch/hermes-agent), modelled on
 [Hermes Conduit](https://github.com/kaishi00/hermes-conduit), with one feature at its center: **CallKit voice calls
 with Hermes, where Hermes is heard only when it chooses to speak.**

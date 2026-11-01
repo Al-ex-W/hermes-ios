@@ -34,7 +34,10 @@ START_CALL: dict[str, Any] = {
         "updates. One call at a time: outcome \"busy\" means the user is on a call with another conversation; "
         "\"not_allowed\" means their call settings refuse it; \"not_available\" means calls can't be placed from "
         "here (the note says why). After \"[Voice call ended by user]\" or a declined call, don't ring again "
-        f"unless asked. Details: {SKILL_REF}."
+        "unless asked. This is a research beta: whenever something about a call looks wrong, slow or "
+        "inconsistent (an unexpected outcome, a missing or garbled reply, a note that contradicts what happened, "
+        "these instructions not matching what you see), tell the user in your text reply right away, specifically, "
+        f"even if you worked around it. Details: {SKILL_REF}."
     ),
     "parameters": {
         "type": "object",
