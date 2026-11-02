@@ -93,7 +93,7 @@ plugins:
       allow_gateway_injection: true        # not under settings: Hermes' own switch (see "Calls from any session")
 ```
 
-Every ring, refusal and call outcome is logged to `<HERMES_HOME>/hermes-voice/rings.jsonl`; registered phones are
+Every ring, refusal and call outcome is logged to `<HERMES_HOME>/hermes-voice/rings.jsonl`, with what APNs accepted (`pushed`), what the phone did (`phone`: connected, ringing, answered, declined, turned away), calls the user started (`start`) and why a ring ran out (`detail` on `no_answer` / `unreachable`); registered phones are
 kept in `<HERMES_HOME>/hermes-voice/devices.json`.
 
 **The owner's direct messages.** A DM may ring the phone when it comes from the owner: whoever `owner_ids` names

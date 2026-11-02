@@ -276,8 +276,38 @@ def test_a_ring_the_phone_never_picks_up_is_unreachable_and_late_hellos_are_canc
                 return started, texts, late, ws.close_code
 
     started, texts, late, code = asyncio.run(scenario())
-    assert texts == ["[Voice line not delivered: the phone never answered the ring] Reply in text."]
+    assert texts == ["[Voice line not delivered: the phone never answered the ring] Reply in text; don't ring again "
+                     "unless they ask, and tell them the ring didn't get through."]
     assert late == {"type": "cancel", "reason": "unreachable"} and code == 1000
+    # The ring log says what APNs took and what the phone did, so an unreachable ring can be diagnosed.
+    entries = [json.loads(line) for line in (fake.home / "hermes-voice" / "rings.jsonl").read_text().splitlines()]
+    mine = [e for e in entries if e.get("call_id") == started["call_id"]]
+    assert [(e["event"], e.get("phones") or e.get("what") or e.get("outcome")) for e in mine] == [
+        ("ring", None), ("pushed", 1), ("ended", "unreachable"), ("phone", "turned away (over)")]
+    assert "APNs accepted the push for 1 phone(s), but no phone connected" in mine[2]["detail"]
+
+
+def test_a_ring_the_phone_reports_but_nobody_answers_is_logged_as_such(core, fake, make_hub):
+    fake.host.add("s1")
+    hub = make_hub(pusher=FakePusher(), ring_timeout_s=0.5)
+
+    async def scenario():
+        async with serving(core) as port:
+            started = await tool(core.tools.start_call, {"text": "Hello?"})
+            async with websockets.connect(f"ws://127.0.0.1:{port}{PREFIX}/phone?ticket={fake.ticket()}") as ws:
+                await ws.send(json.dumps({"type": "hello", "call_id": started["call_id"], "initiated_by": "push"}))
+                await ws.recv()  # ready
+                await ws.send(json.dumps({"type": "ringing"}))
+                await hub.injector.wait_for(1)
+            return started
+
+    started = asyncio.run(scenario())
+    entries = [json.loads(line) for line in (fake.home / "hermes-voice" / "rings.jsonl").read_text().splitlines()]
+    mine = [e for e in entries if e.get("call_id") == started["call_id"]]
+    assert [(e["event"], e.get("what") or e.get("outcome")) for e in mine] == [
+        ("ring", None), ("pushed", None), ("phone", "connected (ringing)"), ("phone", "ringing"),
+        ("ended", "no_answer")]
+    assert mine[-1]["detail"] == "the phone rang but nobody answered"
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
@@ -296,7 +326,7 @@ def test_a_failed_push_is_reported(core, fake, make_hub, mode):
         assert result["outcome"] == "push_failed" and "no iPhone has registered" in result["note"]
     else:
         assert texts == ["[Voice line not delivered: the phone couldn't be rung (no iPhone has registered for "
-                         "calls yet)] Reply in text."]
+                         "calls yet)] Reply in text; don't ring again unless they ask, and tell them it failed."]
 
 
 def test_end_call_cancels_a_ring_and_hangs_up_a_live_call(core, fake, make_hub):
