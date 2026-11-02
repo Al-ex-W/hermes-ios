@@ -322,6 +322,7 @@ class Call:
         self.answered_at: Optional[float] = time.time() if state == "live" else None
         self.ended_at: Optional[float] = None
         self.connected = False  # a phone link said hello for this call
+        self.pushed = 0  # phones APNs accepted the VoIP push for (0: not rung by a push, or not yet)
         self.rang = False  # the phone reported it is ringing
         self.lines: deque[Line] = deque()
         self.speaker: Optional[asyncio.Task] = None
@@ -633,7 +634,8 @@ class CallHub:
             if call.state != "ringing":
                 return
             outcome = "no_answer" if call.connected else "unreachable"
-        self.finish(call, outcome)
+            detail = _ring_expiry_detail(call)
+        self.finish(call, outcome, detail)
 
     def _push(self, call: Call, mode: str) -> None:
         payload = {"call_id": call.call_id, "session_id": call.owner.session_id, "profile": call.owner.profile,
@@ -646,6 +648,10 @@ class CallHub:
         if not result.ok:
             logger.warning("hermes_voice: call %s not rung: %s", call.call_id[:8], result.reason)
             self.finish(call, "push_failed", result.reason)
+            return
+        with self.lock:
+            call.pushed = result.delivered
+        self.policy.log({"event": "pushed", "call_id": call.call_id, "phones": result.delivered})
 
     # ── the tools ────────────────────────────────────────────────────────────────────────────────────────
 
@@ -1006,6 +1012,8 @@ class CallHub:
             except asyncio.TimeoutError:
                 hello = None
             verdict, call = self.admit(hello) if hello is not None else ("bad", None)
+            if verdict != "attach":
+                self._log_phone(hello.call_id if hello is not None else "", f"turned away ({verdict})")
             if verdict in ("bad", "busy"):
                 await _close_quietly(ws, 4400 if verdict == "bad" else 4429)
                 return
@@ -1038,6 +1046,7 @@ class CallHub:
             if live:
                 self._kick(call)  # back after a drop: carry on with what is queued
             logger.info("hermes_voice: call %s connected (%s)", call.call_id[:8], call.state)
+            self._log_phone(call.call_id, f"connected ({state})")
             while not hung_up:
                 message = await _next_message(ws) or {}
                 kind = message.get("type")
@@ -1051,9 +1060,12 @@ class CallHub:
                 elif kind == "ringing":
                     with self.lock:
                         call.rang = True
+                    self._log_phone(call.call_id, "ringing")
                 elif kind == "answered":
+                    self._log_phone(call.call_id, "answered")
                     self.on_answered(call)
                 elif kind == "declined":
+                    self._log_phone(call.call_id, "declined")
                     with self.lock:
                         ringing = call.state == "ringing"
                     self.finish(call, "declined" if ringing else "ended_by_user")
@@ -1105,8 +1117,14 @@ class CallHub:
             started = Call(self, hello.call_id, owner, "user", "live")
             self.slot = started
         logger.info("hermes_voice: the user started call %s in %s", started.call_id[:8], hello.session_id)
+        self.policy.log({"event": "start", "call_id": started.call_id, "session_id": hello.session_id,
+                         "source": "phone"})
         started.inbox.put(inject.started_notice(started.call_id))
         return "attach", started
+
+    def _log_phone(self, call_id: str, what: str) -> None:
+        """What the phone did, in the ring log: the only record of why a ring never reached it."""
+        self.policy.log({"event": "phone", "call_id": call_id, "what": what})
 
     def on_answered(self, call: Call) -> None:
         with self.lock:
@@ -1245,6 +1263,16 @@ def _sync(call: Call, said: str, ending: Optional[str], outcome: str, note: str 
     return result
 
 
+def _ring_expiry_detail(call: Call) -> str:
+    """Why a ring ran out, for the ring log: what APNs took and what the phone did with it."""
+    if call.connected:
+        return "the phone rang but nobody answered" if call.rang else "the phone connected but never reported ringing"
+    if call.pushed:
+        return (f"APNs accepted the push for {call.pushed} phone(s), but no phone connected for this call "
+                "(push not delivered, app didn't wake, or the phone couldn't reach the dashboard)")
+    return "no phone connected for this call"
+
+
 def _refusal(mode: str, outcome: str, note: str) -> dict[str, Any]:
     if mode == "sync":
         return {"said": "", "ending": None, "outcome": outcome, "call_id": None, "note": note}
@@ -1253,10 +1281,12 @@ def _refusal(mode: str, outcome: str, note: str) -> dict[str, Any]:
 
 def _outcome_note(outcome: str, detail: str) -> str:
     return {
-        "no_answer": "The user didn't pick up. Reply in text.",
-        "declined": "The user declined the call. Reply in text.",
-        "push_failed": f"The phone couldn't be rung: {detail or 'the push failed'}. Reply in text.",
-        "unreachable": "The phone never answered the ring (it may be offline). Reply in text.",
+        "no_answer": "The user didn't pick up. Reply in text; don't ring again unless they ask.",
+        "declined": "The user declined the call. Reply in text; don't ring again unless they ask.",
+        "push_failed": (f"The phone couldn't be rung: {detail or 'the push failed'}. Reply in text; don't ring "
+                        "again unless they ask, and tell them it failed."),
+        "unreachable": ("The phone never answered the ring (it may be offline). Reply in text; don't ring again "
+                        "unless they ask, and tell them the ring didn't get through."),
         "lost": "The call's connection was lost. Reply in text.",
         "ended_by_user": "The user hung up. Reply in text.",
         "ended_by_agent": "The call was ended with end_call.",

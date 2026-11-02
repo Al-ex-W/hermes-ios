@@ -102,9 +102,11 @@ def outcome_notice(outcome: str, detail: str = "") -> Optional[str]:
         why = "they declined it" if outcome == "declined" else "they didn't pick up"
         return f"[Voice call not answered] The user didn't take the call ({why}). Reply in text."
     if outcome == "push_failed":
-        return f"[Voice line not delivered: the phone couldn't be rung ({detail or 'push failed'})] Reply in text."
+        return (f"[Voice line not delivered: the phone couldn't be rung ({detail or 'push failed'})] Reply in text; "
+                "don't ring again unless they ask, and tell them it failed.")
     if outcome == "unreachable":
-        return "[Voice line not delivered: the phone never answered the ring] Reply in text."
+        return ("[Voice line not delivered: the phone never answered the ring] Reply in text; don't ring again "
+                "unless they ask, and tell them the ring didn't get through.")
     if outcome == "lost":
         return ("[Voice call ended: the phone's connection was lost and didn't come back] Reply in text; call "
                 "again with start_call only if it's worth it.")
