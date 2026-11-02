@@ -300,15 +300,32 @@ def dashboard_serving() -> bool:
     only importing it: other processes import ``hermes_cli.web_server`` too (a TUI resume that shows an attached
     image does), which mounts the plugin's routes without ever serving them. A messaging gateway that serves the
     same app behind its own API listener (``gateway/run_api.py``: ``app.state.gateway_runner``) isn't it either:
-    the phone connects to ``hermes serve``, and the gateway's conversations reach it over the hub's socket."""
+    the phone connects to ``hermes serve``, and the gateway's conversations reach it over the hub's socket. Nor is
+    a backend the Desktop app spawned (over SSH, or its local pool): it serves the dashboard on a port only the
+    Desktop knows, so the phone never connects there, and a hub of its own would ring the phone for calls the
+    phone then can't find."""
     web = sys.modules.get("hermes_cli.web_server")
     state = getattr(getattr(web, "app", None), "state", None) if web is not None else None
     try:
         if getattr(state, "gateway_runner", None) is not None:
             return False
+        if desktop_owned_backend():
+            return False
         if getattr(sys.modules.get("gateway.run_api"), "_ACTIVE_RUNNER", None) is not None:
             return False
         return bool(getattr(state, "bound_host", None))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def desktop_owned_backend() -> bool:
+    """This process is a backend the Hermes Desktop app spawned and owns (Hermes' own test; argv fallback)."""
+    try:
+        from hermes_cli.process_identity import is_desktop_owned_backend
+    except ImportError:
+        return "--ssh-session-token-file" in sys.argv
+    try:
+        return bool(is_desktop_owned_backend())
     except Exception:  # noqa: BLE001
         return False
 

@@ -169,9 +169,9 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
    plugin README). If the dashboard log warns that `h2` is missing, run `hermes pm repair`.
 
    **Calls from conversations outside the dashboard.** Every Hermes process on the host (the CLI and TUI, the
-   messaging gateway, cron, compute-host children) reaches the phone through the dashboard's
-   `~/.hermes/hermes-voice/hub.sock` (owner-only, with a token that changes on every dashboard start), so the
-   dashboard has to be running. For the conversations the messaging gateway runs (your Telegram or Discord DMs,
+   messaging gateway, cron, compute-host children, and the backends the Hermes Desktop app spawns over SSH or
+   locally) reaches the phone through the dashboard's `~/.hermes/hermes-voice/hub.sock` (owner-only, with a token
+   that changes on every dashboard start), so the `hermes serve` dashboard the phone signs in to has to be running. For the conversations the messaging gateway runs (your Telegram or Discord DMs,
    and the CLI's own sessions, which current Hermes hands to a local gateway) to take what you say while idle as
    a new turn, let the plugin start turns there:
 
