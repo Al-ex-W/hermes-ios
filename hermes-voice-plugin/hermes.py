@@ -28,7 +28,13 @@ _ANY = object()
 
 
 def get_secret(name: str) -> Optional[str]:
-    """A credential from Hermes' secret scope (profile ``.env`` overlay), else the process environment."""
+    """A credential from Hermes' secret scope (profile ``.env`` overlay), else the process environment.
+
+    Under ``multiplex_profiles`` Hermes refuses a read made outside a per-profile scope (``UnscopedSecretError``),
+    and the hub's own threads (pushes, Scribe tokens, TTS, the hub socket) run outside any turn's scope. They
+    then read this plugin's own profile explicitly: the ``.env`` (and secret sources) of the Hermes home this
+    process serves, which is where the setup puts the APNs and ElevenLabs keys. Never ``os.environ``, which
+    under multiplexing could hold another profile's value."""
     try:
         from agent.secret_scope import get_secret as hermes_get_secret
     except ImportError:
@@ -36,11 +42,23 @@ def get_secret(name: str) -> Optional[str]:
     else:
         try:
             value = hermes_get_secret(name)
-        except Exception as error:  # noqa: BLE001 - UnscopedSecretError under multiplexing: fail closed
-            logger.warning("hermes_voice: %s is not readable here (%s)", name, type(error).__name__)
-            return None
+        except Exception as error:  # noqa: BLE001 - UnscopedSecretError under multiplexing
+            value = _own_profile_secret(name)
+            if value is None:
+                logger.warning("hermes_voice: %s is not readable here (%s)", name, type(error).__name__)
+                return None
     value = (value or "").strip()
     return value or None
+
+
+def _own_profile_secret(name: str) -> Optional[str]:
+    """``name`` from this process's own Hermes home, built the way Hermes builds a profile's secret scope."""
+    try:
+        from agent.secret_scope import build_profile_secret_scope
+        return build_profile_secret_scope(hermes_home()).get(name)
+    except Exception:  # noqa: BLE001 - no such helper (older Hermes) or an unreadable .env: fail closed
+        logger.debug("hermes_voice: could not build this profile's secret scope", exc_info=True)
+        return None
 
 
 def hermes_home() -> Path:

@@ -120,7 +120,12 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
    loginctl enable-linger "$USER"     # keeps it running while you're logged out
    ```
 
-2. **Reach it over Tailscale.** Run `tailscale serve --bg 9119`, then give the dashboard its public address in
+   If `hermes gateway install` already made a `hermes-gateway.service` on this machine, copy its `ExecStart`
+   binary, `WorkingDirectory` and `Environment=` lines (`PATH`, `HERMES_HOME`) into this unit instead of
+   `%h/.local/bin/hermes`, so both services run the same Hermes the same way.
+
+2. **Reach it over Tailscale.** Run `tailscale serve --bg 9119` (as root, or a Tailscale operator; the first time
+   it may print a link to turn Serve on for your tailnet, and waits until you do), then give the dashboard its public address in
    `~/.hermes/config.yaml`: the exact HTTPS origin `tailscale serve` printed (no path, no port). This also turns
    the dashboard's sign-in gate on, and it is the Host its DNS-rebinding checks accept; without it every request
    from the phone fails with `400 Invalid Host header`.
@@ -141,6 +146,10 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
    | `HERMES_VOICE_APNS_KEY_PATH` | the APNs auth key (`.p8`) from your Apple Developer account, e.g. `~/.hermes/hermes-voice/AuthKey.p8` (`chmod 600` it) |
    | `HERMES_VOICE_APNS_KEY_ID` | that key's 10-character Key ID |
    | `HERMES_VOICE_APNS_TEAM_ID` | your 10-character Team ID |
+
+   With `multiplex_profiles` on, the plugin's background work (pushes, Scribe tokens, speech) has no per-turn
+   secret scope, so it reads these from the `.env` of the Hermes home the dashboard serves: put them there, not
+   only in a shell environment.
 
    Ringing needs a paid Apple Developer team: an APNs key, and an app build signed with the Push Notifications
    capability.

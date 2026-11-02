@@ -165,6 +165,9 @@ class FakeHermes:
         self.home = home
         self.secrets: dict[str, str] = {}
         self.secret_error: Optional[Exception] = None
+        # What build_profile_secret_scope(home) returns: this profile's own .env, read outside any scope.
+        self.profile_secrets: dict[str, str] = {}
+        self.profile_scope_homes: list[Path] = []
         self.config: dict = {}
         self.env: dict[str, str] = {"HERMES_SESSION_SOURCE": "desktop"}
         # What get_active_subagent_parent() returns: the agent running this turn (see bound_agent), or None.
@@ -248,7 +251,11 @@ class FakeHermes:
             return re.sub(r"\b(sk-[A-Za-z0-9-]{6}|ghp_[A-Za-z0-9]{2})[A-Za-z0-9_-]{8,}([A-Za-z0-9]{4})\b",
                           lambda m: f"{m.group(1)[:6]}...{m.group(2)}", text)
 
-        module("agent.secret_scope", get_secret=get_secret)
+        def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
+            fake.profile_scope_homes.append(Path(hermes_home))
+            return dict(fake.profile_secrets)
+
+        module("agent.secret_scope", get_secret=get_secret, build_profile_secret_scope=build_profile_secret_scope)
         module("agent.redact", redact_sensitive_text=redact_sensitive_text)
         module("agent.memory_provider", spawn_context_thread=spawn_context_thread)
         module("agent.subagent_lifecycle", get_active_subagent_parent=lambda: fake.subagent_parent)
