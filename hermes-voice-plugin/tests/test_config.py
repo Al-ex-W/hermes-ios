@@ -52,15 +52,34 @@ def test_the_environment_is_used_without_hermes(core, fake, monkeypatch):
     assert core.hermes.get_secret("ELEVENLABS_API_KEY") is None
 
 
-def test_an_unscoped_secret_fails_closed_without_logging_values(core, fake, monkeypatch, caplog):
-    class UnscopedSecretError(RuntimeError):
-        pass
+class UnscopedSecretError(RuntimeError):
+    pass
 
+
+def test_an_unscoped_read_uses_this_profiles_own_secrets(core, fake, monkeypatch):
+    # multiplex_profiles: the hub's threads have no turn scope, so the plugin reads its own home's .env
+    # explicitly, never os.environ (which could hold another profile's value).
+    fake.secret_error = UnscopedSecretError("get_secret('ELEVENLABS_API_KEY') with no scope")
+    fake.profile_secrets["ELEVENLABS_API_KEY"] = " own-profile "
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "another-profile")
+    assert core.hermes.get_secret("ELEVENLABS_API_KEY") == "own-profile"
+    assert fake.profile_scope_homes == [fake.home]
+
+
+def test_an_unscoped_secret_missing_from_the_profile_fails_closed_without_logging_values(core, fake, monkeypatch,
+                                                                                        caplog):
     fake.secret_error = UnscopedSecretError("get_secret('ELEVENLABS_API_KEY') with no scope; value hunter2")
     monkeypatch.setenv("ELEVENLABS_API_KEY", "hunter2")
     with caplog.at_level(logging.WARNING, logger="hermes_voice"):
         assert core.hermes.get_secret("ELEVENLABS_API_KEY") is None
     assert "UnscopedSecretError" in caplog.text and "hunter2" not in caplog.text
+
+
+def test_an_unscoped_read_fails_closed_on_hermes_without_the_scope_builder(core, fake, monkeypatch):
+    fake.secret_error = UnscopedSecretError("no scope")
+    monkeypatch.delattr(sys.modules["agent.secret_scope"], "build_profile_secret_scope")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "hunter2")
+    assert core.hermes.get_secret("ELEVENLABS_API_KEY") is None
 
 
 def test_settings_follow_hermes_tts_config_then_plugin_settings(core, fake, caplog):
