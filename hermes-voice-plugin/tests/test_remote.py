@@ -729,6 +729,33 @@ def test_rate_limits_and_quiet_hours_count_rings_from_every_process(core, fake, 
     assert hub.slot is None
 
 
+def test_a_desktop_app_backend_calls_through_the_socket(core, fake, mods, hub_socket, monkeypatch):
+    """A backend the Desktop app spawned (over SSH or locally) serves the dashboard on a port the phone never
+    reaches: found on a real host, its own hub rang the phone for calls the phone then couldn't find
+    ("unreachable"). It calls through the real dashboard's socket instead."""
+    hub = hub_socket(pusher=FakePusher())
+    fake.host.add("s1")
+    web = sys.modules["hermes_cli.web_server"]
+    monkeypatch.setattr(web, "app", types.SimpleNamespace(state=types.SimpleNamespace(bound_host="127.0.0.1")))
+    monkeypatch.setitem(sys.modules, "hermes_cli.process_identity",
+                        types.SimpleNamespace(is_desktop_owned_backend=lambda: True))
+    assert core.hub.routes_mounted() is False and core.tools.reachable() is True
+    result = json.loads(core.tools.start_call({"text": "Hi"}, session_id="s1"))
+    assert result["status"] == "ringing" and hub.slot.owner.remote and hub.slot.call_id == result["call_id"]
+    asyncio.run(until(lambda: mods.remote.subscriptions().get(result["call_id"]) is not None
+                      and mods.remote.subscriptions()[result["call_id"]].ready.is_set()))
+    ended = json.loads(core.tools.end_call({}, session_id="s1"))
+    assert ended["outcome"] == "ended_by_agent"
+
+
+def test_the_desktop_backend_check_falls_back_to_argv(core, monkeypatch):
+    monkeypatch.setitem(sys.modules, "hermes_cli.process_identity", None)  # older Hermes: no helper
+    monkeypatch.setattr(sys, "argv", ["-c", "serve", "--ssh-session-token-file", "/x/token"])
+    assert core.hermes.desktop_owned_backend() is True
+    monkeypatch.setattr(sys, "argv", ["-c", "serve", "--port", "9119"])
+    assert core.hermes.desktop_owned_backend() is False
+
+
 def test_a_gateway_serving_the_dashboard_app_calls_through_the_socket(core, fake, mods, hub_socket, monkeypatch):
     """The messaging gateway mounts the dashboard's app behind its own API listener (app.state.gateway_runner):
     the phone doesn't connect there, so its conversations call through the hub's socket like any other process."""

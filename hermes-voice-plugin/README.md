@@ -14,7 +14,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
 - **Alert pushes** (ordinary APNs notifications, not VoIP): an approval or a question waiting, or a turn done, in a
   dashboard conversation no client has open (see "Alert pushes").
 - **Hub socket** `<HERMES_HOME>/hermes-voice/hub.sock`: how conversations in other Hermes processes (CLI, Ink TUI,
-  the messaging gateway, cron, compute-host children) place and hear calls (see "Calls from any session").
+  the messaging gateway, cron, compute-host children, backends the Hermes Desktop app spawns) place and hear
+  calls (see "Calls from any session").
 - **Routes** under `/api/plugins/hermes_voice/`: `WS /phone?ticket=…`, `POST /devices`, `POST /scribe-token`,
   `GET /status`.
 
