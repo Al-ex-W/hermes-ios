@@ -112,6 +112,43 @@ this dashboard can't vouch for another profile's allowlist or pairings.
 (`hermes chat --source tool`, source `tool`) run as the CLI, but no one is there to talk to, and what they read
 (mail, web pages) could talk the model into ringing. They don't ring unless `allowed_sources` lists them.
 
+## What the conversation is told
+
+The plugin puts two kinds of message into the conversation that owns a call (texts in `inject.py`):
+
+| Message | What it is |
+|---|---|
+| `[Voice] <said> (…)`, `[Voice, cut off] …`, `[Voice, hung up] …`, `[Voice, muted] …`, `[Voice, line dropped] …` | A turn of the user's: their words, then one of the plugin's two hints in parentheses (`inject.REPLY_HINT`, `inject.HUNG_UP_HINT`). `[Voice, speech recognition failed: …]` has no words. |
+| `[Voice call started] …`, `[Voice call not answered] …`, `[Voice call ended by user] …`, `[Voice call ended: …] …`, `[Voice line not delivered: …] …` | An automated notice about one call. Nothing in it was said by the user. |
+
+Every notice is worded as an event of one call, never as an instruction from the user or a standing preference
+(a hang-up notice that said "reply in text from now on" was once stored by a memory system as the user's wish). A
+notice about a call that is over tells the agent that the user can't hear it and is probably not reading the chat:
+finish the task, reply once in text with a short recap, don't ring back unless they asked to be called, and speak
+as usual on the next call. A sync `start_call` result says the same in its `note`.
+
+**For memory plugins.** Hermes has no flag a plugin can set that memory providers see on every path a notice
+takes. `sync_turn` gets the turn's text as `user_content` whatever started the turn. `display_kind`, Hermes' type
+for user rows nobody typed, is set to `internal_notification` by the gateway on `ctx.inject_message` turns (a
+provider sees it only in the `messages` list); a dashboard turn started with `prompt.submit` gets none (that
+method accepts only `hidden`, which would also hide the notice in the chat), and text steered into a running turn
+is typed `steer`, like the user's own steers. `turn_author` is stamped only by Hermes' bot relay. So the marker is
+in the text, and it is stable:
+
+- Every notice starts with `[Voice call ` or `[Voice line `, and carries the sentence
+  `Automated notice from HermesVoice, not something the user said.` (`inject.NOTICE_MARKER`) right after its closing
+  bracket. Skip the whole message: `message.startswith(("[Voice call ", "[Voice line "))`, or
+  `inject.NOTICE_MARKER in message`.
+- In a `[Voice…] <said> (…)` turn only `<said>` is the user's. Drop the bracket prefix and the trailing hint (one of
+  the two strings above) before storing it.
+
+**What the user did not hear.** When a call ends by a hang-up or a lost connection while a line is still playing or
+queued (no `played` ack from the phone), the ended notice, or the sync result's `note`, quotes those lines (the
+first 200 characters of at most three). The hub remembers them for the conversation, in memory only (never on
+disk, at most a day, gone with a restart), and reminds the agent once when the conversation's next call starts: in
+the `[Voice call started]` notice, or in the first `start_call` result (kept for the call after that if nobody
+answers).
+
 ## Calls from any session
 
 The phone's socket and the call slot live in the dashboard process (`hermes serve`). Once it serves, the plugin

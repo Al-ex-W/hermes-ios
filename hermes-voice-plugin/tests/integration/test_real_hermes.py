@@ -147,6 +147,9 @@ def test_sync_start_call_returns_what_the_user_said(hermes):
     notice = [d for d in deliveries if d["call_id"] == push["call_id"]
               and d["text"].startswith("[Voice call ended by user]")]
     assert notice and notice[0]["ok"] and notice[0]["via"] == "submit"  # the session was idle
+    # The model reads it as an automated notice about this call, with what to do now (never "from now on").
+    assert "[Voice call ended by user] Automated notice from HermesVoice, not something the user said." in seen
+    assert "reply once in text with a short recap" in seen and "Reply in text from now on" not in seen
 
 
 def test_async_start_call_injects_what_the_user_says(hermes):
@@ -238,7 +241,9 @@ def test_rings_that_are_declined_unanswered_or_busy(hermes):
     assert busy["status"] == "busy" and busy["call_id"] is None and "Dinner is ready" in busy["note"]
     assert push4["call_id"] != push2["call_id"]
     assert late == {"type": "cancel", "reason": "unreachable"}  # a push that comes in too late is cancelled
-    assert "[Voice call not answered] The user didn't take the call (they didn't pick up)." in seen
+    assert ("[Voice call not answered] Automated notice from HermesVoice, not something the user said. It applies "
+            "to this call only and is not a preference, so don't store it. The user didn't take the call (they "
+            "didn't pick up).") in seen
 
 
 def test_a_conversation_the_plugin_reopens_streams_only_to_its_clients(hermes):

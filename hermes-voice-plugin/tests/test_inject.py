@@ -3,6 +3,8 @@ resolving the live session or reopening the stored one, and the texts."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 
@@ -108,6 +110,68 @@ def test_texts(core):
     assert core.inject.outcome_notice("ended_by_agent") is None and core.inject.outcome_notice("answered") is None
     assert core.inject.started_notice("ab" * 16).startswith("[Voice call started]")
     assert "start_call" in core.inject.started_notice("ab" * 16) and "end_call" in core.inject.started_notice("x")
+
+
+NOTICES = [
+    lambda inject: inject.started_notice("ab" * 16),
+    lambda inject: inject.started_notice("ab" * 16, ["The part they missed."]),
+    lambda inject: inject.outcome_notice("no_answer"),
+    lambda inject: inject.outcome_notice("declined"),
+    lambda inject: inject.outcome_notice("push_failed", "APNs 400 BadTopic"),
+    lambda inject: inject.outcome_notice("unreachable"),
+    lambda inject: inject.outcome_notice("lost"),
+    lambda inject: inject.outcome_notice("lost", "", ["Half a line"]),
+    lambda inject: inject.outcome_notice("ended_by_user"),
+    lambda inject: inject.outcome_notice("ended_by_user", "", ["Half a line", "One never begun"]),
+    lambda inject: inject.line_notice("Could not speak: ElevenLabs returned HTTP 401."),
+]
+# What made a memory system store a hang-up as the user's wish: wording that reads as a standing instruction.
+STANDING = re.compile(r"from now on|reply in text\b(?! with)|always|never call|prefers?\b", re.IGNORECASE)
+
+
+@pytest.mark.parametrize("notice", NOTICES)
+def test_every_notice_is_marked_as_automated_and_is_no_standing_instruction(core, notice):
+    """Issue #16: a notice must not read as something the user said, nor as a preference to remember, and memory
+    plugins must be able to skip it: the marker sentence follows the bracket prefix of every one."""
+    text = notice(core.inject)
+    assert re.match(r"\[Voice (call|line) [^\]]*\] Automated notice from HermesVoice, not something the user said\. ",
+                    text), text
+    assert core.inject.NOTICE_MARKER == "Automated notice from HermesVoice, not something the user said."
+    assert "not a preference, so don't store it." in text
+    assert not STANDING.search(text), STANDING.search(text)
+
+
+def test_the_hang_up_notice_says_what_to_do_and_what_was_not_heard(core):
+    text = core.inject.outcome_notice("ended_by_user", "", ["I found three flights. The cheapest one leaves at"])
+    assert text == (
+        "[Voice call ended by user] Automated notice from HermesVoice, not something the user said. It applies to "
+        "this call only and is not a preference, so don't store it. The user did not hear all of what you were "
+        'saying when the call ended: "I found three flights. The cheapest one leaves at". The user can\'t hear you '
+        "now and is probably not reading this chat. Finish the task you were given, then reply once in text with a "
+        "short recap; if you were waiting for an answer, say what you still need. Don't ring back unless the user "
+        "asked in this conversation to be called when you're done. When they next call or ask for a call, speak as "
+        "usual and first offer anything they missed.")
+    # Long lines are shortened, and only the first few are quoted: the agent has its own words in the tool calls.
+    many = core.inject.outcome_notice("ended_by_user", "", ["x" * 500, "two", "three", "four", "  "])
+    assert f'"{"x" * 200}…", "two", "three" (and 1 more).' in many
+
+
+def test_the_hints_after_the_users_words_are_the_plugins_own(core):
+    """The reply hint is the one the app strips; the hang-up hint no longer says "reply in text" and nothing else:
+    the user is gone, so the agent finishes and recaps once."""
+    assert core.inject.REPLY_HINT == "(Reply out loud with start_call; your text replies are not spoken.)"
+    hint = core.inject.HUNG_UP_HINT
+    assert hint.startswith("(HermesVoice note, not the user's words: they hung up") and hint.endswith(")")
+    assert "short recap" in hint and "Don't ring back unless they asked" in hint
+    assert not STANDING.search(hint)
+
+
+def test_the_started_notice_reminds_once_of_what_the_last_call_left_unheard(core):
+    plain = core.inject.started_notice("ab" * 16)
+    assert "did not hear" not in plain and plain.endswith('starting with "[Voice]".')
+    text = core.inject.started_notice("ab" * 16, ["The cheapest flight leaves at nine."])
+    assert text == plain + (' On the last call in this conversation the user did not hear all of this: "The cheapest '
+                            'flight leaves at nine.". Offer it first, unless they have had it since.')
 
 
 def test_a_call_the_user_started_finds_its_session_in_any_profile(core, fake):

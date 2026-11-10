@@ -112,7 +112,10 @@ def test_hang_up_mid_speech_is_not_reported_as_heard(core, fake, make_hub):
 
     during, after = asyncio.run(scenario())
     assert during["outcome"] == "ended_by_user" and during["said"] == "", during
-    assert after.status == "not_delivered" and "has ended" in after.message and "Reply in text" in after.message
+    assert after.status == "not_delivered" and "has ended" in after.message and "text recap" in after.message
+    # The result says what the user did not hear, and that hanging up is no preference of theirs.
+    assert 'did not hear all of what you were saying when the call ended: "A long answer".' in during["note"], during
+    assert "not a preference" in during["note"] and "Reply in text" not in during["note"]
     # The sync start_call returned the hang-up itself: no "[Voice call ended by user]" notice on top.
     texts = hub.injector.texts()
     assert len(texts) == 1 and texts[0].startswith("[Voice call started]"), texts
@@ -250,12 +253,23 @@ def test_an_async_line_that_isnt_delivered_is_told_to_the_conversation(core, fak
     started, texts = asyncio.run(scenario())
     assert started["status"] == "speaking"
     if trouble == "tts":
-        assert texts[1:] == ["[Voice line not delivered: Could not speak: ElevenLabs returned HTTP 401.]"]
+        assert texts[1:] == [
+            "[Voice line not delivered: Could not speak: ElevenLabs returned HTTP 401.] Automated notice from "
+            "HermesVoice, not something the user said. It is about that one line only and is not a preference, so "
+            "don't store it."]
     elif trouble == "drop":
-        assert texts[1].startswith("[Voice line not delivered: The phone lost its connection while speaking")
-        assert len(texts) == 2
+        assert texts[1].startswith("[Voice line not delivered: The phone lost its connection while this line was")
+        assert core.inject.NOTICE_MARKER in texts[1] and len(texts) == 2
     else:
-        assert texts[1:] == ["[Voice call ended by user] Reply in text from now on; don't call back unless they ask."]
+        line = " ".join(["word"] * 40)
+        assert texts[1:] == [
+            "[Voice call ended by user] Automated notice from HermesVoice, not something the user said. It applies "
+            "to this call only and is not a preference, so don't store it. The user did not hear all of what you "
+            f'were saying when the call ended: "{line}". The user can\'t hear you now and is probably not reading '
+            "this chat. Finish the task you were given, then reply once in text with a short recap; if you were "
+            "waiting for an answer, say what you still need. Don't ring back unless the user asked in this "
+            "conversation to be called when you're done. When they next call or ask for a call, speak as usual and "
+            "first offer anything they missed."]
 
 
 def test_invalid_voice_id_in_config_never_reaches_the_url(core, fake):
@@ -402,7 +416,7 @@ def test_a_drop_longer_than_the_grace_is_not_final(core, fake, make_hub, monkeyp
             return during, gap, after
 
     during, gap, after = asyncio.run(scenario())
-    assert during.status == "cut_off" and "lost its connection" in during.message and "start_call again" in during.message
+    assert during.status == "cut_off" and "lost its connection" in during.message and "again with start_call" in during.message
     assert gap.status == "not_connected" and "not connected right now" in gap.message, gap
     assert after.status == "played", after
 

@@ -74,8 +74,14 @@ What the conversation sees (the chat itself shows only what you said, or a short
 | `[Voice, cut off] …`, `[Voice, hung up] …`, `[Voice, muted] …` | the same, when the turn didn't end on its own |
 | `[Voice call started] …` | you started the call (your turns wait until this is delivered) |
 | `[Voice call not answered] …` | an async call was declined or rang out |
-| `[Voice line not delivered: …]` | the phone couldn't be rung or reached, or a line couldn't be spoken |
-| `[Voice call ended by user] …` | you hung up (unless your last turn already said so) |
+| `[Voice line not delivered: …] …` | the phone couldn't be rung or reached, or a line couldn't be spoken |
+| `[Voice call ended by user] …` | you hung up (unless your last turn already said so and you had heard everything) |
+
+The `[Voice call …]` and `[Voice line …]` messages are automated notices: each says so (`Automated notice from
+HermesVoice, not something the user said.`), so that neither Hermes nor a memory plugin takes one for your words
+or for a preference of yours. After a hang-up Hermes is told that you can't hear it and are probably not reading
+the chat: it finishes the task and leaves one short recap in text. If you hung up while it was still speaking, it
+is told what you did not hear, and reminded to offer that part when your next call in that chat starts.
 
 There is one call at a time. A call belongs to the conversation that started it (and follows it through context
 compression); `start_call` from another conversation returns `busy`. Who may ring you is set in the plugin's policy

@@ -20,25 +20,44 @@ TOOLSET = "voice"
 SKILL = "voice-calls"
 SKILL_REF = f'skill_view("hermes_voice:{SKILL}")'
 
+# The start_call description, in parts. It is sent with every request, so it stays compact; it still has to work
+# for a model that reads nothing else but the tool results.
+_WHAT = (
+    "Talk to the user out loud on their phone (the HermesVoice iPhone app). If this conversation has no call, "
+    "this rings their phone and says `text` once they answer; if it already has one, it just says `text` "
+    "(it never rings twice). During a call your normal text replies are NOT spoken and the user is not reading "
+    "the chat: this tool is the only way they hear you, so say everything that matters with it. What they say "
+    "comes back as messages starting with \"[Voice]\" (\"[Voice, cut off]\", \"[Voice, hung up]\" ...): answer "
+    "those with start_call too. mode \"async\" (default) returns at once with {call_id, status}; mode \"sync\" "
+    "waits until the user replies and returns {said, ending, outcome, call_id}."
+)
+_HOW = (
+    "Say short, natural, spoken sentences: no Markdown, lists, code or URLs (exact identifiers and links go in a "
+    "short text recap)."
+)
+_WHEN = (
+    "Ring only when the user asked to be called or for news they'd want right away, never for routine updates. "
+    "One call at a time: outcome \"busy\" means the user is on a call with another conversation; \"not_allowed\" "
+    "means their call settings refuse it; \"not_available\" means calls can't be placed from here (the note says "
+    "why)."
+)
+_AFTER = (
+    "Messages starting with \"[Voice call\" or \"[Voice line\" are automated notices about one call: not the "
+    "user's words, and never a preference to remember. After \"[Voice call ended by user]\", a declined or "
+    "unanswered call, or outcome \"unreachable\" / \"push_failed\", the user can't hear you and is probably not "
+    "reading the chat: finish the task, reply once in text with a short recap, and don't ring again unless they "
+    "asked to be called. On the next call speak as usual and first offer what they missed."
+)
+_BETA = (
+    "This is a research beta: whenever something about a call looks wrong, slow or "
+    "inconsistent (an unexpected outcome, a missing or garbled reply, a note that contradicts what happened, "
+    "these instructions not matching what you see), tell the user in your text reply right away, specifically, "
+    f"even if you worked around it. Details: {SKILL_REF}."
+)
+
 START_CALL: dict[str, Any] = {
     "name": "start_call",
-    "description": (
-        "Talk to the user out loud on their phone (the HermesVoice iPhone app). If this conversation has no call, "
-        "this rings their phone and says `text` once they answer; if it already has one, it just says `text` "
-        "(it never rings twice). During a call your normal text replies are NOT spoken: this tool is the only way "
-        "the user hears you. What they say comes back as messages starting with \"[Voice]\" (\"[Voice, cut off]\", "
-        "\"[Voice, hung up]\" ...): answer those with start_call too. mode \"async\" (default) returns at once with "
-        "{call_id, status}; mode \"sync\" waits until the user replies and returns {said, ending, outcome, "
-        "call_id}. Say short, natural, spoken sentences: no Markdown, lists, code or URLs (put detail in your text "
-        "reply). Ring only when the user asked to be called or for news they'd want right away, never for routine "
-        "updates. One call at a time: outcome \"busy\" means the user is on a call with another conversation; "
-        "\"not_allowed\" means their call settings refuse it; \"not_available\" means calls can't be placed from "
-        "here (the note says why). After \"[Voice call ended by user]\", a declined or unanswered call, or "
-        "outcome \"unreachable\" / \"push_failed\", don't ring again unless asked. This is a research beta: whenever something about a call looks wrong, slow or "
-        "inconsistent (an unexpected outcome, a missing or garbled reply, a note that contradicts what happened, "
-        "these instructions not matching what you see), tell the user in your text reply right away, specifically, "
-        f"even if you worked around it. Details: {SKILL_REF}."
-    ),
+    "description": " ".join((_WHAT, _HOW, _WHEN, _AFTER, _BETA)),
     "parameters": {
         "type": "object",
         "properties": {

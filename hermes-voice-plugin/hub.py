@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from . import hermes, inject, push
+from . import guidance, hermes, inject, push
 from .config import Settings
 from .config import current as current_settings
 from .policy import Policy, is_messaging, users_own_message
@@ -91,10 +91,18 @@ OUTCOMES = frozenset({
 # Ended by the phone itself: nothing to tell it.
 PHONE_ENDED = frozenset({"declined", "ended_by_user"})
 
-CALL_ENDED = "The call ended while speaking; the user may not have heard all of it. Reply in text."
+# Ended without the user hearing a line to the end (the call's own notice or result says what to do next).
+UNHEARD_OUTCOMES = frozenset({"ended_by_user", "lost"})
+# Ended before anyone answered: whatever the agent was to offer on this call is still to be offered on the next.
+NEVER_ANSWERED = frozenset({"no_answer", "declined", "push_failed", "unreachable"})
+
+CALL_ENDED = (
+    "The call ended while this line was being spoken, so the user may not have heard all of it. They can't hear "
+    "you now: put what matters in a short text recap."
+)
 CALL_DROPPED = (
-    "The phone lost its connection while speaking, so the user may not have heard all of it. Reply in text; "
-    "the phone reconnects by itself, so you can use start_call again on the next [Voice] message."
+    "The phone lost its connection while this line was being spoken, so the user may not have heard all of it. "
+    "The phone reconnects by itself: say it again with start_call on the next [Voice] message."
 )
 
 CALL_ID = re.compile(r"[0-9a-f]{32}")
@@ -329,6 +337,12 @@ class Call:
         self.waiter: Optional[Waiter] = None
         self.ring_timer: Optional[threading.Timer] = None
         self.hang_up_turn = False  # an injected "[Voice, hung up]" turn already told the agent
+        # The lines the user did not hear to the end when the call ended (told to the agent, then offered on the
+        # conversation's next call), and what an earlier call left to offer on this one (`offer_pending`: the
+        # agent hasn't been reminded yet).
+        self.unheard: list[str] = []
+        self.offer: list[str] = []
+        self.offer_pending = False
         # Where turns go when the conversation runs in another process (hubsock.Route): deliver(text), close().
         self.route: Any = None
         self.inbox = InjectQueue(hub, self)
@@ -465,6 +479,8 @@ class CallHub:
         # Conversations with a turn running now (pre_llm_call .. on_session_end).
         self.busy: dict[str, float] = {}
         self.deliveries: deque[tuple[str, str, inject.Delivery]] = deque(maxlen=200)
+        # What each conversation's user did not hear to the end on its last call (memory only).
+        self.missed = guidance.Missed()
 
     # ── loop plumbing ────────────────────────────────────────────────────────────────────────────────────
 
@@ -564,10 +580,10 @@ class CallHub:
     def problem(self, call: Call) -> str:
         """Why nothing can be spoken on the call right now."""
         if call.state == "ended":
-            return (f"Voice call {call.call_id} has ended, so nothing was spoken. Reply in text; start_call would "
-                    "ring the user again.")
+            return (f"Voice call {call.call_id} has ended, so nothing was spoken. Put it in a short text recap; "
+                    "start_call would ring the user again.")
         return (f"The phone on voice call {call.call_id} is not connected right now (it may be reconnecting), so "
-                "nothing was spoken. Reply in text; you can use start_call again on the next [Voice] message.")
+                "nothing was spoken. Say it again with start_call on the next [Voice] message.")
 
     # ── calls ────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -594,18 +610,26 @@ class CallHub:
                 self.slot = None
             self._remember(call)
             timer, call.ring_timer = call.ring_timer, None
+            if outcome in UNHEARD_OUTCOMES:
+                # Still queued or playing: the phone never confirmed it heard these out.
+                call.unheard = [line.text for line in call.lines if line.played_at is None]
             for line in [line for line in call.lines if line.state == "queued"]:
                 self._settle(call, line, SpeakResult("not_delivered", self.problem(call)))
             waiting = call.waiter is not None
-            quiet = outcome == "ended_by_user" and call.hang_up_turn
+            # A "[Voice, hung up]" turn already said the call is over, but not what went unheard.
+            quiet = outcome == "ended_by_user" and call.hang_up_turn and not call.unheard
+            unheard = list(call.unheard)
+            still_to_offer = call.offer if call.offer_pending or outcome in NEVER_ANSWERED else []
+            call.offer, call.offer_pending = [], False
             self.changed.notify_all()
+        self.missed.note(call.owner, still_to_offer + unheard)
         if timer is not None:
             timer.cancel()
         logger.info("hermes_voice: call %s ended: %s", call.call_id[:8], outcome)
         self.policy.log({"event": "ended", "call_id": call.call_id, "session_id": call.owner.session_id,
                          "outcome": outcome, **({"detail": detail[:200]} if detail else {})})
         if not waiting and not quiet:
-            notice = inject.outcome_notice(outcome, detail)
+            notice = inject.outcome_notice(outcome, detail, unheard)
             if notice:
                 call.inbox.put(notice)
         call.inbox.close()
@@ -707,6 +731,10 @@ class CallHub:
                     call.ring_timer = timer
                     timer.start()
                     rang = True
+                    # What this conversation's last call left unheard: the agent is reminded with this call's
+                    # first result (now for an async call, with the reply for a sync one).
+                    call.offer = self.missed.take(lambda owner: owner.matches(origin))
+                    call.offer_pending = bool(call.offer)
             if rang:
                 self.policy.record_ring(origin, call.call_id)
                 logger.info("hermes_voice: ringing for %s (call %s)", origin.session_id, call.call_id[:8])
@@ -720,13 +748,21 @@ class CallHub:
             return Begun({"call_id": call.call_id, "status": "waiting"}, call, waiter)
         with self.lock:
             status = "speaking" if call.state == "live" else "ringing" if call.state == "ringing" else "ended"
+            reminder = self._offer_reminder(call) if status != "ended" else ""
         note = {
             "ringing": "The phone is ringing; your line is spoken once the user answers.",
             "speaking": "Your line is being spoken.",
             "ended": "The call ended before your line could be spoken.",
         }[status]
         note += " What the user says arrives as [Voice] messages; answer them with start_call."
-        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{clip_note}"}, call)
+        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{clip_note}{reminder}"}, call)
+
+    def _offer_reminder(self, call: Call) -> str:
+        """Once per call (under lock): the reminder to offer what the conversation's last call left unheard."""
+        if not call.offer_pending:
+            return ""
+        call.offer_pending = False
+        return guidance.missed_reminder(call.offer)
 
     def end_call(self, origin: hermes.Origin, text: str = "", signals: Optional[Signals] = None) -> dict[str, Any]:
         signals = signals or Signals()
@@ -812,6 +848,8 @@ class CallHub:
                     if result is not None:
                         if call.waiter is waiter:
                             call.waiter = None
+                        if call.state != "ended" and (reminder := self._offer_reminder(call)):
+                            result["note"] = f"{result.get('note') or ''}{reminder}".strip()
                         self.changed.notify_all()
                         break
                     self.changed.wait(0.25)
@@ -833,13 +871,16 @@ class CallHub:
         line = waiter.line
         if waiter.turn is not None:
             turn = waiter.turn
-            outcome = "ended_by_user" if turn.ending == "hang_up" else "answered"
-            return _sync(call, " ".join(turn.text.split()), turn.ending, outcome, line.note.strip())
+            if turn.ending == "hang_up":
+                note = f"{_outcome_note('ended_by_user', '')} {line.note.strip()}".strip()
+                return _sync(call, " ".join(turn.text.split()), turn.ending, "ended_by_user", note)
+            return _sync(call, " ".join(turn.text.split()), turn.ending, "answered", line.note.strip())
         if waiter.superseded:
             return {"call_id": call.call_id, "status": "superseded",
                     "note": "A newer start_call on this call took over waiting for the reply."}
         if call.state == "ended":
-            return _sync(call, "", None, call.outcome or "lost", _outcome_note(call.outcome or "", call.detail))
+            return _sync(call, "", None, call.outcome or "lost",
+                         _outcome_note(call.outcome or "", call.detail, call.unheard))
         if line.state == "failed":
             return _sync(call, "", None, "tts_failed", line.result.message if line.result else "")
         if line.state in ("not_connected", "cut_off", "cancelled", "not_delivered") and not interrupted:
@@ -1119,7 +1160,8 @@ class CallHub:
         logger.info("hermes_voice: the user started call %s in %s", started.call_id[:8], hello.session_id)
         self.policy.log({"event": "start", "call_id": started.call_id, "session_id": hello.session_id,
                          "source": "phone"})
-        started.inbox.put(inject.started_notice(started.call_id))
+        missed = self.missed.take(lambda owner: owner.owns(hello.session_id))
+        started.inbox.put(inject.started_notice(started.call_id, missed))
         return "attach", started
 
     def _log_phone(self, call_id: str, what: str) -> None:
@@ -1279,18 +1321,22 @@ def _refusal(mode: str, outcome: str, note: str) -> dict[str, Any]:
     return {"call_id": None, "status": outcome, "note": note}
 
 
-def _outcome_note(outcome: str, detail: str) -> str:
-    return {
-        "no_answer": "The user didn't pick up. Reply in text; don't ring again unless they ask.",
-        "declined": "The user declined the call. Reply in text; don't ring again unless they ask.",
-        "push_failed": (f"The phone couldn't be rung: {detail or 'the push failed'}. Reply in text; don't ring "
-                        "again unless they ask, and tell them it failed."),
-        "unreachable": ("The phone never answered the ring (it may be offline). Reply in text; don't ring again "
-                        "unless they ask, and tell them the ring didn't get through."),
-        "lost": "The call's connection was lost. Reply in text.",
-        "ended_by_user": "The user hung up. Reply in text.",
-        "ended_by_agent": "The call was ended with end_call.",
-    }.get(outcome, detail)
+def _outcome_note(outcome: str, detail: str, unheard: Any = ()) -> str:
+    """How a call ended, for a sync start_call's result: what happened, that it is no preference of the user's,
+    what they did not hear, and what to do now (the same as the notice an async call gets)."""
+    if outcome == "ended_by_agent":
+        return "The call was ended with end_call."
+    what = {
+        "no_answer": "The user didn't pick up.",
+        "declined": "The user declined the call.",
+        "push_failed": f"The phone couldn't be rung: {detail or 'the push failed'}.",
+        "unreachable": "The phone never answered the ring (it may be offline).",
+        "lost": "The call's connection was lost.",
+        "ended_by_user": "The user hung up.",
+    }.get(outcome)
+    if what is None:
+        return detail
+    return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard)} {inject.after_call(outcome)}"
 
 
 def _previews() -> bool:

@@ -32,7 +32,9 @@ Every user_turn is force-injected into the owning session as "[Voice] <said> (Re
 started after its line was played. Injecting mirrors inject.py: a running session takes the text after its turn
 (Hermes redirects or steers; the fake queues), an idle one starts a new turn. Async calls get their notices injected
 ("[Voice call not answered] …", "[Voice call ended by user] …", "[Voice call ended: …lost…]", "[Voice line not
-delivered: …]"); a sync start_call returns the outcome instead. The texts are hermes-voice-plugin/inject.py's. A ring
+delivered: …]"); a sync start_call returns the outcome instead. The texts are hermes-voice-plugin/inject.py's (each
+notice says it is an automated one, not the user's words). Not modelled: what the user did not hear when a call
+ended and the reminder on the next call, the long-line note, and the call style file. A ring
 ends as no_answer when the phone rang but nobody answered, as unreachable when no phone ever opened the link.
 
 The fake agent (fake_hermes.py run_turn hands these to ``FakeVoicePlugin.handle``):
@@ -105,7 +107,30 @@ PROVIDERS = ("apple", "scribe")
 ENDING_MARKERS = {"end_of_speech": "", "cut_off": "cut off", "hang_up": "hung up", "muted": "muted",
                   "dropped": "line dropped", "provider_error": "speech recognition failed"}
 REPLY_HINT = "(Reply out loud with start_call; your text replies are not spoken.)"
-HUNG_UP_HINT = "(The user hung up, so the call is over; reply in text.)"
+HUNG_UP_HINT = (
+    "(HermesVoice note, not the user's words: they hung up, so this call is over and they can't hear you. Finish "
+    "the task you were given, then reply once in text with a short recap. Don't ring back unless they asked to be "
+    "called when you're done.)"
+)
+# Every notice carries NOTICE_MARKER after its bracket prefix (inject.py: NOTICE_HEAD, AWAY, NEXT_CALL, after_call).
+NOTICE_MARKER = "Automated notice from HermesVoice, not something the user said."
+NOTICE_HEAD = f"{NOTICE_MARKER} It applies to this call only and is not a preference, so don't store it."
+RESULT_SCOPE = "This is about this call only and is not a preference, so don't store it."
+AWAY = (
+    "The user can't hear you now and is probably not reading this chat. Finish the task you were given, then reply "
+    "once in text with a short recap; if you were waiting for an answer, say what you still need."
+)
+NEXT_CALL = "When they next call or ask for a call, speak as usual"
+AFTER_CALL = {
+    "no_answer": f"{AWAY} Don't ring again unless it is urgent or the user asks. {NEXT_CALL}.",
+    "declined": f"{AWAY} Don't ring again unless it is urgent or the user asks. {NEXT_CALL}.",
+    "push_failed": f"{AWAY} Tell them the ring failed, and don't ring again unless the user asks.",
+    "unreachable": f"{AWAY} Tell them the ring didn't get through, and don't ring again unless the user asks.",
+    "lost": (f"{AWAY} Ring again with start_call only if it's worth it. {NEXT_CALL} and first offer anything they "
+             "missed."),
+    "ended_by_user": (f"{AWAY} Don't ring back unless the user asked in this conversation to be called when you're "
+                      f"done. {NEXT_CALL} and first offer anything they missed."),
+}
 # The notes on start_call results (hermes-voice-plugin/hub.py: start_call, _outcome_note).
 ASYNC_NOTES = {
     "ringing": "The phone is ringing; your line is spoken once the user answers.",
@@ -114,12 +139,13 @@ ASYNC_NOTES = {
 }
 ASYNC_HINT = " What the user says arrives as [Voice] messages; answer them with start_call."
 OUTCOME_NOTES = {
-    "no_answer": "The user didn't pick up. Reply in text.",
-    "declined": "The user declined the call. Reply in text.",
-    "push_failed": "The phone couldn't be rung: the push failed. Reply in text.",
-    "unreachable": "The phone never answered the ring (it may be offline). Reply in text.",
-    "lost": "The call's connection was lost. Reply in text.",
-    "ended_by_user": "The user hung up. Reply in text.",
+    "no_answer": f"The user didn't pick up. {RESULT_SCOPE} {AFTER_CALL['no_answer']}",
+    "declined": f"The user declined the call. {RESULT_SCOPE} {AFTER_CALL['declined']}",
+    "push_failed": f"The phone couldn't be rung: the push failed. {RESULT_SCOPE} {AFTER_CALL['push_failed']}",
+    "unreachable": (f"The phone never answered the ring (it may be offline). {RESULT_SCOPE} "
+                    f"{AFTER_CALL['unreachable']}"),
+    "lost": f"The call's connection was lost. {RESULT_SCOPE} {AFTER_CALL['lost']}",
+    "ended_by_user": f"The user hung up. {RESULT_SCOPE} {AFTER_CALL['ended_by_user']}",
     "ended_by_agent": "The call was ended with end_call.",
 }
 
@@ -687,9 +713,9 @@ class FakeVoicePlugin:
     def announce(self, call: Call) -> None:
         """A user-initiated call: tell its session, then let the turns through (held until now)."""
         self.inject(call.owner, (
-            f"{STARTED} The user is calling you from the HermesVoice app (call {call.call_id}). Your text replies "
-            "are not spoken: talk to them with start_call (mode \"sync\" waits for their answer) and hang up with "
-            "end_call. What they say arrives as messages starting with \"[Voice]\"."))
+            f"{STARTED} {NOTICE_HEAD} The user is calling you from the HermesVoice app (call {call.call_id}) "
+            "and hears only what you say with start_call: your text replies are not spoken. Mode \"sync\" waits for "
+            "their answer; hang up with end_call. What they say arrives as messages starting with \"[Voice]\"."))
         call.notice_sent.set()
         held, call.held = call.held, []
         for turn in held:
@@ -758,16 +784,18 @@ class FakeVoicePlugin:
         """inject.py outcome_notice: the notice for a call that ended with nobody waiting on it."""
         if outcome in ("no_answer", "declined"):
             why = "they declined it" if outcome == "declined" else "they didn't pick up"
-            return f"{NOT_ANSWERED} The user didn't take the call ({why}). Reply in text."
+            return f"{NOT_ANSWERED} {NOTICE_HEAD} The user didn't take the call ({why}). {AFTER_CALL[outcome]}"
         if outcome == "push_failed":
-            return f"{NOT_DELIVERED}: the phone couldn't be rung ({self.push_failure or 'push failed'})] Reply in text."
+            return (f"{NOT_DELIVERED}: the phone couldn't be rung ({self.push_failure or 'push failed'})] "
+                    f"{NOTICE_HEAD} Nothing was spoken. {AFTER_CALL[outcome]}")
         if outcome == "unreachable":
-            return f"{NOT_DELIVERED}: the phone never answered the ring] Reply in text."
+            return (f"{NOT_DELIVERED}: the phone never answered the ring] {NOTICE_HEAD} Nothing was spoken. "
+                    f"{AFTER_CALL[outcome]}")
         if outcome == "lost":
-            return (f"{LOST} the phone's connection was lost and didn't come back] Reply in text; call again with "
-                    "start_call only if it's worth it.")
+            return (f"{LOST} the phone's connection was lost and didn't come back] {NOTICE_HEAD} "
+                    f"{AFTER_CALL[outcome]}")
         if outcome == "ended_by_user" and not call.hang_up_reported:
-            return f"{ENDED_BY_USER} Reply in text from now on; don't call back unless they ask."
+            return f"{ENDED_BY_USER} {NOTICE_HEAD} {AFTER_CALL[outcome]}"
         return None
 
     # ── force-inject (inject.py: redirect -> steer -> prompt.submit) ─────────────────────────────────
@@ -882,7 +910,9 @@ class FakeVoicePlugin:
     async def say_async(self, call: Call, text: str) -> None:
         status, detail = await self.say(call, text)
         if status == "tts_failed":
-            self.inject(call.owner, f"{NOT_DELIVERED}: {' '.join(f'text-to-speech failed ({detail})'.split())[:240]}]")
+            self.inject(call.owner, (
+                f"{NOT_DELIVERED}: {' '.join(f'text-to-speech failed ({detail})'.split())[:240]}] {NOTICE_MARKER} "
+                "It is about that one line only and is not a preference, so don't store it."))
 
     # ── the tools ─────────────────────────────────────────────────────────────────────────────────
 
