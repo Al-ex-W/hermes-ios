@@ -18,7 +18,7 @@ struct CallsSettingsView: View {
                 }
                 Picker("End of speech", selection: $model.callSettings.endOfSpeech) {
                     ForEach(EndOfSpeech.allCases) { level in
-                        Text(level.name).tag(level)
+                        Text(level.label()).tag(level)
                     }
                 }
             } header: {
@@ -74,19 +74,21 @@ struct CallsSettingsView: View {
     }
 
     private var listeningFooter: String {
-        let settings = model.callSettings
-        switch settings.provider {
-        case .apple:
-            return "Apple speech recognition runs on this iPhone when the language has an on-device model. "
-                + "A pause of \(Self.seconds(settings.endOfSpeech.appleSilence)) ends what you say."
-        case .scribe:
-            return "ElevenLabs Scribe transcribes in the cloud with a key on the Hermes host; if it isn't available, "
-                + "calls fall back to Apple. A pause of \(Self.seconds(settings.endOfSpeech.scribeSilence)) ends what you say."
-        }
+        Self.listeningFooter(model.callSettings)
     }
 
-    private static func seconds(_ value: TimeInterval) -> String {
-        "\(value.formatted(.number.precision(.fractionLength(1)))) s"
+    /// What the Listening section says under its pickers: where recognition runs, and how a turn ends.
+    static func listeningFooter(_ settings: CallSettings, locale: Locale = .current) -> String {
+        let recognizer: String
+        switch settings.provider {
+        case .apple:
+            recognizer = "Apple speech recognition runs on this iPhone when the language has an on-device model."
+        case .scribe:
+            recognizer = "ElevenLabs Scribe transcribes in the cloud with a key on the Hermes host; if it isn't available, "
+                + "calls fall back to Apple."
+        }
+        return "\(recognizer) A pause of \(EndOfSpeech.seconds(settings.endOfSpeech.pause, locale: locale)) ends what you say; "
+            + "Send now on the call screen ends it at once. A change applies from the next call."
     }
 
     private var tokenState: String {

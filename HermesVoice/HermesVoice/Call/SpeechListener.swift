@@ -2,7 +2,7 @@ import AVFoundation
 import Speech
 
 /// Turns what the user says into utterances: Apple speech recognition (on-device when the language
-/// has a model on the iPhone), ended by a short pause. AppleSpeechProvider makes them user turns.
+/// has a model on the iPhone), ended by a pause of `pause` seconds. AppleSpeechProvider makes them user turns.
 final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
     /// One finished utterance.
     struct Utterance {
@@ -50,7 +50,7 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
     let localeIdentifier: String
 
     /// `localeIdentifier` nil or "" picks the language automatically from the user's preferred languages.
-    init(localeIdentifier: String?, pause: TimeInterval = 1.2) {
+    init(localeIdentifier: String?, pause: TimeInterval = EndOfSpeech.normal.pause) {
         self.pause = pause
         var locale = Self.automaticLocale()
         if let localeIdentifier, !localeIdentifier.isEmpty, SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier)) != nil {
@@ -95,8 +95,8 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
         beginRequest()
     }
 
-    /// Ends the utterance in progress now (Hermes cut in, or the call is ending) and returns it, or nil when
-    /// nothing was heard. Listening goes on with a fresh request.
+    /// Ends the utterance in progress now (Hermes cut in, the user tapped Send now, or the call is ending) and
+    /// returns it, or nil when nothing was heard. Listening goes on with a fresh request.
     func takePartial() -> Utterance? {
         let since = heardSince
         let text = takeHeard()
@@ -106,6 +106,8 @@ final class SpeechListener: NSObject, SFSpeechRecognizerDelegate {
     }
 
     /// While paused (Hermes is speaking, or the call is muted) audio is dropped and any half-heard words discarded.
+    /// The pause that ends an utterance isn't counted meanwhile: its timer stops with the request, and starts again
+    /// only with the first words heard after listening resumes.
     func setPaused(_ value: Bool) {
         guard value != paused else { return }
         paused = value

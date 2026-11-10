@@ -19,8 +19,8 @@ enum SpeechProviderID: String, Codable, CaseIterable, Identifiable {
 
 /// How a user turn ended. The plugin tells Hermes when a turn didn't end on its own (cut off, hung up…).
 enum TurnEnding: Equatable {
-    /// The recognizer decided the user stopped talking: `detector` names how ("apple_silence", "apple_final",
-    /// "scribe_vad"), `detail` is its silence threshold in seconds, when it has one.
+    /// The turn ended normally: the user stopped talking, or tapped Send now. `detector` names how ("apple_silence",
+    /// "apple_final", "scribe_vad", "send_now", "typed"), `detail` is the pause in seconds that ended it, when one did.
     case endOfSpeech(detector: String, detail: Double?)
     /// Hermes started speaking while the user was still talking; what was heard so far was sent.
     case cutOff

@@ -85,6 +85,15 @@ On the iPhone, **Settings → Calls** picks the speech recognizer (Apple, or Ele
 plugin mints, so the key stays on the host), the language and how long a pause ends your turn, and shows whether
 pushes are registered and what the plugin reports.
 
+**When your turn ends.** A turn ends when you have been quiet for the pause set under **End of speech**: Quick
+1.5 s, Normal 3.5 s (the default, so a thinking pause of two or three seconds in the middle of a sentence doesn't
+send half of it), Patient 5 s or Very patient 8 s. Both recognizers honour it: Scribe's own silence threshold
+stops at 3 s, so the app asks Scribe for 1.5 s and holds what it hears until the whole pause has passed. While you
+have words on the call screen, **Send now** ends the turn at once, so a long pause doesn't have to be waited out.
+The call is half-duplex (the microphone is off while Hermes speaks): a line of Hermes that arrives while you are
+mid-turn waits for the turn to end, at most the pause plus two seconds (10 s at the longest), and then cuts in; the
+pause isn't counted while Hermes speaks. A change of the setting applies from the next call.
+
 ### Setup on the Hermes host
 
 The checklist for the machine (a Linux VM with systemd here) that runs Hermes. Do it once, then the

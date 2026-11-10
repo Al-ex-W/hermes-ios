@@ -4,8 +4,21 @@ import Foundation
 enum Scribe {
     static let model = "scribe_v2_realtime"
     static let sampleRate = 16_000
+    /// The longest silence Scribe's own VAD is asked to wait before it commits a segment. The API takes 0.192 to
+    /// 3.0 s for `vad_silence_threshold_secs` (ElevenLabs' guide "Transcripts and commit strategies"; what a larger
+    /// value does isn't documented), less than the Calls setting can ask for. So Scribe commits after a short
+    /// silence, and ScribeTurnAssembler holds the commits on the phone until the setting's whole pause has passed.
+    /// Shorter than the API's limit, so the final text of a segment arrives sooner (Send now sends it) and words
+    /// that were already sent or dropped leave Scribe's open segment sooner.
+    static let maxVADSilence: TimeInterval = 1.5
 
-    /// `wss://api.elevenlabs.io/v1/speech-to-text/realtime?…` for a single-use `token`. `language` nil lets Scribe detect it.
+    /// The `vad_silence_threshold_secs` for turns that end after `pause` seconds of silence.
+    static func vadSilence(pause: TimeInterval) -> TimeInterval {
+        min(max(pause, 0.2), maxVADSilence)
+    }
+
+    /// `wss://api.elevenlabs.io/v1/speech-to-text/realtime?…` for a single-use `token`. `silence` is Scribe's own
+    /// VAD threshold (see `vadSilence`). `language` nil lets Scribe detect it.
     static func url(token: String, silence: TimeInterval, language: String?) -> URL {
         var components = URLComponents(string: "wss://api.elevenlabs.io/v1/speech-to-text/realtime")!
         var items = [
@@ -65,14 +78,24 @@ enum ScribeMessage: Equatable {
     }
 }
 
-/// Builds turns from Scribe's partials and commits. A VAD commit ends the turn. Scribe also commits by itself
-/// when a segment runs long (about 36 s) while the user is still talking: a commit after a segment that long is held
-/// and merged with what follows, and only ends the turn when no more speech comes within `holdFor`.
+/// Builds turns from Scribe's partials and commits. Scribe's VAD commits a segment after `vadSilence` of silence,
+/// which may be shorter than the `pause` that ends a turn: a commit is held, and merged with what the user says
+/// next, until `pause` has passed with no more speech. Scribe also commits by itself when a segment runs long
+/// (about 36 s) while the user is still talking: a commit after a segment that long is held the same way, for a
+/// whole pause.
+///
+/// When a turn is taken or dropped while Scribe's segment is still open (Send now, Hermes cutting in, mute), Scribe
+/// goes on with that segment: what it says of the words already taken is skipped, and its commit is dropped unless
+/// new words were heard first.
 struct ScribeTurnAssembler {
+    /// Silence that ends the turn (the Calls setting).
+    var pause: TimeInterval
+    /// The silence Scribe's VAD waited before a commit (`vad_silence_threshold_secs`).
+    var vadSilence: TimeInterval
     /// A segment at least this long was most likely cut by Scribe's own limit, not by a pause.
     var autoCommitAfter: TimeInterval = 30
-    /// How long a held auto-commit waits for the speech to go on.
-    var holdFor: TimeInterval = 2.5
+    /// The least time a held auto-commit waits for the speech to go on (the next partial takes a moment).
+    var autoCommitHold: TimeInterval = 2.5
 
     struct Finished: Equatable {
         let text: String
@@ -87,10 +110,21 @@ struct ScribeTurnAssembler {
     private(set) var partial = ""
     private(set) var startedAt: Date?
     private var segmentStartedAt: Date?
-    private var heldSince: Date?
+    /// When the held commits become a turn, unless the user goes on talking.
+    private(set) var heldUntil: Date?
     private var language: String?
-    /// The last commit, so the `…_with_timestamps` copy of it isn't counted twice.
+    /// The last commit as Scribe sent it, so the `…_with_timestamps` copy of it isn't counted twice.
     private var lastCommit: (text: String, at: Date)?
+    /// Words at the start of Scribe's open segment that were already taken or dropped.
+    private var skipWords = 0
+    /// After a turn was taken or dropped: commits are dropped until new words are heard.
+    private var quarantined = false
+
+    /// `vadSilence` nil: what `Scribe.vadSilence` asks Scribe for with this `pause`.
+    init(pause: TimeInterval = EndOfSpeech.normal.pause, vadSilence: TimeInterval? = nil) {
+        self.pause = pause
+        self.vadSilence = vadSilence ?? Scribe.vadSilence(pause: pause)
+    }
 
     /// The words of the turn in progress: merged segments, then the partial.
     var text: String {
@@ -99,68 +133,111 @@ struct ScribeTurnAssembler {
 
     var hasText: Bool { !text.isEmpty }
 
-    var isHolding: Bool { heldSince != nil }
+    var isHolding: Bool { heldUntil != nil }
 
     mutating func partial(_ text: String, at now: Date) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = Self.dropWords(skipWords, from: text)
+        // Scribe repeating words that were already taken: not new speech.
+        if quarantined, trimmed.isEmpty { return }
         partial = trimmed
         guard !trimmed.isEmpty else { return }
+        quarantined = false
         if startedAt == nil { startedAt = now }
         if segmentStartedAt == nil { segmentStartedAt = now }
-        // The user went on talking after an auto-commit: it is part of this turn.
-        heldSince = nil
+        // The user went on talking: the held commits are part of this turn.
+        heldUntil = nil
     }
 
-    /// A commit; returns the finished turn unless the commit is held (or was empty, or a repeat).
+    /// A commit; returns the finished turn unless the commit is held (or was dropped, empty, or a repeat).
     mutating func commit(_ text: String, language: String?, timestamps: Bool, at now: Date) -> Finished? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if timestamps, let lastCommit, lastCommit.text == trimmed, now.timeIntervalSince(lastCommit.at) < 3 { return nil }
-        lastCommit = (trimmed, now)
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if timestamps, let lastCommit, lastCommit.text == raw, now.timeIntervalSince(lastCommit.at) < 3 { return nil }
+        lastCommit = (raw, now)
+        let trimmed = Self.dropWords(skipWords, from: raw)
+        // This commit closes the segment whose first words were taken.
+        skipWords = 0
+        if quarantined { return nil }
         if let language { self.language = language }
         partial = ""
         // A commit with no partial before it (since the last one) is a segment of no length.
-        let segmentStart = segmentStartedAt ?? heldSince ?? now
+        let segmentStart = segmentStartedAt ?? now
         segmentStartedAt = nil
         if !trimmed.isEmpty {
             if startedAt == nil { startedAt = now }
             segments.append(trimmed)
         }
         guard !segments.isEmpty else { return nil }
-        if !trimmed.isEmpty, now.timeIntervalSince(segmentStart) >= autoCommitAfter {
-            heldSince = now
-            return nil
+        if trimmed.isEmpty {
+            // Nothing new was said. If a partial (revised away since) had ended the hold, the silence counts again.
+            if heldUntil == nil { heldUntil = now.addingTimeInterval(max(0, pause - vadSilence)) }
+        } else if now.timeIntervalSince(segmentStart) >= autoCommitAfter {
+            // Cut by Scribe's limit with the user still talking: no silence has passed yet.
+            heldUntil = now.addingTimeInterval(max(pause, autoCommitHold))
+        } else {
+            // Scribe's VAD already waited `vadSilence`; the rest of the pause is waited here.
+            heldUntil = now.addingTimeInterval(max(0, pause - vadSilence))
         }
-        return finish(at: now)
+        return tick(at: now)
     }
 
-    /// Ends a held auto-commit once no more speech came for `holdFor`.
+    /// Ends the held commits as a turn once the pause has passed with no more speech.
     mutating func tick(at now: Date) -> Finished? {
-        guard let heldSince, partial.isEmpty, now.timeIntervalSince(heldSince) >= holdFor else { return nil }
-        return finish(at: now)
+        guard let heldUntil, partial.isEmpty, now >= heldUntil else { return nil }
+        let finished = current(at: now)
+        reset()
+        return finished
     }
 
-    /// Ends the turn in progress now (cut off, hung up, dropped…); nil when nothing was heard.
+    /// Ends the turn in progress now (Send now, cut off, hung up, dropped…); nil when nothing was heard.
     mutating func take(at now: Date) -> Finished? {
-        guard hasText else {
-            reset()
-            return nil
-        }
-        return finish(at: now)
+        let finished = current(at: now)
+        discard()
+        return finished
     }
 
-    mutating func reset() {
+    /// Drops the turn in progress (listening paused). Scribe goes on with its open segment: what it still says of
+    /// the words dropped here is skipped.
+    mutating func discard() {
+        skipWords += Self.words(partial).count
+        quarantined = true
+        reset()
+    }
+
+    /// Scribe committed a segment while nothing was listened to: the words taken or dropped before are behind it.
+    mutating func segmentClosed() {
+        skipWords = 0
+    }
+
+    /// A new Scribe session knows nothing of the segments before it.
+    mutating func sessionStarted() {
+        skipWords = 0
+        quarantined = false
+        lastCommit = nil
+    }
+
+    private mutating func reset() {
         segments = []
         partial = ""
         startedAt = nil
         segmentStartedAt = nil
-        heldSince = nil
+        heldUntil = nil
     }
 
-    private mutating func finish(at now: Date) -> Finished? {
+    /// The turn in progress as it would end now; nil when nothing was heard.
+    private func current(at now: Date) -> Finished? {
         let text = self.text
-        let finished = Finished(text: text, startedAt: startedAt ?? now, endedAt: now, language: language,
-                                segments: segments.count + (partial.isEmpty ? 0 : 1))
-        reset()
-        return text.isEmpty ? nil : finished
+        guard !text.isEmpty else { return nil }
+        return Finished(text: text, startedAt: startedAt ?? now, endedAt: now, language: language,
+                        segments: segments.count + (partial.isEmpty ? 0 : 1))
+    }
+
+    private static func words(_ text: String) -> [Substring] {
+        text.split(whereSeparator: \.isWhitespace)
+    }
+
+    /// `text`, trimmed, without its first `count` words.
+    private static func dropWords(_ count: Int, from text: String) -> String {
+        guard count > 0 else { return text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return words(text).dropFirst(count).joined(separator: " ")
     }
 }
