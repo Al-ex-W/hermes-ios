@@ -1167,7 +1167,7 @@ class CallHub:
         self.policy.log({"event": "start", "call_id": started.call_id, "session_id": hello.session_id,
                          "source": "phone"})
         missed = self.missed.take(lambda owner: owner.owns(hello.session_id))
-        started.inbox.put(inject.started_notice(started.call_id, missed))
+        started.inbox.put(inject.started_notice(started.call_id, missed, _style_for(started)))
         return "attach", started
 
     def _log_phone(self, call_id: str, what: str) -> None:
@@ -1343,6 +1343,19 @@ def _outcome_note(outcome: str, detail: str, unheard: Any = ()) -> str:
     if what is None:
         return detail
     return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard)} {inject.after_call(outcome)}"
+
+
+def _style_for(call: Call) -> str:
+    """The user's call style for the notice that opens a call they placed ("" without one, or if it can't be
+    read), from the conversation's own profile. The call's first start_call result then doesn't repeat it."""
+    try:
+        style = guidance.style_text(call.owner.profile_home)
+    except Exception:  # noqa: BLE001 - the style is an extra: a call never fails over it
+        logger.debug("hermes_voice: could not read the call style")
+        return ""
+    if style:
+        guidance.mark_style_given(call.call_id)
+    return style
 
 
 def _previews() -> bool:

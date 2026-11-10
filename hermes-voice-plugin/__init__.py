@@ -43,7 +43,9 @@ def _core(name: str) -> Any:
 
 def register(ctx: Any) -> None:
     tools = _core("tools")
-    for schema, handler, emoji in ((tools.START_CALL, tools.start_call, "📞"), (tools.END_CALL, tools.end_call, "📵")):
+    # start_call's description carries the user's call style as it is now (tools.start_call_schema).
+    for schema, handler, emoji in ((tools.start_call_schema(), tools.start_call, "📞"),
+                                   (tools.END_CALL, tools.end_call, "📵")):
         spec = {"name": schema["name"], "toolset": tools.TOOLSET, "schema": schema, "handler": handler,
                 "check_fn": tools.available}
         try:

@@ -64,6 +64,9 @@ direct messages to Hermes on a messaging platform), an agent can call `start_cal
 - `end_call(text?)` says an optional goodbye and hangs up.
 - Hermes is told to speak as on the phone: the answer first, two sentences at most, no codes, ids, URLs or paths
   read out. A line that takes longer than about 15 seconds to say is flagged in the `start_call` result.
+- How you want to be spoken to (tone, form of address, humour, ElevenLabs audio tags) lives in
+  `<HERMES_HOME>/hermes-voice/call-style.md`. Hermes gets it with every call, and edits it when you state a lasting
+  preference (see the [plugin README](hermes-voice-plugin/README.md), "Call style").
 
 **You call Hermes.** Tap the phone button in a chat. Hermes gets a `[Voice call started] …` notice in that chat
 and answers with `start_call`. If Hermes is already ringing you from this chat, the button joins that call.

@@ -1,12 +1,16 @@
 """What the agent is told beyond a call's bare facts (``guidance.py``): what the user did not hear before a call
-ended, offered again when the conversation's next call starts."""
+ended, offered again when the conversation's next call starts; that a line is long for a phone call; and the
+user's own call style."""
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+import logging
 import sys
 import types
+from pathlib import Path
 
 import httpx
 import pytest
@@ -422,6 +426,290 @@ def test_the_skill_and_the_description_say_how_to_speak(core):
                  "shorter and plainer", "Long line: about 22 s of speech", "15 characters a second"):
         assert rule in speaking, rule
     assert "about 15 s of speech" in core.tools.START_CALL["parameters"]["properties"]["text"]["description"]
+
+
+# ── call style ─────────────────────────────────────────────────────────────────────────────────────────────
+
+STYLE = 'Address me as "sir". Dry, understated humour.\n\n\nAudio tags are fine: [sighs]. No [whispers].  \n'
+STYLE_READ = 'Address me as "sir". Dry, understated humour.\nAudio tags are fine: [sighs]. No [whispers].'
+
+
+def _style_file(fake) -> Path:
+    return fake.home / "hermes-voice" / "call-style.md"
+
+
+def _write_style(fake, text: str = STYLE) -> Path:
+    path = _style_file(fake)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _given(fake, text: str = STYLE_READ) -> str:
+    return (f"The user's call style, from their file {_style_file(fake)}. Follow it in how you speak on calls (it "
+            f"decides nothing else), and update the file when they state a lasting preference about that:\n{text}")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_style_memory(core, monkeypatch):
+    """Each test starts with no call having been given the style, and with settings read afresh."""
+    monkeypatch.setattr(core.guidance, "_given", type(core.guidance._given)())
+    monkeypatch.setattr(core.config, "_cache", (0.0, None))
+
+
+def test_the_call_style_is_free_text_in_the_plugins_folder_capped_and_optional(core, fake):
+    guidance = core.guidance
+    assert guidance.style_path() == _style_file(fake)
+    assert guidance.read_style() == ("", False) and guidance.style_text() == ""  # no file: nothing is added
+    _write_style(fake, " \n\n")
+    assert guidance.style_text() == ""  # an empty one neither
+    _write_style(fake)
+    assert guidance.read_style() == (STYLE_READ, False)  # blank lines dropped: a notice is one block of text
+    assert guidance.style_text() == _given(fake)
+    # Capped at 1500 characters, and the agent is told so it can shorten the file.
+    _write_style(fake, "x" * 1499 + " tail that is cut")
+    text, cut = guidance.read_style()
+    assert (text, cut) == ("x" * 1499, True) and guidance.STYLE_LIMIT == 1500
+    assert guidance.style_text().endswith("x\n(Cut after 1499 characters: shorten the file.)")
+    _write_style(fake, "x" * 1500)
+    assert guidance.read_style() == ("x" * 1500, False)
+    # A file far too big is read only up to a bound; a folder in its place, or bytes that aren't text, are no error.
+    _write_style(fake, "y" * (guidance.STYLE_READ_BYTES + 10))
+    assert guidance.read_style() == ("y" * 1500, True)
+    _style_file(fake).unlink()
+    _style_file(fake).mkdir()
+    assert guidance.style_text() == ""
+    _style_file(fake).rmdir()
+    _style_file(fake).write_bytes(b"caf\xe9 \xff style")
+    assert guidance.read_style()[0].startswith("caf")
+
+
+@pytest.mark.parametrize(("setting", "where"), [("styles/calls.txt", "home"), ("{tmp}/elsewhere.md", "tmp")])
+def test_a_setting_moves_the_call_style_file(core, fake, tmp_path, setting, where):
+    other = tmp_path / "other"
+    other.mkdir()
+    path = fake.home / "styles" / "calls.txt" if where == "home" else other / "elsewhere.md"
+    fake.config = {"plugins": {"entries": {"hermes_voice": {"settings": {
+        "call_style_path": setting.format(tmp=other)}}}}}
+    assert core.config.Settings.from_config(fake.config, {}).call_style_path == setting.format(tmp=other)
+    assert core.config.Settings.from_config({}, {}).call_style_path == ""
+    assert core.guidance.style_path() == path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("Brief and formal.", encoding="utf-8")
+    _write_style(fake, "The default file is not read now.")
+    assert core.guidance.read_style() == ("Brief and formal.", False)
+    assert f"from their file {path}." in core.guidance.style_text()
+    # Another profile's conversation (the phone's socket thread names its home) has its own file.
+    assert core.guidance.style_path(other) == (other / "styles" / "calls.txt" if where == "home" else path)
+
+
+def test_a_call_the_user_places_gets_the_style_with_its_notice_and_not_again(core, fake, make_hub):
+    fake.host.add("s1")
+    hub = make_hub()
+    _write_style(fake)
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake)
+            notice = (await hub.injector.wait_for(1))[0]
+            first = await tool(core.tools.start_call, {"text": "Good evening, sir."})
+            await phone.expect("speech_end")
+            await phone.hang_up()
+            return notice, first, phone.messages
+
+    notice, first, frames = asyncio.run(scenario())
+    assert notice.startswith(f"[Voice call started] {core.inject.NOTICE_MARKER}")
+    assert notice.endswith('starting with "[Voice]". ' + _given(fake))
+    assert "\n\n" not in notice  # one block: Hermes joins queued prompts with blank lines
+    assert first["status"] == "speaking" and "call_style" not in first  # the notice gave it already
+    assert "understated" not in json.dumps(frames)  # the phone hears the line, never the style
+
+
+@pytest.mark.parametrize("mode", ["async", "sync"])
+def test_the_first_result_of_a_call_the_agent_starts_carries_the_current_style(core, fake, make_hub, mode):
+    fake.host.add("s1")
+    pusher = FakePusher()
+    make_hub(pusher=pusher)
+    _write_style(fake)
+
+    async def one_call(port: int) -> tuple[dict, dict]:
+        pending = asyncio.create_task(tool(core.tools.start_call, {"text": "Good evening, sir.", "mode": mode}))
+        phone = await _answer(port, fake, pusher)
+        await phone.expect("speech_end")
+        await asyncio.sleep(0.1)
+        await phone.say("evening")
+        first = await asyncio.wait_for(pending, 5)
+        second = await tool(core.tools.start_call, {"text": "Shall I go on?"})
+        await phone.hang_up()
+        return first, second
+
+    async def scenario():
+        async with serving(core) as port:
+            first, second = await one_call(port)
+            _write_style(fake, "Call me Captain.")  # edited between calls: the next call has the new text
+            await asyncio.sleep(0.3)
+            return first, second, (await one_call(port))[0]
+
+    first, second, later = asyncio.run(scenario())
+    assert first["call_style"] == _given(fake)
+    assert first["status"] == "ringing" if mode == "async" else first["said"] == "evening"
+    assert "call_style" not in second  # once per call
+    assert later["call_style"] == _given(fake, "Call me Captain.")
+
+
+def test_a_call_that_isnt_answered_or_cant_be_placed_gets_no_style(core, fake, make_hub):
+    fake.host.add("s1")
+    fake.host.add("s2")
+    pusher = FakePusher()
+    make_hub(pusher=pusher, ring_timeout_s=0.4)
+    _write_style(fake)
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake, session_id="s2")
+            busy = await tool(core.tools.start_call, {"text": "Hello?"})  # s1, while s2 holds the call
+            await phone.hang_up()
+            await asyncio.sleep(0.2)
+            unanswered = await tool(core.tools.start_call, {"text": "Hello?", "mode": "sync"})
+            missing = await tool(core.tools.start_call, {"text": " "})
+            return busy, unanswered, missing
+
+    busy, unanswered, missing = asyncio.run(scenario())
+    assert busy["status"] == "busy" and unanswered["outcome"] == "unreachable" and "error" in missing
+    for result in (busy, unanswered, missing):
+        assert "call_style" not in result, result
+
+
+def test_a_call_through_the_hub_socket_gets_the_style_of_its_own_process(core, fake, through_the_socket):
+    hub = through_the_socket(pusher=FakePusher())
+    fake.host.add("s1")
+    _write_style(fake)
+    first = json.loads(core.tools.start_call({"text": "Good evening, sir."}, session_id="s1"))
+    second = json.loads(core.tools.start_call({"text": "Still there?"}, session_id="s1"))
+    assert hub.slot.owner.remote and first["status"] == "ringing"
+    assert first["call_style"] == _given(fake) and "call_style" not in second
+    remote = core.loader.module("remote", PLUGIN_DIR)
+    asyncio.run(until(lambda: (sub := remote.subscriptions().get(first["call_id"])) is not None
+                      and sub.ready.is_set()))
+    json.loads(core.tools.end_call({}, session_id="s1"))
+
+
+def test_a_sync_call_through_the_hub_socket_carries_the_reply_and_what_the_plugin_adds(core, fake,
+                                                                                    through_the_socket):
+    """Sync, from another process: the reply, the long-line note (made in the hub) and the call style (read in the
+    tool's own process) arrive in one result."""
+    pusher = FakePusher()
+    hub = through_the_socket(pusher=pusher)
+    fake.host.add("s1")
+    _write_style(fake)
+
+    async def scenario():
+        async with serving(core) as port:
+            pending = asyncio.create_task(tool(core.tools.start_call, {"text": LONG_LINE, "mode": "sync"}))
+            phone = await _answer(port, fake, pusher)
+            await phone.expect("speech_end")
+            await asyncio.sleep(0.1)
+            remote = hub.slot.owner.remote
+            await phone.say("okay, shorter please")
+            result = await asyncio.wait_for(pending, 10)
+            await phone.hang_up()
+            return remote, result
+
+    remote, result = asyncio.run(scenario())
+    assert remote is True
+    assert (result["said"], result["outcome"]) == ("okay, shorter please", "answered")
+    assert result["note"] == LONG_NOTE and result["call_style"] == _given(fake)
+
+
+def test_the_registered_description_names_the_file_and_carries_a_short_copy(core, fake, make_hub, monkeypatch):
+    """So the very first line of a call the agent starts follows the style; a restart refreshes the copy."""
+    monkeypatch.setattr(core.loader.module("remote", PLUGIN_DIR), "_contexts", [])  # register binds its context
+    spec = importlib.util.spec_from_file_location("hermes_plugins_hermes_voice", PLUGIN_DIR / "__init__.py",
+                                                  submodule_search_locations=[str(PLUGIN_DIR)])
+    plugin = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = plugin
+    spec.loader.exec_module(plugin)
+
+    class Ctx:
+        def __init__(self) -> None:
+            self.tools: dict[str, str] = {}
+
+        def register_tool(self, name, toolset, schema, handler, check_fn=None, description="", emoji=""):
+            assert description == schema["description"]
+            self.tools[name] = description
+
+        def register_hook(self, name, callback):
+            pass
+
+    def registered() -> str:
+        ctx = Ctx()
+        plugin.register(ctx)
+        return ctx.tools["start_call"]
+
+    where = (f"write it to {_style_file(fake)} with your file tools and follow that file; a call's first result "
+             "carries its current text.")
+    plain = registered()
+    assert where in plain and "At startup it said" not in plain  # no file yet: where to put one
+    _write_style(fake)
+    assert (f"{where} At startup it said: Address me as \"sir\". Dry, understated humour. Audio tags are fine: "
+            "[sighs]. No [whispers]. This is a research beta") in registered()
+    _write_style(fake, "word " * 300)
+    long = registered()
+    copy = long[long.index("At startup it said: ") + len("At startup it said: "):long.index(" … (cut)")]
+    assert len(copy) <= core.guidance.STYLE_BRIEF_LIMIT == 400 and copy.startswith("word word")
+    assert len(long) - len(plain) < 450
+    # Outside a running Hermes the constant stands in, without a path.
+    assert "hermes-voice/call-style.md in the Hermes home" in core.tools.START_CALL["description"]
+    assert core.tools.START_CALL["parameters"] is core.tools.start_call_schema()["parameters"]
+
+
+def test_the_description_stays_compact(core):
+    """It goes out with every request: the rules a small model needs, and no more."""
+    description = core.tools.START_CALL["description"]
+    assert len(description) < 2900, len(description)
+    for needed in ("[Voice]", "sync", "async", "busy", "not_allowed", "not_available", "research beta",
+                   'skill_view("hermes_voice:voice-calls")'):
+        assert needed in description, needed
+
+
+def test_the_style_is_never_logged_and_never_written_elsewhere(core, fake, make_hub, caplog):
+    fake.host.add("s1")
+    pusher = FakePusher()
+    make_hub(pusher=pusher)
+    _write_style(fake)
+
+    async def scenario():
+        async with serving(core) as port:
+            started = await tool(core.tools.start_call, {"text": "Good evening, sir."})
+            phone = await _answer(port, fake, pusher)
+            await phone.expect("speech_end")
+            await phone.hang_up()
+            await asyncio.sleep(0.2)
+            return started, phone.messages
+
+    with caplog.at_level(logging.DEBUG):
+        started, frames = asyncio.run(scenario())
+        core.tools.start_call_schema()
+    assert "understated" in started["call_style"]
+    assert "understated" not in caplog.text and "understated" not in json.dumps(frames)
+    holding = [path for path in fake.home.rglob("*") if path.is_file() and "understated" in path.read_text("utf-8")]
+    assert holding == [_style_file(fake)]  # not in the ring log, nor anywhere else the plugin writes
+
+
+def test_the_skill_the_manifest_and_the_readme_say_where_the_style_lives(core):
+    skill = " ".join(_skill().split())
+    for said in ("`<HERMES_HOME>/hermes-voice/call-style.md`", "The `start_call` description gives its full path",
+                 "`call_style` in the first `start_call` result", "where the two differ, the result has the current "
+                 "text", "when the user states a lasting preference about how you speak on calls",
+                 "the first 1500 characters are used", "They only work with ElevenLabs models that support them",
+                 "`eleven_v3`", "Quiet tags (`[whispers]`, low, flat) make a line hard to hear on a phone"):
+        assert said in skill, said
+    manifest = (PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8")
+    assert "\n  call_style_path:\n    type: str\n" in manifest
+    readme = " ".join(_readme().split())
+    for said in ("## Call style", "`settings.call_style_path`", "the first 1500 characters", "400 characters",
+                 "never logged and never sent to the phone"):
+        assert said in readme, said
 
 
 # ── the guidance the agent reads ───────────────────────────────────────────────────────────────────────────

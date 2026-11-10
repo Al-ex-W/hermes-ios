@@ -5,6 +5,11 @@
   (``[laughs]``) are directions to the voice, not speech.
 - **Missed speech.** ``Missed`` keeps, per conversation and in memory only, the lines the user did not hear to the
   end when a call ended, so the next call in that conversation can offer them.
+- **Call style.** ``<HERMES_HOME>/hermes-voice/call-style.md`` (or ``settings.call_style_path``) is free text the
+  agent edits with its own file tools when the user states a lasting preference about how to be spoken to (tone,
+  form of address, humour, ElevenLabs audio tags). The agent gets its text (the first ``STYLE_LIMIT`` characters)
+  with the ``[Voice call started]`` notice, with the first ``start_call`` result of a call, and, shortened, in the
+  ``start_call`` description when the plugin loads. It is never logged and never sent to the phone.
 """
 
 from __future__ import annotations
@@ -13,7 +18,12 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable, Iterable
+
+from . import hermes
+from .config import current as current_settings
 
 logger = logging.getLogger("hermes_voice")
 
@@ -120,3 +130,105 @@ class Missed:
                     self.entries.remove(entry)
                     taken.extend(entry[1])
         return taken
+
+
+# ── call style ─────────────────────────────────────────────────────────────────────────────────────────────
+
+STYLE_FILE = "call-style.md"
+# How much of the file the agent gets with a call, and in the tool description (which goes out with every
+# request, so that copy is short).
+STYLE_LIMIT = 1500
+STYLE_BRIEF_LIMIT = 400
+# Nothing past this is read from the file at all.
+STYLE_READ_BYTES = 64 * 1024
+# How many calls this process remembers having given the style to.
+STYLE_MEMORY = 64
+# A start_call result of a call that is ringing or live: its agent should have the style.
+_STYLE_STATUSES = frozenset({"ringing", "speaking", "interrupted", "yielded"})
+
+_given: "OrderedDict[str, None]" = OrderedDict()
+_given_lock = threading.Lock()
+
+
+def style_path(home: Any = None) -> Path:
+    """Where the call style lives: ``settings.call_style_path`` (``~`` allowed; a relative path is inside the
+    Hermes home), else ``<HERMES_HOME>/hermes-voice/call-style.md``. `home`: the Hermes home of the conversation's
+    profile, where this thread isn't in it (the phone's socket)."""
+    base = Path(home) if home else hermes.hermes_home()
+    try:
+        custom = (current_settings().call_style_path or "").strip()
+    except Exception:  # noqa: BLE001 - a broken config must not break calls
+        custom = ""
+    if custom:
+        path = Path(custom).expanduser()
+        return path if path.is_absolute() else base / path
+    return base / "hermes-voice" / STYLE_FILE
+
+
+def read_style(home: Any = None, limit: int = STYLE_LIMIT) -> tuple[str, bool]:
+    """The call style's text (blank lines dropped) cut to `limit` characters, and whether it was cut. ("", False)
+    when there is none. Read on every use, so an edit applies to the next call. Never logged."""
+    try:
+        with style_path(home).open("rb") as file:
+            raw = file.read(STYLE_READ_BYTES + 1)
+    except (OSError, ValueError):
+        return "", False
+    text = raw[:STYLE_READ_BYTES].decode("utf-8", "replace")
+    text = "\n".join(line.rstrip() for line in text.splitlines() if line.strip()).strip()
+    if len(text) <= limit and len(raw) <= STYLE_READ_BYTES:
+        return text, False
+    return text[:limit].rstrip(), True
+
+
+def style_text(home: Any = None) -> str:
+    """The call style as a call's notice or first result gives it to the agent ("" without one)."""
+    text, cut = read_style(home)
+    if not text:
+        return ""
+    cut_note = f"\n(Cut after {len(text)} characters: shorten the file.)" if cut else ""
+    return (f"The user's call style, from their file {style_path(home)}. Follow it in how you speak on calls (it "
+            "decides nothing else), and update the file when they state a lasting preference about that:\n"
+            f"{text}{cut_note}")
+
+
+def style_brief(home: Any = None) -> str:
+    """The call-style sentence of the ``start_call`` description: where the file is, and a short copy of what it
+    says now. Read when the plugin loads, so the first line of a call the agent starts already follows it."""
+    where = ("When the user states a lasting preference about how you speak on calls (tone, form of address, "
+             f"humour, audio tags), write it to {style_path(home)} with your file tools and follow that file; a "
+             "call's first result carries its current text.")
+    text, cut = read_style(home, STYLE_BRIEF_LIMIT)
+    text = " ".join(text.split())
+    if not text:
+        return where
+    return f"{where} At startup it said: {text}{' … (cut)' if cut else ''}"
+
+
+def mark_style_given(call_id: str) -> bool:
+    """Note that the call's agent has the style now. False when it already had it (in this process)."""
+    with _given_lock:
+        if call_id in _given:
+            return False
+        _given[call_id] = None
+        while len(_given) > STYLE_MEMORY:
+            _given.popitem(last=False)
+        return True
+
+
+def add_style(result: dict[str, Any], home: Any = None) -> dict[str, Any]:
+    """Give the agent the call style (``call_style``) with the first ``start_call`` result of a call: the line that
+    rings, or the first one spoken into a call the user started from somewhere this process didn't see. Later
+    results of the call don't repeat it. A call that can't be placed or wasn't answered gets none."""
+    call_id = result.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return result
+    if result.get("status") not in _STYLE_STATUSES and result.get("outcome") != "answered":
+        return result
+    try:
+        text = style_text(home)
+    except Exception:  # noqa: BLE001 - the style is an extra: a call never fails over it
+        logger.debug("hermes_voice: could not read the call style")
+        return result
+    if text and mark_style_given(call_id):
+        result["call_style"] = text
+    return result

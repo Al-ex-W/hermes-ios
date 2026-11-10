@@ -12,7 +12,7 @@ import logging
 import time
 from typing import Any
 
-from . import hermes, hub, remote
+from . import guidance, hermes, hub, remote
 
 logger = logging.getLogger("hermes_voice")
 
@@ -50,6 +50,12 @@ _AFTER = (
     "reading the chat: finish the task, reply once in text with a short recap, and don't ring again unless they "
     "asked to be called. On the next call speak as usual and first offer what they missed."
 )
+# Where the user's call style lives is known only in a running Hermes (start_call_schema); this stands in.
+_STYLE = (
+    "When the user states a lasting preference about how you speak on calls (tone, form of address, humour, audio "
+    "tags), write it to their call style file (hermes-voice/call-style.md in the Hermes home) and follow that "
+    "file; a call's first result carries its current text."
+)
 _BETA = (
     "This is a research beta: whenever something about a call looks wrong, slow or "
     "inconsistent (an unexpected outcome, a missing or garbled reply, a note that contradicts what happened, "
@@ -59,7 +65,7 @@ _BETA = (
 
 START_CALL: dict[str, Any] = {
     "name": "start_call",
-    "description": " ".join((_WHAT, _HOW, _WHEN, _AFTER, _BETA)),
+    "description": " ".join((_WHAT, _HOW, _WHEN, _AFTER, _STYLE, _BETA)),
     "parameters": {
         "type": "object",
         "properties": {
@@ -98,6 +104,18 @@ END_CALL: dict[str, Any] = {
 }
 
 
+def start_call_schema() -> dict[str, Any]:
+    """START_CALL as registered: its description names the user's call style file and carries a short copy of what
+    the file says as the plugin loads, so the first line of a call the agent starts already follows it (a restart
+    refreshes the copy; a call's first result carries the current text)."""
+    try:
+        style = guidance.style_brief()
+    except Exception:  # noqa: BLE001 - registering the tool must not fail over the style
+        logger.debug("hermes_voice: could not read the call style for the tool description")
+        style = _STYLE
+    return {**START_CALL, "description": " ".join((_WHAT, _HOW, _WHEN, _AFTER, style, _BETA))}
+
+
 def available() -> bool:
     """Always shown: the tools work wherever the dashboard's hub is (this process, or its socket for every other
     Hermes process), and where it isn't, ``start_call`` answers ``not_available`` with the reason instead of the
@@ -123,13 +141,14 @@ def start_call(args: Any, session_id: Any = None, task_id: Any = None, **_: Any)
             return _answer({"error": "text is required: the words to say out loud."})
         if mode not in ("async", "sync"):
             return _answer({"error": 'mode must be "async" or "sync".'})
+        # The call style is read here, in the conversation's own process and profile (not in the hub's).
         if not hub.routes_mounted():
-            return _answer(remote.start_call(session_id, text, mode))
+            return _answer(guidance.add_style(remote.start_call(session_id, text, mode)))
         origin = hermes.origin(session_id)
         if not origin.session_id:
             return _answer(hub._refusal(mode, "not_allowed", "This conversation can't place a call."))
         cap = hermes.tool_wait_cap(started) if mode == "sync" else None
-        return _answer(hub.get_hub().start_call(origin, text, mode, cap_s=cap))
+        return _answer(guidance.add_style(hub.get_hub().start_call(origin, text, mode, cap_s=cap)))
     except Exception:  # noqa: BLE001 - a tool must never raise
         logger.warning("hermes_voice: start_call failed", exc_info=True)
         return _answer({"error": "The call couldn't be set up. Tell the user in your text reply instead."})

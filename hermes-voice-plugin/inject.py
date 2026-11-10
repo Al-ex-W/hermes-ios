@@ -107,14 +107,14 @@ def turn_text(kind: str, text: str, error: Optional[str] = None) -> Optional[str
     return f"{prefix} {said} {HUNG_UP_HINT if kind == 'hang_up' else REPLY_HINT}"
 
 
-def started_notice(call_id: str, missed: Iterable[str] = ()) -> str:
+def started_notice(call_id: str, missed: Iterable[str] = (), style: str = "") -> str:
     """The notice that opens a call the user placed. `missed`: what they did not hear on the conversation's last
-    call (the agent is reminded once to offer it)."""
+    call (the agent is reminded once to offer it). `style`: their call style (``guidance.style_text``)."""
     return (
         f"[Voice call started] {NOTICE_HEAD} The user is calling you from the HermesVoice app (call {call_id}) "
         "and hears only what you say with start_call: your text replies are not spoken. Mode \"sync\" waits for "
         "their answer; hang up with end_call. What they say arrives as messages starting with \"[Voice]\"."
-        f"{guidance.missed_reminder(missed)}"
+        f"{guidance.missed_reminder(missed)}{' ' + style if style else ''}"
     )
 
 

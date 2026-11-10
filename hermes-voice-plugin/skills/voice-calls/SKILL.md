@@ -131,6 +131,30 @@ A phone call is not a chat window: the user can't skim, scroll back or copy what
   characters a second). Shorten the lines that follow. Text over about 1000 characters is cut (the result says so).
 - Hang up with `end_call` (optionally with a short goodbye) when the conversation is done or they ask.
 
+## Call style: how this user wants to be spoken to
+
+The user's lasting preferences for calls (tone, form of address, humour, ElevenLabs audio tags) live in a file of
+theirs: `<HERMES_HOME>/hermes-voice/call-style.md`. The `start_call` description gives its full path (a plugin
+setting can move it). This skill can't be edited with `skill_manage`; that file is where such preferences go.
+
+- **Follow it.** The plugin hands you the file's current text when a call starts: in the `[Voice call started]`
+  notice, or as `call_style` in the first `start_call` result of a call (the line that rings). The `start_call`
+  description also carries a short copy, read when Hermes started, so that your very first line can follow it;
+  where the two differ, the result has the current text.
+- **Update it** with your file tools when the user states a lasting preference about how you speak on calls
+  ("call me sir", "drop the jokes on calls", "sound calmer"). Read the file, change it, keep it short (the first
+  1500 characters are used; the plugin says when it cut), and tell the user you noted it. A wish for this one call
+  ("speak up, I'm in the car") is not a lasting preference: just do it.
+- It is about how you speak. It doesn't decide when to call or what to do, and the automated `[Voice call …]`
+  notices never belong in it.
+
+**Audio tags.** Square-bracket tags in `text` (`[laughs]`, `[sighs]`, `[excited]`) go to ElevenLabs as written
+and don't count towards a line's length. They only work with ElevenLabs models that support them (ElevenLabs
+documents them for Eleven v3, model `eleven_v3`); with other models, the plugin's default `eleven_flash_v2_5`
+among them, a tag may be read out loud or dropped. So use tags only when the call style asks for them, and stop
+if the user says they hear the tags spoken. Quiet tags (`[whispers]`, low, flat) make a line hard to hear on a
+phone: keep them to a few words, or leave them out.
+
 ## When to ring
 
 Ring when the user asked to be called ("call me when it's done") or for news they would want right away. Never for
