@@ -88,7 +88,9 @@ pushes are registered and what the plugin reports.
 **When your turn ends.** A turn ends when you have been quiet for the pause set under **End of speech**: Quick
 1.5 s, Normal 3.5 s (the default, so a thinking pause of two or three seconds in the middle of a sentence doesn't
 send half of it), Patient 5 s or Very patient 8 s. Both recognizers honour it: Scribe's own silence threshold
-stops at 3 s, so the app asks Scribe for 1.5 s and holds what it hears until the whole pause has passed. While you
+stops at 3 s, so the app asks Scribe for 1.5 s and holds what it hears until the whole pause has passed; Apple's
+recognizer closes a segment after a shorter pause of its own (and its requests can finish by themselves), so the
+app keeps what was heard and puts what you say next behind it. While you
 have words on the call screen, **Send now** ends the turn at once, so a long pause doesn't have to be waited out.
 The call is half-duplex (the microphone is off while Hermes speaks): a line of Hermes that arrives while you are
 mid-turn waits for the turn to end, at most the pause plus two seconds (10 s at the longest), and then cuts in; the
