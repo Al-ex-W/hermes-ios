@@ -68,7 +68,7 @@ plugins:
     hermes_voice:
       settings:
         voice_id: pNInz6obpgDQGcFmaJgB     # default: tts.elevenlabs.voice_id
-        max_chars: 1000
+        max_chars: 1000                    # longest line spoken at once (a line over ~15 s of speech is flagged)
         ring_timeout_s: 45
         sync_reply_timeout_s: 600
         policy:
@@ -141,6 +141,12 @@ in the text, and it is stable:
   `inject.NOTICE_MARKER in message`.
 - In a `[Voice…] <said> (…)` turn only `<said>` is the user's. Drop the bracket prefix and the trailing hint (one of
   the two strings above) before storing it.
+
+**Long lines.** A `start_call` result flags a line that takes longer than about 15 seconds to say: `Long line:
+about 22 s of speech. Keep lines to a sentence or two and offer details instead.` (async and sync, from any
+process). The estimate is 15 characters a second (150 words a minute at six characters a word, about the pace of
+ElevenLabs' voices) over the characters that are spoken, so audio tags in square brackets don't count
+(`guidance.CHARS_PER_SECOND`, `guidance.LONG_LINE_S`). `max_chars` still cuts a line, and the result says so.
 
 **What the user did not hear.** When a call ends by a hang-up or a lost connection while a line is still playing or
 queued (no `played` ack from the phone), the ended notice, or the sync result's `note`, quotes those lines (the

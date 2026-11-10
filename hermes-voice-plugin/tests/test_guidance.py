@@ -4,10 +4,14 @@ ended, offered again when the conversation's next call starts."""
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
+import types
 
+import httpx
 import pytest
 
-from support import PLUGIN_DIR, FakePusher, PacedSpeech, Phone, serving, tool
+from support import PLUGIN_DIR, FakePusher, PacedSpeech, Phone, serving, tool, until
 
 LONG = " ".join(["word"] * 40)
 REMINDER = (f' On the last call in this conversation the user did not hear all of this: "{LONG}". Offer it first, '
@@ -241,6 +245,183 @@ def test_a_sync_reply_that_ends_in_a_hang_up_says_what_to_do_next(core, fake, ma
     assert result["note"].startswith("The user hung up. This is about this call only and is not a preference")
     assert "reply once in text with a short recap" in result["note"] and "did not hear" not in result["note"]
     assert texts == []  # the result said it: no notice on top
+
+
+# ── long lines ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# 330 characters: 22 s at 15 characters a second.
+LONG_LINE = ("I looked at all three options and here is the full comparison. " * 6)[:330].strip()
+LONG_NOTE = "Long line: about 22 s of speech. Keep lines to a sentence or two and offer details instead."
+
+
+@pytest.fixture
+def through_the_socket(core, fake, make_hub, monkeypatch):
+    """A process whose tools reach the hub over its socket (a backend the Desktop app spawned, here): start_call
+    goes tools.py -> remote.py -> hubsock.py -> the hub."""
+    remote = core.loader.module("remote", PLUGIN_DIR)
+    hubsock = core.loader.module("hubsock", PLUGIN_DIR)
+    monkeypatch.setattr(remote, "TURNS", core.inject.Turns(late=remote._late_delivery))
+    monkeypatch.setattr(remote, "_contexts", [])
+    monkeypatch.setattr(remote, "_subscriptions", {})
+    monkeypatch.setattr(remote, "_user_turn_at", {})
+    servers = []
+
+    def start(**hub_kw):
+        hub = make_hub(**hub_kw)
+        servers.append(hubsock.HubServer(hub, fake.home / "hermes-voice").start())
+        monkeypatch.setitem(sys.modules, "hermes_cli.process_identity",
+                            types.SimpleNamespace(is_desktop_owned_backend=lambda: True))
+        assert core.hub.routes_mounted() is False
+        return hub
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def test_the_estimate_counts_what_is_spoken_at_fifteen_characters_a_second(core):
+    guidance = core.guidance
+    assert (guidance.CHARS_PER_SECOND, guidance.LONG_LINE_S) == (15.0, 15.0)
+    assert guidance.speech_seconds("x" * 150) == 10.0
+    assert guidance.long_line_note("x" * 225) == ""  # 15 s: two full sentences, still fine
+    assert guidance.long_line_note("x" * 226).strip() == (
+        "Long line: about 15 s of speech. Keep lines to a sentence or two and offer details instead.")
+    assert guidance.long_line_note(LONG_LINE).strip() == LONG_NOTE
+    # Audio tags are directions to the voice, not speech; ordinary brackets around a sentence are speech.
+    assert guidance.spoken_chars("[whispers] Hello there. [laughs softly]") == len("Hello there.")
+    assert guidance.spoken_chars("  spaced \n out  ") == len("spaced out")
+    tagged = "[excited] " + "x" * 220 + " [sighs]"
+    assert guidance.long_line_note(tagged) == ""
+    bracketed = "[" + "word " * 20 + "]"
+    assert guidance.spoken_chars(bracketed) == len(" ".join(bracketed.split()))
+
+
+@pytest.mark.parametrize("mode", ["async", "sync"])
+def test_a_long_line_is_flagged_in_the_result(core, fake, make_hub, mode):
+    fake.host.add("s1")
+    pusher = FakePusher()
+    make_hub(pusher=pusher)
+
+    async def scenario():
+        async with serving(core) as port:
+            short = await tool(core.tools.start_call, {"text": "Done. Want the details?"})
+            pending = asyncio.create_task(tool(core.tools.start_call, {"text": LONG_LINE, "mode": mode}))
+            phone = await _answer(port, fake, pusher)
+            await phone.expect("speech_end")
+            end = await phone.expect("speech_end")
+            await asyncio.sleep(0.1)
+            await phone.say("okay")
+            result = await asyncio.wait_for(pending, 5)
+            await phone.hang_up()
+            return short, result, end
+
+    short, result, _ = asyncio.run(scenario())
+    assert "Long line" not in short["note"]
+    if mode == "async":
+        assert result["status"] == "ringing" and result["note"].endswith(LONG_NOTE), result
+    else:
+        assert result["said"] == "okay" and result["note"] == LONG_NOTE, result
+
+
+def test_a_long_line_is_flagged_however_a_sync_wait_ends(core, fake, make_hub):
+    """The user hanging up on a long line is the moment the note matters most."""
+    fake.host.add("s1")
+    pusher = FakePusher()
+    make_hub(pusher=pusher, tts=PacedSpeech(delay=0.02))
+
+    async def scenario():
+        async with serving(core) as port:
+            pending = asyncio.create_task(tool(core.tools.start_call, {"text": LONG_LINE, "mode": "sync"}))
+            phone = await _answer(port, fake, pusher)
+            await asyncio.wait_for(phone.heard_audio.wait(), 5)
+            await phone.hang_up()
+            return await asyncio.wait_for(pending, 5)
+
+    result = asyncio.run(scenario())
+    assert result["outcome"] == "ended_by_user" and result["note"].startswith("The user hung up.")
+    assert result["note"].endswith(LONG_NOTE), result
+
+
+def test_a_cut_line_is_judged_by_what_is_spoken(core, fake, make_hub):
+    fake.host.add("s1")
+    make_hub(max_chars=300)
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake)
+            result = await tool(core.tools.start_call, {"text": "word " * 200})
+            await phone.hang_up()
+            return result
+
+    note = asyncio.run(scenario())["note"]
+    assert "Only the first 299 of 999 characters were spoken; the rest was cut." in note
+    assert "text reply" not in note  # the user is listening, not reading
+    assert note.endswith("Long line: about 20 s of speech. Keep lines to a sentence or two and offer details instead.")
+
+
+@pytest.mark.parametrize("mode", ["async", "sync"])
+def test_a_long_line_is_flagged_through_the_hub_socket(core, fake, through_the_socket, mode):
+    hub = through_the_socket(pusher=FakePusher())
+    fake.host.add("s1")
+    if mode == "sync":
+        fake.interrupt_all = True  # stop the wait at once: only the note matters here
+    result = json.loads(core.tools.start_call({"text": LONG_LINE, "mode": mode}, session_id="s1"))
+    fake.interrupt_all = False
+    assert hub.slot is not None and hub.slot.owner.remote and hub.slot.call_id == result["call_id"]
+    if mode == "async":
+        assert result["status"] == "ringing" and result["note"].endswith(LONG_NOTE), result
+    else:
+        # The ring was cut short before the line went out: nothing was said, so nothing is flagged.
+        assert result["status"] == "interrupted" and "Long line" not in result["note"], result
+    short = json.loads(core.tools.start_call({"text": "Short one."}, session_id="s1"))
+    assert "Long line" not in short["note"]
+    remote = core.loader.module("remote", PLUGIN_DIR)
+    asyncio.run(until(lambda: (sub := remote.subscriptions().get(result["call_id"])) is not None
+                      and sub.ready.is_set()))
+    json.loads(core.tools.end_call({}, session_id="s1"))
+
+
+def test_audio_tags_reach_elevenlabs_untouched(core, fake, make_hub):
+    """Square-bracket tags are the voice's directions: the plugin passes the text on as written."""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=b"\x00\x00" * 2400)
+
+    settings = core.config.Settings(fake_tts=False, model_id="eleven_v3")
+    tts = core.tts.ElevenLabs(lambda: settings, api_key=lambda: "key", transport=httpx.MockTransport(handler))
+    fake.host.add("s1")
+    make_hub(settings=settings, tts=tts)
+    line = "[whispers] It's done. [laughs] Want the details?"
+
+    async def scenario():
+        async with serving(core) as port:
+            phone = await Phone.dial(port, fake)
+            result = await tool(core.tools.start_call, {"text": line})
+            await phone.expect("speech_end")
+            await phone.hang_up()
+            return result
+
+    result = asyncio.run(scenario())
+    assert bodies == [{"text": line, "model_id": "eleven_v3"}]
+    assert "Long line" not in result["note"]
+
+
+def test_the_skill_and_the_description_say_how_to_speak(core):
+    description = core.tools.START_CALL["description"]
+    for rule in ("lead with the answer", "two sentences at most", "offer more instead of saying it all",
+                 "a progress update is a few words", "never read out codes, long ids, hashes, URLs, file paths, "
+                 "issue numbers or exact timestamps", "round numbers", "say it shorter and plainer"):
+        assert rule in description, rule
+    skill = _skill()
+    speaking = " ".join(skill[skill.index("## Speaking well"):skill.index("## When to ring")].split())
+    for rule in ("Lead with the answer. Two sentences at most by default", "offer more", "A few words",
+                 "never a report", "course code", "long identifiers", "hashes", "URLs", "file paths",
+                 "issue numbers", "exact timestamps", "Say the human name", "text recap", "Round them",
+                 "shorter and plainer", "Long line: about 22 s of speech", "15 characters a second"):
+        assert rule in speaking, rule
+    assert "about 15 s of speech" in core.tools.START_CALL["parameters"]["properties"]["text"]["description"]
 
 
 # ── the guidance the agent reads ───────────────────────────────────────────────────────────────────────────

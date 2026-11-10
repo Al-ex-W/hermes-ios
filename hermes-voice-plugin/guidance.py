@@ -1,5 +1,8 @@
 """What the plugin tells the agent beyond a call's bare facts.
 
+- **Long lines.** A line is flagged in the ``start_call`` result when it would take longer than ``LONG_LINE_S``
+  to say, estimated at ``CHARS_PER_SECOND`` over the characters that are spoken: audio tags in square brackets
+  (``[laughs]``) are directions to the voice, not speech.
 - **Missed speech.** ``Missed`` keeps, per conversation and in memory only, the lines the user did not hear to the
   end when a call ended, so the next call in that conversation can offer them.
 """
@@ -7,11 +10,43 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Any, Callable, Iterable
 
 logger = logging.getLogger("hermes_voice")
+
+# ── long lines ─────────────────────────────────────────────────────────────────────────────────────────────
+
+# The speech rate of the estimate: 150 words a minute at six characters a word (its space included), about the
+# pace of ElevenLabs' voices at their default speed.
+CHARS_PER_SECOND = 15.0
+# A line that takes longer than this to say is flagged: 225 spoken characters, two full sentences. (The cut at
+# ``max_chars``, 1000 by default, is over a minute of speech.)
+LONG_LINE_S = 15.0
+# An audio tag: a short direction in square brackets, such as [whispers] or [laughs softly].
+AUDIO_TAG = re.compile(r"\[[^\[\]\n]{1,40}\]")
+
+
+def spoken_chars(text: str) -> int:
+    """How many characters of `text` are said out loud (audio tags and extra whitespace are not)."""
+    return len(" ".join(AUDIO_TAG.sub(" ", text or "").split()))
+
+
+def speech_seconds(text: str) -> float:
+    """About how long `text` takes to say."""
+    return spoken_chars(text) / CHARS_PER_SECOND
+
+
+def long_line_note(text: str) -> str:
+    """The note for a line that is too long for a phone call ("" for one that is fine), with a leading space."""
+    seconds = speech_seconds(text)
+    if seconds <= LONG_LINE_S:
+        return ""
+    return (f" Long line: about {round(seconds)} s of speech. Keep lines to a sentence or two and offer details "
+            "instead.")
+
 
 # ── missed speech ──────────────────────────────────────────────────────────────────────────────────────────
 

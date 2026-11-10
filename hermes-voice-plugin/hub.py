@@ -699,6 +699,8 @@ class CallHub:
         call this starts for a conversation in another process (``hubsock.py``)."""
         settings = self.settings()
         text, clip_note = clip(text, settings.max_chars)
+        # What the result says about the line itself: that it was cut, and that it is long for a phone call.
+        line_note = f"{clip_note}{guidance.long_line_note(text)}"
         with self.lock:
             call = self.slot
             if call is not None and not call.owner.matches(origin):
@@ -738,7 +740,7 @@ class CallHub:
             if rang:
                 self.policy.record_ring(origin, call.call_id)
                 logger.info("hermes_voice: ringing for %s (call %s)", origin.session_id, call.call_id[:8])
-        _, waiter = self.enqueue_line(call, text, mode, clip_note, wait=mode == "sync")
+        _, waiter = self.enqueue_line(call, text, mode, line_note, wait=mode == "sync")
         if rang:
             if mode == "sync":
                 self._push(call, mode)
@@ -755,7 +757,7 @@ class CallHub:
             "ended": "The call ended before your line could be spoken.",
         }[status]
         note += " What the user says arrives as [Voice] messages; answer them with start_call."
-        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{clip_note}{reminder}"}, call)
+        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{line_note}{reminder}"}, call)
 
     def _offer_reminder(self, call: Call) -> str:
         """Once per call (under lock): the reminder to offer what the conversation's last call left unheard."""
@@ -848,6 +850,10 @@ class CallHub:
                     if result is not None:
                         if call.waiter is waiter:
                             call.waiter = None
+                        about_line = line.note.strip()
+                        if about_line and line.sent_at is not None and about_line not in (result.get("note") or ""):
+                            # However the wait ended, a line that went out long (or cut) is said to be so.
+                            result["note"] = f"{result.get('note') or ''} {about_line}".strip()
                         if call.state != "ended" and (reminder := self._offer_reminder(call)):
                             result["note"] = f"{result.get('note') or ''}{reminder}".strip()
                         self.changed.notify_all()
@@ -1367,8 +1373,8 @@ def clip(text: str, limit: int) -> tuple[str, str]:
     cut = text.rfind(" ", 0, limit + 1)
     clipped = text[: cut if cut > limit // 2 else limit].rstrip()
     return clipped, (
-        f" Only the first {len(clipped)} of {len(text)} characters were spoken; the rest was cut, "
-        "so put it in your text reply."
+        f" Only the first {len(clipped)} of {len(text)} characters were spoken; the rest was cut. Say what still "
+        "matters in a short next line."
     )
 
 

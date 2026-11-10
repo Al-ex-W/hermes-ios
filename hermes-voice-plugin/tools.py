@@ -32,8 +32,10 @@ _WHAT = (
     "waits until the user replies and returns {said, ending, outcome, call_id}."
 )
 _HOW = (
-    "Say short, natural, spoken sentences: no Markdown, lists, code or URLs (exact identifiers and links go in a "
-    "short text recap)."
+    "Speak as on the phone: lead with the answer, two sentences at most, then offer more instead of saying it "
+    "all; a progress update is a few words. No Markdown, lists or code, and never read out codes, long ids, "
+    "hashes, URLs, file paths, issue numbers or exact timestamps: say the human name, round numbers, and keep "
+    "exact identifiers for a short text recap. Asked to repeat, say it shorter and plainer."
 )
 _WHEN = (
     "Ring only when the user asked to be called or for news they'd want right away, never for routine updates. "
@@ -63,7 +65,10 @@ START_CALL: dict[str, Any] = {
         "properties": {
             "text": {
                 "type": "string",
-                "description": "What to say, as plain conversational speech (it is read out as written).",
+                "description": (
+                    "What to say, as plain conversational speech (it is read out as written). A sentence or "
+                    "two: the result flags a line over about 15 s of speech."
+                ),
             },
             "mode": {
                 "type": "string",
