@@ -94,7 +94,7 @@ class Phone:
         started = time.time() if started is None else started
         ending: dict[str, Any] = {"kind": kind}
         if kind == "end_of_speech":
-            ending.update(detector="apple_silence", detail=1.2)
+            ending.update(detector="apple_silence", detail=3.5)
         await self.send({"type": "user_turn", "call_id": self.call_id, "text": text, "ending": ending,
                          "provider": "apple", "language": "en-US", "started_at": stamp(started),
                          "ended_at": stamp(max(started, time.time()))})

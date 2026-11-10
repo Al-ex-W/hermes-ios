@@ -176,6 +176,15 @@ final class FakeVoicePluginTests: XCTestCase {
         await waitOnLink(timeout: 10) { self.speechStarts.count >= 2 }
         XCTAssertTrue(speechStarts[1].text.contains("blue"), speechStarts[1].text)
 
+        // A turn the user ended with Send now is a finished turn like any other.
+        await waitOnLink(timeout: 10) { self.speechEnded(self.speechStarts[1].id) }
+        link.send(.played(speechStarts[1].id))
+        let later = Date()
+        link.send(.userTurn(UserTurn(callID: callID, text: "green", ending: .endOfSpeech(detector: "send_now", detail: nil),
+                                     provider: .scribe, language: nil, startedAt: later, endedAt: later)))
+        await waitOnLink(timeout: 10) { self.speechStarts.count >= 3 }
+        XCTAssertTrue(speechStarts.count >= 3 && speechStarts[2].text.contains("green"), "\(speechStarts.map(\.text))")
+
         link.close(after: [.bye("hang_up")])
         XCTAssertFalse(events.contains { if case .closed = $0 { return true } else { return false } })
         try await waitForCallToEnd()

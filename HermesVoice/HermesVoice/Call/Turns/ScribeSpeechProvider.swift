@@ -1,7 +1,9 @@
 import AVFoundation
 
 /// User turns from ElevenLabs Scribe realtime: the call's microphone, converted to 16 kHz PCM16, streams to Scribe
-/// over a WebSocket opened with a single-use token from the Hermes Voice plugin; Scribe's VAD commits end turns.
+/// over a WebSocket opened with a single-use token from the Hermes Voice plugin. Scribe's VAD commits each segment
+/// after a short silence, and a turn ends once `pause` seconds have passed with no more speech (Scribe's own
+/// threshold stops at 3 s, so ScribeTurnAssembler waits out the rest on the phone).
 /// While paused the stream carries silence (Scribe closes a session that gets no audio for 15 s).
 @MainActor
 final class ScribeSpeechProvider: SpeechProvider {
@@ -23,16 +25,16 @@ final class ScribeSpeechProvider: SpeechProvider {
     private let continuation: AsyncStream<SpeechEvent>.Continuation
     private let callID: String
     private let language: String?
-    private let silence: TimeInterval
+    /// Silence that ends a turn (the Calls setting).
+    private let pause: TimeInterval
     private let mintToken: () async throws -> String
-    private var assembler = ScribeTurnAssembler()
+    /// Also drops what Scribe still says of words that were flushed or dropped (after a flush or a pause).
+    private var assembler: ScribeTurnAssembler
     private let pump = ScribeAudioPump()
     private var input: AudioInputTap?
     private var socket: URLSessionWebSocketTask?
     private var sessionLanguage: String?
     private var paused = false
-    /// After a flush or a pause, commits of the words before it are dropped until new speech is heard.
-    private var quarantined = false
     private var stopped = false
     private var failures = 0
     private var lastError = ""
@@ -40,12 +42,14 @@ final class ScribeSpeechProvider: SpeechProvider {
     private var ticker: Timer?
     private static let reconnectDelays: [Double] = [0.5, 1, 2, 4, 8]
 
-    /// `language`: ISO 639-1 code, or nil to let Scribe detect it. `mintToken` gets a single-use token per session.
-    init(callID: String, language: String?, silence: TimeInterval, mintToken: @escaping () async throws -> String) {
+    /// `language`: ISO 639-1 code, or nil to let Scribe detect it. `pause`: seconds of silence that end a turn.
+    /// `mintToken` gets a single-use token per session.
+    init(callID: String, language: String?, pause: TimeInterval, mintToken: @escaping () async throws -> String) {
         self.callID = callID
         self.language = language
-        self.silence = silence
+        self.pause = pause
         self.mintToken = mintToken
+        assembler = ScribeTurnAssembler(pause: pause)
         (events, continuation) = AsyncStream.makeStream(of: SpeechEvent.self)
     }
 
@@ -54,7 +58,8 @@ final class ScribeSpeechProvider: SpeechProvider {
         let pump = pump
         input.setSink { buffer in pump.append(buffer) }
         try await open()
-        ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        // Ends held commits once the pause has passed.
+        ticker = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.tick() }
         }
     }
@@ -64,17 +69,15 @@ final class ScribeSpeechProvider: SpeechProvider {
         paused = value
         pump.setPaused(value)
         if value {
-            // Whatever was half heard was flushed by the caller, or is dropped now.
-            quarantined = true
-            if assembler.hasText {
-                assembler.reset()
-                continuation.yield(.partial(""))
-            }
+            // Whatever was half heard was flushed by the caller, or is dropped now. Held commits go with it, so the
+            // pause that ends a turn isn't counted while Hermes speaks.
+            let hadText = assembler.hasText
+            assembler.discard()
+            if hadText { continuation.yield(.partial("")) }
         }
     }
 
     func flush(_ ending: TurnEnding) -> UserTurn? {
-        quarantined = true
         guard let finished = assembler.take(at: Date()) else { return nil }
         continuation.yield(.partial(""))
         return turn(finished, ending: ending)
@@ -102,7 +105,8 @@ final class ScribeSpeechProvider: SpeechProvider {
     private func open() async throws {
         let token = try await mintToken()
         guard !stopped else { return }
-        let task = URLSession.shared.webSocketTask(with: Scribe.url(token: token, silence: silence, language: language))
+        let url = Scribe.url(token: token, silence: assembler.vadSilence, language: language)
+        let task = URLSession.shared.webSocketTask(with: url)
         socket = task
         task.resume()
         receive(on: task)
@@ -135,18 +139,19 @@ final class ScribeSpeechProvider: SpeechProvider {
             failures = 0
             lastError = ""
             sessionLanguage = language
+            assembler.sessionStarted()
             pump.attach(task)
             continuation.yield(.status(nil))
         case let .partial(text):
             guard !paused else { return }
-            if !text.trimmingCharacters(in: .whitespaces).isEmpty { quarantined = false }
             assembler.partial(text, at: now)
             continuation.yield(.partial(assembler.text))
         case let .committed(text, language, timestamps):
-            guard !paused, !quarantined else { return }
+            // While paused Scribe hears silence, so this commit closes the segment that was open before the pause.
+            guard !paused else { return assembler.segmentClosed() }
             if let finished = assembler.commit(text, language: language, timestamps: timestamps, at: now) {
                 continuation.yield(.partial(""))
-                continuation.yield(.turn(turn(finished, ending: .endOfSpeech(detector: "scribe_vad", detail: silence))))
+                continuation.yield(.turn(turn(finished, ending: .endOfSpeech(detector: "scribe_vad", detail: pause))))
             } else {
                 continuation.yield(.partial(assembler.text))
             }
@@ -195,7 +200,7 @@ final class ScribeSpeechProvider: SpeechProvider {
     private func tick() {
         guard !paused, let finished = assembler.tick(at: Date()) else { return }
         continuation.yield(.partial(""))
-        continuation.yield(.turn(turn(finished, ending: .endOfSpeech(detector: "scribe_vad", detail: silence))))
+        continuation.yield(.turn(turn(finished, ending: .endOfSpeech(detector: "scribe_vad", detail: pause))))
     }
 
     private func turn(_ finished: ScribeTurnAssembler.Finished, ending: TurnEnding) -> UserTurn {

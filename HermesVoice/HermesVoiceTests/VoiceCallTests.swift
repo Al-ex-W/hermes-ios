@@ -223,8 +223,8 @@ final class VoiceCallTests: XCTestCase {
     }
 
     /// A call the user started, live with its audio running, listening with a FakeSpeech.
-    private func liveCall() async -> (VoiceCall, FakeSpeech) {
-        let call = userCall()
+    private func liveCall(_ configure: (inout VoiceCall.Environment) -> Void = { _ in }) async -> (VoiceCall, FakeSpeech) {
+        let call = userCall(configure)
         call.begin()
         await waitUntil { self.links.count == 1 && self.link.connects == 1 }
         link.deliver(.ready(callID: callID, ringing: false))
@@ -571,6 +571,104 @@ final class VoiceCallTests: XCTestCase {
         XCTAssertEqual(speech.paused.last, true)
         XCTAssertEqual(speech.flushed, [.cutOff])
         XCTAssertTrue(link.turns.isEmpty)
+    }
+
+    func testSpeechWaitsThroughAThinkingPause() async {
+        // The grace outlasts the pause that ends a turn (`cutOffGrace(pause:)`), so a user who has stopped talking,
+        // to think or because they are done, isn't cut off before that pause is over.
+        let (call, speech) = await liveCall { $0.cutOffGrace = 5 }
+        speech.hear("let me think")
+        link.deliver(.speechStart(id: "u1", text: "Sure", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        await settle(0.6)
+        XCTAssertFalse(call.hermesSpeaking)
+        XCTAssertEqual(speech.paused.last, false, "still listening: the pause runs on")
+        XCTAssertTrue(link.turns.isEmpty)
+        // The pause passes: the turn ended by itself, and Hermes' line plays.
+        speech.finishTurn()
+        await waitUntil { call.hermesSpeaking }
+        XCTAssertEqual(link.turns.map(\.ending), [.endOfSpeech(detector: "test", detail: nil)])
+        XCTAssertEqual(speech.paused.last, true, "no pause is counted while Hermes speaks")
+        link.deliver(.speechEnd(id: "u1", cancelled: false, error: nil))
+        XCTAssertEqual(link.sent.last, .played("u1"))
+        XCTAssertEqual(speech.paused.last, false)
+    }
+
+    // MARK: Send now
+
+    func testSendNowEndsTheTurnAtOnce() async {
+        let (call, speech) = await liveCall()
+        XCTAssertFalse(call.canSendNow)
+        speech.hear("that is all I wanted to say")
+        await waitUntil { call.canSendNow }
+        call.sendNow()
+        XCTAssertEqual(link.turns.map(\.text), ["that is all I wanted to say"])
+        XCTAssertEqual(link.turns.first?.ending, .endOfSpeech(detector: "send_now", detail: nil))
+        XCTAssertEqual(link.turns.first?.callID, callID)
+        XCTAssertEqual(call.hearing, "")
+        XCTAssertFalse(call.canSendNow)
+        XCTAssertEqual(speech.paused.last, false, "listening goes on")
+        XCTAssertFalse(call.hermesSpeaking)
+        // Nothing is left to send.
+        call.sendNow()
+        XCTAssertEqual(link.turns.count, 1)
+        // What is said next is a turn of its own.
+        speech.hear("one more thing")
+        speech.finishTurn()
+        await waitUntil { self.link.turns.count == 2 }
+        XCTAssertEqual(link.turns.map(\.text), ["that is all I wanted to say", "one more thing"])
+    }
+
+    func testSendNowGoesOutAsAFinishedTurn() async throws {
+        let (call, speech) = await liveCall()
+        speech.hear("done")
+        call.sendNow()
+        let sent = try XCTUnwrap(link.sent.first)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try sent.encoded().utf8)) as? [String: Any])
+        XCTAssertEqual(json["type"] as? String, "user_turn")
+        XCTAssertEqual(json["text"] as? String, "done")
+        // The plugin reads `kind`; a turn that ended normally is the reply a waiting start_call takes.
+        XCTAssertEqual(json["ending"] as? NSDictionary, ["kind": "end_of_speech", "detector": "send_now"])
+    }
+
+    func testSendNowLetsHermesSpeechThatWaitedPlay() async {
+        let (call, speech) = await liveCall { $0.cutOffGrace = 30 }
+        speech.hear("I am done")
+        link.deliver(.speechStart(id: "u1", text: "Sure", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        XCTAssertFalse(call.hermesSpeaking)
+        call.sendNow()
+        XCTAssertTrue(call.hermesSpeaking, "the line that waited for the turn plays at once")
+        XCTAssertEqual(call.lastSpoken, "Sure")
+        XCTAssertEqual(speech.paused.last, true)
+        XCTAssertEqual(link.turns.map(\.ending), [.endOfSpeech(detector: "send_now", detail: nil)], "sent, not cut off")
+        link.deliver(.speechEnd(id: "u1", cancelled: false, error: nil))
+        XCTAssertEqual(link.sent.last, .played("u1"))
+        XCTAssertFalse(call.hermesSpeaking)
+    }
+
+    func testSendNowWhileTheLinkIsDownWaitsForTheNextOne() async {
+        let (call, speech) = await liveCall()
+        link.drop()
+        speech.hear("are you there")
+        call.sendNow()
+        await waitUntil { self.links.count == 2 && self.link.connects == 1 }
+        XCTAssertTrue(link.turns.isEmpty)
+        link.deliver(.ready(callID: callID, ringing: false))
+        XCTAssertEqual(link.turns.map(\.text), ["are you there"])
+        XCTAssertEqual(link.turns.first?.ending, .endOfSpeech(detector: "send_now", detail: nil))
+    }
+
+    func testNothingToSendNowWithoutWords() async {
+        let (call, speech) = await liveCall()
+        call.sendNow()
+        XCTAssertTrue(link.turns.isEmpty)
+        // While Hermes speaks (or the call is muted) nothing is heard, so there is nothing to send.
+        link.deliver(.speechStart(id: "u1", text: "Hi", sampleRate: 24_000))
+        XCTAssertFalse(call.canSendNow)
+        call.sendNow()
+        XCTAssertTrue(link.turns.isEmpty)
+        XCTAssertEqual(speech.paused.last, true)
     }
 
     func testHangUpFlushesWhatWasHeard() async {

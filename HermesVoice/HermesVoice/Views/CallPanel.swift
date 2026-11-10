@@ -31,7 +31,14 @@ struct CallPanel: View {
                 Text(note).font(.caption).foregroundStyle(.secondary)
             }
             if !call.hearing.isEmpty {
-                Text(call.hearing).font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                HStack(spacing: 10) {
+                    // Cut at the head, so the newest words stay in view: they are what Send now sends.
+                    Text(call.hearing).font(.callout).foregroundStyle(.secondary).lineLimit(2).truncationMode(.head)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if call.canSendNow {
+                        sendNowButton
+                    }
+                }
             } else if call.hermesSpeaking {
                 Text(call.lastSpoken).font(.callout).foregroundStyle(.secondary).lineLimit(2)
             }
@@ -76,6 +83,20 @@ struct CallPanel: View {
         }
         .font(.headline)
         .buttonStyle(.plain)
+    }
+
+    /// Ends the user's turn at once, instead of after the pause set in Settings → Calls.
+    private var sendNowButton: some View {
+        Button { call.sendNow() } label: {
+            Label("Send now", systemImage: "arrow.up")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.green, in: Capsule())
+                .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Sends what you said so far to Hermes without waiting for a pause")
     }
 
     private var liveControls: some View {

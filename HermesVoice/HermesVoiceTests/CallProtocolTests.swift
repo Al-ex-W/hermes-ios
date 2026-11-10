@@ -13,7 +13,7 @@ final class CallProtocolTests: XCTestCase {
 
     func testUserTurnEncodesSnakeCaseWithISODates() throws {
         let started = Date(timeIntervalSince1970: 1_790_000_000.25)
-        let turn = UserTurn(callID: callID, text: "Hej Hermes", ending: .endOfSpeech(detector: "apple_silence", detail: 1.2),
+        let turn = UserTurn(callID: callID, text: "Hej Hermes", ending: .endOfSpeech(detector: "apple_silence", detail: 3.5),
                             provider: .apple, language: "sv-SE", startedAt: started, endedAt: started.addingTimeInterval(2))
         let json = try object(PhoneMessage.userTurn(turn).encoded())
 
@@ -27,13 +27,14 @@ final class CallProtocolTests: XCTestCase {
         let ending = try XCTUnwrap(json["ending"] as? [String: Any])
         XCTAssertEqual(ending["kind"] as? String, "end_of_speech")
         XCTAssertEqual(ending["detector"] as? String, "apple_silence")
-        XCTAssertEqual(ending["detail"] as? Double, 1.2)
+        XCTAssertEqual(ending["detail"] as? Double, 3.5)
         XCTAssertNil(ending["error"])
     }
 
     func testEveryEndingRoundTrips() throws {
         let endings: [TurnEnding] = [
-            .endOfSpeech(detector: "scribe_vad", detail: 0.8), .endOfSpeech(detector: "typed", detail: nil),
+            .endOfSpeech(detector: "scribe_vad", detail: 3.5), .endOfSpeech(detector: "typed", detail: nil),
+            .endOfSpeech(detector: "send_now", detail: nil),
             .cutOff, .hangUp, .muted, .dropped, .providerError("Recognition failed"),
         ]
         let now = Date(timeIntervalSince1970: 1_790_000_000.5)
@@ -54,6 +55,7 @@ final class CallProtocolTests: XCTestCase {
         XCTAssertEqual(try kind(.dropped) as NSDictionary, ["kind": "dropped"])
         XCTAssertEqual(try kind(.providerError("boom")) as NSDictionary, ["kind": "provider_error", "error": "boom"])
         XCTAssertEqual(try kind(.endOfSpeech(detector: "typed", detail: nil)) as NSDictionary, ["kind": "end_of_speech", "detector": "typed"])
+        XCTAssertEqual(try kind(.endOfSpeech(detector: "send_now", detail: nil)) as NSDictionary, ["kind": "end_of_speech", "detector": "send_now"])
     }
 
     func testDecodesDatesWithoutFractionAndRejectsUnknownEndings() throws {

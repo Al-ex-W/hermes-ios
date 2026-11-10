@@ -40,7 +40,7 @@ final class VoiceCall: ObservableObject, Identifiable {
         var attach: @MainActor (ChatModel) async throws -> Void = { try await $0.ensureAttached() }
         /// Matches the plugin's ring timeout.
         var ringTimeout: TimeInterval = 45
-        /// How long Hermes' speech waits for the user to finish a sentence before cutting in.
+        /// How long Hermes' speech waits for the user's turn to end before cutting in (see `cutOffGrace(pause:)`).
         var cutOffGrace: TimeInterval = 3
         /// Seconds before each reconnect attempt; together under the plugin's 60 s before a dropped call is lost.
         var reconnectDelays: [Double] = [0.5, 1, 2, 4, 8, 8, 15, 15]
@@ -49,22 +49,31 @@ final class VoiceCall: ObservableObject, Identifiable {
         /// How long an answered call waits for CallKit to bring up its audio before it says `answered` anyway.
         var answerAudioWait: TimeInterval = 5
 
+        /// The grace for turns that end after `pause` seconds of silence. A turn ends `pause` after the user's last
+        /// word, so the grace has to outlast the pause, or Hermes' next line would cut in on everyone who is still
+        /// inside it (thinking, or simply done): the pause, plus two seconds to finish the sentence. At most 10 s:
+        /// the plugin waits 15 s past a line's length (hub.py `PLAYBACK_MARGIN`) for the phone to say it played.
+        static func cutOffGrace(pause: TimeInterval) -> TimeInterval {
+            min(10, max(3, pause + 2))
+        }
+
         static func live(client: DashboardClient, settings: CallSettings) -> Environment {
-            Environment(
+            let pause = settings.endOfSpeech.pause
+            var environment = Environment(
                 makeLink: { hello in VoiceLink(client: client, hello: hello) },
                 makeSpeech: { provider, callID in
                     switch provider {
                     case .apple:
-                        return AppleSpeechProvider(callID: callID, localeIdentifier: settings.speechLocale,
-                                                   pause: settings.endOfSpeech.appleSilence)
+                        return AppleSpeechProvider(callID: callID, localeIdentifier: settings.speechLocale, pause: pause)
                     case .scribe:
-                        return ScribeSpeechProvider(callID: callID, language: settings.languageCode,
-                                                    silence: settings.endOfSpeech.scribeSilence) {
+                        return ScribeSpeechProvider(callID: callID, language: settings.languageCode, pause: pause) {
                             try await VoicePluginAPI.scribeToken(client)
                         }
                     }
                 }
             )
+            environment.cutOffGrace = cutOffGrace(pause: pause)
+            return environment
         }
     }
 
@@ -263,6 +272,18 @@ final class VoiceCall: ObservableObject, Identifiable {
         guard audioStarts > 0 else { return speakerOn.toggle() }
         try? CallAudio.setSpeaker(!CallAudio.outputIsSpeaker)
         speakerOn = CallAudio.outputIsSpeaker
+    }
+
+    /// Words of the user's turn are on screen and can be sent with `sendNow`.
+    var canSendNow: Bool { state == .live && !hearing.isEmpty }
+
+    /// The user is done talking: what was heard so far goes to Hermes at once, as a turn that ended normally,
+    /// without waiting out the pause that ends a turn. Speech of Hermes that waited for the turn plays now.
+    func sendNow() {
+        guard state == .live, let turn = speech?.flush(.endOfSpeech(detector: "send_now", detail: nil)) else { return }
+        hearing = ""
+        deliver(turn)
+        if deferTimer != nil { releaseSpeech() }
     }
 
     /// A turn typed instead of spoken (the Simulator has no microphone).
@@ -610,8 +631,9 @@ final class VoiceCall: ObservableObject, Identifiable {
 
     // MARK: Hermes' speech
 
-    /// Hermes started speaking while the user is mid-sentence: its speech waits up to `cutOffGrace` for the sentence
-    /// to end (the call is half-duplex: the microphone is off while Hermes speaks). Then the user is cut off.
+    /// Hermes started speaking while the user is mid-turn: its speech waits up to `cutOffGrace` for the turn to end,
+    /// by its pause or by Send now (the call is half-duplex: the microphone is off while Hermes speaks). Then the
+    /// user is cut off. The pause that ends a turn runs on meanwhile, and stops once Hermes speaks.
     private func holdSpeech(_ message: PluginMessage) {
         deferred = [message]
         let grace = environment.cutOffGrace
