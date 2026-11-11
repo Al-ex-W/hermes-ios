@@ -10,9 +10,11 @@ private let notificationLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? 
 
 /// A background alert from the Hermes Voice plugin: an approval or a question waiting in a session, or a turn that
 /// finished. The push is `{aps: {alert: {title, body}, category, thread-id, sound}, hermes: {kind, session_id, profile,
-/// request_id, choices, questions}}`; the app posts the same shape locally for follow-ups.
+/// request_id, choices, questions}}`; the app posts the same shape locally for follow-ups. A test alert (Settings >
+/// Notifications) has `test: true` and `test_id` under `hermes` and belongs to no session: it is answered on this
+/// iPhone alone, never with `request.answer`.
 struct AlertPush: Equatable, Sendable {
-    enum Kind: String, Sendable {
+    enum Kind: String, Sendable, CaseIterable {
         case approval
         case clarify
         case turnDone = "turn_done"
@@ -30,9 +32,16 @@ struct AlertPush: Equatable, Sendable {
     let questions: [ClarifyQuestion]
     let title: String
     let body: String
+    /// A test alert the plugin sent because this iPhone asked (`hermes.test`): nothing waits on its answer.
+    let isTest: Bool
+    /// The plugin's id for the test (`hermes.test_id`), to tell it what the user did.
+    let testID: String?
 
     init(kind: Kind, sessionID: String, profile: String? = nil, requestID: String? = nil, choices: [ApprovalChoice] = [],
-         questions: [ClarifyQuestion] = [], title: String = "Hermes", body: String = "") {
+         questions: [ClarifyQuestion] = [], title: String = "Hermes", body: String = "", isTest: Bool = false,
+         testID: String? = nil) {
+        self.isTest = isTest
+        self.testID = isTest ? testID : nil
         self.kind = kind
         self.sessionID = sessionID
         self.profile = profile
@@ -61,7 +70,8 @@ struct AlertPush: Equatable, Sendable {
         self.init(kind: kind, sessionID: sessionID, profile: Self.text(hermes["profile"]),
                   requestID: Self.text(hermes["request_id"]), choices: offered ?? ApprovalChoice.allCases,
                   questions: questions, title: Self.text(alert["title"]) ?? "Hermes",
-                  body: alert["body"]?.stringValue ?? alert.stringValue ?? "")
+                  body: alert["body"]?.stringValue ?? alert.stringValue ?? "",
+                  isTest: hermes["test"]?.boolValue == true, testID: Self.text(hermes["test_id"]))
     }
 
     /// The notification category that carries this kind's actions.
@@ -78,6 +88,8 @@ struct AlertPush: Equatable, Sendable {
         var hermes: [String: JSONValue] = ["kind": .string(kind.rawValue), "session_id": .string(sessionID)]
         if let profile { hermes["profile"] = .string(profile) }
         if let requestID { hermes["request_id"] = .string(requestID) }
+        if isTest { hermes["test"] = .bool(true) }
+        if let testID { hermes["test_id"] = .string(testID) }
         if kind == .approval { hermes["choices"] = .array(choices.map { .string($0.rawValue) }) }
         if kind == .clarify {
             hermes["questions"] = .array(questions.map { question in
@@ -97,7 +109,7 @@ struct AlertPush: Equatable, Sendable {
         let next = remaining.first
         let choices = next?.choices.map { "\n" + $0.joined(separator: " · ") } ?? ""
         return AlertPush(kind: kind, sessionID: sessionID, profile: profile, requestID: requestID, questions: remaining,
-                         title: title, body: (next?.question ?? body) + choices)
+                         title: title, body: (next?.question ?? body) + choices, isTest: isTest, testID: testID)
     }
 
     /// The offered choices Hermes knows, and always `deny` (as the approval card shows them).
@@ -291,6 +303,18 @@ final class AlertNotifications: NSObject, ObservableObject {
     /// Whether iOS lets the app show notifications (for Settings > Notifications).
     @Published private(set) var authorization: UNAuthorizationStatus = .notDetermined
     @Published var openRequest: SessionTarget?
+    /// The test alert Settings > Notifications asked the plugin for, and what became of it.
+    @Published private(set) var test: TestAlertState?
+
+    /// How long the plugin waits before it pushes a test, so the user can lock the phone or leave the app first.
+    nonisolated static let testDelay: TimeInterval = 5
+    /// How often a delayed test's outcome is read from the plugin, and how many times at most.
+    var testPollInterval: TimeInterval = 1
+    var testPolls = 40
+    /// The dashboard client a test alert's answer is reported through; nil: the app's own, signing in first when
+    /// the action woke the app (as a real answer does).
+    var testClient: (() async throws -> DashboardClient)?
+    private var testFollow: Task<Void, Never>?
 
     private weak var model: AppModel?
     /// The chat on screen, set by the detail column.
@@ -314,9 +338,11 @@ final class AlertNotifications: NSObject, ObservableObject {
         }
     }
 
-    /// Foreground presentation: nothing while the alert's session is on screen (its card or reply shows there).
+    /// Foreground presentation: nothing while the alert's session is on screen (its card or reply shows there). A
+    /// test alert always shows: it belongs to no session, and the user asked to see it.
     nonisolated static func presentation(for push: AlertPush?, sessionOnScreen: Bool) -> UNNotificationPresentationOptions {
-        push != nil && sessionOnScreen ? [] : [.banner, .list, .sound]
+        guard let push, !push.isTest, sessionOnScreen else { return [.banner, .list, .sound] }
+        return []
     }
 
     func attach(to model: AppModel) {
@@ -393,9 +419,11 @@ final class AlertNotifications: NSObject, ObservableObject {
         center.removeAllDeliveredNotifications()
     }
 
-    /// Settings > Notifications' test: a local notification now, asking for permission first if iOS never asked.
-    /// Nil when it went out, else why not.
-    func sendTest() async -> String? {
+    /// Settings > Notifications' test: asks the plugin to push a `kind` alert to this iPhone through APNs in
+    /// `testDelay` seconds (asking iOS for permission first if it never asked), and keeps `test` at what became of it.
+    func sendTest(_ kind: AlertPush.Kind) async {
+        testFollow?.cancel()
+        test = .asking(kind)
         var status = await center.notificationSettings().authorizationStatus
         if status == .notDetermined {
             _ = try? await center.requestAuthorization(options: [.alert, .sound])
@@ -403,8 +431,69 @@ final class AlertNotifications: NSObject, ObservableObject {
         }
         await sync(asking: false)
         guard Self.registered(.defaults, status: status).anyEnabled else {
-            return "Notifications are off for this app in iOS Settings."
+            test = .failed(kind, "Notifications are off for this app in iOS Settings.")
+            return
         }
+        guard let model, model.signedIn, let client = model.client else {
+            test = .failed(kind, "Sign in to Hermes first.")
+            return
+        }
+        // The plugin finds this iPhone by the tokens it registered: make sure it has the latest.
+        await model.push.send(to: client)
+        await requestTest(kind, client: client, voipToken: model.push.token, alertToken: model.push.alertToken)
+    }
+
+    /// Asks the plugin on `client` for the test alert and follows a delayed one to its outcome. A host whose plugin
+    /// has no test route gets a local notification instead, and the row says so.
+    func requestTest(_ kind: AlertPush.Kind, client: DashboardClient, voipToken: String?, alertToken: String?,
+                     delay: TimeInterval = AlertNotifications.testDelay) async {
+        testFollow?.cancel()
+        test = .asking(kind)
+        guard let body = VoicePluginAPI.testAlertBody(kind: kind, voipToken: voipToken, alertToken: alertToken, delay: delay) else {
+            test = .failed(kind, TestAlertState.noToken)
+            return
+        }
+        do {
+            let result = try await VoicePluginAPI.testAlert(client, body: body)
+            apply(result)
+            if result.status == .scheduled { follow(result.id, kind: kind, client: client) }
+        } catch VoicePluginAPI.Failure.notInstalled {
+            let local = await postLocalTest()
+            test = .failed(kind, "This Hermes host can't send test pushes: install or update the hermes_voice plugin there. "
+                           + (local ?? "A local notification was shown instead; it only checks that iOS lets the app notify."))
+        } catch {
+            test = .failed(kind, error.localizedDescription)
+        }
+    }
+
+    private func apply(_ result: TestAlertResult) {
+        test = (test ?? .asking(result.kind)).applying(result)
+    }
+
+    /// Reads a delayed test's outcome until the plugin has pushed it (or failed to).
+    private func follow(_ id: String, kind: AlertPush.Kind, client: DashboardClient) {
+        testFollow = Task { [weak self] in
+            guard let interval = self?.testPollInterval, let polls = self?.testPolls else { return }
+            for _ in 0..<polls {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard !Task.isCancelled, let self, self.test?.id == id, self.test?.phase == .scheduled else { return }
+                if let result = try? await VoicePluginAPI.testAlertStatus(client, id: id), result.status != .scheduled {
+                    guard !Task.isCancelled else { return }
+                    return self.apply(result)
+                }
+            }
+            guard !Task.isCancelled, let self, self.test?.id == id, self.test?.phase == .scheduled else { return }
+            self.test = .failed(kind, TestAlertState.lost, id: id)
+        }
+    }
+
+    /// A test alert showed while the app was in front.
+    private func testArrived(_ push: AlertPush) {
+        test = (test ?? TestAlertState(kind: push.kind, id: push.testID, phase: .sent, message: "")).arrived(push)
+    }
+
+    /// A notification of the app's own (no APNs): nil when it went out, else why not.
+    private func postLocalTest() async -> String? {
         let content = UNMutableNotificationContent()
         content.title = "Hermes"
         content.body = "Notifications from Hermes reach this iPhone."
@@ -417,11 +506,44 @@ final class AlertNotifications: NSObject, ObservableObject {
         }
     }
 
+    /// A test alert's action. Nothing in Hermes waits on it, so no `request.answer` goes out: the answer is
+    /// confirmed on this iPhone (the Settings row and a notification), and the plugin is told which action it was,
+    /// over the dashboard sign-in a real answer needs too.
+    private func handleTest(_ intent: AlertIntent, _ push: AlertPush) async {
+        if case let .unanswerable(reason, retry) = intent { return post(push, note: reason, actions: retry) }
+        guard let answer = TestAlertAnswer.of(intent) else { return }
+        let background = BackgroundTask(name: "Hermes test alert answer")
+        defer { background.end() }
+        var summary = answer.summary
+        if let id = push.testID {
+            do {
+                let client: DashboardClient
+                if let testClient { client = try await testClient() } else { client = try await signedInClient() }
+                try await VoicePluginAPI.answerTestAlert(client, id: id, action: answer.action)
+            } catch {
+                summary += " Hermes wasn't told: \(error.localizedDescription)"
+            }
+        }
+        notificationLog.info("test \(push.kind.rawValue, privacy: .public) alert: \(answer.action, privacy: .public)")
+        testFollow?.cancel()
+        test = TestAlertState(kind: push.kind, id: push.testID, phase: .answered, message: summary)
+        let content = UNMutableNotificationContent()
+        content.title = push.title
+        content.body = summary
+        do {
+            try await center.add(UNNotificationRequest(identifier: "hermes-test-result", content: content, trigger: nil))
+        } catch {
+            notificationLog.error("Can't confirm the test answer: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     // MARK: Actions
 
     func handle(action: String, text: String?, push: AlertPush?) async {
         guard let push else { return }
-        switch AlertIntent.of(action: action, text: text, push: push) {
+        let intent = AlertIntent.of(action: action, text: text, push: push)
+        if push.isTest { return await handleTest(intent, push) }
+        switch intent {
         case .ignore:
             return
         case .open:
@@ -526,6 +648,7 @@ extension AlertNotifications: UNUserNotificationCenterDelegate {
                                             withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         let push = AlertPush(userInfo: notification.request.content.userInfo)
         Task { @MainActor in
+            if let push, push.isTest { self.testArrived(push) }
             completionHandler(Self.presentation(for: push, sessionOnScreen: push.map { self.isOnScreen($0.sessionID) } ?? false))
         }
     }

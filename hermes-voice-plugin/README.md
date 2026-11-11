@@ -18,7 +18,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
 - **Hub socket** `<HERMES_HOME>/hermes-voice/hub.sock`: how conversations in other Hermes processes (CLI, Ink TUI,
   the messaging gateway, cron, compute-host children, backends the Hermes Desktop app spawns) place and hear
   calls (see "Calls from any session").
-- **Routes** under `/api/plugins/hermes_voice/`: `WS /phone?ticket=…`, `POST /devices`, `POST /scribe-token`,
+- **Routes** under `/api/plugins/hermes_voice/`: `WS /phone?ticket=…`, `POST /devices`, `POST /devices/test` (with
+  `GET /devices/test/{test_id}` and `POST /devices/test/{test_id}/answer`; see "Test alerts"), `POST /scribe-token`,
   `GET /status`.
 
 `POST /devices {voip_token, alert_token?, environment: "sandbox" | "production", bundle_id, alerts?}` registers a
@@ -301,6 +302,71 @@ only the alert token: the phone still rings. A push APNs couldn't take for a pas
 budget (one sounding turn_done per conversation every 5 minutes, 20 sounding alerts an hour), alerts go silently:
 no `sound`, `"interruption-level": "passive"`. The log names the kind, how many phones and APNs' reason, never a
 token or the payload.
+
+### Test alerts
+
+A chat that is open gets no alerts, so an approval asked for in it never reaches the phone as a push. To check that
+pushes arrive and can be answered, the app's **Settings → Notifications → Send test notification** asks for a
+sample one:
+
+```
+POST /api/plugins/hermes_voice/devices/test
+{"voip_token": "<hex>", "alert_token": "<hex>", "kind": "approval", "delay_s": 5}
+```
+
+- `voip_token` and/or `alert_token` say which phone asks, as a registration does (the VoIP token first, else the
+  alert token). The push goes to that phone's alert token and to no other phone.
+- `kind`: `approval` (the default), `clarify` or `turn_done`. `delay_s`: 0 to 30, default 0; the app sends 5 so the
+  user can lock the phone or leave the app first.
+- The route sits behind the dashboard's auth like the others and takes 6 requests a minute (`429` after that); a
+  bad body is `400 {detail}`.
+
+The push goes through the same sender as a real alert (`push.Apns.push_alert`: the same headers, the kind's
+category and expiry, collapse id `test-<test_id>`), always with sound, outside quiet hours' silence and the
+budget. Its payload is a real one's plus two marks:
+
+```json
+{"aps": {"alert": {"title": "Hermes test", "body": "Test approval: nothing will run, whatever you choose."},
+         "category": "HERMES_APPROVAL", "thread-id": "hermes-voice-test", "sound": "default"},
+ "hermes": {"kind": "approval", "session_id": "hermes-voice-test", "profile": "default",
+            "request_id": "test-<test_id>", "choices": ["once", "session", "always", "deny"],
+            "test": true, "test_id": "<16 hex>"}}
+```
+
+A `clarify` test carries one open question (`qid: "test"`), a `turn_done` test no `request_id`. The answer, with
+`200`:
+
+```json
+{"ok": true, "test_id": "<16 hex>", "kind": "approval", "status": "sent", "code": "sent",
+ "message": "APNs accepted the test notification. …", "delay_s": 0.0, "action": null}
+```
+
+`status` is `sent` (APNs accepted it), `scheduled` (`delay_s` > 0: it goes out then), `failed` or `answered`;
+`ok` is false only for `failed`. `message` is a sentence the app shows as it is. `code` for a failure:
+
+| `code` | What happened |
+|---|---|
+| `not_registered` | no registered phone has these tokens |
+| `apns_not_configured` | the APNs key isn't set or readable, or `h2` is missing (the message says which) |
+| `off_on_host` | `settings.alerts` turns alerts, or this kind, off |
+| `no_alert_token` | the phone registered for calls only (iOS gave it no alert token) |
+| `off_on_phone` | the phone turned this kind off |
+| `bad_token` | APNs `BadDeviceToken` / `Unregistered` / `410`: an old token, or one of the other environment (sandbox for a build from Xcode, production for TestFlight and the App Store). As for a real alert, the alert token is forgotten until the phone registers again |
+| `wrong_environment` | APNs `BadEnvironmentKeyInToken`: the key doesn't cover the phone's environment |
+| `wrong_topic` | APNs `DeviceTokenNotForTopic` / `BadTopic` / `TopicDisallowed`: the key is for another app or team |
+| `bad_key` | any other APNs `403` (`InvalidProviderToken` …): key id, team id or `.p8` are wrong |
+| `apns_unreachable` | APNs couldn't be reached, or answered `429` / `5xx` |
+| `refused` | anything else; the message carries APNs' answer |
+
+`GET /devices/test/{test_id}` answers the same object later (the host keeps the last 50 tests in memory): that is
+how the app learns a delayed test's outcome. The app answers a test alert on the phone alone: no `request.answer`,
+no conversation. It then posts `POST /devices/test/{test_id}/answer {"action": "once" | "session" | "always" |
+"deny" | "reply" | "open"}` (which button; never a reply's text), and the test becomes `answered` with that
+`action`.
+
+`rings.jsonl` gets `{"event": "test_alert", "kind", "result": <code>, "detail": <APNs' answer>}` for each test and
+`{"event": "test_alert_answered", "kind", "action"}` for each answer; neither these lines nor the dashboard log
+carry a token or the payload.
 
 ## Phone protocol
 

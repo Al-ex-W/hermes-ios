@@ -12,6 +12,10 @@ call mode can be tested in the iOS Simulator without Hermes, APNs or ElevenLabs:
                                                   start_call and returns the VoIP push the phone would have got
   GET  /api/plugins/hermes_voice/debug/pushes     every push the fake would have sent
 
+The alert half lives in fake_hermes.py's ``AlertVoicePlugin``, which the dashboard mounts: ``alerts`` on
+POST /devices, GET debug/alerts, and the plugin's test alert routes (POST /devices/test, GET /devices/test/{test_id},
+POST /devices/test/{test_id}/answer) with GET debug/test-alerts.
+
 The HTTP routes need the dashboard sign-in cookie, like every /api/* route of the fake.
 
 Link protocol (JSON text frames plus binary PCM16LE mono at 24 kHz; the speech is a tone per word):

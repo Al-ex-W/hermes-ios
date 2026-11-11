@@ -157,6 +157,122 @@ final class FakeVoicePluginTests: XCTestCase {
         guard case .failed = push.upload else { return XCTFail("upload is \(push.upload)") }
     }
 
+    /// The test alerts the fake plugin kept (`GET debug/test-alerts`), oldest first.
+    private func testAlerts() async throws -> [JSON] {
+        let listed = try await client.request("GET", "\(VoicePluginAPI.path)/debug/test-alerts") as? JSON
+        return listed?["tests"] as? [JSON] ?? []
+    }
+
+    func testTestAlertIsSentAfterItsDelayAndAnsweredWithoutTheGateway() async throws {
+        let voip = String(repeating: "a7", count: 32), alert = String(repeating: "b8", count: 32)
+        try await VoicePluginAPI.registerDevice(client, body: PushRegistration.deviceBody(
+            voipToken: voip, environment: "sandbox", bundleID: "com.example.hermesvoice", alertToken: alert, alerts: .defaults))
+        let notifications = AlertNotifications()
+        notifications.testPollInterval = 0.05
+        notifications.testClient = { [client] in try XCTUnwrap(client) }
+        var connected = 0
+        notifications.connect = { client in
+            connected += 1
+            return GatewayConnection(client: client)
+        }
+
+        // Settings > Notifications > Send test notification: scheduled, with the hint to lock the phone.
+        await notifications.requestTest(.approval, client: client, voipToken: voip, alertToken: alert, delay: 0.4)
+        let scheduled = try XCTUnwrap(notifications.test)
+        XCTAssertEqual(scheduled.phase, .scheduled)
+        XCTAssertTrue(TestAlertRow(scheduled, delay: 0.4).busy)
+        XCTAssertTrue(scheduled.message.contains("Lock the iPhone"), scheduled.message)
+        let id = try XCTUnwrap(scheduled.id)
+        await waitUntil(timeout: 5) { notifications.test?.phase == .sent }
+        XCTAssertTrue(notifications.test?.message.contains("APNs accepted") == true, notifications.test?.message ?? "nil")
+        XCTAssertFalse(TestAlertRow(notifications.test, delay: 0.4).isError)
+
+        // What the phone would have got: the plugin's payload, to this phone's alert token.
+        let kept = try await testAlerts()
+        let sent = try XCTUnwrap(kept.last { $0["test_id"] as? String == id })
+        XCTAssertEqual(sent["sent_to"] as? [String], [alert])
+        let push = try XCTUnwrap(AlertPush(userInfo: try XCTUnwrap(sent["payload"] as? JSON)))
+        XCTAssertTrue(push.isTest)
+        XCTAssertEqual(push.testID, id)
+        XCTAssertEqual(push.category, AlertCategory.approval)
+        XCTAssertEqual(AlertNotifications.presentation(for: push, sessionOnScreen: true), [.banner, .list, .sound])
+
+        // "Run" on the lock screen: confirmed here, reported to the plugin, and no request.answer.
+        await notifications.handle(action: AlertAction.run, text: nil, push: push)
+        XCTAssertEqual(notifications.test, TestAlertState(kind: .approval, id: id, phase: .answered,
+                                                         message: "Test approval answered: Run. Nothing was run."))
+        XCTAssertEqual(connected, 0)
+        let answered = try await VoicePluginAPI.testAlertStatus(client, id: id)
+        XCTAssertEqual(answered.status, .answered)
+        XCTAssertEqual(answered.action, "once")
+    }
+
+    func testTestAlertOfEachKindAndItsReply() async throws {
+        let voip = String(repeating: "c9", count: 32), alert = String(repeating: "da", count: 32)
+        try await VoicePluginAPI.registerDevice(client, body: PushRegistration.deviceBody(
+            voipToken: voip, environment: "sandbox", bundleID: "com.example.hermesvoice", alertToken: alert, alerts: .defaults))
+        let notifications = AlertNotifications()
+        notifications.testClient = { [client] in try XCTUnwrap(client) }
+        for kind in AlertPush.Kind.allCases {
+            await notifications.requestTest(kind, client: client, voipToken: voip, alertToken: alert, delay: 0)
+            XCTAssertEqual(notifications.test?.phase, .sent, "\(kind)")
+            let id = try XCTUnwrap(notifications.test?.id)
+            let kept = try await testAlerts()
+            let sent = try XCTUnwrap(kept.last { $0["test_id"] as? String == id })
+            let push = try XCTUnwrap(AlertPush(userInfo: try XCTUnwrap(sent["payload"] as? JSON)))
+            XCTAssertEqual(push.kind, kind)
+            XCTAssertTrue(push.isTest)
+            XCTAssertEqual(push.category, [.approval: "HERMES_APPROVAL", .clarify: "HERMES_CLARIFY", .turnDone: "HERMES_TURN_DONE"][kind])
+            let action = [.approval: AlertAction.reject, .clarify: AlertAction.reply, .turnDone: AlertAction.open][kind] ?? ""
+            await notifications.handle(action: action, text: kind == .clarify ? "blue" : nil, push: push)
+            XCTAssertEqual(notifications.test?.phase, .answered, "\(kind)")
+            let reported = try await VoicePluginAPI.testAlertStatus(client, id: id)
+            XCTAssertEqual(reported.action, [.approval: "deny", .clarify: "reply", .turnDone: "open"][kind], "\(kind)")
+            XCTAssertFalse(reported.message.contains("blue"), "the reply's text stays on the phone")
+        }
+        XCTAssertNil(notifications.openRequest)
+    }
+
+    func testTestAlertFailuresAreSaidInPlace() async throws {
+        let notifications = AlertNotifications()
+        // A phone the plugin never heard of.
+        await notifications.requestTest(.approval, client: client, voipToken: String(repeating: "0e", count: 32), alertToken: nil)
+        XCTAssertEqual(notifications.test?.phase, .failed)
+        XCTAssertTrue(notifications.test?.message.contains("isn't registered") == true, notifications.test?.message ?? "nil")
+        XCTAssertTrue(TestAlertRow(notifications.test, delay: 5).isError)
+
+        // Registered for calls only: iOS gave no alert token (notifications never allowed). The explicit null clears
+        // the token an earlier run against the same fake left there.
+        let voip = String(repeating: "eb", count: 32), alert = String(repeating: "fc", count: 32)
+        var callsOnly = PushRegistration.deviceBody(voipToken: voip, environment: "sandbox", bundleID: "com.example.hermesvoice",
+                                                    alertToken: nil, alerts: .defaults)
+        callsOnly["alert_token"] = NSNull()
+        try await VoicePluginAPI.registerDevice(client, body: callsOnly)
+        await notifications.requestTest(.approval, client: client, voipToken: voip, alertToken: nil)
+        XCTAssertTrue(notifications.test?.message.contains("no notification token") == true, notifications.test?.message ?? "nil")
+
+        // Question alerts turned off on this phone.
+        try await VoicePluginAPI.registerDevice(client, body: PushRegistration.deviceBody(
+            voipToken: voip, environment: "sandbox", bundleID: "com.example.hermesvoice", alertToken: alert,
+            alerts: NotificationPreferences(approval: true, clarify: false, turnDone: true)))
+        await notifications.requestTest(.clarify, client: client, voipToken: voip, alertToken: alert)
+        XCTAssertEqual(notifications.test, .failed(.clarify, "This iPhone has question notifications turned off.", id: notifications.test?.id))
+
+        // A request the plugin refuses says why in its own words; a test it doesn't keep isn't "not installed".
+        do {
+            _ = try await VoicePluginAPI.testAlert(client, body: ["voip_token": voip, "kind": "approval", "delay_s": 99])
+            XCTFail("a delay of 99 s is refused")
+        } catch let VoicePluginAPI.Failure.refused(detail) {
+            XCTAssertTrue(detail.contains("delay_s"), detail)
+        }
+        do {
+            _ = try await VoicePluginAPI.testAlertStatus(client, id: "0000000000000000")
+            XCTFail("no such test")
+        } catch let VoicePluginAPI.Failure.refused(detail) {
+            XCTAssertTrue(detail.contains("No such test notification"), detail)
+        }
+    }
+
     func testUserCallHearsHermesAndSendsTurns() async throws {
         let session = try await session()
         let callID = CallID.make()
