@@ -66,6 +66,8 @@ class Settings:
     fake_tts: bool = False
     ring_timeout_s: float = 45.0
     sync_reply_timeout_s: float = 600.0
+    # The user's call style file ("" = <HERMES_HOME>/hermes-voice/call-style.md); see guidance.py.
+    call_style_path: str = ""
     policy: PolicyConfig = field(default_factory=PolicyConfig)
 
     @classmethod
@@ -100,6 +102,7 @@ class Settings:
             in ("1", "true", "yes", "on"),
             ring_timeout_s=_float(own.get("ring_timeout_s"), 45.0, 10.0, 120.0),
             sync_reply_timeout_s=_float(own.get("sync_reply_timeout_s"), 600.0, 30.0, 3600.0),
+            call_style_path=str(own.get("call_style_path") or "").strip()[:1024],
             policy=_policy(own.get("policy") if isinstance(own.get("policy"), dict) else {}),
         )
 

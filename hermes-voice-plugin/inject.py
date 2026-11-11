@@ -44,9 +44,9 @@ import time
 import uuid
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Iterable, Optional, Protocol
 
-from . import hermes
+from . import guidance, hermes
 
 logger = logging.getLogger("hermes_voice")
 
@@ -55,8 +55,28 @@ DONE = frozenset({"redirected", "queued"})
 STALE_CODES = frozenset({4001, 4007})
 UNSUPPORTED = 4010
 
+# The hints that follow the user's words in a "[Voice] …" turn: the plugin's, not the user's. The HermesVoice app
+# strips these exact strings when it shows the turn (VoiceTranscript.swift), so a change here needs one there.
 REPLY_HINT = "(Reply out loud with start_call; your text replies are not spoken.)"
-HUNG_UP_HINT = "(The user hung up, so the call is over; reply in text.)"
+HUNG_UP_HINT = (
+    "(HermesVoice note, not the user's words: they hung up, so this call is over and they can't hear you. Finish "
+    "the task you were given, then reply once in text with a short recap. Don't ring back unless they asked to be "
+    "called when you're done.)"
+)
+# Every notice the plugin injects ("[Voice call …] …", "[Voice line …] …") carries NOTICE_MARKER right after its
+# bracket prefix: the documented way for memory plugins (and people) to tell it from something the user said.
+NOTICE_MARKER = "Automated notice from HermesVoice, not something the user said."
+THIS_CALL_ONLY = "It applies to this call only and is not a preference, so don't store it."
+THIS_LINE_ONLY = "It is about that one line only and is not a preference, so don't store it."
+NOTICE_HEAD = f"{NOTICE_MARKER} {THIS_CALL_ONLY}"
+# The same point in a start_call result (a tool result, which nobody mistakes for the user's words).
+RESULT_SCOPE = "This is about this call only and is not a preference, so don't store it."
+# What to do when the user is no longer on the line.
+AWAY = (
+    "The user can't hear you now and is probably not reading this chat. Finish the task you were given, then reply "
+    "once in text with a short recap; if you were waiting for an answer, say what you still need."
+)
+NEXT_CALL = "When they next call or ask for a call, speak as usual"
 INJECTION_OFF = (
     "Hermes doesn't let hermes_voice start a turn in this conversation (plugins.entries.hermes_voice."
     "allow_gateway_injection is off), so what the user says while it is idle can't reach it"
@@ -87,36 +107,57 @@ def turn_text(kind: str, text: str, error: Optional[str] = None) -> Optional[str
     return f"{prefix} {said} {HUNG_UP_HINT if kind == 'hang_up' else REPLY_HINT}"
 
 
-def started_notice(call_id: str) -> str:
+def started_notice(call_id: str, missed: Iterable[str] = (), style: str = "") -> str:
+    """The notice that opens a call the user placed. `missed`: what they did not hear on the conversation's last
+    call (the agent is reminded once to offer it). `style`: their call style (``guidance.style_text``)."""
     return (
-        f"[Voice call started] The user is calling you from the HermesVoice app (call {call_id}). Your text replies "
-        "are not spoken: talk to them with start_call (mode \"sync\" waits for their answer) and hang up with "
-        "end_call. What they say arrives as messages starting with \"[Voice]\"."
+        f"[Voice call started] {NOTICE_HEAD} The user is calling you from the HermesVoice app (call {call_id}) "
+        "and hears only what you say with start_call: your text replies are not spoken. Mode \"sync\" waits for "
+        "their answer; hang up with end_call. What they say arrives as messages starting with \"[Voice]\"."
+        f"{guidance.missed_reminder(missed)}{' ' + style if style else ''}"
     )
 
 
-def outcome_notice(outcome: str, detail: str = "") -> Optional[str]:
-    """The notice for a call that ended without anyone waiting on it (async start_call, user-started calls)."""
+def after_call(outcome: str) -> str:
+    """What to do once a call is over or never happened. The notices and the sync results say the same."""
+    if outcome in ("no_answer", "declined"):
+        return f"{AWAY} Don't ring again unless it is urgent or the user asks. {NEXT_CALL}."
+    if outcome == "push_failed":
+        return f"{AWAY} Tell them the ring failed, and don't ring again unless the user asks."
+    if outcome == "unreachable":
+        return f"{AWAY} Tell them the ring didn't get through, and don't ring again unless the user asks."
+    if outcome == "lost":
+        return (f"{AWAY} Ring again with start_call only if it's worth it. {NEXT_CALL} and first offer anything "
+                "they missed.")
+    if outcome == "ended_by_user":
+        return (f"{AWAY} Don't ring back unless the user asked in this conversation to be called when you're done. "
+                f"{NEXT_CALL} and first offer anything they missed.")
+    return ""
+
+
+def outcome_notice(outcome: str, detail: str = "", unheard: Iterable[str] = ()) -> Optional[str]:
+    """The notice for a call that ended without anyone waiting on it (async start_call, user-started calls).
+    `unheard`: the lines the user did not hear to the end."""
     detail = " ".join((detail or "").split())[:200]
     if outcome in ("no_answer", "declined"):
         why = "they declined it" if outcome == "declined" else "they didn't pick up"
-        return f"[Voice call not answered] The user didn't take the call ({why}). Reply in text."
+        return f"[Voice call not answered] {NOTICE_HEAD} The user didn't take the call ({why}). {after_call(outcome)}"
     if outcome == "push_failed":
-        return (f"[Voice line not delivered: the phone couldn't be rung ({detail or 'push failed'})] Reply in text; "
-                "don't ring again unless they ask, and tell them it failed.")
+        return (f"[Voice line not delivered: the phone couldn't be rung ({detail or 'push failed'})] {NOTICE_HEAD} "
+                f"Nothing was spoken. {after_call(outcome)}")
     if outcome == "unreachable":
-        return ("[Voice line not delivered: the phone never answered the ring] Reply in text; don't ring again "
-                "unless they ask, and tell them the ring didn't get through.")
+        return (f"[Voice line not delivered: the phone never answered the ring] {NOTICE_HEAD} Nothing was spoken. "
+                f"{after_call(outcome)}")
     if outcome == "lost":
-        return ("[Voice call ended: the phone's connection was lost and didn't come back] Reply in text; call "
-                "again with start_call only if it's worth it.")
+        return (f"[Voice call ended: the phone's connection was lost and didn't come back] {NOTICE_HEAD}"
+                f"{guidance.unheard_note(unheard)} {after_call(outcome)}")
     if outcome == "ended_by_user":
-        return "[Voice call ended by user] Reply in text from now on; don't call back unless they ask."
+        return f"[Voice call ended by user] {NOTICE_HEAD}{guidance.unheard_note(unheard)} {after_call(outcome)}"
     return None
 
 
 def line_notice(message: str) -> str:
-    return f"[Voice line not delivered: {' '.join(message.split())[:240]}]"
+    return f"[Voice line not delivered: {' '.join(message.split())[:240]}] {NOTICE_MARKER} {THIS_LINE_ONLY}"
 
 
 # ── delivery ───────────────────────────────────────────────────────────────────────────────────────────────

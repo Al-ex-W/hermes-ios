@@ -8,6 +8,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
   spoken reply and returns `{said, ending, outcome, call_id}`; `async` returns `{call_id, status}` at once and your
   reply arrives in the conversation as a `[Voice] …` message. `end_call(text?)` hangs up.
 - **Skill** `voice-calls`: the longer rules (`skill_view("hermes_voice:voice-calls")`).
+- **Call style** `<HERMES_HOME>/hermes-voice/call-style.md`: the user's own preferences for how Hermes speaks on
+  calls, which the agent reads at every call and edits itself (see "Call style").
 - **Hooks**: `pre_llm_call` / `on_session_end` track which conversations are busy, and keep a call with its
   conversation when compression rotates the session id; `post_llm_call` / `on_session_end` also tell the alert
   pushes when a turn ended, and with what reply.
@@ -68,7 +70,8 @@ plugins:
     hermes_voice:
       settings:
         voice_id: pNInz6obpgDQGcFmaJgB     # default: tts.elevenlabs.voice_id
-        max_chars: 1000
+        max_chars: 1000                    # longest line spoken at once (a line over ~15 s of speech is flagged)
+        call_style_path: hermes-voice/call-style.md   # the user's call style; relative: inside the Hermes home
         ring_timeout_s: 45
         sync_reply_timeout_s: 600
         policy:
@@ -111,6 +114,82 @@ this dashboard can't vouch for another profile's allowlist or pairings.
 **Runs nobody sits at.** `hermes chat -q` and `hermes -z` (source `oneshot`) and third-party integrations
 (`hermes chat --source tool`, source `tool`) run as the CLI, but no one is there to talk to, and what they read
 (mail, web pages) could talk the model into ringing. They don't ring unless `allowed_sources` lists them.
+
+## What the conversation is told
+
+The plugin puts two kinds of message into the conversation that owns a call (texts in `inject.py`):
+
+| Message | What it is |
+|---|---|
+| `[Voice] <said> (…)`, `[Voice, cut off] …`, `[Voice, hung up] …`, `[Voice, muted] …`, `[Voice, line dropped] …` | A turn of the user's: their words, then one of the plugin's two hints in parentheses (`inject.REPLY_HINT`, `inject.HUNG_UP_HINT`). A `[Voice, speech recognition failed…]` turn may have no words. |
+| `[Voice call started] …`, `[Voice call not answered] …`, `[Voice call ended by user] …`, `[Voice call ended: …] …`, `[Voice line not delivered: …] …` | An automated notice about one call. Nothing in it was said by the user. |
+
+Every notice is worded as an event of one call, never as an instruction from the user or a standing preference
+(a hang-up notice that said "reply in text from now on" was once stored by a memory system as the user's wish). A
+notice about a call that is over tells the agent that the user can't hear it and is probably not reading the chat:
+finish the task, reply once in text with a short recap, don't ring back unless they asked to be called, and speak
+as usual on the next call. A sync `start_call` result says the same in its `note`.
+
+**For memory plugins.** Hermes has no flag a plugin can set that memory providers see on every path a notice
+takes. `sync_turn` gets the turn's text as `user_content` whatever started the turn. `display_kind`, Hermes' type
+for user rows nobody typed, is set to `internal_notification` by the gateway on `ctx.inject_message` turns (a
+provider sees it only in the `messages` list); a dashboard turn started with `prompt.submit` gets none (that
+method accepts only `hidden`, which would also hide the notice in the chat), and text steered into a running turn
+is typed `steer`, like the user's own steers. `turn_author` is stamped only by Hermes' bot relay. So the marker is
+in the text, and it is stable:
+
+- Every notice starts with `[Voice call ` or `[Voice line `, and carries the sentence
+  `Automated notice from HermesVoice, not something the user said.` (`inject.NOTICE_MARKER`) right after its closing
+  bracket. Skip the whole message: `message.startswith(("[Voice call ", "[Voice line "))`, or
+  `inject.NOTICE_MARKER in message`.
+- In a `[Voice…] <said> (…)` turn only `<said>` is the user's. Drop the bracket prefix and the trailing hint (one of
+  the two strings above) before storing it.
+
+**Long lines.** A `start_call` result flags a line that takes longer than about 15 seconds to say: `Long line:
+about 22 s of speech. Keep lines to a sentence or two and offer details instead.` (async and sync, from any
+process). The estimate is 15 characters a second (150 words a minute at six characters a word, about the pace of
+ElevenLabs' voices) over the characters that are spoken, so audio tags in square brackets don't count
+(`guidance.CHARS_PER_SECOND`, `guidance.LONG_LINE_S`). `max_chars` still cuts a line, and the result says so.
+
+**What the user did not hear.** When a call ends by a hang-up or a lost connection while a line is still playing or
+queued (no `played` ack from the phone), the ended notice, or the sync result's `note`, quotes those lines (the
+first 200 characters of at most three). The hub remembers them for the conversation, in memory only (never on
+disk, at most a day, gone with a restart), and reminds the agent once when the conversation's next call starts: in
+the `[Voice call started]` notice, or in the first `start_call` result (kept for the call after that if nobody
+answers).
+
+## Call style
+
+A namespaced plugin skill can't be patched with `skill_manage`, so what the user wants from calls (tone, form of
+address, humour, ElevenLabs audio tags) has its own file: `<HERMES_HOME>/hermes-voice/call-style.md`, free text.
+`settings.call_style_path` moves it (`~` is expanded; a relative path is inside the Hermes home). Write it
+yourself, or tell Hermes on a call ("call me sir from now on"): the skill and the tool description tell the agent
+to edit the file with its normal file tools when you state a lasting preference about how it speaks on calls.
+
+```markdown
+Address me as "sir". Dry, understated humour; never bubbly.
+Calm and unhurried. No filler ("great question").
+Audio tags are fine: [sighs], [chuckles]. No [whispers]: I take calls on the street.
+```
+
+The plugin gives the agent the file's current text (blank lines dropped; the first 1500 characters, with a note
+when it was cut):
+
+- in the `[Voice call started]` notice of a call you placed;
+- as `call_style` in the first `start_call` result of a call: the line that rings, or the first one spoken into a
+  call. It is read in the process and profile the conversation runs in, once per call;
+- shortened to 400 characters, in the `start_call` tool description, read when the plugin loads, so the first
+  line of a call Hermes starts already follows it. A restart refreshes that copy; results always carry the
+  current text.
+
+The file's content is never logged and never sent to the phone by the plugin; it does become part of the
+conversation (a notice or a tool result), like anything else the agent reads. A missing or empty file adds nothing.
+
+**Audio tags.** `text` goes to ElevenLabs as the agent wrote it, so square-bracket tags (`[laughs]`,
+`[whispers]`) reach the model untouched; they are not counted as speech in the long-line estimate. They only do
+something with a model that supports them: ElevenLabs documents them for Eleven v3 (`model_id: eleven_v3`), which
+is slower to start speaking than the default `eleven_flash_v2_5`. Other models may read a tag out loud or drop it.
+The phone gets the same text in `speech_start` (tags included).
 
 ## Calls from any session
 

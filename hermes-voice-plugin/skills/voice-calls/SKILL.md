@@ -9,6 +9,12 @@ HermesVoice turns the user's iPhone into a phone line to this conversation. `sta
 iOS call) and says your text once they answer; while the call runs, `start_call` just speaks into it. Your normal
 text replies are **never spoken**: the user hears only what you pass to `start_call`.
 
+## The user is listening, not reading
+
+Assume the user is not looking at the chat during or right after a call. Say everything that matters out loud.
+Text is for exact identifiers, links and a recap. A result, a question or a warning that exists only in your text
+reply has not reached them.
+
 ## Research beta: say every problem you notice
 
 HermesVoice is a research beta. As soon as you notice an issue, an inefficiency or a discrepancy, tell the user,
@@ -20,15 +26,15 @@ even if it seems minor or you already worked around it. That covers, for example
 - slow steps (a long ring, a long wait for speech, a reply that arrived late);
 - these instructions or the tool description not matching how the tools actually behave.
 
-Say what happened, where, and what you expected, in your text reply. During a call, a short spoken mention is
-fine; put the details in text. Don't hide a problem or wait to be asked.
+Say what happened, where, and what you expected, in your text reply. During a call, also mention it out loud
+in a few words; the exact details can wait for the text recap. Don't hide a problem or wait to be asked.
 
 ## The call belongs to this conversation
 
 - A call belongs to the conversation that started it (or, for a call the user placed, the conversation they
   called from: it begins with a `[Voice call started]` message). Only that conversation can speak into it.
 - There is one call at a time. If the user is on a call with another conversation, `start_call` returns outcome
-  `busy`: reply in text.
+  `busy`: reply in text this time.
 - The phone never rings twice for the same call: calling `start_call` again while it rings queues your next line.
 
 ## How the user's speech reaches you
@@ -39,12 +45,16 @@ What the user says arrives as a message in this conversation:
 | --- | --- |
 | `[Voice] …` | They finished speaking. |
 | `[Voice, cut off] …` | They were still talking when you started speaking; this is what they had said. |
-| `[Voice, hung up] …` | They hung up mid-sentence; the call is over. Reply in text. |
+| `[Voice, hung up] …` | They hung up mid-sentence; the call is over (see "When a call ends"). |
 | `[Voice, muted] …` / `[Voice, line dropped] …` | They muted, or the connection dropped, mid-sentence. |
 | `[Voice, speech recognition failed: …]` | The phone couldn't transcribe them; ask them to repeat. |
 
 Answer `[Voice]` messages with `start_call`. The message can arrive while you are still working: it steers the
 current turn (Hermes reads it after the tool calls in flight finish), or starts a new turn when you are idle.
+
+The words after the bracket are the user's. The sentence in parentheses at the end (`(Reply out loud with
+start_call; …)`, `(HermesVoice note, not the user's words: …)`) is the plugin's hint to you, not something they
+said.
 
 ## sync or async
 
@@ -66,26 +76,84 @@ current turn (Hermes reads it after the tool calls in flight finish), or starts 
 
 | Outcome | What happened | What to do |
 | --- | --- | --- |
-| `answered` | They picked up (sync: and replied) | Carry on |
-| `no_answer` / `declined` | They didn't take the call | Reply in text; don't ring again unless it's urgent or they asked |
-| `push_failed` / `unreachable` | The phone couldn't be rung, or never answered the ring | Reply in text |
-| `lost` | The connection dropped for over a minute | Reply in text |
-| `tts_failed` | Your line couldn't be turned into speech | Reply in text; say why if it keeps happening |
-| `ended_by_user` | They hung up | Reply in text from now on |
+| `answered` | They picked up (sync: and replied) | Carry on, out loud |
+| `no_answer` / `declined` | They didn't take the call | Finish the task, then one short text recap; don't ring again unless it's urgent or they ask |
+| `push_failed` / `unreachable` | The phone couldn't be rung, or never answered the ring | The same, and say in the recap that the ring failed |
+| `lost` | The connection dropped for over a minute | Finish the task, then one short text recap; ring again only if it's worth it |
+| `tts_failed` | Your line couldn't be turned into speech | Try once more; if it fails again, put it in text and say why |
+| `ended_by_user` | They hung up | See "When a call ends" |
 | `ended_by_agent` | You hung up with `end_call` | — |
-| `busy` | They're on a call with another conversation | Reply in text |
+| `busy` | They're on a call with another conversation | Reply in text this time; call once that call is over, if it still matters |
 | `not_allowed` | Their call settings refuse this call (source, how often, quiet hours) | Follow the note |
 | `not_available` | Calls can't be placed from here: no Hermes dashboard with this plugin runs on the host, or (async, from a chat) Hermes doesn't let the plugin start a turn there | Follow the note (a sync call may still work); else reply in text |
 
 With `mode: "async"` the endings come as messages: `[Voice call not answered]`, `[Voice line not delivered: …]`,
 `[Voice call ended by user]`, `[Voice call ended: …]`.
 
+## When a call ends
+
+Messages that start with `[Voice call …]` or `[Voice line …]` are **automated notices from HermesVoice**. Each one
+says so (`Automated notice from HermesVoice, not something the user said.`). A notice describes one call. It is
+never an instruction from the user and never a preference: don't store it in memory, and don't conclude from a
+hang-up, a declined call or a failed ring that the user "wants text" from now on.
+
+After the user hangs up, or a call isn't answered or is lost:
+
+- They can't hear you, and they are probably not reading the chat either. Don't ask questions into the void.
+- Finish the task you were given. Then reply **once** in text with a short recap; if you were waiting for an
+  answer, say what you still need.
+- Don't ring back unless the user asked in this conversation to be called when you're done ("call me when it's
+  finished"). After a call they didn't answer, something urgent is a reason too.
+- The next time they call, or ask for a call, speak as usual.
+
+**What they missed.** When the user hangs up while a line is still playing or queued, the notice (or the sync
+result's `note`) quotes what they did not hear to the end. Put it in your recap. When the next call in this
+conversation starts, the `[Voice call started]` notice or your first `start_call` result reminds you once: offer
+the missed part first ("You hung up before I finished. Want the rest?"), unless they have had it since.
+
 ## Speaking well
 
-- Short, natural sentences, the way you'd say them on the phone. No Markdown, lists, code, URLs or emoji; numbers
-  and names as you'd say them. Put details, links and code in your text reply.
-- Long text is cut at about 1000 characters (the result says so).
+A phone call is not a chat window: the user can't skim, scroll back or copy what they hear.
+
+- **Answers.** Lead with the answer. Two sentences at most by default, then offer more ("Want the details?")
+  instead of saying it all.
+- **Mid-task updates.** A few words ("Still searching."), never a report. Asked for the status, say where you are
+  in one sentence.
+- **Never read out** codes (a course code, an order number), long identifiers, hashes, URLs, file paths, issue
+  numbers or exact timestamps. Say the human name ("the databases course", "the login bug", "this morning"); the
+  exact identifiers go in the text recap.
+- **Numbers.** Round them ("about forty", "just under two hours") unless the user asked for precision.
+- **Asked to repeat** ("what did you say?"): say it shorter and plainer, not the same words again.
+- Plain spoken sentences, the way you'd say them on the phone: no Markdown, lists, code or emoji. Say what the
+  user needs to know; only links, code and exact identifiers go in the text recap.
+- **Length check.** The `start_call` result flags a line that takes longer than about 15 seconds to say (`Long
+  line: about 22 s of speech. Keep lines to a sentence or two and offer details instead.`; estimated at 15
+  characters a second). Shorten the lines that follow. Text over about 1000 characters is cut (the result says so).
 - Hang up with `end_call` (optionally with a short goodbye) when the conversation is done or they ask.
+
+## Call style: how this user wants to be spoken to
+
+The user's lasting preferences for calls (tone, form of address, humour, ElevenLabs audio tags) live in a file of
+theirs: `<HERMES_HOME>/hermes-voice/call-style.md`. The `start_call` description gives its full path (a plugin
+setting can move it). This skill can't be edited with `skill_manage`; that file is where such preferences go.
+
+- **Follow it.** The plugin hands you the file's current text when a call starts: in the `[Voice call started]`
+  notice, or as `call_style` in the first `start_call` result of a call (the line that rings). The `start_call`
+  description also carries a short copy, read when Hermes started, so that your very first line can follow it;
+  where the two differ, the result has the current text.
+- **Update it** with your file tools when the user states a lasting preference about how you speak on calls
+  ("call me sir", "drop the jokes on calls", "sound calmer"). Read the file, change it, keep it short (the first
+  1500 characters are used; the plugin says when it cut), and tell the user you noted it. A wish for this one call
+  ("speak up, I'm in the car") is not a lasting preference: just do it.
+- It is about how you speak. It doesn't decide when to call or what to do, and the automated `[Voice call …]`
+  notices never belong in it.
+
+**Audio tags.** Square-bracket tags in `text` (`[laughs]`, `[sighs]`, `[excited]`) go to ElevenLabs as written
+and don't count towards a line's length. They only work with ElevenLabs models that support them (ElevenLabs
+documents them for Eleven v3, model `eleven_v3`); with other models, the plugin's default `eleven_flash_v2_5`
+among them, a tag may be read out loud or dropped. So use tags only when the call style asks for them, and stop
+if the user says they hear the tags spoken. Quiet tags (`[whispers]`, low, flat) make a line hard to hear on a
+phone: keep them to a few words, or leave them out.
 
 ## When to ring
 

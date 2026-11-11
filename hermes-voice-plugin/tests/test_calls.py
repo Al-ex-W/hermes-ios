@@ -18,6 +18,18 @@ import websockets
 from support import PLUGIN_DIR, PREFIX, FakePusher, Phone, bound_agent, iso, say_line, serving, tool, until
 
 
+# What the conversation is told when the user hangs up and had heard everything (issue #16: an automated notice
+# about this one call, never an instruction of the user's or a standing preference).
+HUNG_UP_NOTICE = (
+    "[Voice call ended by user] Automated notice from HermesVoice, not something the user said. It applies to this "
+    "call only and is not a preference, so don't store it. The user can't hear you now and is probably not reading "
+    "this chat. Finish the task you were given, then reply once in text with a short recap; if you were waiting "
+    "for an answer, say what you still need. Don't ring back unless the user asked in this conversation to be "
+    "called when you're done. When they next call or ask for a call, speak as usual and first offer anything they "
+    "missed."
+)
+
+
 async def _rung(pusher: FakePusher) -> dict:
     await asyncio.to_thread(pusher.pushed.wait, 5)
     return pusher.payloads[-1]
@@ -146,12 +158,15 @@ def test_turns_of_an_async_call_are_injected_in_order_with_their_endings(core, f
 
     texts, after = asyncio.run(scenario())
     hint = "(Reply out loud with start_call; your text replies are not spoken.)"
-    assert texts[0].startswith("[Voice call started] The user is calling you")
+    assert texts[0].startswith(f"[Voice call started] {core.inject.NOTICE_MARKER}")
+    assert "The user is calling you from the HermesVoice app (call " in texts[0]
     assert texts[1:] == [
         f"[Voice] hello there {hint}",
         f"[Voice, speech recognition failed] I could not {hint}",
         f"[Voice, speech recognition failed: Scribe closed the stream] {hint}",
-        "[Voice, hung up] and then I (The user hung up, so the call is over; reply in text.)",
+        "[Voice, hung up] and then I (HermesVoice note, not the user's words: they hung up, so this call is over "
+        "and they can't hear you. Finish the task you were given, then reply once in text with a short recap. "
+        "Don't ring back unless they asked to be called when you're done.)",
     ]
     assert after == texts  # the hung-up turn already said it: no "[Voice call ended by user]" on top
 
@@ -167,7 +182,7 @@ def test_hanging_up_injects_the_ended_notice(core, fake, make_hub):
             return await hub.injector.wait_for(2), phone.socket.close_code
 
     texts, code = asyncio.run(scenario())
-    assert texts[1].startswith("[Voice call ended by user]")
+    assert texts[1] == HUNG_UP_NOTICE  # nothing was playing: nothing to say about missed speech
     assert code == 1000 and hub.slot is None
 
 
@@ -194,7 +209,13 @@ def test_a_declined_call(core, fake, make_hub, mode):
         assert result["outcome"] == "declined" and result["said"] == "" and texts == []
     else:
         assert result["status"] == "ringing"
-        assert texts == ["[Voice call not answered] The user didn't take the call (they declined it). Reply in text."]
+        assert texts == [
+            "[Voice call not answered] Automated notice from HermesVoice, not something the user said. It applies "
+            "to this call only and is not a preference, so don't store it. The user didn't take the call (they "
+            "declined it). The user can't hear you now and is probably not reading this chat. Finish the task you "
+            "were given, then reply once in text with a short recap; if you were waiting for an answer, say what "
+            "you still need. Don't ring again unless it is urgent or the user asks. When they next call or ask "
+            "for a call, speak as usual."]
 
 
 @pytest.mark.parametrize(("reason", "outcome"), [("no_answer", "no_answer"), ("declined", "declined"),
@@ -276,8 +297,12 @@ def test_a_ring_the_phone_never_picks_up_is_unreachable_and_late_hellos_are_canc
                 return started, texts, late, ws.close_code
 
     started, texts, late, code = asyncio.run(scenario())
-    assert texts == ["[Voice line not delivered: the phone never answered the ring] Reply in text; don't ring again "
-                     "unless they ask, and tell them the ring didn't get through."]
+    assert texts == [
+        "[Voice line not delivered: the phone never answered the ring] Automated notice from HermesVoice, not "
+        "something the user said. It applies to this call only and is not a preference, so don't store it. Nothing "
+        "was spoken. The user can't hear you now and is probably not reading this chat. Finish the task you were "
+        "given, then reply once in text with a short recap; if you were waiting for an answer, say what you still "
+        "need. Tell them the ring didn't get through, and don't ring again unless the user asks."]
     assert late == {"type": "cancel", "reason": "unreachable"} and code == 1000
     # The ring log says what APNs took and what the phone did, so an unreachable ring can be diagnosed.
     entries = [json.loads(line) for line in (fake.home / "hermes-voice" / "rings.jsonl").read_text().splitlines()]
@@ -325,8 +350,11 @@ def test_a_failed_push_is_reported(core, fake, make_hub, mode):
     if mode == "sync":
         assert result["outcome"] == "push_failed" and "no iPhone has registered" in result["note"]
     else:
-        assert texts == ["[Voice line not delivered: the phone couldn't be rung (no iPhone has registered for "
-                         "calls yet)] Reply in text; don't ring again unless they ask, and tell them it failed."]
+        assert len(texts) == 1 and texts[0].startswith(
+            "[Voice line not delivered: the phone couldn't be rung (no iPhone has registered for calls yet)] "
+            "Automated notice from HermesVoice, not something the user said. It applies to this call only and is "
+            "not a preference, so don't store it. Nothing was spoken. ")
+        assert texts[0].endswith(" Tell them the ring failed, and don't ring again unless the user asks.")
 
 
 def test_end_call_cancels_a_ring_and_hangs_up_a_live_call(core, fake, make_hub):

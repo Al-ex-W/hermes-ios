@@ -124,7 +124,7 @@ def test_the_ring_log_records_decisions_and_outcomes(core, fake, make_hub, tmp_p
         (None, False),
         ([{"type": "image_url", "image_url": {"url": "x"}}], False),
         ("[Voice] yes call me (Reply out loud with start_call; your text replies are not spoken.)", False),
-        ("[Voice call ended by user] Reply in text from now on", False),
+        ("[Voice call ended by user] Automated notice from HermesVoice, not something the user said.", False),
         ("[Continuing toward your standing goal]\nGoal: ship it", False),
         ("[System note: Your previous turn was interrupted mid-run", False),
         ("[IMPORTANT: Background process 12 exited (exit code 0).", False),

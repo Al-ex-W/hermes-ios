@@ -23,7 +23,7 @@ from hermes_sandbox import Fail, Text, ToolCall, message_text, since_last_reply
 
 # One line: Hermes may append notes of its own to a user's message (e.g. on their very first one).
 CALL_ME = re.compile(r"call me (sync|async): ([^\n]+)")
-VOICE_TURN = re.compile(r"\[Voice(?:, [^\]]*)?\] (.+?) \((Reply out loud|The user hung up)")
+VOICE_TURN = re.compile(r"\[Voice(?:, [^\]]*)?\] (.+?) \((Reply out loud|HermesVoice note, not the user's words)")
 
 
 def invoke(body: dict[str, Any], name: str, args: dict[str, Any], delay: float = 0.0) -> ToolCall:
@@ -70,8 +70,8 @@ class Agent:
                 self.answered.add(said)
                 if said in self.fail:
                     return Fail()
-                if hint == "The user hung up":
-                    return Text("Talk soon.")  # the call is over: reply in text, as the hint says
+                if hint != "Reply out loud":
+                    return Text("Talk soon.")  # they hung up: one text reply, as the hint says
                 return invoke(body, "start_call", {"text": f"You said {said}.", "mode": "async"},
                               self.slow.get(said, 0.0))
         last = recent[-1] if recent else {}
