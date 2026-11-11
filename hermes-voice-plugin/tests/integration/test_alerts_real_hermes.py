@@ -38,7 +38,7 @@ import time as _time
 alerts = []
 
 
-def _push_alert(self, kind, payload, collapse_id=""):
+def _push_alert(self, kind, payload, collapse_id="", only=None):
     with lock:
         alerts.append({"kind": kind, "payload": payload, "collapse_id": collapse_id, "at": _time.time()})
     return hub_module().push.PushResult(True, "", 1)
@@ -400,6 +400,66 @@ def test_an_approval_with_no_client_attached_sends_one_apns_alert_to_each_phone_
     assert sorted(push["token"] for push in done) == sorted([PHONE_A["alert_token"], PHONE_B["alert_token"]])
     assert {push["host"] for push in done} == {"api.sandbox.push.apple.com", "api.push.apple.com"}
     assert (sandbox.root / "target").exists()  # denied: the command never ran
+
+
+def test_a_test_alert_goes_through_apns_to_the_phone_that_asks_and_takes_its_answer(hermes):
+    """``POST /devices/test`` behind the real dashboard's auth: the sample alert goes through the real sender to the
+    asking phone alone, a delayed one's outcome can be read, and the phone's answer is noted; no conversation exists
+    and no ``request.answer`` is involved."""
+    sandbox, _ = hermes
+    apns = sandbox.apns
+    route = f"{hs.PREFIX}/devices/test"
+
+    async def scenario():
+        dashboard = hs.Dashboard(sandbox)
+        try:
+            anonymous = (await dashboard.post(route, {"voip_token": PHONE_A["voip_token"]})).status_code
+            assert (await dashboard.sign_in()).status_code == 200
+            for phone in (PHONE_A, PHONE_B):
+                assert (await dashboard.post(f"{hs.PREFIX}/devices", phone)).json() == {"ok": True}
+            assert (await dashboard.post(f"{hs.HELPER}/arm-apns", {"url": apns.url})).status_code == 200
+            before = len(apns.received())
+            question = (await dashboard.post(route, {"voip_token": PHONE_B["voip_token"], "kind": "clarify"})).json()
+            off = (await dashboard.post(route, {"voip_token": PHONE_B["voip_token"]})).json()  # B: no approvals
+            unknown = (await dashboard.post(route, {"voip_token": "c1" * 32})).json()
+            later = (await dashboard.post(route, {"alert_token": PHONE_A["alert_token"], "delay_s": 1})).json()
+            waiting = len(apns.received()) - before
+            sent = later
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and sent["status"] == "scheduled":
+                await asyncio.sleep(0.2)
+                sent = (await dashboard.get(f"{route}/{later['test_id']}")).json()
+            answered = (await dashboard.post(f"{route}/{later['test_id']}/answer", {"action": "once"})).json()
+            return anonymous, question, off, unknown, later, waiting, sent, answered, apns.received()[before:]
+        finally:
+            await dashboard.close()
+
+    anonymous, question, off, unknown, later, waiting, sent, answered, pushes = asyncio.run(scenario())
+    assert anonymous == 401  # the dashboard's own auth
+    assert (question["ok"], question["status"], question["code"]) == (True, "sent", "sent")
+    assert (off["status"], off["code"]) == ("failed", "off_on_phone")
+    assert (unknown["status"], unknown["code"]) == ("failed", "not_registered")
+    assert later["status"] == "scheduled" and waiting == 1  # only the question went out so far
+    assert sent["status"] == "sent" and answered["status"] == "answered" and answered["action"] == "once"
+    tests = [push for push in pushes if ((push.get("payload") or {}).get("hermes") or {}).get("test") is True]
+    assert [(push["token"], push["host"]) for push in tests] == [
+        (PHONE_B["alert_token"], "api.push.apple.com"), (PHONE_A["alert_token"], "api.sandbox.push.apple.com")]
+    first, second = tests
+    assert first["token_ok"] is True and first["headers"]["apns-push-type"] == "alert"
+    assert first["headers"]["apns-topic"] == "com.example.hermesvoice"
+    assert first["payload"]["aps"]["category"] == "HERMES_CLARIFY" and first["payload"]["aps"]["sound"] == "default"
+    assert first["payload"]["hermes"]["test_id"] == question["test_id"]
+    assert second["payload"]["aps"]["category"] == "HERMES_APPROVAL"
+    assert second["payload"]["hermes"]["request_id"] == f"test-{later['test_id']}"
+    assert second["headers"]["apns-collapse-id"] == f"test-{later['test_id']}"
+    log = (sandbox.hermes_home / "hermes-voice" / "rings.jsonl").read_text(encoding="utf-8")
+    entries = [json.loads(line) for line in log.splitlines() if "test_alert" in line]
+    assert [(entry["event"], entry["kind"], entry.get("result") or entry.get("action")) for entry in entries][-5:] == [
+        ("test_alert", "clarify", "sent"), ("test_alert", "approval", "off_on_phone"),
+        ("test_alert", "approval", "not_registered"), ("test_alert", "approval", "sent"),
+        ("test_alert_answered", "approval", "once")]
+    for phone in (PHONE_A, PHONE_B):
+        assert phone["alert_token"] not in log and phone["voip_token"] not in log
 
 
 def _of(pushes: list[dict], category: str) -> list[dict]:

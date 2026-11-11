@@ -690,3 +690,82 @@ def test_device_registrations_can_be_held_in_flight():
     assert before == {}, "a held registration isn't stored yet"
     assert released == {"ok": True, "hold": False, "waiting": 1}
     assert stored == {"ok": True} and after == {"clarify": False}
+
+
+def plugin_notify() -> Any:
+    """The real plugin's ``notify`` module (loaded the way Hermes loads the plugin's core)."""
+    import importlib.util
+    from pathlib import Path
+
+    plugin = Path(__file__).resolve().parents[2] / "hermes-voice-plugin"
+    spec = importlib.util.spec_from_file_location("hermes_voice_loader", plugin / "loader.py")
+    assert spec is not None and spec.loader is not None
+    loader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loader)
+    return loader.module("notify", plugin)
+
+
+def test_test_alerts_answer_like_the_plugin():
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                test = f"{PREFIX}/devices/test"
+                unregistered = (await http.post(test, json={"voip_token": VOIP})).json()
+                device = {"voip_token": VOIP, "environment": "sandbox", "bundle_id": "com.example.hermesvoice"}
+                await http.post(f"{PREFIX}/devices", json=device)
+                no_token = (await http.post(test, json={"voip_token": VOIP})).json()
+                await http.post(f"{PREFIX}/devices", json={**device, "alert_token": ALERT,
+                                                           "alerts": {"turn_done": False}})
+                off = (await http.post(test, json={"voip_token": VOIP, "kind": "turn_done"})).json()
+                sent = (await http.post(test, json={"voip_token": VOIP.upper()})).json()
+                by_alert = (await http.post(test, json={"alert_token": ALERT, "kind": "clarify"})).json()
+                fake.voice_plugin.test_alert_failure = ("bad_token", "APNs doesn't know this iPhone's token.")
+                refused = (await http.post(test, json={"voip_token": VOIP})).json()
+                later = (await http.post(test, json={"voip_token": VOIP, "delay_s": 0.2})).json()
+                waiting = (await http.get(f"{test}/{later['test_id']}")).json()
+                await until(lambda: fake.voice_plugin.test_alerts[later["test_id"]]["view"]["status"] == "sent", 5)
+                arrived = (await http.get(f"{test}/{later['test_id']}")).json()
+                answered = (await http.post(f"{test}/{later['test_id']}/answer", json={"action": "deny"})).json()
+                listed = (await http.get(f"{PREFIX}/debug/test-alerts")).json()["tests"]
+                bad = [(await http.post(test, json=body)).status_code for body in (
+                    {"voip_token": VOIP, "kind": "voip"}, {"kind": "approval"}, {"voip_token": "xyz"},
+                    {"voip_token": VOIP, "delay_s": 31}, {"voip_token": VOIP, "delay_s": True})]
+                bad_action = await http.post(f"{test}/{later['test_id']}/answer", json={"action": "shout"})
+                unknown = [(await http.get(f"{test}/nope")).status_code,
+                           (await http.post(f"{test}/nope/answer", json={"action": "open"})).status_code]
+            async with httpx.AsyncClient(base_url=f"http://{base}") as anonymous:
+                denied = [(await anonymous.post(test, json={"voip_token": VOIP})).status_code,
+                          (await anonymous.get(f"{PREFIX}/debug/test-alerts")).status_code]
+        return (unregistered, no_token, off, sent, by_alert, refused, later, waiting, arrived, answered, listed, bad,
+                bad_action, unknown, denied)
+
+    (unregistered, no_token, off, sent, by_alert, refused, later, waiting, arrived, answered, listed, bad, bad_action,
+     unknown, denied) = asyncio.run(scenario())
+    notify = plugin_notify()
+    keys = {"ok", "test_id", "kind", "status", "code", "message", "delay_s", "action"}
+    assert all(set(view) == keys for view in (unregistered, no_token, off, sent, later, answered))
+    assert set(notify.TestAlert("x", "approval").view()) == keys, "the plugin answers the same fields"
+    assert [(view["ok"], view["status"], view["code"]) for view in (unregistered, no_token, off)] == [
+        (False, "failed", "not_registered"), (False, "failed", "no_alert_token"), (False, "failed", "off_on_phone")]
+    assert no_token["message"] == notify.NO_ALERT_TOKEN
+    assert off["message"] == f"This iPhone has {notify.KIND_NAMES['turn_done']} notifications turned off."
+    assert (sent["ok"], sent["status"], sent["code"], sent["kind"], sent["delay_s"]) == (True, "sent", "sent",
+                                                                                         "approval", 0.0)
+    assert by_alert["status"] == "sent" and by_alert["kind"] == "clarify"
+    assert (refused["ok"], refused["status"], refused["code"]) == (False, "failed", "bad_token")
+    assert later["status"] == "scheduled" and waiting == later and "0.2 s" in later["message"]
+    assert arrived["status"] == "sent" and arrived["message"] == sent["message"]
+    assert (answered["status"], answered["code"], answered["action"], answered["ok"]) == ("answered", "answered",
+                                                                                          "deny", True)
+    assert bad == [400] * 5 and bad_action.status_code == 400 and unknown == [404, 404] and denied == [401, 401]
+    assert tuple(notify.TEST_ACTIONS) == ("once", "session", "always", "deny", "reply", "open")
+
+    # The payload a phone would get is the plugin's own, kind by kind.
+    by_id = {entry["test_id"]: entry for entry in listed}
+    assert [entry["status"] for entry in listed] == ["failed", "failed", "failed", "sent", "sent", "failed",
+                                                     "answered"]
+    for view in (sent, by_alert, later):
+        entry = by_id[view["test_id"]]
+        assert entry["payload"] == notify.test_payload(view["kind"], view["test_id"], "default")
+        assert entry["sent_to"] == [ALERT]
+    assert by_id[unregistered["test_id"]]["payload"] is None and by_id[refused["test_id"]]["payload"] is None

@@ -138,6 +138,14 @@ Devices may also register an APNs `alert_token` with `alerts: {approval, clarify
 `POST …/debug/hold-devices {hold: true}` keeps each later registration waiting (`{hold: false}` lets them go;
 the answer says how many wait), so a test can change the alerts while one is in flight.
 
+Test alerts work as in the plugin: `POST …/devices/test {voip_token?, alert_token?, kind?, delay_s?}` answers
+`{ok, test_id, kind, status, code, message, delay_s, action}` (`not_registered`, `no_alert_token` and `off_on_phone`
+as the plugin says them, else `sent`, at once or after `delay_s`), `GET …/devices/test/{test_id}` answers it again and
+`POST …/devices/test/{test_id}/answer {action}` marks it answered. Nothing is pushed: `GET …/debug/test-alerts`
+lists every test with the `payload` the phone would have got. To see it in the Simulator, save that payload as
+`payload.json` and run `xcrun simctl push booted <bundle id> payload.json`; the notification's actions then work as
+on a phone.
+
 ### Settings screens (M3)
 
 The Settings, Profiles and Providers screens have their routes here too, each honouring `?profile=`: the config

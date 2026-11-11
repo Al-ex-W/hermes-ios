@@ -103,6 +103,9 @@ agent/learning_graph.py, tui_gateway/methods_{subagents,session_foreign}.py and 
 The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
 (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
 the plugin would send ({aps, hermes}: approval or clarify waiting, turn done) and the alert tokens they go to.
+POST /api/plugins/hermes_voice/devices/test {voip_token?, alert_token?, kind?, delay_s?} answers like the plugin's
+test alert route (with GET /devices/test/{test_id} and POST /devices/test/{test_id}/answer {action}); nothing is
+pushed, and GET /api/plugins/hermes_voice/debug/test-alerts lists each test with its payload.
 
 Run (from hermes-voice-mcp, to reuse its venv):
   uv run python ../devtools/fake_hermes.py --port 9311 --voice-url http://127.0.0.1:8765 --voice-token <token>
@@ -1872,6 +1875,17 @@ ALERT_KINDS = ("approval", "clarify", "turn_done")
 ALERT_DEFAULTS = {"approval": True, "clarify": True, "turn_done": True}
 ALERT_CATEGORIES = {"approval": "HERMES_APPROVAL", "clarify": "HERMES_CLARIFY", "turn_done": "HERMES_TURN_DONE"}
 ALERT_MEMORY = 200
+# Test alerts (``POST /devices/test``): the texts and names of hermes-voice-plugin/notify.py.
+TEST_ALERT_SESSION = "hermes-voice-test"
+TEST_ALERT_BODIES = {
+    "approval": "Test approval: nothing will run, whatever you choose.",
+    "clarify": "Test question: reply with anything.",
+    "turn_done": "Test: this is how a finished turn looks.",
+}
+TEST_ALERT_KIND_NAMES = {"approval": "approval", "clarify": "question", "turn_done": "turn-finished"}
+TEST_ALERT_ACTIONS = ("once", "session", "always", "deny", "reply", "open")
+TEST_ALERT_SENT = ("APNs accepted the test notification. If it doesn't show within a few seconds, check Focus and "
+                   "the app's notification settings on the iPhone.")
 
 
 def aux_block(timeout: int, *, reasoning_effort: bool = True, **extra: Any) -> dict[str, Any]:
@@ -2439,16 +2453,157 @@ class AlertVoicePlugin(FakeVoicePlugin):
     Registering again works as the plugin's ``DeviceStore.register`` with ``kept_fields``: a body that doesn't
     name ``alert_token`` keeps the stored one (an explicit null clears it), and the alert choices merge kind by
     kind over the stored ones, so a body with ``alerts`` but no ``alert_token`` (iOS has no alert token yet) is
-    fine."""
+    fine.
+
+    Test alerts, as the plugin's ``POST /devices/test {voip_token?, alert_token?, kind?, delay_s?}`` with
+    ``GET /devices/test/{test_id}`` and ``POST /devices/test/{test_id}/answer {action}`` (``notify.TestAlerts``):
+    the same answers ``{ok, test_id, kind, status, code, message, delay_s, action}`` for a phone that isn't
+    registered, has no alert token or turned the kind off, and ``sent`` otherwise, at once or after ``delay_s``.
+    Nothing is pushed: ``GET /debug/test-alerts`` lists each test with the ``payload`` the phone would have got
+    (hand it to ``xcrun simctl push``) and the alert token it would have gone to. ``test_alert_failure`` (a
+    ``(code, message)``) makes the next test fail the way APNs' refusals do."""
 
     # A test knob: ``POST /debug/hold-devices {hold: true}`` keeps every registration waiting until ``{hold: false}``,
     # so an app test can make a change while one is in flight.
     devices_gate: asyncio.Event | None = None
     devices_held = 0
+    # Test knob: the next test alert fails with this (code, message), as when APNs refuses it.
+    test_alert_failure: tuple[str, str] | None = None
 
     def routes(self) -> list[BaseRoute]:
         return [*super().routes(), Route(f"{PLUGIN_PREFIX}/debug/alerts", self.debug_alerts, methods=["GET"]),
-                Route(f"{PLUGIN_PREFIX}/debug/hold-devices", self.debug_hold_devices, methods=["POST"])]
+                Route(f"{PLUGIN_PREFIX}/debug/hold-devices", self.debug_hold_devices, methods=["POST"]),
+                Route(f"{PLUGIN_PREFIX}/devices/test", self.test_alert, methods=["POST"]),
+                Route(f"{PLUGIN_PREFIX}/devices/test/{{test_id}}", self.test_alert_status, methods=["GET"]),
+                Route(f"{PLUGIN_PREFIX}/devices/test/{{test_id}}/answer", self.test_alert_answer, methods=["POST"]),
+                Route(f"{PLUGIN_PREFIX}/debug/test-alerts", self.debug_test_alerts, methods=["GET"])]
+
+    # ── test alerts ───────────────────────────────────────────────────────────────────────────────
+
+    def __init__(self, fake: Any, args: argparse.Namespace | None = None) -> None:
+        super().__init__(fake, args)
+        # Test id -> {view (what the routes answer), payload, sent_to}.
+        self.test_alerts: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def test_alert_payload(kind: str, test_id: str, profile: str = "default") -> dict[str, Any]:
+        """The plugin's ``notify.test_payload``."""
+        hermes: dict[str, Any] = {"kind": kind, "session_id": TEST_ALERT_SESSION, "profile": profile}
+        if kind in ("approval", "clarify"):
+            hermes["request_id"] = f"test-{test_id}"
+        if kind == "approval":
+            hermes["choices"] = ["once", "session", "always", "deny"]
+        if kind == "clarify":
+            hermes["questions"] = [{"qid": "test", "question": TEST_ALERT_BODIES["clarify"], "choices": None,
+                                    "multi_select": False}]
+        hermes.update(test=True, test_id=test_id)
+        return {"aps": {"alert": {"title": "Hermes test", "body": TEST_ALERT_BODIES[kind]},
+                        "category": ALERT_CATEGORIES[kind], "thread-id": TEST_ALERT_SESSION, "sound": "default"},
+                "hermes": hermes}
+
+    def _test_error(self, request: Request, status: int, detail: str) -> Response:
+        self.log(f"http {request.method} {request.url.path} -> {status} ({detail})")
+        return JSONResponse({"detail": detail}, status_code=status)
+
+    async def test_alert(self, request: Request) -> Response:
+        if (denied := self.gate(request, post=True)) is not None:
+            return denied
+        body = await self.json_body(request)
+        if body is None:
+            return self._test_error(request, 400, "Body must be a JSON object")
+        kind = body.get("kind", "approval")
+        if kind not in ALERT_KINDS:
+            return self._test_error(request, 400, f"kind must be one of {', '.join(ALERT_KINDS)}")
+        tokens = []
+        for name in ("voip_token", "alert_token"):
+            token = body.get(name) or ""
+            if token and not (isinstance(token, str) and re.fullmatch(r"[0-9a-fA-F]{64,200}", token.strip())):
+                return self._test_error(request, 400, f"{name} must be the hex APNs token")
+            tokens.append(token.strip().lower())
+        if not any(tokens):
+            return self._test_error(request, 400, "voip_token or alert_token must name the phone that asks")
+        delay = body.get("delay_s", 0)
+        if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not 0 <= delay <= 30:
+            return self._test_error(request, 400, "delay_s must be a number of seconds from 0 to 30")
+        voip, alert = tokens
+        device = self.devices.get(voip) if voip else None
+        if device is None and alert:
+            device = next((d for d in self.devices.values() if d.get("alert_token") == alert), None)
+        test_id = uuid.uuid4().hex[:16]
+        view: dict[str, Any] = {"ok": True, "test_id": test_id, "kind": kind, "status": "scheduled",
+                                "code": "scheduled", "message": "", "delay_s": float(delay), "action": None}
+        entry = {"view": view, "payload": None, "sent_to": []}
+        name = TEST_ALERT_KIND_NAMES[kind]
+        failure = None
+        if device is None:
+            failure = ("not_registered", "This iPhone isn't registered with the Hermes host yet. Open the app while "
+                                         "signed in, then try again.")
+        elif not device.get("alert_token"):
+            failure = ("no_alert_token", "This iPhone has no notification token on the Hermes host: allow "
+                                         "notifications for the app in iOS Settings, then open the app again.")
+        elif not self.alerts_of(device)[kind]:
+            failure = ("off_on_phone", f"This iPhone has {name} notifications turned off.")
+        elif self.test_alert_failure is not None:
+            failure, self.test_alert_failure = self.test_alert_failure, None
+        self.test_alerts[test_id] = entry
+        while len(self.test_alerts) > 50:
+            del self.test_alerts[next(iter(self.test_alerts))]
+        if failure is not None:
+            view.update(ok=False, status="failed", code=failure[0], message=failure[1])
+        else:
+            entry["payload"] = self.test_alert_payload(kind, test_id)
+            entry["sent_to"] = [device["alert_token"]]
+            if delay > 0:
+                view["message"] = (f"The test notification goes out in {float(delay):g} s. Lock the iPhone or leave "
+                                   "the app now.")
+                self.spawn(self._send_test_alert_later(entry, float(delay)))
+            else:
+                self._test_alert_sent(entry)
+        self.log(f"http POST {PLUGIN_PREFIX}/devices/test -> 200 ({kind}: {view['code']}"
+                 + (f", in {float(delay):g} s" if view["status"] == "scheduled" else "") + ")")
+        return JSONResponse(view)
+
+    async def _send_test_alert_later(self, entry: dict[str, Any], delay: float) -> None:
+        await asyncio.sleep(delay)
+        self._test_alert_sent(entry)
+
+    def _test_alert_sent(self, entry: dict[str, Any]) -> None:
+        view = entry["view"]
+        if view["status"] == "scheduled":
+            view.update(status="sent", code="sent", message=TEST_ALERT_SENT)
+        self.log(f"test alert {view['kind']} {view['test_id']} -> {len(entry['sent_to'])} device(s) "
+                 f"(nothing is pushed: GET {PLUGIN_PREFIX}/debug/test-alerts has the payload)")
+
+    async def test_alert_status(self, request: Request) -> Response:
+        if (denied := self.gate(request, post=False)) is not None:
+            return denied
+        entry = self.test_alerts.get(request.path_params["test_id"])
+        if entry is None:
+            return self._test_error(request, 404, "No such test notification (the host keeps the latest ones only)")
+        return JSONResponse(entry["view"])
+
+    async def test_alert_answer(self, request: Request) -> Response:
+        if (denied := self.gate(request, post=True)) is not None:
+            return denied
+        action = (await self.json_body(request) or {}).get("action")
+        if not isinstance(action, str) or action not in TEST_ALERT_ACTIONS:
+            return self._test_error(request, 400, f"action must be one of {', '.join(TEST_ALERT_ACTIONS)}")
+        entry = self.test_alerts.get(request.path_params["test_id"])
+        if entry is None:
+            return self._test_error(request, 404, "No such test notification (the host keeps the latest ones only)")
+        view = entry["view"]
+        if view["status"] != "failed":
+            view.update(status="answered", code="answered", action=action,
+                        message=f"The iPhone answered the test notification ({action}).")
+        self.log(f"http POST {request.url.path} -> 200 ({view['kind']}: {view['status']}, {action})")
+        return JSONResponse(view)
+
+    async def debug_test_alerts(self, request: Request) -> Response:
+        """Every test alert, oldest first: ``{tests: [{…view, payload, sent_to}]}``."""
+        if (denied := self.gate(request, post=False)) is not None:
+            return denied
+        return JSONResponse({"tests": [{**entry["view"], "payload": entry["payload"], "sent_to": entry["sent_to"]}
+                                       for entry in self.test_alerts.values()]})
 
     async def debug_hold_devices(self, request: Request) -> Response:
         """{hold: true} holds every later ``POST /devices`` before it is stored; {hold: false} lets them all go.
