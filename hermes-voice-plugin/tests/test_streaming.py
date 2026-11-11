@@ -266,10 +266,11 @@ def test_an_async_line_that_isnt_delivered_is_told_to_the_conversation(core, fak
             "[Voice call ended by user] Automated notice from HermesVoice, not something the user said. It applies "
             "to this call only and is not a preference, so don't store it. The user did not hear all of what you "
             f'were saying when the call ended: "{line}". The user can\'t hear you now and is probably not reading '
-            "this chat. Finish the task you were given, then reply once in text with a short recap; if you were "
-            "waiting for an answer, say what you still need. Don't ring back unless the user asked in this "
-            "conversation to be called when you're done. When they next call or ask for a call, speak as usual and "
-            "first offer anything they missed."]
+            "this chat. Finish the task you were given. Don't take actions that needed their answer. Then reply "
+            "once in text with a short recap, for when they look; if you were waiting for an answer, say what you "
+            "still need. The hang-up may have been deliberate: don't ring to ask why. Don't ring back unless the "
+            "user asked in this conversation to be called when you're done. When they next call or ask for a call, "
+            "speak as usual and first offer anything they missed."]
 
 
 def test_invalid_voice_id_in_config_never_reaches_the_url(core, fake):

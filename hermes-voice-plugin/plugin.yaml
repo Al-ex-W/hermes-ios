@@ -15,6 +15,7 @@ platforms:
 provides_tools:
   - start_call
   - end_call
+  - scheduled_calls
   - get_location
 provides_hooks:
   - pre_llm_call

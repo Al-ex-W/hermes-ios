@@ -13,7 +13,8 @@ text replies are **never spoken**: the user hears only what you pass to `start_c
 
 Assume the user is not looking at the chat during or right after a call. Say everything that matters out loud.
 Text is for exact identifiers, links and a recap. A result, a question or a warning that exists only in your text
-reply has not reached them.
+reply has not reached them. That is no licence for long lines: say what matters in several short lines, each a
+sentence or two (short lines, not fewer facts).
 
 ## Research beta: say every problem you notice
 
@@ -108,11 +109,13 @@ idle and no chat window is open.
 - `at`: a clock time such as `"07:00"` (24-hour; the next time the clock shows it, so tomorrow if it has passed
   today), or an ISO date-time such as `"2026-01-31T07:00"`. Times are on the Hermes host's clock (the zone of the
   user's quiet hours, if they set one). At most 7 days ahead. Give `in_minutes` or `at`, not both.
-- `text` is the line the user hears when they answer, so write it for that moment ("Good morning, it's seven.").
+- `text` is the line the user hears when they answer, so write one that still makes sense then ("This is your
+  wake-up call. It's seven."), not one that depends on what is true now ("The build is still running").
   `mode` is ignored.
 
 The result comes at once: `{status: "scheduled", scheduled_id, rings_at, note, pending}`. Tell the user the time
-(`rings_at`) and carry on or end your turn.
+and carry on or end your turn. Out loud, say `rings_at` the way people say times ("tomorrow at seven"); the exact
+value is for the text recap.
 
 - **Never wait for the time yourself**: no sleep, no waiting command, no sync call held open. Such a wait is cut off
   at Hermes' tool deadline, so the phone rings early or not at all.
@@ -121,20 +124,27 @@ The result comes at once: `{status: "scheduled", scheduled_id, rings_at, note, p
 
 At the time the phone rings, and your line is spoken once the user answers. You then get a `[Voice call started]`
 notice that names the scheduled call (and says how late it rang, if Hermes was not running at the time). Don't
-speak on that notice: wait for their `[Voice]` reply and answer it with `start_call`, as on any call. A call the
-user asked for rings during their quiet hours too.
+speak on that notice: wait for their `[Voice]` reply and answer it with `start_call`, as on any call. Your line
+is as old as its scheduling, so check anything time-dependent (a build's state, the weather, a price) before you
+say more. A call the user asked for rings during their quiet hours too.
+
+A scheduled call never fails silently. If it can't ring at its time, or nobody answers, this conversation gets a
+notice that says what happened and what to do: reply in text, and schedule again only if the user asks.
 
 - **Not answered.** The phone rings once more a few minutes later (the result's `note` says when). After that you
   get the usual `[Voice call not answered]` or `[Voice line not delivered: …]` notice; it says that this was the
   scheduled call, when it was tried, and what its line was. Put the line in a short text reply. Don't schedule it
   again unless the user asks.
 - **Not placed.** `[Voice call not placed: …]` means the ring never went out: Hermes was down for too long at the
-  time, or the user stayed on another call. Tell them in text what the call was for.
+  time (more than 15 minutes by default), or the user stayed on another call through every retry. Tell them in
+  text what happened and what the call was for.
 - **Already on a call with you.** If the user is on a call with this conversation at the time, the line is said
   into that call without ringing, and a `[Voice line spoken: …]` notice tells you.
-- **List and cancel.** Every scheduling result lists this conversation's scheduled calls in `pending`. `end_call`
-  with `scheduled_id` cancels one (`"all"` cancels them all, `"list"` only lists them) and hangs nothing up. To
-  change a time, cancel the call and schedule a new one. At most 5 calls can wait per conversation.
+- **List and cancel.** `scheduled_calls` lists this conversation's scheduled calls (`pending`), and every
+  scheduling result lists them too. `scheduled_calls` with `cancel` set to a `scheduled_id` cancels that call,
+  `cancel: "all"` cancels them all; it returns `{pending, cancelled, note}` and never rings or hangs up (`end_call`
+  only hangs up). To change a time, cancel the call and schedule a new one. At most 5 calls can wait per
+  conversation.
 
 ## When a call ends
 
@@ -146,16 +156,19 @@ hang-up, a declined call or a failed ring that the user "wants text" from now on
 After the user hangs up, or a call isn't answered or is lost:
 
 - They can't hear you, and they are probably not reading the chat either. Don't ask questions into the void.
-- Finish the task you were given. Then reply **once** in text with a short recap; if you were waiting for an
-  answer, say what you still need.
+- Finish the task you were given, but don't take actions that needed their answer. Then reply **once** in text
+  with a short recap, for when they look; if you were waiting for an answer, say what you still need.
 - Don't ring back unless the user asked in this conversation to be called when you're done ("call me when it's
-  finished"). After a call they didn't answer, something urgent is a reason too.
+  finished"). A hang-up may have been deliberate: don't ring to ask why. After a call they didn't answer,
+  something urgent is a reason too.
 - The next time they call, or ask for a call, speak as usual.
 
 **What they missed.** When the user hangs up while a line is still playing or queued, the notice (or the sync
 result's `note`) quotes what they did not hear to the end. Put it in your recap. When the next call in this
 conversation starts, the `[Voice call started]` notice or your first `start_call` result reminds you once: offer
-the missed part first ("You hung up before I finished. Want the rest?"), unless they have had it since.
+the missed part first ("You hung up before I finished. Want the rest?"), unless they have had it since. If the
+line they hung up on was a long one (over about 15 seconds of speech), the notice says so: keep lines shorter on
+the next call.
 
 ## Speaking well
 
@@ -169,19 +182,21 @@ A phone call is not a chat window: the user can't skim, scroll back or copy what
   numbers or exact timestamps. Say the human name ("the databases course", "the login bug", "this morning"); the
   exact identifiers go in the text recap.
 - **Numbers.** Round them ("about forty", "just under two hours") unless the user asked for precision.
+- **Times.** Say them the way people do ("tomorrow at seven", "around three", "in ten minutes"), never as
+  "15:03:22" or a date-time string. That goes for a scheduled call's `rings_at` too.
 - **Asked to repeat** ("what did you say?"): say it shorter and plainer, not the same words again.
 - Plain spoken sentences, the way you'd say them on the phone: no Markdown, lists, code or emoji. Say what the
   user needs to know; only links, code and exact identifiers go in the text recap.
-- **Length check.** The `start_call` result flags a line that takes longer than about 15 seconds to say (`Long
-  line: about 22 s of speech. Keep lines to a sentence or two and offer details instead.`; estimated at 15
-  characters a second). Shorten the lines that follow. Text over about 1000 characters is cut (the result says so).
+- **Length check.** The `note` of the `start_call` result flags a line that takes longer than about 15 seconds to
+  say (`Long line: about 22 s of speech. Keep lines to a sentence or two and offer details instead.`; estimated
+  at 15 characters a second). Say the next lines shorter. Text over about 1000 characters is cut (the note says so).
 - Hang up with `end_call` (optionally with a short goodbye) when the conversation is done or they ask.
 
 ## Call style: how this user wants to be spoken to
 
 The user's lasting preferences for calls (tone, form of address, humour, ElevenLabs audio tags) live in a file of
-theirs: `<HERMES_HOME>/hermes-voice/call-style.md`. The `start_call` description gives its full path (a plugin
-setting can move it). This skill can't be edited with `skill_manage`; that file is where such preferences go.
+theirs: `<HERMES_HOME>/hermes-voice/call-style.md`, in this profile's Hermes home. The `start_call` description
+gives its full path (a plugin setting can move it). This skill can't be edited with `skill_manage`; that file is where such preferences go.
 
 - **Follow it.** The plugin hands you the file's current text when a call starts: in the `[Voice call started]`
   notice, or as `call_style` in the first `start_call` result of a call (the line that rings). The `start_call`
@@ -190,7 +205,7 @@ setting can move it). This skill can't be edited with `skill_manage`; that file 
 - **Update it** with your file tools when the user states a lasting preference about how you speak on calls
   ("call me sir", "drop the jokes on calls", "sound calmer"). Read the file, change it, keep it short (the first
   1500 characters are used; the plugin says when it cut), and tell the user you noted it. A wish for this one call
-  ("speak up, I'm in the car") is not a lasting preference: just do it.
+  ("speak up, I'm in the car", "shorter this time") is not a lasting preference: just do it.
 - It is about how you speak. It doesn't decide when to call or what to do, and the automated `[Voice call …]`
   notices never belong in it.
 

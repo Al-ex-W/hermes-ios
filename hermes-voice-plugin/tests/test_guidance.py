@@ -122,10 +122,11 @@ def test_a_sync_call_says_what_was_not_heard_and_the_next_one_reminds_with_the_r
     assert first["note"] == (
         "The user hung up. This is about this call only and is not a preference, so don't store it. The user did "
         f'not hear all of what you were saying when the call ended: "{LONG}". The user can\'t hear you now and is '
-        "probably not reading this chat. Finish the task you were given, then reply once in text with a short "
-        "recap; if you were waiting for an answer, say what you still need. Don't ring back unless the user asked "
-        "in this conversation to be called when you're done. When they next call or ask for a call, speak as usual "
-        "and first offer anything they missed.")
+        "probably not reading this chat. Finish the task you were given. Don't take actions that needed their "
+        "answer. Then reply once in text with a short recap, for when they look; if you were waiting for an "
+        "answer, say what you still need. The hang-up may have been deliberate: don't ring to ask why. Don't ring "
+        "back unless the user asked in this conversation to be called when you're done. When they next call or ask "
+        "for a call, speak as usual and first offer anything they missed.")
     assert second["said"] == "Yes, go on." and second["outcome"] == "answered"
     assert second["note"] == REMINDER.strip()
     # The first hang-up was the sync result's to tell; the second (nobody waiting, all heard) is a plain notice.
@@ -414,9 +415,11 @@ def test_audio_tags_reach_elevenlabs_untouched(core, fake, make_hub):
 
 def test_the_skill_and_the_description_say_how_to_speak(core):
     description = core.tools.START_CALL["description"]
-    for rule in ("lead with the answer", "two sentences at most", "offer more instead of saying it all",
-                 "a progress update is a few words", "never read out codes, long ids, hashes, URLs, file paths, "
-                 "issue numbers or exact timestamps", "round numbers", "say it shorter and plainer"):
+    for rule in ("lead with the answer", "two sentences at most per line", "then offer more",
+                 "a progress update is a few words", "Never read out codes, long ids, hashes, URLs, file paths or "
+                 "issue numbers", "round numbers", 'times the way people say them ("tomorrow at seven")',
+                 "keep exact values for the text recap", 'If a result\'s note says "Long line", say the next lines '
+                 "shorter", "say it shorter and plainer"):
         assert rule in description, rule
     skill = _skill()
     speaking = " ".join(skill[skill.index("## Speaking well"):skill.index("## When to ring")].split())
@@ -646,29 +649,29 @@ def test_the_registered_description_names_the_file_and_carries_a_short_copy(core
         plugin.register(ctx)
         return ctx.tools["start_call"]
 
-    where = (f"write it to {_style_file(fake)} with your file tools and follow that file; a call's first result "
-             "carries its current text.")
+    where = (f'not a one-off like "shorter this time"), write it to their call style file {_style_file(fake)} '
+             "with your file tools and follow it; a call's first result has its text as call_style.")
     plain = registered()
     assert where in plain and "At startup it said" not in plain  # no file yet: where to put one
     _write_style(fake)
     assert (f"{where} At startup it said: Address me as \"sir\". Dry, understated humour. Audio tags are fine: "
-            "[sighs]. No [whispers]. This is a research beta") in registered()
+            "[sighs]. No [whispers]. Research beta") in registered()
     _write_style(fake, "word " * 300)
     long = registered()
     copy = long[long.index("At startup it said: ") + len("At startup it said: "):long.index(" … (cut)")]
     assert len(copy) <= core.guidance.STYLE_BRIEF_LIMIT == 400 and copy.startswith("word word")
     assert len(long) - len(plain) < 450
     # Outside a running Hermes the constant stands in, without a path.
-    assert "hermes-voice/call-style.md in the Hermes home" in core.tools.START_CALL["description"]
+    assert "hermes-voice/call-style.md in this profile's Hermes home" in core.tools.START_CALL["description"]
     assert core.tools.START_CALL["parameters"] is core.tools.start_call_schema()["parameters"]
 
 
 def test_the_description_stays_compact(core):
     """It goes out with every request: the rules a small model needs, and no more."""
     description = core.tools.START_CALL["description"]
-    assert len(description) < 2900, len(description)
-    for needed in ("[Voice]", "sync", "async", "busy", "not_allowed", "not_available", "research beta",
-                   'skill_view("hermes_voice:voice-calls")'):
+    assert len(description) < 2400, len(description)
+    for needed in ("[Voice]", "sync", "async", "busy", "not_allowed", "not_available", "Research beta",
+                   "scheduled_calls", "call_style", 'skill_view("hermes_voice:voice-calls")'):
         assert needed in description, needed
 
 
@@ -725,9 +728,11 @@ def _readme() -> str:
 
 def test_the_description_and_the_skill_treat_a_hang_up_as_an_event_not_a_preference(core):
     description = core.tools.START_CALL["description"]
-    assert '"[Voice call" or "[Voice line" are automated notices about one call' in description
-    assert "never a preference to remember" in description
-    assert "the user is not reading the chat" in description and "say everything that matters with it" in description
+    assert ('"[Voice]" / "[Voice, …]" messages are the user\'s words: answer with start_call. Messages starting '
+            '"[Voice call" or "[Voice line" are automated notices, not their words or preferences.') in description
+    # Short lines, not fewer facts: what matters is said, in several lines.
+    assert ("your text replies are NOT spoken or read: if it matters, say it, in several short lines"
+            in description)
     assert "reply once in text with a short recap" in description and "first offer what they missed" in description
     skill = _skill()
     for text in (description, skill, _readme()):

@@ -45,7 +45,7 @@ iPhone (HermesVoice)                           Hermes host: hermes serve :9119 (
 | Path | What |
 |---|---|
 | [`HermesVoice/`](HermesVoice) | SwiftUI iOS app (iOS 17+), generated with XcodeGen from `project.yml` |
-| [`hermes-voice-plugin/`](hermes-voice-plugin) | The `hermes_voice` Hermes plugin: `start_call` / `end_call` / `get_location`, the phone's socket, VoIP, alert and background pushes, TTS |
+| [`hermes-voice-plugin/`](hermes-voice-plugin) | The `hermes_voice` Hermes plugin: `start_call` / `end_call` / `scheduled_calls` / `get_location`, the phone's socket, VoIP, alert and background pushes, TTS |
 | [`hermes-voice-mcp/`](hermes-voice-mcp) | Legacy: the `speak` MCP server and its phone socket (until the cutover) |
 | [`devtools/`](devtools) | `fake_hermes.py`, a fake dashboard (with a fake `hermes_voice` plugin) for Simulator tests |
 
@@ -72,7 +72,7 @@ direct messages to Hermes on a messaging platform), an agent can call `start_cal
   chat or desktop open, and during quiet hours, since it is a call you asked for. Who may schedule is checked when
   scheduling. A ring you don't answer is repeated once after five minutes, then the conversation is told; a call
   the host slept through rings up to 15 minutes late and says so, else the conversation is told it was not placed.
-  `end_call(scheduled_id)` cancels. Details and settings: [plugin README](hermes-voice-plugin/README.md), "Calls
+  `scheduled_calls` lists and cancels. Details and settings: [plugin README](hermes-voice-plugin/README.md), "Calls
   that ring later".
 - Hermes is told to speak as on the phone: the answer first, two sentences at most, no codes, ids, URLs or paths
   read out. A line that takes longer than about 15 seconds to say is flagged in the `start_call` result.

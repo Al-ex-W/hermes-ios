@@ -141,9 +141,11 @@ NOTICE_MARKER = "Automated notice from HermesVoice, not something the user said.
 NOTICE_HEAD = f"{NOTICE_MARKER} It applies to this call only and is not a preference, so don't store it."
 RESULT_SCOPE = "This is about this call only and is not a preference, so don't store it."
 AWAY = (
-    "The user can't hear you now and is probably not reading this chat. Finish the task you were given, then reply "
-    "once in text with a short recap; if you were waiting for an answer, say what you still need."
+    "The user can't hear you now and is probably not reading this chat. Finish the task you were given. Don't take "
+    "actions that needed their answer. Then reply once in text with a short recap, for when they look; if you were "
+    "waiting for an answer, say what you still need."
 )
+DELIBERATE = "The hang-up may have been deliberate: don't ring to ask why."
 NEXT_CALL = "When they next call or ask for a call, speak as usual"
 AFTER_CALL = {
     "no_answer": f"{AWAY} Don't ring again unless it is urgent or the user asks. {NEXT_CALL}.",
@@ -152,8 +154,8 @@ AFTER_CALL = {
     "unreachable": f"{AWAY} Tell them the ring didn't get through, and don't ring again unless the user asks.",
     "lost": (f"{AWAY} Ring again with start_call only if it's worth it. {NEXT_CALL} and first offer anything they "
              "missed."),
-    "ended_by_user": (f"{AWAY} Don't ring back unless the user asked in this conversation to be called when you're "
-                      f"done. {NEXT_CALL} and first offer anything they missed."),
+    "ended_by_user": (f"{AWAY} {DELIBERATE} Don't ring back unless the user asked in this conversation to be called "
+                      f"when you're done. {NEXT_CALL} and first offer anything they missed."),
 }
 # The notes on start_call results (hermes-voice-plugin/hub.py: start_call, _outcome_note).
 ASYNC_NOTES = {

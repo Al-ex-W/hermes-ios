@@ -859,8 +859,8 @@ class CallHub:
                 live = call.state == "live"
         if not mine:
             pending = self.schedule.pending(origin)
-            later = (f" It has {len(pending)} scheduled for later (see pending); end_call with scheduled_id "
-                     "cancels one." if pending else "")
+            later = (f" It has {len(pending)} scheduled for later (see pending); scheduled_calls cancels them."
+                     if pending else "")
             return {"call_id": None, "outcome": None, "note": f"This conversation has no voice call running.{later}",
                     **({"pending": pending} if pending else {})}
         note = ""
@@ -1501,7 +1501,7 @@ def _outcome_note(outcome: str, detail: str, unheard: Any = ()) -> str:
     }.get(outcome)
     if what is None:
         return detail
-    return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard)} {inject.after_call(outcome)}"
+    return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard)} {inject.after_call(outcome, unheard)}"
 
 
 def _style_for(call: Call) -> str:
