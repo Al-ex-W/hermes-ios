@@ -14,6 +14,12 @@ The target is the owner's live runtime session (``server._find_live_session_by_k
 reopened with ``session.resume`` (which follows a compression rotation to its tip). A stale runtime id (4001 /
 4007) is resolved again once.
 
+Hermes keeps one writer per conversation (the lease in ``<HERMES_HOME>/runtime/active_sessions.json``, claimed on
+a session's first turn and held while that process has it open). ``prompt.submit`` for a chat another process holds
+is refused with 4090 / ``SESSION_NOT_OWNED`` ("This chat is open in another Hermes window/terminal") before
+anything is written: that delivery is marked ``held``, and the hub hands it to the holding process or keeps and
+retries it (``hub.py``: ``CallHub.deliver``, ``InjectQueue``).
+
 Every host method runs with Hermes' drop sink bound as its transport (``hermes.detached_transport``): this thread
 has no client, and the host's fallback is its stdout, where a reopened conversation would stream from then on.
 
@@ -130,6 +136,9 @@ class Delivery:
     detail: str = ""
     # Not delivered where the conversation runs, and not refused there either: the dashboard may still reach it.
     fallback: bool = False
+    # Refused because another Hermes process holds the chat (Hermes' one-writer lease). Nothing was written, so
+    # it can go to that process, or be tried again once the chat is free.
+    held: bool = False
 
 
 class Owner(Protocol):
@@ -208,7 +217,7 @@ class TuiInjector:
                 return None
             if _ok(response):
                 return Delivery(True, "submit", _status(response) or "streaming")
-            return Delivery(False, "submit", "", _message(response))
+            return Delivery(False, "submit", "", _message(response), held=held_refusal(response))
         response = _call(table, REDIRECT, {"session_id": sid, "text": text})
         if _stale(response):
             return None
@@ -224,7 +233,7 @@ class TuiInjector:
             return None
         if _ok(response):
             return Delivery(True, "submit", _status(response) or "streaming")
-        return Delivery(False, "submit", "", _message(response))
+        return Delivery(False, "submit", "", _message(response), held=held_refusal(response))
 
 
 def _call(table: dict, method: str, params: dict) -> Any:
@@ -259,6 +268,51 @@ def _message(response: Any) -> str:
     if isinstance(error, dict):
         return str(error.get("message") or error.get("code") or "unknown error")[:200]
     return "unknown error"
+
+
+# ── a chat another Hermes process holds ────────────────────────────────────────────────────────────────────
+
+# ``prompt.submit``'s refusal of a session whose active-session lease another process holds
+# (``tui_gateway/methods_prompt.py``: ``_slot_refusal``; ``hermes_cli/active_sessions.py``: the reason and text).
+HELD_CODE = 4090
+HELD_REASON = "SESSION_NOT_OWNED"
+HELD_TEXT = "This chat is open in another Hermes window"
+
+# What the hub says into the call (its own speech, not the agent's) when the call's chat can't be written.
+CHAT_HELD_SPOKEN = ("I can't reach this chat right now: it's open in another Hermes window. Close it there, or call "
+                    "from another chat.")
+
+
+def held_refusal(response: Any) -> bool:
+    """Whether a host method refused because another Hermes process holds the conversation. Hermes refuses that
+    before it writes anything, so the same text can be delivered again later without a duplicate."""
+    error = response.get("error") if isinstance(response, dict) else None
+    if not isinstance(error, dict) or error.get("code") != HELD_CODE:
+        return False
+    data = error.get("data")
+    reason = data.get("reason") if isinstance(data, dict) else None
+    if reason is not None:
+        return reason == HELD_REASON
+    return str(error.get("message") or "").startswith(HELD_TEXT)  # a Hermes that names no reason
+
+
+def delayed(text: str, seconds: float, call_over: bool, lost: int = 0) -> str:
+    """`text` for a conversation that couldn't take it when it was said, with a note saying so (and how many
+    earlier deliveries of the call were given up meanwhile)."""
+    now = ("The call is over by now, so reply in text." if call_over
+           else "The user is still on the call and was told this chat couldn't be reached.")
+    gone = f" {lost} earlier message(s) from this call could not be delivered at all." if lost > 0 else ""
+    return (f"{text} (Delayed by {max(1, round(seconds))} s: this chat was open in another Hermes window, so "
+            f"nothing could be put into it.{gone} {now})")
+
+
+def kind_of(text: str) -> str:
+    """What a delivery is, for the ring log (which never holds the text itself)."""
+    if text.startswith("[Voice call started]"):
+        return "call_started"
+    if text.startswith("[Voice]") or text.startswith("[Voice, "):
+        return "turn"
+    return "notice"
 
 
 # ── delivery in the conversation's own process (calls from other processes) ───────────────────────────────
@@ -531,7 +585,9 @@ def deliver_here(target: AgentTarget, text: str, turns: Turns) -> Delivery:
     # user's own prompt in meanwhile).
     if not child and hermes.methods() is not None and hermes.find_live(target.session_id) is not None:
         delivery = TuiInjector().deliver_live(target.owner, text)
-        if delivery.ok:
+        if delivery.ok or delivery.held:
+            # Held: this process has the chat open, but another one holds it. Hermes would refuse a turn started
+            # here just the same, only later and without telling: the hub finds the holder, or retries.
             return delivery
     agent = target.agent()
     if agent is not None and turns.live(agent, target):

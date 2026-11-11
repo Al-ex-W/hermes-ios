@@ -22,13 +22,21 @@ Protocol: one JSON object per line (UTF-8, at most 64 KiB). The client starts wi
 - ``end {origin, text?}``: ``end_call`` (the goodbye is spoken first, up to a minute).
 - ``subscribe_turns {call_id, origin}``: the conversation's process takes the call's turns from now on. Events
   follow on this connection: ``{"event": "turn", call_id, seq, text}`` (the client answers
-  ``{"op": "delivered", seq, ok, via?, status?, detail?, fallback?}``) and ``{"event": "ended", call_id, outcome}``.
+  ``{"op": "delivered", seq, ok, via?, status?, detail?, fallback?, held?}``) and ``{"event": "ended", call_id,
+  outcome}``.
+- ``attend {pid?}``: this process hosts sessions of its own (a Desktop backend, an Ink TUI) and takes what a call
+  has for a chat it holds, for as long as the connection stays (``remote.Attendant``). Hermes keeps one writer per
+  conversation, so the dashboard can't write a chat such a process has open. The hub then asks every attending
+  process ``{"event": "find", seq, session_ids}`` (answered ``{"op": "attended", seq, session_id: <the one it has
+  open> | null, holds?: <it has the chat's lease>}``) and hands the text to one that has it:
+  ``{"event": "deliver", seq, session_id, text}`` (answered ``{"op": "attended", seq, ok, via?, status?, detail?,
+  held?}``).
 
-And four one-way messages: ``{"op": "signal", ref: <request id>, interrupt?: true, yield?: true}`` (the tool
-thread waiting on ``await_turn`` / ``end`` was stopped, or Hermes asked it to yield), ``delivered`` (above),
-``{"op": "rekey", call_id, session_id}`` (the subscriber's conversation continues under a new id after compression)
-and ``{"op": "requeue", call_id, text}`` (a turn the subscriber took but no turn there read: a compute-host child
-hands it back, and it goes through the dashboard's session).
+And five one-way messages: ``{"op": "signal", ref: <request id>, interrupt?: true, yield?: true}`` (the tool
+thread waiting on ``await_turn`` / ``end`` was stopped, or Hermes asked it to yield), ``delivered`` and ``attended``
+(above), ``{"op": "rekey", call_id, session_id}`` (the subscriber's conversation continues under a new id after
+compression) and ``{"op": "requeue", call_id, text}`` (a turn the subscriber took but no turn there read: a
+compute-host child hands it back, and it goes through the dashboard's session).
 
 ``origin`` is ``hermes.Origin`` as fields (no runtime session: that is the other process's). The policy, rate limits
 and quiet hours run here, for every process. A process of another profile (one without a dashboard of its own finds
@@ -71,6 +79,8 @@ SEND_TIMEOUT = 10.0
 SUBSCRIBER_GRACE = 30.0
 # How long the conversation's process may take to put one turn in.
 ACK_TIMEOUT = 20.0
+# How long the attending processes may take to say whether they have a chat open.
+FIND_TIMEOUT = 3.0
 MAX_REQUESTS = 16
 MAX_TEXT = 20_000
 # sockaddr_un.sun_path: 104 bytes on macOS, 108 on Linux (with the terminating NUL).
@@ -168,6 +178,16 @@ class _Ack:
     def __init__(self) -> None:
         self.event = threading.Event()
         self.delivery = inject.Delivery(False, detail="no answer from the conversation's process")
+
+
+class _Asked:
+    """Something an attending client was asked (``find`` / ``deliver``), until it answers or goes away."""
+
+    def __init__(self, conn: "Conn", seq: int) -> None:
+        self.conn = conn
+        self.seq = seq
+        self.event = threading.Event()
+        self.answer: Optional[dict] = None
 
 
 class Route:
@@ -271,7 +291,7 @@ class Route:
             return
         ack.delivery = inject.Delivery(
             message.get("ok") is True, _text(message.get("via"), 40), _text(message.get("status"), 40),
-            _text(message.get("detail"), 300), message.get("fallback") is True)
+            _text(message.get("detail"), 300), message.get("fallback") is True, message.get("held") is True)
         ack.event.set()
 
     def close(self, outcome: str) -> None:
@@ -309,6 +329,9 @@ class Conn:
         self.routes: set[Route] = set()
         self.lock = threading.Lock()
         self.buffer = b""
+        # ``attend``: this client takes deliveries for the chats it holds; its process id, for the log.
+        self.attending = False
+        self.pid = 0
 
     def send(self, message: dict) -> bool:
         data = (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -362,6 +385,7 @@ class Conn:
             route.detach(self)
         self.routes.clear()
         self.server.drop_waiters(self)
+        self.server.drop_attendant(self)
         self.server.conns.discard(self)
 
 
@@ -383,6 +407,10 @@ class HubServer:
         self.conns: set[Conn] = set()
         self.waiters: dict[str, tuple[Call, Waiter, Conn]] = {}
         self.lock = threading.Lock()
+        # Processes that attend for the chats they hold, and what they were asked and haven't answered yet.
+        self.attendants: list[Conn] = []
+        self.asked: dict[int, _Asked] = {}
+        self.ask_seq = 0
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────────────────────────
 
@@ -413,6 +441,7 @@ class HubServer:
             self._remove_files()
             raise
         self.sock, self.bound = sock, target
+        self.hub.holders = self.through_holder
         hermes.spawn_thread(self._accept, name="hermes-voice-hubsock-accept")
         logger.info("hermes_voice: hub socket open at %s", self.path)
         return self
@@ -421,6 +450,8 @@ class HubServer:
         if self.closed.is_set():
             return
         self.closed.set()
+        if getattr(self.hub, "holders", None) == self.through_holder:
+            self.hub.holders = None
         sock, self.sock = self.sock, None
         if sock is not None:
             try:
@@ -531,6 +562,14 @@ class HubServer:
         if op == "rekey":
             self._rekey(conn, message)
             return
+        if op == "attended":
+            seq = message.get("seq")
+            with self.lock:
+                asked = self.asked.get(seq) if isinstance(seq, int) else None
+            if asked is not None and asked.conn is conn:
+                asked.answer = message
+                asked.event.set()
+            return
         if op == "requeue":
             text = message.get("text")
             if isinstance(text, str) and text.strip():
@@ -591,6 +630,17 @@ class HubServer:
                                      signals)
         if op == "subscribe_turns":
             return self._subscribe(conn, message)
+        if op == "attend":
+            pid = message.get("pid")
+            conn.pid = pid if isinstance(pid, int) and not isinstance(pid, bool) else 0
+            with self.lock:
+                conn.attending = True
+                if conn not in self.attendants:
+                    self.attendants.append(conn)
+            if conn.closed.is_set():
+                self.drop_attendant(conn)
+            logger.info("hermes_voice: Hermes process %s attends for the chats it holds", conn.pid or "?")
+            return {"attending": True}
         raise ProtocolError("unknown_op", f"unknown op {op!r}")
 
     def _foreign(self, origin: hermes.Origin, mode: str) -> Optional[dict[str, Any]]:
@@ -644,6 +694,71 @@ class HubServer:
             conn.waiters.discard(waiter_id)
             if entry is not None:
                 self.hub.abandon(entry[0], entry[1])
+
+    # ── chats other processes hold ───────────────────────────────────────────────────────────────────────
+
+    def drop_attendant(self, conn: Conn) -> None:
+        """An attending client is gone: what it was asked gets no answer."""
+        with self.lock:
+            if conn in self.attendants:
+                self.attendants.remove(conn)
+            waiting = [asked for asked in self.asked.values() if asked.conn is conn]
+        for asked in waiting:
+            asked.event.set()
+
+    def _ask(self, conn: Conn, event: dict) -> "_Asked":
+        with self.lock:
+            self.ask_seq += 1
+            asked = self.asked[self.ask_seq] = _Asked(conn, self.ask_seq)
+        if conn.closed.is_set() or not conn.send({**event, "seq": asked.seq}):
+            asked.event.set()
+        return asked
+
+    def _answer(self, asked: "_Asked", timeout: float) -> Optional[dict]:
+        """What the client answered, or None (it went away, or said nothing in time)."""
+        asked.event.wait(max(0.0, timeout))
+        with self.lock:
+            self.asked.pop(asked.seq, None)
+        return asked.answer
+
+    def through_holder(self, session_ids: list[str], text: str) -> Optional[inject.Delivery]:
+        """Put `text` into a chat this process may not write, through the Hermes process that has it open
+        (``CallHub.holders``; InjectQueue thread). Every attending process says whether it has one of
+        `session_ids` open; the text goes to those that do (one that holds the chat's lease first) until one takes
+        it. None when no attending process has the chat, or the ones that do are refused it as well.
+
+        A process that was handed the text and didn't say what it did with it may have taken it: that is final
+        (never tried again, so never put in twice)."""
+        with self.lock:
+            attendants = list(self.attendants)
+        if not attendants or not session_ids:
+            return None
+        deadline = time.monotonic() + FIND_TIMEOUT
+        finds = [(conn, self._ask(conn, {"event": "find", "session_ids": session_ids})) for conn in attendants]
+        found: list[tuple[bool, Conn, str]] = []
+        for conn, asked in finds:
+            answer = self._answer(asked, deadline - time.monotonic()) or {}
+            session_id = answer.get("session_id")
+            if isinstance(session_id, str) and session_id in session_ids:
+                found.append((answer.get("holds") is True, conn, session_id))
+        for _, conn, session_id in sorted(found, key=lambda entry: not entry[0]):
+            asked = self._ask(conn, {"event": "deliver", "session_id": session_id, "text": text})
+            answer = self._answer(asked, ACK_TIMEOUT)
+            if answer is None:
+                if conn.closed.is_set():
+                    continue  # it went away, and its session with it: the refusal stands, the queue tries again
+                return inject.Delivery(False, "holder", detail="the Hermes process that holds the chat didn't "
+                                                                  "say whether it took it")
+            via = f"holder:{_text(answer.get('via'), 40)}".rstrip(":")
+            delivery = inject.Delivery(answer.get("ok") is True, via, _text(answer.get("status"), 40),
+                                       _text(answer.get("detail"), 300), held=answer.get("held") is True)
+            if delivery.ok:
+                logger.info("hermes_voice: delivered to %s through the Hermes process that holds it (pid %s)",
+                            session_id, conn.pid or "?")
+                return delivery
+            if not delivery.held:
+                return delivery
+        return None
 
     def _subscribe(self, conn: Conn, message: dict) -> dict[str, Any]:
         """Take the call's turns. A call that just ended still has its last notices to deliver (an async ring
