@@ -289,8 +289,8 @@ settings any more):
   chat), which the app may not be able to open; the call itself works the same.
 - Alert pushes cover only conversations the dashboard hosts. A suspended app counts as attached until Hermes
   notices its socket is gone, and an alert APNs refuses isn't retried.
-- Half duplex: the mic is off while Hermes speaks. If you're mid-sentence when Hermes starts, it waits up to 3 s,
-  then what it heard so far goes in as `cut_off`.
+- Half duplex: the mic is off while Hermes speaks. If you're mid-sentence when Hermes starts, it waits for
+  your pause setting plus 2 s (at most 10 s), then what it heard so far goes in as `cut_off`.
 - The Simulator has no VoIP pushes, CallKit audio or microphone: there calls ring inside the app only, Hermes can
   be heard, and you answer by typing. Debug builds take `hermesvoice://ring?call_id=…&session_id=…` as a push.
 
