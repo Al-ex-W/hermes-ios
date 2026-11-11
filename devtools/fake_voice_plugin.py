@@ -11,6 +11,8 @@ call mode can be tested in the iOS Simulator without Hermes, APNs or ElevenLabs:
   POST /api/plugins/hermes_voice/debug/ring       {session_id, mode?, text?}: makes that session's fake agent call
                                                   start_call and returns the VoIP push the phone would have got
   GET  /api/plugins/hermes_voice/debug/pushes     every push the fake would have sent
+  GET  /api/plugins/hermes_voice/debug/playback   what phones reported about how lines played (the last 200):
+                                                  {reports: [{call_id, type, id, reason?, playback?, problems?}]}
 
 The alert half lives in fake_hermes.py's ``AlertVoicePlugin``, which the dashboard mounts: ``alerts`` on
 POST /devices, GET debug/alerts, and the plugin's test alert routes (POST /devices/test, GET /devices/test/{test_id},
@@ -21,7 +23,11 @@ The HTTP routes need the dashboard sign-in cookie, like every /api/* route of th
 Link protocol (JSON text frames plus binary PCM16LE mono at 24 kHz; the speech is a tone per word):
   phone hello {call_id (32 hex), session_id?, title?, initiated_by: "user"|"push", app_version}
         -> ready {call_id, state: "ringing"|"live"}
-  phone ringing / answered / declined (a push call), played {id}, user_turn {…}, ping -> pong, bye {reason?}
+  phone ringing / answered / declined (a push call), played {id, playback?}, user_turn {…}, ping -> pong,
+        bye {reason?}; unplayed {id, reason: hang_up|cancelled|lost|dropped, playback?} for a line that was not
+        played to the end (lost: the fake stops waiting for its ack) and replayed {id} when the user had the phone
+        play a line again. playback: {audio_s, played_s, stalls, stall_s, rebuilds, route_changes, route?, volume?,
+        level_db?, gain_db?} (hermes-voice-plugin/guidance.py: Playback); the fake checks its shape and keeps it
   plugin speech_start {id, text, sample_rate, format: "pcm_s16le"}, PCM frames, then speech_end {id} |
         speech_end {id, cancelled: true} | speech_end {id, error}; cancel {reason} ends a ringing call,
         ended {outcome} a live one
@@ -38,7 +44,8 @@ started after its line was played. Injecting mirrors inject.py: a running sessio
 ("[Voice call not answered] …", "[Voice call ended by user] …", "[Voice call ended: …lost…]", "[Voice line not
 delivered: …]"); a sync start_call returns the outcome instead. The texts are hermes-voice-plugin/inject.py's (each
 notice says it is an automated one, not the user's words). Not modelled: what the user did not hear when a call
-ended and the reminder on the next call, the long-line note, and the call style file. A ring
+ended and the reminder on the next call, the long-line note, the call style file, the notes the real plugin makes
+of the playback reports (they are only kept, for debug/playback), and its replay of a repeated line's audio. A ring
 ends as no_answer when the phone rang but nobody answered, as unreachable when no phone ever opened the link.
 
 The fake agent (fake_hermes.py run_turn hands these to ``FakeVoicePlugin.handle``):
@@ -225,6 +232,31 @@ async def next_message(ws: WebSocket) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+# The playback facts a phone reports with played / unplayed (hermes-voice-plugin/guidance.py: Playback).
+UNPLAYED_REASONS = ("hang_up", "cancelled", "lost", "dropped")
+PLAYBACK_NUMBERS = ("audio_s", "played_s", "stalls", "stall_s", "rebuilds", "route_changes", "volume", "level_db",
+                    "gain_db")
+PLAYBACK_ROUTES = ("receiver", "speaker", "bluetooth", "headphones", "car", "other")
+
+
+def playback_problems(facts: Any) -> list[str]:
+    """What is wrong with a ``playback`` object's shape ([] when it is as the plugin documents it)."""
+    if not isinstance(facts, dict):
+        return ["playback is not an object"]
+    problems = [f"unknown field {key}" for key in facts if key not in PLAYBACK_NUMBERS and key != "route"]
+    for key in PLAYBACK_NUMBERS:
+        value = facts.get(key)
+        if key in facts and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)):
+            problems.append(f"{key} is not a number")
+        elif key in facts and key not in ("level_db", "gain_db") and value < 0:
+            problems.append(f"{key} is negative")
+    if "route" in facts and facts["route"] not in PLAYBACK_ROUTES:
+        problems.append(f"route {facts['route']!r}")
+    if isinstance(facts.get("volume"), (int, float)) and facts["volume"] > 1:
+        problems.append("volume is over 1")
+    return problems
+
+
 _TONES: dict[int, bytes] = {}
 
 
@@ -381,6 +413,8 @@ class FakeVoicePlugin:
         self.ended: OrderedDict[str, Call] = OrderedDict()
         self.devices: dict[str, dict[str, Any]] = {}
         self.pushes: list[dict[str, Any]] = []
+        # What phones reported about how lines played: played (with facts), unplayed, replayed.
+        self.playback: list[dict[str, Any]] = []
         self.ring_watchers: dict[str, list[asyncio.Future]] = {}
         self.tasks: set[asyncio.Task] = set()
 
@@ -400,6 +434,7 @@ class FakeVoicePlugin:
             Route(f"{PREFIX}/status", self.status, methods=["GET"]),
             Route(f"{PREFIX}/debug/ring", self.debug_ring, methods=["POST"]),
             Route(f"{PREFIX}/debug/pushes", self.debug_pushes, methods=["GET"]),
+            Route(f"{PREFIX}/debug/playback", self.debug_playback, methods=["GET"]),
         ]
 
     # ── helpers ───────────────────────────────────────────────────────────────────────────────────
@@ -500,6 +535,33 @@ class FakeVoicePlugin:
         if (denied := self.gate(request, post=False)) is not None:
             return denied
         return JSONResponse({"pushes": self.pushes})
+
+    async def debug_playback(self, request: Request) -> Response:
+        if (denied := self.gate(request, post=False)) is not None:
+            return denied
+        return JSONResponse({"reports": self.playback})
+
+    def note_playback(self, call: Call, message: dict[str, Any]) -> None:
+        """Keep a played (with facts) / unplayed / replayed report, with what is wrong with its shape (the real
+        plugin reads each field on its own and leaves out what it can't use; the fake says so)."""
+        report: dict[str, Any] = {"call_id": call.call_id, "type": message.get("type"), "id": str(message.get("id"))}
+        problems: list[str] = []
+        if report["type"] == "unplayed":
+            report["reason"] = message.get("reason")
+            if report["reason"] not in UNPLAYED_REASONS:
+                problems.append(f"reason {report['reason']!r}")
+        facts = message.get("playback")
+        if facts is not None:
+            report["playback"] = facts
+            problems += playback_problems(facts)
+        if problems:
+            report["problems"] = problems
+        self.playback.append(report)
+        del self.playback[:-200]
+        self.log(f"call {call.call_id[:8]} {report['type']} {report['id'][:12]}"
+                 + (f" ({report['reason']})" if "reason" in report else "")
+                 + (f" {self.host.short(facts, 160)}" if facts is not None else "")
+                 + (f" MALFORMED: {', '.join(problems)}" if problems else ""))
 
     async def debug_ring(self, request: Request) -> Response:
         """Have the session's fake agent call start_call, as the prompt "call me <mode>: <text>" does."""
@@ -645,6 +707,16 @@ class FakeVoicePlugin:
                 event.set()
                 if (waiter := call.waiter) is not None and waiter.speech_id == speech_id and waiter.after is None:
                     waiter.after = time.time()
+            if "playback" in message:
+                self.note_playback(call, message)
+        elif kind == "unplayed":
+            self.note_playback(call, message)
+            # Its audio never all reached the speaker and the phone has moved on: stop waiting for the ack (the
+            # line then counts as unconfirmed).
+            if message.get("reason") == "lost" and (event := call.acks.get(str(message.get("id")))) is not None:
+                event.set()
+        elif kind == "replayed":
+            self.note_playback(call, message)
         elif kind == "ringing":
             self.log(f"call {call.call_id[:8]} is ringing on the phone")
         elif kind == "answered":

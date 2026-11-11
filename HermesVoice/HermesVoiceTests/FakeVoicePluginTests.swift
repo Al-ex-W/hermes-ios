@@ -306,6 +306,35 @@ final class FakeVoicePluginTests: XCTestCase {
         try await waitForCallToEnd()
     }
 
+    /// The playback feedback over the real link: a played ack with its facts, a Repeat, and what was heard of a line
+    /// at the hang-up. The fake keeps each report and says what is wrong with its shape (`GET …/debug/playback`).
+    func testPlaybackReportsReachThePlugin() async throws {
+        let session = try await session()
+        let callID = CallID.make()
+        let link = link(PhoneHello(callID: callID, sessionID: session.id, title: session.title, initiatedBy: .user))
+        await link.connect()
+        await waitOnLink(timeout: 10) { self.speechStarts.first.map { self.speechEnded($0.id) } ?? false }
+        let greeting = try XCTUnwrap(speechStarts.first)
+        let facts = PlaybackFacts(audioSeconds: 1.61, playedSeconds: 1.61, stalls: 1, stallSeconds: 0.4, rebuilds: 1,
+                                  routeChanges: 2, route: .bluetooth, volume: 0.25, levelDB: -36.5, gainDB: 12.5)
+        let cut = PlaybackFacts(audioSeconds: 9, playedSeconds: 2.2, route: .receiver)
+        link.send(.played(greeting.id, playback: facts))
+        link.send(.replayed(greeting.id))
+        link.close(after: [.unplayed("0123456789ab", reason: "hang_up", playback: cut), .bye("hang_up")])
+        try await waitForCallToEnd()
+
+        let answer = try await client.request("GET", "\(VoicePluginAPI.path)/debug/playback") as? JSON
+        let reports = ((answer?["reports"] as? [JSON]) ?? []).filter { $0["call_id"] as? String == callID }
+        XCTAssertEqual(reports.map { $0["type"] as? String }, ["played", "replayed", "unplayed"])
+        XCTAssertEqual(reports.compactMap { $0["problems"] as? [String] }, [], "the shapes are the ones the plugin documents")
+        guard reports.count == 3 else { return }
+        XCTAssertEqual(reports[0]["id"] as? String, greeting.id)
+        XCTAssertEqual(reports[0]["playback"] as? NSDictionary, facts.json as NSDictionary)
+        XCTAssertEqual(reports[1]["id"] as? String, greeting.id)
+        XCTAssertEqual(reports[2]["reason"] as? String, "hang_up")
+        XCTAssertEqual(reports[2]["playback"] as? NSDictionary, cut.json as NSDictionary)
+    }
+
     func testHangingUpWhileHermesSpeaksEndsTheCall() async throws {
         // The bye goes out while the plugin is still streaming the greeting: it must read it and end the call,
         // not take the close for a dropped link and hold the call for a reconnect.

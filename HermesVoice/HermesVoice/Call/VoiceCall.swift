@@ -87,6 +87,8 @@ final class VoiceCall: ObservableObject, Identifiable {
     @Published private(set) var speechProvider: SpeechProviderID
     /// A notice shown under the call status (reconnecting, audio interrupted, speech recognition trouble).
     @Published private(set) var statusNote: String?
+    /// A line of Hermes is kept for Repeat (see `repeatLast`).
+    @Published private(set) var hasLineToRepeat = false
 
     /// 32 lowercase hex characters: the plugin's call id, and the CallKit UUID with the dashes taken out.
     let callID: String
@@ -131,6 +133,8 @@ final class VoiceCall: ObservableObject, Identifiable {
     private var replaying = false
     /// Utterances started by the plugin and not yet heard (or cancelled).
     private var pendingSpeech: Set<String> = []
+    /// The pending utterances in the order they began.
+    private var speechOrder: [String] = []
     /// Pending utterances whose audio has all arrived (a normal speech_end), waiting to be played back.
     private var completeSpeech: Set<String> = []
     /// Pending utterances still streaming (no speech_end yet), with when the plugin last sent anything for them
@@ -150,6 +154,29 @@ final class VoiceCall: ObservableObject, Identifiable {
     /// The last few utterances confirmed as heard. Their `played` is sent again after a reconnect, in case
     /// it went out on a socket that was already dead; the plugin ignores ids it isn't waiting for.
     private var recentlyPlayed: [String] = []
+    /// One line of Hermes as it arrived: what Repeat plays again.
+    private struct KeptLine {
+        let id: String
+        let text: String
+        let rate: Double
+        var pcm = Data()
+        /// Not to be kept: it grew past `keptLineLimit`, or the link dropped under it (the plugin then carries on
+        /// where it was, so what arrives is not the whole line).
+        var unusable = false
+    }
+    /// The last line whose audio all arrived, kept in memory only and only until the call ends, so that Repeat
+    /// plays it at once, without the host. `arriving` is the line still streaming, which takes its place at its
+    /// speech_end.
+    private var lastLine: KeptLine? { didSet { hasLineToRepeat = lastLine != nil } }
+    private var arriving: KeptLine?
+    /// The line the link last dropped under.
+    private var brokenLine: String?
+    /// The most audio kept for Repeat (16-bit mono at 24 kHz: about two minutes).
+    private static let keptLineLimit = 6 * 1024 * 1024
+    private var replays = 0
+    /// Reports the plugin hasn't had because no link was up (a line the link dropped under, a Repeat): sent on the
+    /// next `ready`.
+    private var owed: [PhoneMessage] = []
     private var audioStarts = 0
     private var speakerChosen = false
     private var audioNote: String? { didSet { refreshNote() } }
@@ -233,6 +260,11 @@ final class VoiceCall: ObservableObject, Identifiable {
         if linkReady {
             final = outbox.map(PhoneMessage.userTurn)
             outbox.removeAll()
+            // How much of each line that was still playing was heard: Hermes can then tell "too long, they left"
+            // from "they heard it and left".
+            final += speechOrder.filter { pendingSpeech.contains($0) && !Self.isReplay($0) }.map { id in
+                .unplayed(id, reason: "hang_up", playback: audio.takeFacts(for: id))
+            }
         }
         final.append(.bye("hang_up"))
         link?.close(after: final)
@@ -364,6 +396,8 @@ final class VoiceCall: ObservableObject, Identifiable {
             reconnects = 0
             linkNote = nil
             recentlyPlayed.forEach { link?.send(.played($0)) }
+            owed.forEach { link?.send($0) }
+            owed.removeAll()
             if ringing {
                 if initiatedBy == .push { link?.send(.ringing) }
                 if answered {
@@ -429,6 +463,14 @@ final class VoiceCall: ObservableObject, Identifiable {
         // on the next link), so its queued audio is dropped now and listening resumes.
         if !pendingSpeech.isSubset(of: completeSpeech) {
             speechGeneration += 1
+            // What became of the lines that are dropped here goes to the plugin on the next link.
+            // One that had all arrived won't come again (`lost`); the plugin carries on with the one that was
+            // still streaming (`dropped`).
+            for id in speechOrder where pendingSpeech.contains(id) && !Self.isReplay(id) {
+                owe(.unplayed(id, reason: completeSpeech.contains(id) ? "lost" : "dropped", playback: audio.takeFacts(for: id)))
+            }
+            brokenLine = arriving?.id
+            arriving = nil
             dropQueuedAudio()
             pendingSpeech.removeAll()
             completeSpeech.removeAll()
@@ -540,10 +582,15 @@ final class VoiceCall: ObservableObject, Identifiable {
         pendingSpeech.removeAll()
         completeSpeech.removeAll()
         speechHeard.removeAll()
+        speechOrder.removeAll()
         streamingSpeech = nil
         speechWatch?.cancel()
         speechWatch = nil
         audioUntil = nil
+        // The audio kept for Repeat goes with the call.
+        lastLine = nil
+        arriving = nil
+        owed.removeAll()
         hermesSpeaking = false
         hearing = ""
         audioNote = nil
@@ -661,12 +708,15 @@ final class VoiceCall: ObservableObject, Identifiable {
             if rate > 0 { speechRate = rate }
             lastSpoken = text
             pendingSpeech.insert(id)
+            if !speechOrder.contains(id) { speechOrder.append(id) }
             if completeSpeech.contains(id) {
                 // A repeat after a reconnect of one whose audio all arrived already: no more frames, no deadline.
                 streamingSpeech = nil
             } else {
                 streamingSpeech = id
                 speechHeard[id] = Date()
+                audio.beginLine(id)
+                arriving = KeptLine(id: id, text: text, rate: speechRate, unusable: id == brokenLine)
             }
             hermesSpeaking = true
             updateListening(flushing: .cutOff)
@@ -683,6 +733,7 @@ final class VoiceCall: ObservableObject, Identifiable {
                 watchSpeech()
             }
             audio.enqueue(pcm16: data)
+            keep(data)
             audioUntil = max(audioUntil ?? now, now).addingTimeInterval(Double(data.count / 2) / speechRate)
             speechHeard = speechHeard.mapValues { _ in now }
         case let .speechEnd(id, cancelled, error):
@@ -690,20 +741,32 @@ final class VoiceCall: ObservableObject, Identifiable {
             if streamingSpeech == id { streamingSpeech = nil }
             if cancelled || error != nil {
                 // The rest of this utterance will never come: drop what is queued at once.
+                if arriving?.id == id { arriving = nil }
+                let facts = audio.takeFacts(for: id)
                 dropQueuedAudio()
+                report(.unplayed(id, reason: "cancelled", playback: facts))
                 return finishSpeech(id)
             }
             completeSpeech.insert(id)
+            if let line = arriving, line.id == id {
+                // All of it is here: this is the line Repeat plays from now on.
+                arriving = nil
+                if !line.unusable, !line.pcm.isEmpty { lastLine = line }
+            }
             let generation = speechGeneration
             audio.whenPlayedBack { [weak self] heard in
                 guard let self, generation == self.speechGeneration else { return }
+                let facts = self.audio.takeFacts(for: id)
                 // Only a line that all reached the speaker is acked: the plugin then takes what the user says next
                 // as the reply to it. Unacked, it counts as unconfirmed (the user may not have heard it).
                 if heard {
                     // Acked on whichever link is up now (the plugin carries pending acks across reconnects);
                     // the next `ready` repeats it in case it is lost with a dying socket or sent while none is up.
-                    self.link?.send(.played(id))
+                    self.link?.send(.played(id, playback: facts))
                     self.recentlyPlayed = Array((self.recentlyPlayed + [id]).suffix(4))
+                } else {
+                    // The plugin stops waiting for the ack, and Hermes hears that the line didn't get through.
+                    self.report(.unplayed(id, reason: "lost", playback: facts))
                 }
                 self.finishSpeech(id)
             }
@@ -712,9 +775,66 @@ final class VoiceCall: ObservableObject, Identifiable {
         }
     }
 
+    /// Adds a frame to the line that is arriving, for Repeat (up to `keptLineLimit`).
+    private func keep(_ data: Data) {
+        guard var line = arriving, line.id == streamingSpeech, !line.unusable else { return }
+        if line.pcm.count + data.count > Self.keptLineLimit {
+            line.unusable = true
+            line.pcm = Data()
+        } else {
+            line.pcm.append(data)
+        }
+        arriving = line
+    }
+
+    /// Sends a report about a line now, or on the next link when none is up.
+    private func report(_ message: PhoneMessage) {
+        guard linkReady, let link else { return owe(message) }
+        link.send(message)
+    }
+
+    private func owe(_ message: PhoneMessage) {
+        owed = Array((owed + [message]).suffix(8))
+    }
+
+    // MARK: Repeat
+
+    /// The last line of Hermes can be played again now: the call is live and Hermes isn't speaking.
+    var canRepeat: Bool { state == .live && hasLineToRepeat && !hermesSpeaking }
+
+    private static func isReplay(_ id: String) -> Bool { id.hasPrefix("replay-") }
+
+    /// Plays the last line of Hermes again, from the audio kept on the phone: at once, and without the host. It
+    /// is a line of Hermes like any other for the call's half-duplex rules: the microphone is off while it plays
+    /// (what was heard of an unfinished sentence goes to Hermes first, as cut off), and listening resumes once it
+    /// has played. The plugin is told (`replayed`), so that Hermes learns it wasn't understood the first time.
+    func repeatLast() {
+        guard canRepeat, let line = lastLine else { return }
+        replays += 1
+        let id = "replay-\(replays)"
+        // Before the cut-off turn (if any), so that the plugin has it when it hands that turn to Hermes.
+        report(.replayed(line.id))
+        lastSpoken = line.text
+        pendingSpeech.insert(id)
+        completeSpeech.insert(id)
+        speechOrder.append(id)
+        hermesSpeaking = true
+        updateListening(flushing: .cutOff)
+        audio.setSampleRate(line.rate)
+        audio.beginLine(id)
+        audio.enqueue(pcm16: line.pcm)
+        let generation = speechGeneration
+        audio.whenPlayedBack { [weak self] _ in
+            guard let self, generation == self.speechGeneration else { return }
+            _ = self.audio.takeFacts(for: id)
+            self.finishSpeech(id)
+        }
+    }
+
     private func finishSpeech(_ id: String) {
         pendingSpeech.remove(id)
         completeSpeech.remove(id)
+        speechOrder.removeAll { $0 == id }
         speechHeard[id] = nil
         hermesSpeaking = !pendingSpeech.isEmpty
         updateListening()

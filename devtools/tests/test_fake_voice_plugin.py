@@ -505,3 +505,50 @@ def test_a_tts_error_and_a_link_that_never_comes_back_are_injected():
     assert lost["text"] == "The call was lost."
     assert rows[2].startswith("[Voice call ended: the phone's connection was lost")
     assert status["calls"] == 0
+
+
+def test_playback_reports_are_taken_checked_and_kept():
+    """The app's playback feedback: facts with a played ack, a line that was not played to the end, a Repeat."""
+    facts = {"audio_s": 1.2, "played_s": 1.2, "stalls": 1, "stall_s": 0.4, "rebuilds": 0, "route_changes": 0,
+             "route": "speaker", "volume": 0.5, "level_db": -21.5, "gain_db": 0}
+
+    async def scenario():
+        async with serving() as (fake, base):
+            async with signed_in(base) as http:
+                gateway = await Gateway.connect(base, http)
+                _, key = await start_session(gateway)
+                call_id = uuid.uuid4().hex
+                phone = await Phone.dial(base, http, call_id, "user", session_id=key)
+                await phone.next("ready")
+                start, _, _ = await phone.line()
+                await phone.send({"type": "played", "id": start["id"], "playback": facts})
+                await turn(gateway)
+                await phone.send({"type": "replayed", "id": start["id"]})
+                await phone.say("again please")
+                again, _, _ = await phone.line()
+                # Its audio never reached the speaker: the fake stops waiting for the ack at once.
+                await phone.send({"type": "unplayed", "id": again["id"], "reason": "lost",
+                                  "playback": {"audio_s": 0.9, "played_s": 0, "route": "submarine", "volume": 3,
+                                               "stalls": "two", "surprise": 1}})
+                await turn(gateway)
+                await phone.send({"type": "unplayed", "id": "abc", "reason": "hang_up"})
+                await phone.send({"type": "bye", "reason": "hang_up"})
+                await phone.next("ended")
+                await until(lambda: len(fake.voice_plugin.playback) == 4)
+                reports = (await http.get(f"{PREFIX}/debug/playback")).json()["reports"]
+                async with httpx.AsyncClient(base_url=f"http://{base}") as anonymous:
+                    denied = (await anonymous.get(f"{PREFIX}/debug/playback")).status_code
+                await gateway.close()
+            return call_id, start, again, reports, denied
+
+    call_id, start, again, reports, denied = asyncio.run(scenario())
+    assert denied == 401
+    assert reports == [
+        {"call_id": call_id, "type": "played", "id": start["id"], "playback": facts},
+        {"call_id": call_id, "type": "replayed", "id": start["id"]},
+        {"call_id": call_id, "type": "unplayed", "id": again["id"], "reason": "lost",
+         "playback": {"audio_s": 0.9, "played_s": 0, "route": "submarine", "volume": 3, "stalls": "two",
+                      "surprise": 1},
+         "problems": ["unknown field surprise", "stalls is not a number", "route 'submarine'", "volume is over 1"]},
+        {"call_id": call_id, "type": "unplayed", "id": "abc", "reason": "hang_up"},
+    ]

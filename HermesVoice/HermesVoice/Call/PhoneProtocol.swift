@@ -34,8 +34,13 @@ enum PhoneMessage: Equatable {
     case answered
     /// The user declined before answering.
     case declined
-    /// An utterance was heard to the end.
-    case played(String)
+    /// An utterance was heard to the end; `playback` says how it played (a plugin from before the facts ignores it).
+    case played(String, playback: PlaybackFacts? = nil)
+    /// An utterance was not played to the end: the user hung up (`hang_up`), the plugin cancelled it (`cancelled`),
+    /// its audio never all reached the speaker (`lost`), or the link dropped under it (`dropped`).
+    case unplayed(String, reason: String, playback: PlaybackFacts? = nil)
+    /// The user had the phone play the utterance again (Repeat), from the audio it kept.
+    case replayed(String)
     case userTurn(UserTurn)
     case ping
     case bye(String?)
@@ -47,6 +52,8 @@ enum PhoneMessage: Equatable {
         case .answered: return "answered"
         case .declined: return "declined"
         case .played: return "played"
+        case .unplayed: return "unplayed"
+        case .replayed: return "replayed"
         case .userTurn: return "user_turn"
         case .ping: return "ping"
         case .bye: return "bye"
@@ -76,13 +83,72 @@ enum PhoneMessage: Equatable {
             object["title"] = hello.title
             object["initiated_by"] = hello.initiatedBy.rawValue
             object["app_version"] = hello.appVersion
-        case let .played(id):
+        case let .played(id, playback):
+            object["id"] = id
+            object["playback"] = playback?.json
+        case let .unplayed(id, reason, playback):
+            object["id"] = id
+            object["reason"] = reason
+            object["playback"] = playback?.json
+        case let .replayed(id):
             object["id"] = id
         case let .bye(reason):
             object["reason"] = reason
         case .ringing, .answered, .declined, .ping, .userTurn:
             break
         }
+        return object
+    }
+}
+
+/// Where the call's audio comes out, as the plugin is told (`playback.route`).
+enum AudioRoute: String, Equatable {
+    case receiver, speaker, bluetooth, headphones, car, other
+
+    /// The route for an output port's type (`AVAudioSession.Port.rawValue`).
+    init(port: String) {
+        switch port {
+        case "Receiver": self = .receiver
+        case "Speaker": self = .speaker
+        case "BluetoothHFP", "BluetoothA2DPOutput", "BluetoothLE": self = .bluetooth
+        case "Headphones", "HeadsetMic", "USBAudio": self = .headphones
+        case "CarAudio": self = .car
+        default: self = .other
+        }
+    }
+}
+
+/// What happened to one line of Hermes on this phone: the `playback` object of `played` and `unplayed`. The
+/// plugin turns it into a note for the agent when the line may not have been heard well, and into how much of a
+/// line the user heard when they hang up in the middle of it.
+struct PlaybackFacts: Equatable {
+    /// Audio received for the line, and how much of it reached the speaker.
+    var audioSeconds: Double = 0
+    var playedSeconds: Double = 0
+    /// Times the player ran dry while more of the line was still coming, and those gaps added up.
+    var stalls = 0
+    var stallSeconds: Double = 0
+    /// Audio engine restarts and output route changes while the line was open.
+    var rebuilds = 0
+    var routeChanges = 0
+    var route: AudioRoute?
+    /// The system output volume, 0 to 1.
+    var volume: Double?
+    /// The line's speech level as it arrived (dBFS), and the gain the leveller ended on (dB).
+    var levelDB: Double?
+    var gainDB: Double?
+
+    var json: JSON {
+        func rounded(_ value: Double, _ places: Double = 100) -> Double { (value * places).rounded() / places }
+        var object: JSON = [
+            "audio_s": rounded(audioSeconds), "played_s": rounded(playedSeconds),
+            "stalls": stalls, "stall_s": rounded(stallSeconds),
+            "rebuilds": rebuilds, "route_changes": routeChanges,
+        ]
+        object["route"] = route?.rawValue
+        object["volume"] = volume.map { rounded($0) }
+        object["level_db"] = levelDB.map { rounded($0, 10) }
+        object["gain_db"] = gainDB.map { rounded($0, 10) }
         return object
     }
 }

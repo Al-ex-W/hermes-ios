@@ -132,6 +132,11 @@ push with `xcrun simctl openurl booted "hermesvoice://ring?call_id=<hex>&session
 inside the app; answer from the call panel). The module docstring has a curl recipe; `--call-ring-timeout` and
 `--call-drop-retention` shorten the timers.
 
+The fake takes the app's playback feedback (`played {id, playback}`, `unplayed {id, reason, playback}`,
+`replayed {id}`), checks each report's shape and keeps the last 200: `GET …/debug/playback` returns them, with
+`problems` on a malformed one. A line reported as `lost` stops waiting for its ack. It makes no notes for its
+fake agent out of them (the real plugin does), and it does not replay a repeated line's audio.
+
 Devices may also register an APNs `alert_token` with `alerts: {approval, clarify, turn_done}` (bad shapes get
 `422`); `GET /status` lists them, and `GET …/debug/alerts?session_id=…&kind=approval|clarify|turn_done` returns the
 `{aps, hermes}` notification the plugin would push, the alert tokens it would go to, and the history.

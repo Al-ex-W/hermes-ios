@@ -15,6 +15,9 @@ enum VoiceTranscript {
         "(The user hung up, so the call is over; reply in text.)",
     ]
 
+    /// How the plugin's note about the playback of Hermes' last line starts, when one follows a turn's hint.
+    static let playbackNoteHead = "(HermesVoice playback note, not the user's words: "
+
     /// What the user said on a call, with how the turn ended when it didn't end on its own ("cut off", "hung up"…);
     /// nil for anything else. Merged queue slots (several prompts joined by blank lines) are left as they are.
     static func spoken(_ text: String) -> String? {
@@ -49,6 +52,10 @@ enum VoiceTranscript {
         var said = body.trimmingCharacters(in: .whitespaces)
         // A turn the chat couldn't take when it was said ends with the plugin's "(Delayed by N s: …)" note.
         if said.hasSuffix(")"), let note = said.range(of: " (Delayed by ", options: .backwards) {
+            said = String(said[..<note.lowerBound]).trimmingCharacters(in: .whitespaces)
+        }
+        // What the plugin tells Hermes about how its last line played on the phone (inject.py `PLAYBACK_NOTE_HEAD`).
+        if said.hasSuffix(")"), let note = said.range(of: " \(playbackNoteHead)", options: .backwards) {
             said = String(said[..<note.lowerBound]).trimmingCharacters(in: .whitespaces)
         }
         for hint in hints where said.hasSuffix(hint) {
