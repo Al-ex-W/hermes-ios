@@ -6,7 +6,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
 - **Tools** (toolset `voice`): `start_call(text, mode="async")` rings the phone (VoIP push straight to APNs) and
   says `text` once you answer, or just speaks if this conversation already has a call. `mode="sync"` waits for your
   spoken reply and returns `{said, ending, outcome, call_id}`; `async` returns `{call_id, status}` at once and your
-  reply arrives in the conversation as a `[Voice] …` message. `end_call(text?)` hangs up.
+  reply arrives in the conversation as a `[Voice] …` message. `end_call(text?)` hangs up. `get_location(max_age_s?)`
+  asks the phone where it is, when the user shares that (see "Location").
 - **Skill** `voice-calls`: the longer rules (`skill_view("hermes_voice:voice-calls")`).
 - **Call style** `<HERMES_HOME>/hermes-voice/call-style.md`: the user's own preferences for how Hermes speaks on
   calls, which the agent reads at every call and edits itself (see "Call style").
@@ -19,8 +20,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
   the messaging gateway, cron, compute-host children, backends the Hermes Desktop app spawns) place and hear
   calls (see "Calls from any session").
 - **Routes** under `/api/plugins/hermes_voice/`: `WS /phone?ticket=…`, `POST /devices`, `POST /devices/test` (with
-  `GET /devices/test/{test_id}` and `POST /devices/test/{test_id}/answer`; see "Test alerts"), `POST /scribe-token`,
-  `GET /status`.
+  `GET /devices/test/{test_id}` and `POST /devices/test/{test_id}/answer`; see "Test alerts"), `POST /location`
+  (see "Location"), `POST /scribe-token`, `GET /status`.
 
 `POST /devices {voip_token, alert_token?, environment: "sandbox" | "production", bundle_id, alerts?}` registers a
 phone: VoIP pushes go to `voip_token` (topic `<bundle_id>.voip`), alert pushes to `alert_token` (topic
@@ -95,6 +96,14 @@ plugins:
           grace_s: 5                       # how long nothing has the conversation open before an alert
           previews: true                   # false: no conversation text or title goes through APNs (alerts
                                            # and the call push alike)
+        location:
+          enabled: true                    # false: get_location is refused for everyone on this host
+          allow_cron: true                 # scheduled jobs (and kanban tasks) may ask
+          timeout_s: 20                    # how long the tool waits for the phone (5 to 60)
+          fresh_s: 60                      # a fix younger than this is given without asking the phone again
+          keep_s: 1800                     # how long the last fix stays in memory; never on disk
+          requests_per_session: 6          # per session_window_s (600)
+          requests_global: 30              # per global_window_s (3600)
       allow_gateway_injection: true        # not under settings: Hermes' own switch (see "Calls from any session")
 ```
 
@@ -368,14 +377,91 @@ no conversation. It then posts `POST /devices/test/{test_id}/answer {"action": "
 `{"event": "test_alert_answered", "kind", "action"}` for each answer; neither these lines nor the dashboard log
 carry a token or the payload.
 
+## Location
+
+`get_location` tells the agent where the user's iPhone is, for tasks such as "check my calendar and the trains and
+call me if I'll be late". It works only while the user turned **Share location with Hermes** on in the app
+(Settings → Location; off by default). Code: `location.py`.
+
+**The phone says whether it shares** with its registration: `POST /devices` takes `location: {"enabled": bool,
+"background"?: bool}` (`background`: iOS lets the app answer while it isn't on screen, i.e. "Always"). A
+registration without `location` keeps what is stored; `{"enabled": false}` turns it off at once, drops the stored
+fix and answers a request that is waiting. The app sends `enabled: false` whenever sharing can't work (the switch
+is off, iOS denies location, the user signed out).
+
+**Asking.** A request gets a 16-hex id, and the phone is asked one of two ways:
+
+- **On a call** (the phone's socket is up, ringing or live): the plugin sends `location_request {id}` on `/phone`,
+  and the phone answers `location {id, latitude, longitude, accuracy_m, fixed_at, speed_mps?, course_deg?}` or
+  `location {id, error}`.
+- **Otherwise** a background push to the alert token of every phone that shares: `apns-push-type: background`,
+  `apns-priority: 5`, topic = the bundle id, expiring after 30 s, collapse id `hermes-location`, payload
+  `{"aps": {"content-available": 1}, "hermes": {"kind": "location_request", "request_id": "<id>", "profile":
+  "default"}}`. The app wakes, gets a fix and posts it:
+
+  ```
+  POST /api/plugins/hermes_voice/location
+  {"voip_token": "<hex>", "alert_token": "<hex>", "request_id": "<id>",
+   "latitude": 59.0, "longitude": 18.0, "accuracy_m": 12.5, "fixed_at": "2026-11-11T08:00:00Z",
+   "speed_mps": 1.4, "course_deg": 270.0}
+  ```
+
+  or `{…tokens, "request_id", "error": "off" | "denied" | "unavailable" | "timeout"}` when it has no fix. The
+  tokens name the phone as a registration does (the VoIP token first, else the alert token). Answers: `200 {"ok":
+  true}`; `404` for a phone that isn't registered, `403` for one that doesn't share, `409` for a request nobody
+  made or one older than 10 minutes, `400 {detail}` for a bad body, `429` past 30 a minute. The route sits behind
+  the dashboard's auth like the others.
+
+**iOS decides whether a background push arrives.** APNs accepting the push says nothing about delivery: iOS
+throttles background pushes (a few an hour at best), holds them back in Low Power Mode and without a connection,
+and never delivers them to an app the user force-quit. With "While Using the App" the app also can't get a fix
+while it is in the background. So outside a call a request can go unanswered; the tool then answers `no_answer`,
+says why in plain words, and adds the last fix it has, marked as old.
+
+**The tool** waits `timeout_s` (20 s) and answers `{status: "ok", latitude, longitude, accuracy_m, age_s,
+fixed_at, source: "call" | "push" | "cached", speed_mps?, course_deg?, note}`, or `{status, note}`:
+
+| `status` | What happened |
+|---|---|
+| `sharing_off` | no registered phone shares its location (or the phone answered that sharing is off); nothing was asked or sent |
+| `no_phone` | no phone is registered |
+| `no_answer` | the phone didn't answer within `timeout_s` |
+| `unavailable` | the phone answered `denied`, `unavailable` or `timeout` |
+| `push_failed` | no call is connected and the push couldn't go out (APNs not configured, no alert token, APNs refused it) |
+| `rate_limited` | the conversation or the host asked too often (`requests_per_session`, `requests_global`) |
+| `not_allowed` | this conversation may not ask, or `location.enabled` is false |
+| `not_available` | no dashboard with this plugin runs on the host (from another Hermes process), or its plugin is older |
+| `interrupted` | the user pressed Stop while it waited |
+
+`no_answer`, `unavailable`, `push_failed` and `rate_limited` carry `last_known: {latitude, …, age_s, stale: true}`
+when the plugin still has a fix, and the note says how old it is. A fix younger than `max_age_s` (the tool's
+argument; default `fresh_s`, 60 s) is given as `source: "cached"` without asking the phone; `max_age_s: 0` always
+asks.
+
+**Who may ask.** The same conversations that may ring the phone: the sources in `policy.allowed_sources` and the
+owner's own direct messages (`policy.allow_owner_dms`, `policy.owner_ids`). Scheduled jobs and kanban tasks may ask
+too unless `location.allow_cron` is false (for calls they are off by default; here they are the point). Never: a
+delegated subagent, a group chat, somebody else's chat, a one-shot or `--source tool` run unless
+`allowed_sources` lists it, or another profile's process unless `policy.allowed_profiles` lists the profile. From
+other Hermes processes the tool goes through the hub socket (op `location`), and the checks run in the dashboard.
+
+**Privacy.** The plugin keeps one fix, the latest, in the dashboard process's memory: never on disk, gone `keep_s`
+(30 minutes) after it arrived, when the phone turns sharing off, and with a restart. A fix is taken only as the
+answer to a request this process made, from a registered phone that shares. `rings.jsonl` gets `{"event":
+"location", "session_id", "source", "result", "via", "took_s"}` for every request (and `reason` for a refusal);
+neither it nor the dashboard log ever carries a coordinate, and `GET /status` reports `location: {enabled,
+sharing, phones, background, last_fix_age_s}`: whether a phone shares, not where it is. The fix does become part
+of the conversation that asked (a tool result), like anything else the agent reads, and so reaches the model
+provider of that conversation.
+
 ## Phone protocol
 
 JSON text frames on `/phone` plus binary PCM (16-bit little-endian mono, 24 kHz):
 
 | Direction | Messages |
 |---|---|
-| phone → plugin | `hello {call_id, session_id?, title?, initiated_by: user\|push, app_version}`, `ringing`, `answered`, `declined`, `played {id}`, `user_turn {call_id, text, ending {kind, detector?, detail?, error?}, provider, language?, started_at, ended_at}`, `ping`, `bye {reason?}` |
-| plugin → phone | `ready {call_id, state: ringing\|live}`, `cancel {reason}`, `speech_start {id, text, sample_rate, format}` + PCM + `speech_end {id}` (or with `cancelled: true` / `error`), `pong`, `ended {outcome}` |
+| phone → plugin | `hello {call_id, session_id?, title?, initiated_by: user\|push, app_version}`, `ringing`, `answered`, `declined`, `played {id}`, `user_turn {call_id, text, ending {kind, detector?, detail?, error?}, provider, language?, started_at, ended_at}`, `location {id, latitude, longitude, accuracy_m, fixed_at, speed_mps?, course_deg?}` or `location {id, error}`, `ping`, `bye {reason?}` |
+| plugin → phone | `ready {call_id, state: ringing\|live}`, `cancel {reason}`, `speech_start {id, text, sample_rate, format}` + PCM + `speech_end {id}` (or with `cancelled: true` / `error`), `location_request {id}`, `pong`, `ended {outcome}` |
 
 Close codes: 4401 auth (a bad or reused ticket, or a Host / Origin the dashboard refuses), 4400 bad hello, 4409
 replaced by a newer link, 4429 another conversation holds the call, 1011 the link stopped taking frames. The
@@ -388,10 +474,10 @@ plugin accepts the socket before refusing it, so the phone sees the code. VoIP p
 - A hello for a call that is over gets `cancel {reason}` (never answered) or `ended {outcome}`, then close 1000; a
   push hello for a call the plugin doesn't know gets `cancel {reason: "unknown_call"}`.
 - `GET /status` → `{calls, tts: "elevenlabs" | "fake", h2, apns_configured, scribe_configured, active_call,
-  hub_socket: "open" | "waiting" | "taken" | "paused" | "failed" | "off", alerts}`,
+  hub_socket: "open" | "waiting" | "taken" | "paused" | "failed" | "off", alerts, location}`,
   where `active_call` is `{call_id, session_id, title, state, initiated_by: "push" | "user"}` or null (the app's
-  call button joins a call Hermes holds for the same chat) and `alerts` is `{enabled, kinds, watching, devices,
-  sent}`. HTTP errors are `{detail}`.
+  call button joins a call Hermes holds for the same chat), `alerts` is `{enabled, kinds, watching, devices,
+  sent}` and `location` is `{enabled, sharing, phones, background, last_fix_age_s}`. HTTP errors are `{detail}`.
 - The VoIP push's `session_id` can be a conversation of another process (`local-…` for a CLI one the gateway runs,
   a messaging chat's), which the dashboard may not be able to open: the call works the same.
 

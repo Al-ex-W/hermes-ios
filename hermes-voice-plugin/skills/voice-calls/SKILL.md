@@ -178,3 +178,47 @@ They are sent only for conversations the dashboard hosts, and only while no clie
 chat) has that conversation open, after a grace period of about 5 s; so an approval you trigger in the chat the user
 is looking at never arrives as a push. During quiet hours and past the alert budget they arrive silently. To check
 that pushes reach the phone, tell the user to use Settings → Notifications → Send test notification in the app.
+
+## Where the user is (`get_location`)
+
+`get_location` asks the user's iPhone where it is right now. It works only while the user has turned on **Share
+location with Hermes** in the app (Settings → Location; it is off by default), and it tells you nothing otherwise.
+
+**When to use it.** When the task needs the user's current position: "will I make it to my meeting?", a route or
+a departure time, what is near them. Not out of curiosity, and not as a habit at the start of a turn: every request
+wakes the phone and costs it battery. Use the position for the task; don't read coordinates out on a call, and
+don't write them into memory or notes unless the user asks.
+
+**What comes back.** `{status: "ok", latitude, longitude, accuracy_m, age_s, fixed_at, source, note}`:
+
+- `latitude`, `longitude`: decimal degrees (WGS 84).
+- `accuracy_m`: the radius in metres the phone is within. Under about 100 m is good enough for a street or a stop;
+  1000 m or more means the app only has approximate location (the note says so): fine for a town, not for a route.
+- `age_s`, `fixed_at`: how old the fix is, and when the phone got it (UTC).
+- `source`: `call` (asked over the voice call's connection), `push` (the phone was woken by a background push) or
+  `cached` (the phone sent this fix less than `max_age_s` ago, 60 s by default, so it was not asked again).
+- `speed_mps`, `course_deg`: only when the phone is moving and knows them.
+
+`max_age_s` says how old a fix you accept without asking the phone again; `0` always asks. For "am I going to be
+late" a minute-old fix is fine.
+
+**When there is no fix**, the result is `{status, note}`, and the note says what to do:
+
+| Status | What happened | What to do |
+| --- | --- | --- |
+| `sharing_off` | The user hasn't turned sharing on (or turned it off). Nothing was asked or sent | Say that you can't see where they are, and that they can turn it on in the HermesVoice app under Settings → Location. Or just ask them where they are |
+| `no_phone` | No iPhone is registered with this host | Ask them where they are |
+| `no_answer` | The phone was asked and didn't answer within about 20 s. Outside a call it is asked with a background push, which iOS delays or drops when the phone is in Low Power Mode, has no connection, was asked several times lately, or when the user force-quit the app | Don't retry at once. Use `last_known` if it is there and say how old it is, or ask the user |
+| `unavailable` | The phone answered that it can't give a position (permission, or no fix) | Follow the note |
+| `push_failed` | The push couldn't be sent (APNs isn't set up, or refused it) | Tell the user; ask where they are |
+| `rate_limited` | The phone was asked too often lately | Wait; use `last_known` meanwhile |
+| `not_allowed` | This conversation may not ask: a group chat, somebody else's chat, a subagent, or the host turned it off | Don't try to get around it |
+| `not_available` | No Hermes dashboard with this plugin runs on the host | Ask them where they are |
+
+**An old fix is old.** A result without a fresh fix can carry `last_known`: the last position the phone sent, with
+`age_s` and `stale: true`. The user may have moved since. If you use it, say so ("ten minutes ago you were at
+…"). Never present it as where they are now. The host keeps that last position in memory only, for at most 30
+minutes.
+
+You can ask from any conversation that may call the user, and from scheduled jobs (unless the host turned that
+off): a scheduled "check my calendar and the trains, and call me if I'll be late" is what this is for.

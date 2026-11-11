@@ -222,6 +222,16 @@ def test_what_the_phone_could_not_do_is_said_in_words(core, env, error, status, 
     assert out["result"]["status"] == status and says in out["result"]["note"]
 
 
+def test_a_phone_that_ran_out_of_time_without_background_access(core, env):
+    env.store.register(core.push.Device(VOIP, "sandbox", BUNDLE, ALERT, location=True, location_background=False))
+    thread, out = ask(env)
+    wait_for(lambda: env.mock.requests)
+    env.locations.answered({"request_id": env.mock.request_ids()[0], "error": "timeout"}, "push",
+                           env.location.find_device(env.hub, VOIP))
+    thread.join(5)
+    assert out["result"]["status"] == "unavailable" and "While Using the App" in out["result"]["note"]
+
+
 @pytest.mark.parametrize("script, says", [
     ([(400, "BadDeviceToken")], "APNs 400 BadDeviceToken"),
     ([(503, "")], "APNs 503"),

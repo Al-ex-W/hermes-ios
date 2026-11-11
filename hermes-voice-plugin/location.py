@@ -94,8 +94,8 @@ NO_ANSWER_PUSH = (
     "asked several times lately, or when the user force-quit the app. {background}"
 )
 NOT_IN_BACKGROUND = (
-    "This iPhone also lets the app use location only while the app is open (\"While Using the App\"), so it "
-    f"can't answer from the background; the user can allow that under {SETTINGS_PATH}."
+    "This iPhone lets the app use location only while the app is open (\"While Using the App\"), so it can't "
+    f"answer from the background; the user can allow that under {SETTINGS_PATH}."
 )
 NO_ANSWER_CALL = (
     "The phone was asked over the voice call's connection and did not answer within {seconds:g} s (the connection "
@@ -397,6 +397,8 @@ class Locations:
             return ended({"status": "ok", **fix.view(now), "note": _fix_note(fix, now)}, "ok", pending.via)
         if pending.error:
             status, note = PHONE_ERRORS.get(pending.error, PHONE_ERRORS["unavailable"])
+            if pending.error == "timeout" and not any(device.location_background for device in sharing):
+                note = f"{note} {NOT_IN_BACKGROUND}"
             return ended(self._with_last(_status(status, note), now), pending.error, pending.via)
         if pending.via == "call":
             note = NO_ANSWER_CALL.format(seconds=settings.timeout_s)
@@ -446,6 +448,11 @@ class Locations:
         links = [link for link in list(hub.links.values()) if not link.ended.is_set()]
         if loop is None or loop.is_closed() or not links:
             return False
+        try:
+            if asyncio.get_running_loop() is loop:
+                return False  # on the loop itself there is no waiting for the send: the push asks instead
+        except RuntimeError:
+            pass  # a tool thread, as always
 
         async def send() -> bool:
             for link in links:
