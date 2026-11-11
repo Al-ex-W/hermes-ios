@@ -300,13 +300,16 @@ class Apns:
             return PushResult(True, "", delivered)
         return PushResult(False, "; ".join(dict.fromkeys(failures)) or "APNs refused the push")
 
-    def push_alert(self, kind: str, payload: dict[str, Any], collapse_id: str = "") -> PushResult:
-        """Show an alert on every phone of this profile that takes `kind` alerts. OK when APNs accepted at least
-        one; not OK, with nothing sent, when no phone takes them."""
+    def push_alert(self, kind: str, payload: dict[str, Any], collapse_id: str = "",
+                   only: Optional[str] = None) -> PushResult:
+        """Show an alert on every phone of this profile that takes `kind` alerts, or, with `only` (an alert token),
+        on that phone alone (a test alert goes to the phone that asked). OK when APNs accepted at least one; not
+        OK, with nothing sent, when no phone takes them."""
         key, reason = self._ready()
         if key is None:
             return PushResult(False, reason)
-        devices = [device for device in self.store.devices() if device.wants(kind)]
+        devices = [device for device in self.store.devices()
+                   if device.wants(kind) and (only is None or device.alert_token == only)]
         if not devices:
             return PushResult(False, f"no iPhone takes {kind} alerts")
         body = encode_alert(payload)
@@ -335,6 +338,11 @@ class Apns:
         if delivered:
             return PushResult(True, "", delivered)
         return PushResult(False, "; ".join(dict.fromkeys(failures)) or "APNs refused the alert", retry=transient)
+
+    def ready(self) -> tuple[bool, str]:
+        """Whether a push can go out from here (the key is set and readable, HTTP/2 is there), else why not."""
+        key, reason = self._ready()
+        return key is not None, reason
 
     def _ready(self) -> tuple[Optional[ApnsKey], str]:
         """The key, once APNs can be reached from here at all (else why not)."""
