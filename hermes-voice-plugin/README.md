@@ -12,7 +12,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
   calls, which the agent reads at every call and edits itself (see "Call style").
 - **Hooks**: `pre_llm_call` / `on_session_end` track which conversations are busy, and keep a call with its
   conversation when compression rotates the session id; `post_llm_call` / `on_session_end` also tell the alert
-  pushes when a turn ended, and with what reply.
+  pushes when a turn ended, and with what reply, and `on_session_finalize` lets them read how a turn ended
+  before the dashboard drops a conversation nobody has open.
 - **Alert pushes** (ordinary APNs notifications, not VoIP): an approval or a question waiting, or a turn done, in a
   dashboard conversation no client has open (see "Alert pushes").
 - **Hub socket** `<HERMES_HOME>/hermes-voice/hub.sock`: how conversations in other Hermes processes (CLI, Ink TUI,
@@ -218,9 +219,14 @@ end calls through it (`hubsock.py` has the protocol), and take the call's turns 
   ```
 
   Without it an async `start_call` from such a session is refused (`not_available`, the note says how to fix it);
-  a sync one still returns the reply. The classic CLI REPL needs nothing. A compute-host child never starts a turn
-  itself: the dashboard, which holds the session, submits it (and sends it to the child), so the dashboard shows
-  it running and queues what the user types meanwhile.
+  a sync one still returns the reply. A classic CLI REPL that runs its own agent needs nothing; Hermes 0.23 has
+  none (the CLI, one-shot runs and the Ink TUI are all clients of sessions its gateway runs), so there every CLI
+  and TUI conversation needs the setting. Since Hermes 0.22.6 the gateway also drops such a conversation from
+  memory once its window is closed (or the one-shot run is over) and then refuses a plugin's turn for it; the
+  plugin then has Hermes restore it and tries again (`hermes.restore_retired_session`), so a call still reaches a
+  conversation whose terminal you closed. A compute-host child never starts a turn itself: the dashboard, which
+  holds the session, submits it (and sends it to the child), so the dashboard shows it running and queues what
+  the user types meanwhile.
 - A sync wait runs in Hermes' human-wait window of the tool's own process, and ends before Hermes would give up on
   the tool call: its tool deadline (`timeouts.tools.sequential_call`, 420 s by default) plus at most
   `approvals.timeout` + 60 s of human wait, less the time already spent (the same in the dashboard). The result
@@ -273,7 +279,11 @@ nothing has that conversation open (no app, Desktop window or dashboard chat att
   background, say) alerts; one they watched end doesn't. The watcher sees the turn end itself (Hermes doesn't run
   `on_session_end` on every way out of a turn) and reads how it ended from the turn's `message.complete`
   (relayed from a compute-host child too): its reply, or that it failed. An interrupted or muted turn, and a
-  `[SILENT]` reply, say nothing.
+  `[SILENT]` reply, say nothing. The dashboard closes a conversation nobody has open once its turn is over (20 s
+  after the last client left, then every 20 s) and frees its events with it; when that comes before the
+  watcher's next look (every 0.5 s), the turn's end is read in the `on_session_finalize` hook instead. Not
+  covered: under `turn_isolation`, a turn that starts and ends between two looks is never seen (no hook of the
+  dashboard's fires for a turn that ran in a child).
 
 Messaging and CLI conversations don't alert: they ask on their own surface, and the phone answers through the
 dashboard. Each alert goes to every registered phone with an alert token that didn't turn the kind off; the host
@@ -313,7 +323,9 @@ JSON text frames on `/phone` plus binary PCM (16-bit little-endian mono, 24 kHz)
 
 Close codes: 4401 auth (a bad or reused ticket, or a Host / Origin the dashboard refuses), 4400 bad hello, 4409
 replaced by a newer link, 4429 another conversation holds the call, 1011 the link stopped taking frames. The
-plugin accepts the socket before refusing it, so the phone sees the code. VoIP push payload:
+plugin accepts the socket before refusing it, so the phone sees the code. Hermes 0.22.7 and later checks Host,
+Origin and peer itself in front of every plugin socket and refuses those before the upgrade: the phone then gets
+HTTP 403 on the handshake and no close code, which the app treats like 4401. VoIP push payload:
 `{call_id, session_id, profile, mode, title}`; the app turns the 32-hex `call_id` into the CallKit UUID.
 
 - A push call is `ready {state: "ringing"}` until the phone says `answered`; nothing is spoken before that.
@@ -329,6 +341,34 @@ plugin accepts the socket before refusing it, so the phone sees the code. VoIP p
 - The VoIP push's `session_id` can be a conversation of another process (`local-…` for a CLI one the gateway runs,
   a messaging chat's), which the dashboard may not be able to open: the call works the same.
 
+## Hermes versions
+
+The plugin uses Hermes internals that carry no compatibility promise (most go through `hermes.py`, each
+with a fallback), so it is only known to work with a Hermes the integration suite below was run against:
+
+| Hermes | Result |
+|---|---|
+| v0.23.0 (`2bd378ed1b`, 2026-11-05) | green |
+| canary of 2026-10-25 (`d778246c84`, v0.22.5 + 315 commits) | green at the time; not run again since |
+
+`plugin.yaml` sets `requires_hermes: ">=0.22.5"`, so an older Hermes refuses to load the plugin. Run the suite
+after every Hermes update. What Hermes changed under the plugin so far:
+
+- **0.22.6: closed local conversations leave the gateway's memory** (`gateway/session_retirement.py`). A keyed
+  `ctx.inject_message` for one was refused ("not a live local session"), so what you said on a call was lost when
+  the call's CLI or TUI conversation was idle and its window closed (always, for a finished `hermes chat -q` run).
+  The plugin now has Hermes restore the conversation and tries again (see "Calls from any session").
+- **0.22.6: `ConfigBackendUnavailable` is a `SystemExit`**, which `except Exception` doesn't catch. The plugin
+  keeps the settings it last read instead of letting it end the thread that asked.
+- **0.22.7: the dashboard checks Host / Origin / peer in front of every plugin socket** and refuses before the
+  upgrade (HTTP 403) what the plugin used to close with 4401. Nothing to change: the app treats both alike.
+- **0.22.3: a closed dashboard conversation's replay ring is freed at once** (`event_replay.forget_session`). The
+  dashboard closes a conversation nobody has open once its turn is over; when that came before the alert
+  watcher's next look, the turn's end could no longer be read and, under `turn_isolation`, its `turn_done` alert
+  was lost (by the timing, about 3 in 100 such turns with Hermes' 20 s reap grace; 4 of 21 in the tests, whose
+  grace is 2 s, which made the suite flaky). The watcher now reads the turn's end in `on_session_finalize` (see
+  "Alert pushes").
+
 ## Development
 
 ```bash
@@ -339,7 +379,7 @@ uv run pytest -q
 The tests stub every Hermes module the plugin imports, run the plugin's router on a real server (an OS-assigned
 port) and drive it with a fake phone over a real WebSocket, plus a mock APNs and a mock ElevenLabs.
 
-`tests/integration/` runs the plugin inside a real `hermes serve --isolated` (opt-in, about eight minutes):
+`tests/integration/` runs the plugin inside a real `hermes serve --isolated` (opt-in, 6 to 9 minutes):
 
 ```bash
 HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
