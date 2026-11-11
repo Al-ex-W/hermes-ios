@@ -37,6 +37,8 @@ enum PhoneMessage: Equatable {
     /// An utterance was heard to the end.
     case played(String)
     case userTurn(UserTurn)
+    /// The answer to a `location_request`: a fix, or why the phone has none (`LocationSharing`).
+    case location(id: String, LocationAnswer)
     case ping
     case bye(String?)
 
@@ -48,6 +50,7 @@ enum PhoneMessage: Equatable {
         case .declined: return "declined"
         case .played: return "played"
         case .userTurn: return "user_turn"
+        case .location: return "location"
         case .ping: return "ping"
         case .bye: return "bye"
         }
@@ -80,6 +83,9 @@ enum PhoneMessage: Equatable {
             object["id"] = id
         case let .bye(reason):
             object["reason"] = reason
+        case let .location(id, answer):
+            object.merge(answer.json) { _, new in new }
+            object["id"] = id
         case .ringing, .answered, .declined, .ping, .userTurn:
             break
         }
@@ -136,6 +142,8 @@ enum PluginMessage: Equatable {
     case speechEnd(id: String, cancelled: Bool, error: String?)
     case pong
     case ended(CallOutcome)
+    /// Hermes asks where the phone is (`get_location`); answered with `location {id, …}`.
+    case locationRequest(String)
 
     /// One text frame, or nil when it isn't one the phone knows.
     static func parse(_ text: String) -> PluginMessage? {
@@ -156,6 +164,8 @@ enum PluginMessage: Equatable {
             return .pong
         case "ended":
             return .ended(CallOutcome(object["outcome"] as? String ?? ""))
+        case "location_request":
+            return id.isEmpty ? nil : .locationRequest(id)
         default:
             return nil
         }
@@ -218,6 +228,21 @@ struct VoicePluginStatus: Equatable {
     var apnsConfigured: Bool
     var scribeConfigured: Bool
     var activeCall: ActiveCall?
+    /// The plugin has `get_location` (`location` in the status); nil with an older plugin.
+    var location: Location?
+
+    /// `location`: whether a phone shares its location with this host (never where it is).
+    struct Location: Equatable {
+        /// False when the host turned the tool off (`settings.location.enabled`).
+        var enabled: Bool
+        var sharing: Bool
+
+        init?(_ object: JSON?) {
+            guard let object else { return nil }
+            enabled = object["enabled"] as? Bool ?? true
+            sharing = object["sharing"] as? Bool ?? false
+        }
+    }
 
     init(calls: Int = 0, tts: String = "", h2: Bool = false, apnsConfigured: Bool = false, scribeConfigured: Bool = false,
          activeCall: ActiveCall? = nil) {
@@ -239,6 +264,7 @@ struct VoicePluginStatus: Equatable {
             scribeConfigured: object["scribe_configured"] as? Bool ?? false,
             activeCall: ActiveCall(object["active_call"] as? JSON)
         )
+        location = Location(object["location"] as? JSON)
     }
 
     /// Hermes can ring this phone: VoIP pushes need APNs credentials and the HTTP/2 client.

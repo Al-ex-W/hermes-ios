@@ -23,8 +23,10 @@ call mode can be tested in the iOS Simulator without Hermes, APNs or ElevenLabs:
 Location (hermes-voice-plugin/location.py): a device registers ``location: {"enabled": bool, "background"?: bool}``
 with POST /devices (kept when a later registration doesn't name it). ``get_location`` asks on the call's link when
 one is up (``location_request {id}`` -> phone ``location {id, latitude, …}`` or ``location {id, error}``), else by
-a background push, which the fake only records: hand the ``payload`` of debug/location-request (or debug/location)
-to ``xcrun simctl push <device> <bundle id> payload.json`` and the app posts its fix to POST /location. The fix is
+a background push, which the fake only records (``payload``, ``sent_to``). In the Simulator, hand the request to a
+debug build of the app with ``xcrun simctl openurl booted "hermesvoice://location-request?request_id=<id>"`` and it
+posts its fix to POST /location (``xcrun simctl push`` doesn't reach the app's handler with a content-available
+payload: the Simulator turns it into a background fetch). The fix is
 kept in memory, dropped when the phone turns sharing off, and shown only by debug/location. Not modelled: who may
 ask, the rate limits, and the stored fix's age limit.
 
@@ -600,7 +602,7 @@ class FakeVoicePlugin:
             entry["sent_to"] = [device["alert_token"] for device in self.sharing_devices()
                                 if device.get("alert_token")]
             self.log(f"location request {request_id} -> a background push to {len(entry['sent_to'])} device(s) "
-                     f"(nothing is pushed: GET {PREFIX}/debug/location has the payload for `xcrun simctl push`)")
+                     f"(nothing is pushed: GET {PREFIX}/debug/location has the payload)")
         self.location_requests[request_id] = entry
         while len(self.location_requests) > 50:
             del self.location_requests[next(iter(self.location_requests))]

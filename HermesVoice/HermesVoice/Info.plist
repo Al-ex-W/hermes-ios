@@ -23,7 +23,9 @@
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
-			<!-- Debug builds take hermesvoice://ring?call_id=…&session_id=… as a VoIP push (PushRegistration.deliverDebugPush). -->
+			<!-- Debug builds take hermesvoice://ring?call_id=…&session_id=… as a VoIP push (PushRegistration.deliverDebugPush)
+			     and hermesvoice://location-request?request_id=… as the background push that asks where the phone is
+			     (LocationSharing.deliverDebugRequest). -->
 			<key>CFBundleURLName</key>
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 			<key>CFBundleURLSchemes</key>
@@ -34,6 +36,10 @@
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>When you turn on Share location with Hermes, your own Hermes agent can ask this iPhone where it is, for example to tell whether you will be late. The position goes only to your Hermes host, and only when it asks.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>With Always, Hermes Voice can answer your Hermes agent's question about where this iPhone is while the app is in the background or the iPhone is locked. The position goes only to your own Hermes host, and only when it asks.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Hermes Voice listens during a call so you can talk to Hermes.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
@@ -48,6 +54,8 @@
 	<array>
 		<string>audio</string>
 		<string>voip</string>
+		<!-- Background pushes (content-available): Hermes asks where the phone is (LocationSharing). -->
+		<string>remote-notification</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

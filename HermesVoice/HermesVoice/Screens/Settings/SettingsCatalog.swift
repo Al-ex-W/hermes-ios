@@ -2,11 +2,11 @@ import Foundation
 
 /// Every page of Settings, in the desktop's navigation order (`apps/desktop/src/app/settings/index.tsx`).
 /// The desktop's Voice page, keyboard shortcuts, window layout, pet, local models and uninstall are left out;
-/// its Gateways page is our Connection page; Calls is this app's own.
+/// its Gateways page is our Connection page; Calls and Location are this app's own.
 enum SettingsPageID: String, Hashable, CaseIterable, Identifiable {
     case model, chat, appearance, workspace, safety, browser, vault, memory, advanced
     case notifications, billing
-    case providers, profiles, connection, calls, apiKeys, sessions
+    case providers, profiles, connection, calls, location, apiKeys, sessions
     case about
 
     var id: String { rawValue }
@@ -28,6 +28,7 @@ enum SettingsPageID: String, Hashable, CaseIterable, Identifiable {
         case .profiles: return "Profiles"
         case .connection: return "Connection"
         case .calls: return "Calls"
+        case .location: return "Location"
         case .apiKeys: return "Tools & Keys"
         case .sessions: return "Sessions"
         case .about: return "About"
@@ -52,6 +53,7 @@ enum SettingsPageID: String, Hashable, CaseIterable, Identifiable {
         case .profiles: return Theme.Icon.profile
         case .connection: return "network"
         case .calls: return "phone"
+        case .location: return "location"
         case .apiKeys: return "key"
         case .sessions: return "archivebox"
         case .about: return "info.circle"
@@ -61,7 +63,7 @@ enum SettingsPageID: String, Hashable, CaseIterable, Identifiable {
     /// The navigation groups, with the desktop's gaps between them.
     static let groups: [[SettingsPageID]] = [
         [.model, .chat, .appearance, .workspace, .safety, .browser, .vault, .memory, .advanced, .notifications, .billing],
-        [.providers, .profiles, .connection, .calls, .apiKeys, .sessions],
+        [.providers, .profiles, .connection, .calls, .location, .apiKeys, .sessions],
         [.about],
     ]
 }

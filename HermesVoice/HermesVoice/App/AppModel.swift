@@ -16,6 +16,8 @@ final class AppModel: ObservableObject {
     let push = PushRegistration()
     /// Background alerts (approval, question, turn done): their actions, taps and foreground banners.
     let notifications = AlertNotifications()
+    /// "Share location with Hermes": off by default; while on, Hermes may ask this iPhone where it is.
+    let location: LocationSharing
     private(set) var client: DashboardClient?
     private(set) var connection: GatewayConnection?
     /// Approvals, questions and passwords Hermes is waiting on, for every chat.
@@ -31,13 +33,15 @@ final class AppModel: ObservableObject {
     private var subscriptions: Set<AnyCancellable> = []
 
     /// `phase`: where the app starts (tests); by default what iOS reports (a VoIP push launches it in the background).
-    init(phase: GatewayLifecycle.Phase? = nil) {
+    init(phase: GatewayLifecycle.Phase? = nil, location: LocationSharing? = nil) {
         lifecycle = GatewayLifecycle(phase: phase ?? GatewayLifecycle.currentPhase)
+        self.location = location ?? LocationSharing()
         calls.$inCall.removeDuplicates().sink { [weak self] inCall in
             self?.lifecycle.setCallActive(inCall)
         }.store(in: &subscriptions)
         push.onToken = { [weak self] _ in self?.sendPushToken() }
         notifications.attach(to: self)
+        attachLocation()
         push.onIncoming = { [weak self] call, completion in
             guard let self else { return completion() }
             guard let call else { return self.calls.reportUnusablePush(completion: completion) }
@@ -79,6 +83,7 @@ final class AppModel: ObservableObject {
             generation += 1
             signedIn = true
             error = nil
+            push.setLocation(location.registration)
             sendPushToken()
         } catch {
             self.error = error.localizedDescription
@@ -93,6 +98,8 @@ final class AppModel: ObservableObject {
         connection?.disconnect()
         if let leaving = client {
             push.setAlerts(.none)
+            // Signed out, the phone can't answer a location request: the host hears that sharing is off.
+            push.setLocation(["enabled": false, "background": false])
             let push = push
             Task {
                 await Self.waiting(atMost: 5) { await push.send(to: leaving) }
@@ -197,6 +204,30 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Location sharing: its state goes with the device registration (again whenever the switch or the iOS
+    /// permission changes), a call answers Hermes' requests on its socket, and a background push is answered through
+    /// the dashboard, signing in first when the push woke the app.
+    private func attachLocation() {
+        push.setLocation(location.registration)
+        location.onRegistrationChange = { [weak self] in
+            guard let self, self.signedIn else { return }
+            self.push.setLocation(self.location.registration)
+            self.sendPushToken()
+        }
+        location.tokens = { [weak self] in (self?.push.token, self?.push.alertToken) }
+        location.client = { [weak self] in
+            guard let self else { throw DashboardError.signedOut }
+            if !self.signedIn {
+                // Launched in the background before the first unlock, the Keychain read came back empty.
+                if self.settings.password.isEmpty { self.settings = ConnectionSettings.load() }
+                await self.restore()
+            }
+            guard self.signedIn, let client = self.client else { throw DashboardError.signedOut }
+            return client
+        }
+        calls.locate = { [weak self] in await self?.location.answerOnCall() ?? .failure(.off) }
+    }
+
     /// Tells the Hermes Voice plugin where to ring this phone.
     func sendPushToken() {
         guard let client else { return }
@@ -208,7 +239,7 @@ final class AppModel: ObservableObject {
     private func incomingCall(_ call: CallPush) async throws -> VoiceCall {
         if !signedIn { await restore() }
         guard signedIn, let client, let connection else { throw DashboardError.signedOut }
-        let environment = VoiceCall.Environment.live(client: client, settings: callSettings)
+        let environment = VoiceCall.Environment.live(client: client, settings: callSettings, locate: calls.locate)
         let router = PushedCallRouter.live(client: client, connection: connection) { [weak self] id in
             self?.existingChat(id).map { SessionSummary(id: id, title: $0.title, lastActive: nil, profile: $0.profile) }
         }

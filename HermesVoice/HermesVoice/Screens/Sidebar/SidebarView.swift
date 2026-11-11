@@ -9,6 +9,7 @@ struct SidebarView: View {
     let agents: AgentsStore
     @EnvironmentObject private var calls: CallController
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var location: LocationSharing
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var showSettings = false
     @State private var showProfiles = false
@@ -63,6 +64,12 @@ struct SidebarView: View {
             ToolbarItemGroup(placement: .topBarLeading) {
                 Button { showSettings = true } label: { Image(systemName: Theme.Icon.settings) }
                     .accessibilityLabel("Settings")
+                // While this iPhone shares its location with Hermes, the sidebar says so (Settings > Location).
+                if location.sharing {
+                    Button { showSettings = true } label: { Image(systemName: "location.fill") }
+                        .accessibilityLabel("Location sharing with Hermes is on")
+                        .accessibilityIdentifier("sidebar.location-sharing")
+                }
                 // The desktop's statusbar Command Center button: it opens in the detail column (pushed on iPhone),
                 // and on iPad pressing it again goes back to what was open.
                 Button { sidebar.toggleCommandCenter() } label: {
