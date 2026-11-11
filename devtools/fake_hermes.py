@@ -2639,6 +2639,14 @@ class AlertVoicePlugin(FakeVoicePlugin):
         if problem is not None:
             self.log(f"http POST {PLUGIN_PREFIX}/devices -> 422 ({problem})")
             return JSONResponse({"detail": problem}, status_code=422)
+        # ``location: {"enabled": bool, "background"?: bool}`` (push.py::_location_choice): whether the phone shares
+        # its location; a registration that doesn't name it keeps what is stored.
+        location = body.get("location")
+        if location is not None and not (isinstance(location, dict) and isinstance(location.get("enabled"), bool)
+                                         and isinstance(location.get("background", False), bool)):
+            problem = 'location must be {"enabled": true or false, "background": true or false}'
+            self.log(f"http POST {PLUGIN_PREFIX}/devices -> 422 ({problem})")
+            return JSONResponse({"detail": problem}, status_code=422)
         voip = body.get("voip_token")
         alert = body.get("alert_token")
         earlier = self.devices.get(voip) if isinstance(voip, str) else None
@@ -2658,6 +2666,15 @@ class AlertVoicePlugin(FakeVoicePlugin):
                 chosen = self.alerts_of(device)
                 shown = ", ".join(k for k, on in chosen.items() if on) or "no alerts"
                 self.log(f"device {voip[:8]}… alert token {device['alert_token'][:8]}… ({shown})")
+            before = (earlier or {}).get("location") or {"enabled": False, "background": False}
+            device["location"] = before if location is None else {
+                "enabled": location["enabled"],
+                "background": location["enabled"] and location.get("background", False)}
+            if device["location"] != before:
+                self.log(f"device {voip[:8]}… location sharing "
+                         + ("off" if not device["location"]["enabled"] else
+                            "on" + (" (also in the background)" if device["location"]["background"] else "")))
+            self.location_changed(device)
         return response
 
     async def status(self, request: Request) -> Response:

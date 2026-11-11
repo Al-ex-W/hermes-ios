@@ -14,7 +14,16 @@
   the user did with the notification (an approval choice, ``reply`` or ``open``).
 - ``POST /scribe-token``: a single-use ElevenLabs Scribe token for on-phone speech recognition; the API key stays
   on this host.
-- ``GET /status``: what works here (TTS, h2, APNs, Scribe), the call in progress and the alert watcher.
+- ``POST /devices`` also takes ``location: {"enabled": bool, "background"?: bool}``: whether the user turned
+  "Share location with Hermes" on in the app (off by default), and whether iOS lets the app answer in the
+  background. A registration without ``location`` keeps what is stored.
+- ``POST /location {voip_token?, alert_token?, request_id, latitude, longitude, accuracy_m, fixed_at, speed_mps?,
+  course_deg?}`` (or ``{..., request_id, error: "off" | "denied" | "unavailable" | "timeout"}``): the phone's
+  answer to a location request it got by background push (``location.py``). Only from a registered phone that
+  shares its location, and only for a request this host made: ``404`` for an unknown phone, ``403`` for one that
+  doesn't share, ``409`` for a request nobody made (or one that is too old). The fix is kept in memory only.
+- ``GET /status``: what works here (TTS, h2, APNs, Scribe), the call in progress, the alert watcher and
+  ``location`` (whether a phone shares its location; never where it is).
 
 HTTP routes sit behind the dashboard's own auth middleware. WebSocket upgrades skip that middleware, so the socket
 checks the dashboard's WebSocket auth itself (the check ``/api/audio/speak-stream`` uses), failing closed.
@@ -81,6 +90,7 @@ hub_module = _core("hub")
 hermes = _core("hermes")
 push = _core("push")
 notify = _core("notify")
+location = _core("location")
 hub_module.mark_routes_mounted()
 # Alert pushes: the watcher acts once this process serves the dashboard (hub.routes_mounted()).
 notify.start()
@@ -109,6 +119,9 @@ _scribe_limiter = _Limiter(SCRIBE_LIMIT, SCRIBE_WINDOW_S)
 _device_limiter = _Limiter(DEVICE_LIMIT, DEVICE_WINDOW_S)
 _test_limiter = _Limiter(TEST_LIMIT, TEST_WINDOW_S)
 _test_poll_limiter = _Limiter(TEST_POLL_LIMIT, TEST_POLL_WINDOW_S)
+# The phone answers each location request once; the tool's own limits bound how many requests there are.
+LOCATION_LIMIT, LOCATION_WINDOW_S = 30, 60.0
+_location_limiter = _Limiter(LOCATION_LIMIT, LOCATION_WINDOW_S)
 
 
 def _hub() -> Any:
@@ -178,7 +191,38 @@ async def devices(request: Request) -> Any:
     off = [kind for kind in push.ALERT_KINDS if not stored.wants(kind)] if stored.alert_token else []
     logger.info("hermes_voice: registered a %s device for %s (%s)", stored.environment, stored.bundle_id,
                 "no alerts" if not stored.alert_token else f"alerts off: {', '.join(off)}" if off else "alerts on")
+    # A phone that doesn't share its location (any more) takes its last fix with it (location.py).
+    await run_in_threadpool(location.locations().device_registered, stored)
     return {"ok": True}
+
+
+@router.post("/location")
+async def phone_location(request: Request) -> Any:
+    """The phone's answer to a location request it got by background push: a fix, or why it has none."""
+    hub = _hub()
+    if not _location_limiter.allow():
+        return _error(429, "Too many location answers; try again shortly")
+    body = await _json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    tokens = []
+    for name in ("voip_token", "alert_token"):
+        token = body.get(name) or ""
+        if token and not (isinstance(token, str) and push.DEVICE_TOKEN.fullmatch(token.strip())):
+            return _error(400, f"{name} must be the hex APNs token")
+        tokens.append(token.strip().lower())
+    if not any(tokens):
+        return _error(400, "voip_token or alert_token must name the phone that answers")
+    device = await run_in_threadpool(location.find_device, hub, tokens[0], tokens[1])
+    if device is None:
+        return _error(404, "This iPhone isn't registered with the Hermes host")
+    if not device.location:
+        return _error(403, "This iPhone doesn't share its location with the Hermes host")
+    try:
+        await run_in_threadpool(location.locations().answered, body, "push", device)
+    except location.LocationError as error:
+        return _error(error.status, str(error))
+    return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
 
 async def _json_object(request: Request) -> Any:
@@ -295,6 +339,10 @@ async def status() -> Any:
             report["alerts"] = notify.alerts().status()
         except Exception:  # noqa: BLE001 - the call status still answers
             logger.debug("hermes_voice: alert status unavailable", exc_info=True)
+        try:
+            report["location"] = location.locations().status()
+        except Exception:  # noqa: BLE001
+            logger.debug("hermes_voice: location status unavailable", exc_info=True)
         return report
 
     return await run_in_threadpool(collect)

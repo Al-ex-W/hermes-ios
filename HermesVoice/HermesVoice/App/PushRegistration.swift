@@ -25,6 +25,9 @@ final class PushRegistration: NSObject, ObservableObject {
     /// The alerts the plugin may push: the user's opt-ins while iOS lets the app notify, else none. Nil until
     /// AlertNotifications has read them, and a registration then leaves the plugin's stored ones as they are.
     private(set) var alerts: NotificationPreferences?
+    /// Whether this iPhone shares its location with Hermes (`LocationSharing.registration`); nil until known, and a
+    /// registration then leaves the plugin's stored value as it is.
+    private(set) var location: [String: Bool]?
     /// A new token arrived.
     var onToken: ((String) -> Void)?
     /// A new alert token arrived.
@@ -69,7 +72,7 @@ final class PushRegistration: NSObject, ObservableObject {
         do {
             try await VoicePluginAPI.registerDevice(client, body: Self.deviceBody(
                 voipToken: token, environment: Self.environment, bundleID: Bundle.main.bundleIdentifier ?? "",
-                alertToken: alertToken, alerts: alerts
+                alertToken: alertToken, alerts: alerts, location: location
             ))
             if self.token == token { upload = .sent(Date()) }
         } catch {
@@ -78,14 +81,24 @@ final class PushRegistration: NSObject, ObservableObject {
     }
 
     /// The `POST /devices` body: the VoIP token the plugin keeps the phone by, the alert token once iOS gave one, and
-    /// the alerts it may push (`{approval, clarify, turn_done}`) once known. A key left out leaves the plugin's
-    /// stored value: an alert token from an earlier launch still reaches this phone.
+    /// the alerts it may push (`{approval, clarify, turn_done}`) once known, and whether it shares its location
+    /// (`location: {enabled, background}`). A key left out leaves the plugin's stored value: an alert token from an
+    /// earlier launch still reaches this phone.
     nonisolated static func deviceBody(voipToken: String, environment: String, bundleID: String, alertToken: String?,
-                                       alerts: NotificationPreferences?) -> JSON {
+                                       alerts: NotificationPreferences?, location: [String: Bool]? = nil) -> JSON {
         var body: JSON = ["voip_token": voipToken, "environment": environment, "bundle_id": bundleID]
         if let alertToken { body["alert_token"] = alertToken }
         if let alerts { body["alerts"] = alerts.alerts }
+        if let location { body["location"] = location }
         return body
+    }
+
+    /// Whether the phone shares its location, to register; true when it changed (and needs sending).
+    @discardableResult
+    func setLocation(_ location: [String: Bool]) -> Bool {
+        guard location != self.location else { return false }
+        self.location = location
+        return true
     }
 
     /// The alerts to register; true when they changed (and need sending).

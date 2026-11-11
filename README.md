@@ -18,6 +18,9 @@ with Hermes, where Hermes is heard only when it chooses to speak.**
   a `[Voice] …` message.
 - When a conversation nobody has open waits for your approval or an answer, or finishes a turn, the plugin sends an
   ordinary notification (an alert push) to the phone.
+- If you turn it on, Hermes can ask the phone where it is (`get_location`), say for a scheduled "will I be late?"
+  check. It is off by default, and the position goes only to your own Hermes host (see
+  [Location and privacy](#location-and-privacy)).
 
 Calls run through the **`hermes_voice` Hermes plugin** ([`hermes-voice-plugin/`](hermes-voice-plugin)), served by
 the Hermes dashboard itself. The older `hermes-voice-mcp` server (a `speak` MCP tool on its own port) is kept below
@@ -42,7 +45,7 @@ iPhone (HermesVoice)                           Hermes host: hermes serve :9119 (
 | Path | What |
 |---|---|
 | [`HermesVoice/`](HermesVoice) | SwiftUI iOS app (iOS 17+), generated with XcodeGen from `project.yml` |
-| [`hermes-voice-plugin/`](hermes-voice-plugin) | The `hermes_voice` Hermes plugin: `start_call` / `end_call`, the phone's socket, VoIP and alert pushes, TTS |
+| [`hermes-voice-plugin/`](hermes-voice-plugin) | The `hermes_voice` Hermes plugin: `start_call` / `end_call` / `get_location`, the phone's socket, VoIP, alert and background pushes, TTS |
 | [`hermes-voice-mcp/`](hermes-voice-mcp) | Legacy: the `speak` MCP server and its phone socket (until the cutover) |
 | [`devtools/`](devtools) | `fake_hermes.py`, a fake dashboard (with a fake `hermes_voice` plugin) for Simulator tests |
 
@@ -308,7 +311,8 @@ settings any more):
 - Half duplex: the mic is off while Hermes speaks. If you're mid-sentence when Hermes starts, it waits for
   your pause setting plus 2 s (at most 10 s), then what it heard so far goes in as `cut_off`.
 - The Simulator has no VoIP pushes, CallKit audio or microphone: there calls ring inside the app only, Hermes can
-  be heard, and you answer by typing. Debug builds take `hermesvoice://ring?call_id=…&session_id=…` as a push.
+  be heard, and you answer by typing. Debug builds take `hermesvoice://ring?call_id=…&session_id=…` as a push, and
+  `hermesvoice://location-request?request_id=…` as the background push that asks where the phone is.
 
 ## Settings, profiles and notifications
 
@@ -317,7 +321,7 @@ Browser, Passwords & Logins, Memory & Context, Advanced, Notifications, Billing,
 Sessions and About, with a search over every field. The config pages are built from the dashboard's
 `/api/config/schema`, and each change is saved on its own (`PUT /api/config` with only that key). The desktop's
 Voice page, keyboard shortcuts, window layout, pet, local models and uninstall are left out; its Gateways page is
-this app's **Connection** page, and **Calls** is this app's own.
+this app's **Connection** page, and **Calls** and **Location** are this app's own.
 
 - **Profiles** opens from the sidebar's title menu (**Manage profiles…**) or from Settings: create, clone, rename,
   delete, set the default, export or import (paths on the host), and edit SOUL.md.
@@ -340,6 +344,32 @@ this app's **Connection** page, and **Calls** is this app's own.
   runs nothing and touches no conversation. The app confirms with "Test approval answered: Run", tells the plugin
   which button it was, and the row shows it. With a plugin that has no test route, the app shows a local
   notification and says so.
+
+### Location and privacy
+
+**Settings → Location → Share location with Hermes** is off by default. While it is on, your Hermes agent can ask
+this iPhone where it is with the plugin's `get_location` tool: the motivating use is a scheduled job that checks
+your calendar, where you are and the trains, and calls you when you are about to be late.
+
+- **What is sent:** latitude, longitude, the fix's accuracy in metres and its time, and speed and heading when the
+  phone is moving. Nothing else, and never on the app's own initiative: only as the answer to a request from
+  Hermes. The app keeps no position, only the time one was last sent (shown on the page).
+- **To whom:** only the Hermes host you signed in to, over the dashboard connection. The plugin keeps the latest
+  fix in memory (never on disk, at most 30 minutes, gone with a restart or when you turn sharing off) and logs that
+  a request happened, never where you are. The fix does become part of the conversation that asked for it, like
+  any tool result, and so reaches that conversation's model provider.
+- **Who may ask:** your own conversations, as for calls, and scheduled jobs (`settings.location.allow_cron`).
+  Subagents, group chats and other people's chats may not, and the plugin limits how often the phone is asked.
+- **When it works:** during a call the request comes over the call's connection. Otherwise the plugin sends a
+  background push that wakes the app. With iOS' "While Using the App" permission the app can answer only while it
+  is on screen; "Always" (asked for on the page, never by itself) also covers the app in the background and a
+  locked phone. Even then iOS may delay or drop a background push (Low Power Mode, no connection, several requests
+  in a short time), and it delivers none to an app you force-quit: Hermes is then told that the phone didn't
+  answer, and gets at most the last position with its age.
+- **Turning it off** stops everything at once: a fix on its way is dropped, the host is told (the tool then
+  answers that sharing is off) and forgets the fix it had. The sidebar shows a location arrow while sharing is on,
+  and the page says what iOS currently allows (not asked yet, denied, restricted, While Using, Always, and whether
+  the position is only approximate because Precise Location is off).
 
 ## Files, review, messaging, agents and kanban
 
@@ -371,7 +401,9 @@ open HermesVoice.xcodeproj
 Signing is personal, so it isn't in the repo. Copy `HermesVoice/Config/Local.xcconfig.example` to
 `HermesVoice/Config/Local.xcconfig` (gitignored) and set your `BUNDLE_ID_PREFIX` and Apple `DEVELOPMENT_TEAM`;
 the app's bundle id becomes `$(BUNDLE_ID_PREFIX).hermesvoice`. For Hermes to ring the phone, the team must be a
-paid one with the Push Notifications capability (the app also uses the `voip` and `audio` background modes).
+paid one with the Push Notifications capability (the app also uses the `voip`, `audio` and `remote-notification`
+background modes; the last one is for the background push that asks where the phone is. It has no `location`
+background mode: it gets one fix per request and tracks nothing in between).
 
 In the app, enter the **Hermes dashboard** address (`https://<machine>.<tailnet>.ts.net`), username and password.
 
@@ -426,7 +458,12 @@ makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/rin
 `xcrun simctl openurl booted "hermesvoice://ring?…"` (see `devtools/fake_voice_plugin.py`). It answers the test
 alert routes as the plugin does without pushing anything; `GET /api/plugins/hermes_voice/debug/test-alerts` has
 each test's payload, which `xcrun simctl push booted <bundle id> payload.json` shows in the Simulator with its
-actions (see [`devtools/README.md`](devtools/README.md)).
+actions (see [`devtools/README.md`](devtools/README.md)). For location, typing `where am I` makes the fake agent
+call `get_location`, and `POST /api/plugins/hermes_voice/debug/location-request` asks the phone without the agent:
+on the call's link while a call is up, else it returns the background push it would have sent. The Simulator
+doesn't hand a `content-available` push from `xcrun simctl push` to the app's handler, so a debug build takes
+`xcrun simctl openurl booted "hermesvoice://location-request?request_id=<id>"` as that push; give the Simulator a
+position first with `xcrun simctl location booted set 59.0,18.0`.
 
 ## How the pieces talk
 
@@ -459,6 +496,11 @@ actions (see [`devtools/README.md`](devtools/README.md)).
   kind, status, code, message, delay_s, action}`; the app reads a delayed test's outcome with `GET
   …/devices/test/{test_id}`. A test alert's actions send no `request.answer`: the app confirms on the phone and
   posts `…/devices/test/{test_id}/answer {action}`.
+- **Location**: the registration (`POST …/devices`) carries `location: {enabled, background}`. On a call the plugin
+  sends `location_request {id}` on the call's socket and the app answers `location {id, latitude, longitude,
+  accuracy_m, fixed_at, speed_mps?, course_deg?}` or `location {id, error}`. Otherwise it sends a background push
+  `{"aps": {"content-available": 1}, "hermes": {kind: "location_request", request_id, profile}}` to the alert
+  token, and the app posts the same answer with `request_id` and its tokens to `POST …/location`.
 
 ## Legacy: the hermes-voice-mcp server
 

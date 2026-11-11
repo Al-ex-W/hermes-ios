@@ -12,6 +12,7 @@ struct HermesVoiceApp: App {
                 .environmentObject(delegate.model.calls)
                 .environmentObject(delegate.model.push)
                 .environmentObject(delegate.model.notifications)
+                .environmentObject(delegate.model.location)
                 .task { await delegate.model.restore() }
         }
     }
@@ -34,6 +35,17 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
         MainActor.assumeIsolated { model.push.didFailToRegisterForAlerts(error) }
+    }
+
+    /// A background push (`content-available`). The only one the plugin sends asks where the phone is; the app
+    /// answers within the time iOS gives it (about 30 s), and only while the user shares their location.
+    func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                     fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        guard let request = LocationRequestPush(userInfo: userInfo) else { return completionHandler(.noData) }
+        Task { @MainActor in
+            let sent = await self.model.location.handle(request)
+            completionHandler(sent ? .newData : .failed)
+        }
     }
 }
 
@@ -62,7 +74,9 @@ struct RootView: View {
             }
         }
         #if DEBUG
-        .onOpenURL { url in model.push.deliverDebugPush(url) }
+        .onOpenURL { url in
+            if !model.push.deliverDebugPush(url) { model.location.deliverDebugRequest(url) }
+        }
         #endif
         .alert("Call", isPresented: Binding(get: { calls.lastError != nil }, set: { if !$0 { calls.lastError = nil } })) {
             Button("OK", role: .cancel) {}

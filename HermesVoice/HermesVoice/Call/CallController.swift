@@ -11,6 +11,8 @@ final class CallController: NSObject, ObservableObject {
     @Published var lastError: String?
     /// A call rings, is being set up or runs: the app keeps its gateway connection meanwhile, even in the background.
     @Published private(set) var inCall = false
+    /// Where the phone is, for a call Hermes asks on (`VoiceCall.Environment.locate`); set by the app model.
+    var locate: (@MainActor () async -> LocationAnswer)?
 
     private let provider: CXProvider
     private let controller = CXCallController()
@@ -84,7 +86,7 @@ final class CallController: NSObject, ObservableObject {
             callID = current.callID
         }
         let call = VoiceCall(chat: chat, settings: settings, initiatedBy: .user, callID: callID,
-                             environment: .live(client: client, settings: settings))
+                             environment: .live(client: client, settings: settings, locate: locate))
         adopt(call)
         call.begin()
         #if targetEnvironment(simulator)

@@ -48,6 +48,9 @@ final class VoiceCall: ObservableObject, Identifiable {
         var declineLinger: TimeInterval = 10
         /// How long an answered call waits for CallKit to bring up its audio before it says `answered` anyway.
         var answerAudioWait: TimeInterval = 5
+        /// Where the phone is, when Hermes asks on the call (`location_request`): a fix while the user shares their
+        /// location, else why not (`LocationSharing.answerOnCall`).
+        var locate: @MainActor () async -> LocationAnswer = { .failure(.off) }
 
         /// The grace for turns that end after `pause` seconds of silence. A turn ends `pause` after the user's last
         /// word, so the grace has to outlast the pause, or Hermes' next line would cut in on everyone who is still
@@ -57,7 +60,8 @@ final class VoiceCall: ObservableObject, Identifiable {
             min(10, max(3, pause + 2))
         }
 
-        static func live(client: DashboardClient, settings: CallSettings) -> Environment {
+        static func live(client: DashboardClient, settings: CallSettings,
+                         locate: (@MainActor () async -> LocationAnswer)? = nil) -> Environment {
             let pause = settings.endOfSpeech.pause
             var environment = Environment(
                 makeLink: { hello in VoiceLink(client: client, hello: hello) },
@@ -73,6 +77,7 @@ final class VoiceCall: ObservableObject, Identifiable {
                 }
             )
             environment.cutOffGrace = cutOffGrace(pause: pause)
+            if let locate { environment.locate = locate }
             return environment
         }
     }
@@ -391,6 +396,14 @@ final class VoiceCall: ObservableObject, Identifiable {
             }
         case .pong:
             break
+        case let .locationRequest(id):
+            // Answered on whatever link the call has by then (a reconnect meanwhile loses nothing).
+            let locate = environment.locate
+            Task { @MainActor [weak self] in
+                let answer = await locate()
+                guard let self, !self.isEnded else { return }
+                self.link?.send(.location(id: id, answer))
+            }
         }
     }
 
