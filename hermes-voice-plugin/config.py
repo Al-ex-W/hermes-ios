@@ -58,6 +58,19 @@ class PolicyConfig:
 
 
 @dataclass(frozen=True)
+class ScheduledConfig:
+    """Calls that ring later (``start_call`` with ``in_minutes`` / ``at``; schedule.py)."""
+
+    # How many more times the phone rings when nobody answers a scheduled call (0: it rings once), and how long
+    # after the ring before.
+    retries: int = 1
+    retry_after_s: float = 300.0
+    # A call the host missed (it was down or asleep at the time) still rings when it is at most this late; a later
+    # one is dropped and its conversation told.
+    late_limit_s: float = 900.0
+
+
+@dataclass(frozen=True)
 class Settings:
     elevenlabs_base_url: str = DEFAULT_BASE_URL
     voice_id: str = DEFAULT_VOICE_ID
@@ -69,6 +82,7 @@ class Settings:
     # The user's call style file ("" = <HERMES_HOME>/hermes-voice/call-style.md); see guidance.py.
     call_style_path: str = ""
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    scheduled: ScheduledConfig = field(default_factory=ScheduledConfig)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -104,7 +118,17 @@ class Settings:
             sync_reply_timeout_s=_float(own.get("sync_reply_timeout_s"), 600.0, 30.0, 3600.0),
             call_style_path=str(own.get("call_style_path") or "").strip()[:1024],
             policy=_policy(own.get("policy") if isinstance(own.get("policy"), dict) else {}),
+            scheduled=_scheduled(own.get("scheduled") if isinstance(own.get("scheduled"), dict) else {}),
         )
+
+
+def _scheduled(raw: dict) -> ScheduledConfig:
+    default = ScheduledConfig()
+    return ScheduledConfig(
+        retries=_int(raw.get("retries"), default.retries, 0, 5),
+        retry_after_s=_float(raw.get("retry_after_s"), default.retry_after_s, 5.0, 3600.0),
+        late_limit_s=_float(raw.get("late_limit_s"), default.late_limit_s, 0.0, 86400.0),
+    )
 
 
 def _policy(raw: dict) -> PolicyConfig:

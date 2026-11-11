@@ -68,6 +68,12 @@ config_schema:
       dashboard; empty), allow_cron / allow_subagents / allow_groups (false), rings_per_session (3) per
       session_window_s (600), rings_global (10) per global_window_s (3600), quiet_hours {start: "22:00", end:
       "07:00", action: refuse|confirm, timezone} (alert pushes go silently then)
+  scheduled:
+    type: dict
+    description: >-
+      Calls that ring later (start_call with in_minutes / at; kept in <HERMES_HOME>/hermes-voice/scheduled.json
+      and rung by `hermes serve`): retries (1; more rings when nobody answers, 0 = ring once), retry_after_s (300),
+      late_limit_s (900; a call the host missed still rings when at most this late, else its conversation is told)
   alerts:
     type: dict
     description: >-

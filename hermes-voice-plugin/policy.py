@@ -7,6 +7,10 @@ third-party integrations (``tool``) may not; at most 3 rings per conversation pe
 overall; no quiet hours.
 Every decision and every call's outcome goes to ``<HERMES_HOME>/hermes-voice/rings.jsonl``.
 
+A call scheduled for later (``schedule.py``) is asked about when it is scheduled, and only who the conversation is
+(``check_schedule``): at its time it is the call the user asked for, so the rate limits and quiet hours don't
+refuse it then (its ring still counts for the rings after it).
+
 The policy runs in the dashboard process's hub for every process (calls from other processes come in over
 ``hubsock.py``), so the rate limits and quiet hours count every ring, wherever it came from. Who the owner of a
 messaging DM is gets decided in the process that hosts the chat (``gateway_owner``), where the gateway's own
@@ -41,6 +45,9 @@ NON_MESSAGING = frozenset({
 PLATFORM_NAME = re.compile(r"[a-z][a-z0-9_]{1,31}")
 RING_LOG_MAX_LINES = 1000
 CONFIRM_WINDOW_S = 900.0
+# For a scheduled job or one-shot run that is refused: the way to a call at a set time (schedule.py).
+LATER = (" For a call at a set time, the conversation the user asked in schedules it itself: start_call with at or "
+         "in_minutes. That needs no cron job.")
 
 
 @dataclass(frozen=True)
@@ -75,10 +82,28 @@ class Policy:
                       "reason": decision.reason})
         return decision
 
+    def check_schedule(self, origin: hermes.Origin) -> Decision:
+        """Whether this conversation may schedule a call (``start_call`` with ``in_minutes`` / ``at``): who it is
+        (cron, subagent, group, source), as for a ring now. How often it rang and quiet hours are not asked: a
+        scheduled call is one the user asked for, and it rings at its time whatever those say then."""
+        decision = self._who(origin) or Decision(True)
+        if not decision.allowed:
+            self.log({"event": "refused", "session_id": origin.session_id, "source": _surface(origin),
+                      "reason": decision.reason, "scheduling": True})
+        return decision
+
     def _decide(self, origin: hermes.Origin) -> Decision:
         cfg = self.settings().policy
+        refusal = self._who(origin)
+        if refusal is not None:
+            return refusal
+        return self._when(origin, cfg)
+
+    def _who(self, origin: hermes.Origin) -> Optional[Decision]:
+        """The refusal for a conversation that may not ring at all, else None."""
+        cfg = self.settings().policy
         if origin.is_cron and not cfg.allow_cron:
-            return Decision(False, "cron", "Scheduled jobs can't call the user. Report in text instead.")
+            return Decision(False, "cron", f"Scheduled jobs can't call the user. Report in text instead.{LATER}")
         if origin.is_subagent and not cfg.allow_subagents:
             return Decision(False, "subagent",
                             "Only the main conversation can call the user. Report back; it can call.")
@@ -91,7 +116,12 @@ class Policy:
                 return Decision(False, "not_owner",
                                 "Only the owner's own direct messages may call them. Reply in text.")
         elif surface not in cfg.allowed_sources:
-            return Decision(False, "source", f"Conversations from {surface or 'this surface'} can't call the user.")
+            return Decision(False, "source", f"Conversations from {surface or 'this surface'} can't call the user."
+                                             f"{LATER if surface == 'oneshot' else ''}")
+        return None
+
+    def _when(self, origin: hermes.Origin, cfg: Any) -> Decision:
+        """How often this conversation and the host rang lately, and quiet hours (a ring now only)."""
         now = self.clock()
         with self.lock:
             recent = [(at, sid) for at, sid in self.rings if now - at < max(cfg.global_window_s, cfg.session_window_s)]
@@ -132,11 +162,14 @@ class Policy:
                     for key in list(self.user_turn_at)[:100]:
                         del self.user_turn_at[key]
 
-    def record_ring(self, origin: hermes.Origin, call_id: str) -> None:
+    def record_ring(self, origin: hermes.Origin, call_id: str, **more: Any) -> None:
+        """A ring went out: it counts for the rate limits and goes into the ring log, with `more` (a scheduled
+        ring names its ``scheduled`` id there)."""
         with self.lock:
             self.rings.append((self.clock(), origin.session_id))
             self.refused_at.pop(origin.session_id, None)
-        self.log({"event": "ring", "call_id": call_id, "session_id": origin.session_id, "source": _surface(origin)})
+        self.log({"event": "ring", "call_id": call_id, "session_id": origin.session_id, "source": _surface(origin),
+                  **more})
 
     # ── ring log ─────────────────────────────────────────────────────────────────────────────────────────
 
