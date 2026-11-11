@@ -135,6 +135,10 @@ final class CallProtocolTests: XCTestCase {
         XCTAssertEqual(VoiceTranscript.spoken("[Voice, cut off] wait no \(hint)"), "wait no (cut off)")
         XCTAssertEqual(VoiceTranscript.spoken("[Voice, hung up] bye (The user hung up, so the call is over; reply in text.)"),
                        "bye (hung up)")
+        let hungUp = "(HermesVoice note, not the user's words: they hung up, so this call is over and they can't hear "
+            + "you. Finish the task you were given, then reply once in text with a short recap. Don't ring back unless "
+            + "they asked to be called when you're done.)"
+        XCTAssertEqual(VoiceTranscript.spoken("[Voice, hung up] bye \(hungUp)"), "bye (hung up)")
         XCTAssertNil(VoiceTranscript.spoken("[Voice] one\n\n[Voice] two"))
         XCTAssertNil(VoiceTranscript.spoken("hello"))
         XCTAssertNil(VoiceTranscript.spoken("[Voice call started] The user is calling you"))

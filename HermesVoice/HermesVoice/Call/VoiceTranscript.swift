@@ -8,6 +8,10 @@ enum VoiceTranscript {
     /// The hints the plugin appends to a turn, for Hermes only.
     static let hints = [
         "(Reply out loud with start_call; your text replies are not spoken.)",
+        "(HermesVoice note, not the user's words: they hung up, so this call is over and they can't hear you. "
+            + "Finish the task you were given, then reply once in text with a short recap. Don't ring back unless "
+            + "they asked to be called when you're done.)",
+        // Plugins before the reworded call notices.
         "(The user hung up, so the call is over; reply in text.)",
     ]
 

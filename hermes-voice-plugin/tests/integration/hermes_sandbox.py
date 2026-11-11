@@ -797,7 +797,7 @@ class Phone:
         await self.socket.send(json.dumps(message))
 
     async def say(self, text: str, ending: str = "end_of_speech") -> None:
-        detail = {"detector": "apple_silence", "detail": 1.2} if ending == "end_of_speech" else {}
+        detail = {"detector": "apple_silence", "detail": 3.5} if ending == "end_of_speech" else {}
         await self.send({"type": "user_turn", "call_id": self.ready["call_id"], "text": text,
                          "ending": {"kind": ending, **detail}, "provider": "apple", "language": "en-US",
                          "started_at": iso(-0.1), "ended_at": iso()})
