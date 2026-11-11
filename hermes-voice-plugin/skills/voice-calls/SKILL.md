@@ -44,7 +44,7 @@ What the user says arrives as a message in this conversation:
 | Message | Meaning |
 | --- | --- |
 | `[Voice] …` | They finished speaking. |
-| `[Voice, cut off] …` | They were still talking when you started speaking; this is what they had said. |
+| `[Voice, cut off] …` | They were still talking, or pausing to think, when you started speaking; this is what they had said. |
 | `[Voice, hung up] …` | They hung up mid-sentence; the call is over (see "When a call ends"). |
 | `[Voice, muted] …` / `[Voice, line dropped] …` | They muted, or the connection dropped, mid-sentence. |
 | `[Voice, speech recognition failed: …]` | The phone couldn't transcribe them; ask them to repeat. |
@@ -55,6 +55,14 @@ current turn (Hermes reads it after the tool calls in flight finish), or starts 
 The words after the bracket are the user's. The sentence in parentheses at the end (`(Reply out loud with
 start_call; …)`, `(HermesVoice note, not the user's words: …)`) is the plugin's hint to you, not something they
 said.
+
+The phone waits for a pause before it sends a turn (3.5 s by default, so the user can think mid-sentence), so a
+reply reaches you a few seconds after they stop talking.
+
+A turn that ends with `(Delayed by N s: this chat was open in another Hermes window, …)` could not be put into this
+conversation when it was said, because another Hermes window or terminal had the chat open. The plugin told the
+user so out loud, and the note says whether they are still on the call. Answer it as usual; if it is old, say so
+briefly.
 
 ## sync or async
 

@@ -98,7 +98,10 @@ plugins:
 ```
 
 Every ring, refusal and call outcome is logged to `<HERMES_HOME>/hermes-voice/rings.jsonl`, with what APNs accepted (`pushed`), what the phone did (`phone`: connected, ringing, answered, declined, turned away), calls the user started (`start`) and why a ring ran out (`detail` on `no_answer` / `unreachable`); registered phones are
-kept in `<HERMES_HOME>/hermes-voice/devices.json`.
+kept in `<HERMES_HOME>/hermes-voice/devices.json`. The log also says what a call couldn't put into its chat, never
+the text itself: `chat_held` (another Hermes process holds the chat; `holder` is the surface Hermes names,
+`announced` whether the user was told on the call), `delivered_late` (it got in after `waited_s`) and
+`undelivered` (given up, with the `reason`); `what` is `call_started`, `turn` or `notice`.
 
 **The owner's direct messages.** A DM may ring the phone when it comes from the owner: whoever `owner_ids` names
 (a user id, or `"<platform>:<user id>"`), or, with no `owner_ids`, whoever the gateway was told to serve by name: its
@@ -229,6 +232,34 @@ another dashboard in the same home holds `hub.sock` (a second `hermes serve`, or
 keeps trying and takes it over once the other stops (`GET /status` says `hub_socket: "taken"` meanwhile).
 Disabling the plugin closes the socket; enabling it again reopens it.
 
+### A chat another Hermes process holds
+
+Hermes keeps one writer per conversation: a process that ran a turn in a chat holds it (a lease in
+`<HERMES_HOME>/runtime/active_sessions.json`) for as long as it has the chat open, and answers every other
+process's `prompt.submit` for it with 4090 / `SESSION_NOT_OWNED` ("This chat is open in another Hermes
+window/terminal"), before anything is written. A call the user starts from the phone belongs to a dashboard
+session, so in a chat the Desktop app's backend (or an Ink TUI, or the classic CLI) holds, the dashboard can write
+neither the `[Voice call started]` notice nor what the user says. Hermes has no hand-over for such a lease between
+processes, so:
+
+1. **The process that holds the chat puts it in.** Every process that hosts sessions of its own and isn't the
+   dashboard (a Desktop backend, the Ink TUI) keeps a connection to the hub socket (`attend`). On a refusal the hub
+   asks those processes which of them has the chat open and hands the text to that one, which injects it into its
+   own live session (redirect, steer or a new turn, as the dashboard does for its own). Its agent answers with
+   `start_call` through the hub socket, and from then on that process takes the call's turns itself.
+2. **Otherwise the call keeps it and says so.** The delivery stays at the head of the call's queue and is tried
+   again every 3 s for 2 minutes from when it was queued; later turns wait behind it, so they arrive in order and
+   none twice. Each one that gets in late carries a note ("Delayed by … s: this chat was open in another Hermes
+   window …", and how many earlier ones were given up). On the first refusal the hub itself says into the call,
+   once per call: "I can't reach this chat right now: it's open in another Hermes window. Close it there, or call
+   from another chat." The ring log gets `chat_held`, then `delivered_late` or `undelivered`.
+
+The same holds for the notices of a call Hermes started (`[Voice call not answered]`, a call that ended): kept and
+retried, and logged if they never get in. Only a refusal for a held chat is retried: after any other failure the
+text may have been taken, so it is logged (`undelivered`) and not sent again. Not covered by step 1: the classic
+CLI REPL (it hosts no session the plugin can inject into by id), a process whose plugin is older than this, and a
+second plain `hermes serve` in the same home.
+
 ## Alert pushes
 
 The phone also hears, as an ordinary notification, about what needs it in a conversation the dashboard hosts while
@@ -322,6 +353,11 @@ HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
   call; a voice turn the provider refuses (no `on_session_end`) doesn't swallow the next one.
 - `test_isolated_calls.py`, under `turn_isolation`: an idle voice turn is started by the dashboard (which then shows
   it running), and a prompt typed meanwhile reaches the model instead of failing as "session busy".
+- `test_chat_open_elsewhere.py`: a second `hermes serve` in the same home, started the way the Desktop app starts
+  its backend, holds the chat a call is started in from the phone: the notice and the turns reach that backend's
+  session, and its agent answers into the call. Then a process without the plugin holds a chat's lease: the phone
+  hears that the chat can't be reached, and once that process is gone the notice and the kept turn arrive in order,
+  marked as delayed.
 - `test_alerts_real_hermes.py`, with turns in the dashboard and under `turn_isolation`: approval and question
   alerts once the client leaves, answered with `request.answer` from the alert's ids; a turn the provider fails
   alerts that it failed; and through the real APNs

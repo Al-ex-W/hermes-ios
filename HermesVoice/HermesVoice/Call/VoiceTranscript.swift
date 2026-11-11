@@ -47,6 +47,10 @@ enum VoiceTranscript {
             return nil
         }
         var said = body.trimmingCharacters(in: .whitespaces)
+        // A turn the chat couldn't take when it was said ends with the plugin's "(Delayed by N s: …)" note.
+        if said.hasSuffix(")"), let note = said.range(of: " (Delayed by ", options: .backwards) {
+            said = String(said[..<note.lowerBound]).trimmingCharacters(in: .whitespaces)
+        }
         for hint in hints where said.hasSuffix(hint) {
             said = String(said.dropLast(hint.count)).trimmingCharacters(in: .whitespaces)
         }

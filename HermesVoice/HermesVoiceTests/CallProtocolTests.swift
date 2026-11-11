@@ -139,6 +139,9 @@ final class CallProtocolTests: XCTestCase {
             + "you. Finish the task you were given, then reply once in text with a short recap. Don't ring back unless "
             + "they asked to be called when you're done.)"
         XCTAssertEqual(VoiceTranscript.spoken("[Voice, hung up] bye \(hungUp)"), "bye (hung up)")
+        let delayed = "(Delayed by 12 s: this chat was open in another Hermes window, so nothing could be put into it. "
+            + "The user is still on the call and was told this chat couldn't be reached.)"
+        XCTAssertEqual(VoiceTranscript.spoken("[Voice] the blue one \(hint) \(delayed)"), "the blue one")
         XCTAssertNil(VoiceTranscript.spoken("[Voice] one\n\n[Voice] two"))
         XCTAssertNil(VoiceTranscript.spoken("hello"))
         XCTAssertNil(VoiceTranscript.spoken("[Voice call started] The user is calling you"))

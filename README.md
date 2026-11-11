@@ -268,6 +268,16 @@ settings any more):
 - **Steer timing.** During a long tool batch, Hermes reads an injected turn after the batch. A redirect Hermes
   accepts in the very moment its last model reply completes is dropped with that turn (a steer would be carried
   into the next turn), so that one thing you said never reaches the conversation.
+- **A chat that is open in another Hermes process.** Hermes lets one process write a conversation: the one that
+  ran a turn in it, for as long as it has it open (the Desktop app's backend keeps its chats, also after their tab
+  is closed). A call you start from the phone in such a chat belongs to a dashboard session, and Hermes refuses
+  the dashboard ("This chat is open in another Hermes window/terminal"). When the process that holds the chat
+  hosts its own sessions and runs this plugin (a Desktop backend, the Ink TUI), it puts the call's notice and what
+  you say into its own session, and its agent answers into the call. Otherwise (the classic CLI, a Hermes with an
+  older plugin or none) the call says once "I can't reach this chat right now: it's open in another Hermes window.
+  Close it there, or call from another chat.", keeps each thing you say for up to two minutes, and puts it in, in
+  order and marked as delayed, once the chat is free; what never got in is in `rings.jsonl` (`undelivered`).
+  Hermes refuses what you type in that chat from the app in the same way.
 - Calls from other processes need the dashboard running (it holds the phone's socket and the one call); without
   it `start_call` answers `not_available`. A call whose process goes away for more than 30 s is hung up.
 - From a messaging chat, a sync `start_call` waits at most Hermes' bound on one human wait inside a tool call
@@ -357,7 +367,10 @@ that calls `start_call`, and play the phone on `/phone`: a sync call that return
 whose turns are injected (a new turn while idle, a redirect while a turn runs), a declined call, one that rings
 out, `busy`, an unreachable phone, and the dashboard's auth on the socket. A second Hermes process in the same home
 (`hermes chat -Q -q`, whose turn runs in the gateway Hermes starts) calls through the hub socket: its sync call
-gets the reply, and its async call's reply becomes a stored turn of that session. Approvals and questions waiting
+gets the reply, and its async call's reply becomes a stored turn of that session. A call started from the phone in
+a chat another process holds: a backend started the way the Desktop app starts its own takes the call's turns and
+answers into the call; with a holder that can't be asked, the phone hears that the chat can't be reached, and the
+turns arrive in order once the holder is gone. Approvals and questions waiting
 on a conversation nobody has open send alert pushes, answered with `request.answer`, with turns in the dashboard
 and under `turn_isolation`; through the plugin's real APNs sender and a mock APNs, an approval reaches each phone
 that takes approval alerts exactly once. APNs itself is replaced by a recorder or that mock. They look for Hermes

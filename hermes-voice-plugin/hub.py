@@ -24,6 +24,14 @@ The hub lives in the dashboard process. Conversations in other Hermes processes 
 (``hubsock.py``, opened once the dashboard serves): their calls carry a ``route`` that hands each turn to the
 conversation's own process, which injects it there (``remote.py``).
 
+A chat another Hermes process holds (Hermes keeps one writer per conversation; typically a Desktop backend that
+has the chat open while the user calls from the app): this process's ``prompt.submit`` is refused (``Delivery.held``).
+The turn then goes to the process that holds the chat, when it runs this plugin (``holders``: it attends on the hub
+socket and injects into its own live session). Otherwise it stays at the head of the call's queue and is tried again
+every ``HELD_RETRY_S`` for ``HELD_RETRY_LIMIT_S`` (later turns wait behind it, so order holds and nothing is put in
+twice), the user hears once per call that the chat can't be reached (``inject.CHAT_HELD_SPOKEN``, the hub's own
+line), and the ring log says ``chat_held``, then ``delivered_late`` or ``undelivered``: never silence.
+
 Threads: tool handlers run on agent threads, the socket on the dashboard's event loop (captured on the first
 request). Call state is guarded by ``lock``; links and speech run on the loop only.
 """
@@ -83,6 +91,13 @@ TURN_CLOCK_SLACK = 1.0
 HISTORY_LIMIT = 50
 # How long after the dashboard's import the hub waits for it to serve before opening its socket.
 SOCKET_WAIT_LIMIT = 600.0
+# A delivery refused because another Hermes process holds the chat is tried again this often, for this long after
+# it was queued (the lease goes when that process closes the chat or exits); then it is given up and logged.
+HELD_RETRY_S = 3.0
+HELD_RETRY_LIMIT_S = 120.0
+# How long the line that tells the user waits for the phone's link (a call the user starts fails its first
+# delivery while the link is still coming up).
+HELD_LINK_WAIT = 5.0
 
 OUTCOMES = frozenset({
     "answered", "no_answer", "declined", "push_failed", "unreachable", "lost", "tts_failed", "ended_by_user",
@@ -346,6 +361,9 @@ class Call:
         # Where turns go when the conversation runs in another process (hubsock.Route): deliver(text), close().
         self.route: Any = None
         self.inbox = InjectQueue(hub, self)
+        # Another Hermes process holds the call's chat: logged (once), and said into the call (once).
+        self.held_logged = False
+        self.held_announced = False
 
     def info(self) -> dict[str, Any]:
         """The call as ``GET /status`` shows it (``active_call``), so the app's call button can join it.
@@ -357,14 +375,24 @@ class Call:
 class InjectQueue:
     """Deliveries into the owner's conversation, one at a time and in order, off the event loop. For a call the
     user started, the "[Voice call started]" notice goes first, so turns wait until it is delivered. Once the call
-    is over, its route (if any) hears so after the last delivery."""
+    is over, its route (if any) hears so after the last delivery.
+
+    A delivery refused because another Hermes process holds the chat (``Delivery.held``: nothing was written) is
+    tried again here until it is in or ``HELD_RETRY_LIMIT_S`` old, with everything queued after it waiting its
+    turn. What gets in late says so (``inject.delayed``)."""
 
     END = None
 
     def __init__(self, hub: "CallHub", call: Call) -> None:
         self.hub = hub
         self.call = call
-        self.items: deque[Optional[str]] = deque()
+        # (text, when it was queued: time.monotonic()), or END.
+        self.items: deque[Optional[tuple[str, float]]] = deque()
+        # Since when the chat has refused as held (None: it takes deliveries), when it last took one again, and
+        # how many deliveries were given up meanwhile. Only the queue's own thread touches these.
+        self.held_since: Optional[float] = None
+        self.freed_at = 0.0
+        self.lost = 0
         self.lock = threading.Lock()
         self.running = False
         # Everything the call had to deliver is done (a route attached after this hears the end at once).
@@ -383,7 +411,7 @@ class InjectQueue:
                 return False
             if text is InjectQueue.END:
                 self.closing = True
-            self.items.append(text)
+            self.items.append(None if text is InjectQueue.END else (text, time.monotonic()))
             if self.running:
                 return True
             self.running = True
@@ -401,8 +429,8 @@ class InjectQueue:
                 if not self.items:
                     self.running = False
                     return
-                text = self.items.popleft()
-            if text is InjectQueue.END:
+                item = self.items.popleft()
+            if item is InjectQueue.END:
                 with self.hub.lock:
                     self.finished = True
                     route = self.call.route
@@ -412,12 +440,38 @@ class InjectQueue:
                 except Exception:  # noqa: BLE001
                     logger.debug("hermes_voice: closing a call's route failed", exc_info=True)
                 continue
+            self._deliver(*item)
+
+    def _deliver(self, text: str, queued: float) -> None:
+        """One delivery. While another Hermes process holds the chat it is tried again (what is queued behind it
+        waits), until it is in or too old; anything else that fails is final (it may have been taken)."""
+        hub, call = self.hub, self.call
+        refused = False
+        while True:
+            # Late: refused before, or it waited behind something that was.
+            late = refused or self.held_since is not None or queued < self.freed_at
+            waited = time.monotonic() - queued
             try:
-                delivery = self.hub.deliver(self.call, text)
+                sent = inject.delayed(text, waited, call.state == "ended", self.lost) if late else text
+                delivery = hub.deliver(call, sent)
             except Exception as error:  # noqa: BLE001
                 logger.warning("hermes_voice: injection failed", exc_info=True)
                 delivery = inject.Delivery(False, detail=type(error).__name__)
-            self.hub.delivered(self.call, text, delivery)
+            if delivery.ok:
+                if self.held_since is not None:
+                    self.held_since, self.freed_at, self.lost = None, time.monotonic(), 0
+                break
+            if not delivery.held:
+                break
+            refused = True
+            if self.held_since is None:
+                self.held_since = time.monotonic()
+            hub.chat_held(call, delivery)
+            if time.monotonic() - queued >= HELD_RETRY_LIMIT_S:
+                self.lost += 1
+                break
+            time.sleep(HELD_RETRY_S)
+        hub.delivered(call, text, delivery, waited=time.monotonic() - queued, late=late)
 
 
 # ── phone links (event loop only) ──────────────────────────────────────────────────────────────────────────
@@ -481,6 +535,9 @@ class CallHub:
         self.deliveries: deque[tuple[str, str, inject.Delivery]] = deque(maxlen=200)
         # What each conversation's user did not hear to the end on its last call (memory only).
         self.missed = guidance.Missed()
+        # Asks the Hermes processes that attend on the hub socket to put a text into a chat one of them holds:
+        # (the chat's stored ids, text) -> how it went, or None when none of them has it (``hubsock.HubServer``).
+        self.holders: Optional[Callable[[list[str], str], Optional[inject.Delivery]]] = None
 
     # ── loop plumbing ────────────────────────────────────────────────────────────────────────────────────
 
@@ -1205,7 +1262,25 @@ class CallHub:
         call.inbox.put(text)
 
     def deliver(self, call: Call, text: str) -> inject.Delivery:
-        """Put `text` into the call owner's conversation (InjectQueue thread). A conversation in another process
+        """Put `text` into the call owner's conversation (InjectQueue thread). When Hermes refuses it here because
+        another Hermes process holds the chat, that process puts it in, if it attends on the hub socket
+        (``holders``, set by ``hubsock.HubServer``); else the refusal stands and the queue tries again."""
+        delivery = self._deliver(call, text)
+        holders = self.holders
+        if delivery.ok or not delivery.held or holders is None:
+            return delivery
+        owner = call.owner
+        with owner.lock:
+            ids = [owner.session_id, *sorted(owner.lineage - {owner.session_id})]
+        try:
+            through = holders([sid for sid in ids if sid], text)
+        except Exception:  # noqa: BLE001 - the refusal stands
+            logger.warning("hermes_voice: asking the process that holds the chat failed", exc_info=True)
+            through = None
+        return delivery if through is None else through
+
+    def _deliver(self, call: Call, text: str) -> inject.Delivery:
+        """Into a conversation of this process through its session host. A conversation in another process
         gets it there, through the call's route. What that process can't deliver while the conversation is idle
         is tried here too, but only into a session this process has open (turns that run in compute-host
         children belong to dashboard sessions); a messaging chat is never reopened here."""
@@ -1218,7 +1293,7 @@ class CallHub:
             return delivery
         live = getattr(self.injector, "deliver_live", None)
         local = live(call.owner, text) if callable(live) else self.injector.deliver(call.owner, text)
-        if local.ok:
+        if local.ok or local.held:
             return local
         return inject.Delivery(False, delivery.via, delivery.status, delivery.detail)
 
@@ -1239,10 +1314,43 @@ class CallHub:
         except RuntimeError:
             logger.warning("hermes_voice: a voice turn handed back after the call ended was lost")
 
-    def delivered(self, call: Call, text: str, delivery: inject.Delivery) -> None:
+    def delivered(self, call: Call, text: str, delivery: inject.Delivery, waited: float = 0.0,
+                  late: bool = False) -> None:
+        """How a delivery ended. One that failed, or got in late, goes into the ring log (what it was, never its
+        text): nothing a call had for its chat is lost without a record."""
         self.deliveries.append((call.call_id, text, delivery))
+        entry = {"call_id": call.call_id, "session_id": call.owner.session_id, "what": inject.kind_of(text)}
         if not delivery.ok:
             logger.warning("hermes_voice: couldn't deliver to %s: %s", call.owner.session_id, delivery.detail)
+            reason = "chat_held" if delivery.held else " ".join((delivery.detail or "unknown").split())[:160]
+            self.policy.log({"event": "undelivered", **entry, "reason": reason,
+                             **({"waited_s": round(waited)} if delivery.held else {})})
+        elif late:
+            logger.info("hermes_voice: delivered to %s after %.0fs (the chat was held by another Hermes process)",
+                        call.owner.session_id, waited)
+            self.policy.log({"event": "delivered_late", **entry, "waited_s": round(waited)})
+
+    def chat_held(self, call: Call, delivery: inject.Delivery) -> None:
+        """Another Hermes process holds the call's chat, and what the call has for it can't be put in (InjectQueue
+        thread, on every refusal). The user hears so through the hub's own speech, once per call and only while
+        they are on it; the ring log gets it when first seen and when it is said."""
+        with self.lock:
+            announce = call.state == "live" and not call.held_announced
+            first = not call.held_logged
+            call.held_announced = call.held_announced or announce
+            call.held_logged = True
+        if announce:
+            # A call the user starts fails its first delivery while the phone's link is still coming up.
+            deadline = time.monotonic() + HELD_LINK_WAIT
+            while not call.connected and call.state == "live" and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.enqueue_line(call, inject.CHAT_HELD_SPOKEN, mode="hub")  # "hub": no notice for the chat if it fails
+        if first or announce:
+            holder = re.search(r"opened by ([\w:.-]+)", delivery.detail or "")
+            logger.warning("hermes_voice: call %s can't reach its chat %s: another Hermes process holds it%s",
+                           call.call_id[:8], call.owner.session_id, " (told the user)" if announce else "")
+            self.policy.log({"event": "chat_held", "call_id": call.call_id, "session_id": call.owner.session_id,
+                             "holder": holder.group(1) if holder else "", "announced": announce})
 
     # ── hooks ────────────────────────────────────────────────────────────────────────────────────────────
 
