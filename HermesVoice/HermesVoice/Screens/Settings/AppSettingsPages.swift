@@ -115,10 +115,10 @@ struct NotificationsSettingsView: View {
     @EnvironmentObject private var notifications: AlertNotifications
     let anchor: String?
     @State private var preferences = NotificationPreferences.load()
-    @State private var testing = false
-    @State private var testResult: String?
+    @State private var testKind = AlertPush.Kind.approval
 
     private var blocked: Bool { notifications.authorization == .denied }
+    private var testRow: TestAlertRow { TestAlertRow(notifications.test, delay: AlertNotifications.testDelay) }
 
     var body: some View {
         Form {
@@ -146,23 +146,35 @@ struct NotificationsSettingsView: View {
             }
             .hermesFormRows()
             Section {
-                Button {
-                    Task {
-                        testing = true
-                        testResult = await notifications.sendTest() ?? "Sent. It shows as a banner in a moment."
-                        testing = false
+                Picker("Test notification kind", selection: $testKind) {
+                    ForEach(AlertPush.Kind.allCases, id: \.self) { kind in
+                        Text(TestAlertRow.title(kind)).tag(kind)
                     }
+                }
+                .pickerStyle(.segmented)
+                .disabled(testRow.busy)
+                .accessibilityIdentifier("notifications.test.kind")
+                Button {
+                    Task { await notifications.sendTest(testKind) }
                 } label: {
                     HStack {
                         Text("Send test notification")
                         Spacer()
-                        if testing { ProgressView() }
+                        if testRow.busy { ProgressView() }
                     }
                 }
-                .disabled(testing || blocked)
+                .disabled(testRow.busy || blocked)
                 .id("notifications.test")
+                .accessibilityIdentifier("notifications.test")
+            } header: {
+                FormNote("Test")
             } footer: {
-                FormNote(testResult ?? "Checks that iOS lets Hermes notify this iPhone.")
+                // The plugin's own words (APNs' answer, setting names): shown as they are, not as Markdown.
+                Text(verbatim: testRow.message)
+                    .hermesText(.caption)
+                    .foregroundStyle(testRow.isError ? Theme.destructive : Theme.Text.tertiary)
+                    .textCase(nil)
+                    .accessibilityIdentifier("notifications.test.result")
             }
             .hermesFormRows()
         }
