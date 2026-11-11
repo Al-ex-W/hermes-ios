@@ -92,11 +92,49 @@ briefly.
 | `ended_by_user` | They hung up | See "When a call ends" |
 | `ended_by_agent` | You hung up with `end_call` | — |
 | `busy` | They're on a call with another conversation | Reply in text this time; call once that call is over, if it still matters |
-| `not_allowed` | Their call settings refuse this call (source, how often, quiet hours) | Follow the note |
+| `not_allowed` | Their call settings refuse this call (source, how often, quiet hours) | Follow the note (a scheduled job can't ring: see "Calling later") |
 | `not_available` | Calls can't be placed from here: no Hermes dashboard with this plugin runs on the host, or (async, from a chat) Hermes doesn't let the plugin start a turn there | Follow the note (a sync call may still work); else reply in text |
 
 With `mode: "async"` the endings come as messages: `[Voice call not answered]`, `[Voice line not delivered: …]`,
 `[Voice call ended by user]`, `[Voice call ended: …]`.
+
+## Calling later
+
+"Call me in ten minutes", "wake me at seven", "ring me at half past two with the result": schedule the call with
+`start_call` and a time. The plugin keeps the call and rings at that time by itself, also when this conversation is
+idle and no chat window is open.
+
+- `in_minutes`: minutes from now. "Call me in ten" is `in_minutes: 10` (fractions work).
+- `at`: a clock time such as `"07:00"` (24-hour; the next time the clock shows it, so tomorrow if it has passed
+  today), or an ISO date-time such as `"2026-01-31T07:00"`. Times are on the Hermes host's clock (the zone of the
+  user's quiet hours, if they set one). At most 7 days ahead. Give `in_minutes` or `at`, not both.
+- `text` is the line the user hears when they answer, so write it for that moment ("Good morning, it's seven.").
+  `mode` is ignored.
+
+The result comes at once: `{status: "scheduled", scheduled_id, rings_at, note, pending}`. Tell the user the time
+(`rings_at`) and carry on or end your turn.
+
+- **Never wait for the time yourself**: no sleep, no waiting command, no sync call held open. Such a wait is cut off
+  at Hermes' tool deadline, so the phone rings early or not at all.
+- **Never use a cron job** or another scheduler for a call: scheduled jobs are refused by the user's call settings
+  (`not_allowed`), and nobody finds out until the call is missing.
+
+At the time the phone rings, and your line is spoken once the user answers. You then get a `[Voice call started]`
+notice that names the scheduled call (and says how late it rang, if Hermes was not running at the time). Don't
+speak on that notice: wait for their `[Voice]` reply and answer it with `start_call`, as on any call. A call the
+user asked for rings during their quiet hours too.
+
+- **Not answered.** The phone rings once more a few minutes later (the result's `note` says when). After that you
+  get the usual `[Voice call not answered]` or `[Voice line not delivered: …]` notice; it says that this was the
+  scheduled call, when it was tried, and what its line was. Put the line in a short text reply. Don't schedule it
+  again unless the user asks.
+- **Not placed.** `[Voice call not placed: …]` means the ring never went out: Hermes was down for too long at the
+  time, or the user stayed on another call. Tell them in text what the call was for.
+- **Already on a call with you.** If the user is on a call with this conversation at the time, the line is said
+  into that call without ringing, and a `[Voice line spoken: …]` notice tells you.
+- **List and cancel.** Every scheduling result lists this conversation's scheduled calls in `pending`. `end_call`
+  with `scheduled_id` cancels one (`"all"` cancels them all, `"list"` only lists them) and hangs nothing up. To
+  change a time, cancel the call and schedule a new one. At most 5 calls can wait per conversation.
 
 ## When a call ends
 
@@ -169,7 +207,7 @@ Ring when the user asked to be called ("call me when it's done") or for news the
 routine updates. You can call from any conversation on this host (dashboard, desktop, CLI, TUI, or the user's own
 direct messages to Hermes); calls from scheduled jobs, subagents, group chats and other people's chats are refused
 by default, and the user may have quiet hours: with `not_allowed` the note says what to do (sometimes: ask in text
-first, then call again).
+first, then call again). For a call at a set time ("in ten minutes", "at seven"), see "Calling later".
 
 ## Notifications the app sends (not calls)
 

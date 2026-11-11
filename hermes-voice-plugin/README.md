@@ -6,7 +6,9 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
 - **Tools** (toolset `voice`): `start_call(text, mode="async")` rings the phone (VoIP push straight to APNs) and
   says `text` once you answer, or just speaks if this conversation already has a call. `mode="sync"` waits for your
   spoken reply and returns `{said, ending, outcome, call_id}`; `async` returns `{call_id, status}` at once and your
-  reply arrives in the conversation as a `[Voice] …` message. `end_call(text?)` hangs up.
+  reply arrives in the conversation as a `[Voice] …` message. `end_call(text?)` hangs up. With `in_minutes` or `at`,
+  `start_call` schedules the call instead and the plugin rings at that time by itself (see "Calls that ring
+  later"); `end_call(scheduled_id)` cancels one.
 - **Skill** `voice-calls`: the longer rules (`skill_view("hermes_voice:voice-calls")`).
 - **Call style** `<HERMES_HOME>/hermes-voice/call-style.md`: the user's own preferences for how Hermes speaks on
   calls, which the agent reads at every call and edits itself (see "Call style").
@@ -88,6 +90,10 @@ plugins:
           rings_per_session: 3             # per session_window_s (600)
           rings_global: 10                 # per global_window_s (3600)
           quiet_hours: {start: "22:00", end: "07:00", action: refuse}   # or action: confirm
+        scheduled:                         # calls that ring later (start_call with in_minutes / at)
+          retries: 1                       # more rings when nobody answers (0: it rings once)
+          retry_after_s: 300               # how long after the ring before
+          late_limit_s: 900                # a call the host missed still rings when at most this late
         alerts:
           enabled: true
           approval: true                   # each kind can be turned off for every phone here
@@ -103,14 +109,72 @@ Every ring, refusal and call outcome is logged to `<HERMES_HOME>/hermes-voice/ri
 kept in `<HERMES_HOME>/hermes-voice/devices.json`. The log also says what a call couldn't put into its chat, never
 the text itself: `chat_held` (another Hermes process holds the chat; `holder` is the surface Hermes names,
 `announced` whether the user was told on the call), `delivered_late` (it got in after `waited_s`) and
-`undelivered` (given up, with the `reason`); `what` is `call_started`, `turn` or `notice`.
+`undelivered` (given up, with the `reason`); `what` is `call_started`, `turn` or `notice`. Calls that ring later
+are in it as `scheduled`, `ring` with the `scheduled` id and `attempt` (and `late_s`, `quiet_hours`),
+`scheduled_busy`, `scheduled_spoken`, `scheduled_retry`, `scheduled_done`, `scheduled_cancelled` and
+`scheduled_dropped`, again without the line's text.
 
 **The owner's direct messages.** A DM may ring the phone when it comes from the owner: whoever `owner_ids` names
 (a user id, or `"<platform>:<user id>"`), or, with no `owner_ids`, whoever the gateway was told to serve by name: its
 platform allowlist (`TELEGRAM_ALLOWED_USERS` …) or `GATEWAY_ALLOWED_USERS`, or a pairing the owner approved. An
 allow-all switch, a `*` wildcard, a group-only allowlist or a Discord role grant makes nobody the owner. Group
 chats, scheduled jobs and subagents stay off unless their `allow_*` setting is on. The rate limits and quiet hours
-count every ring on the host, whichever process it came from.
+count every ring on the host, whichever process it came from. A scheduled job or one-shot run that is refused is
+told the way that works: the conversation the user asked in schedules the call with `start_call` and `at` or
+`in_minutes` (below). `allow_cron` stays what it was: it lets every scheduled job ring.
+
+## Calls that ring later
+
+"Call me in ten", a wake-up call at 07:00: the agent can't wait for the time inside its turn (the wait ends at
+Hermes' tool deadline and dies with the session), and a Hermes cron job is a scheduled origin, which the policy
+refuses when it fires. So the plugin keeps the schedule itself (`schedule.py`):
+
+- **Scheduling.** `start_call(text, in_minutes=10)` or `start_call(text, at="07:00")`. `in_minutes` is a number
+  (fractions allowed). `at` is `HH:MM` (24-hour, also `7am` / `7:30 pm`: the next time the clock shows that) or an
+  ISO 8601 date-time; a time without an offset is read on the host's clock, or in `policy.quiet_hours.timezone`
+  when that is set. Not in the past (an ISO time up to 10 s ago rings now), at most 7 days ahead, at most 5 waiting
+  calls per conversation and 20 on the host. The result comes at once:
+  `{status: "scheduled", scheduled_id, rings_at, note, pending}`, with `rings_at` as a local date-time
+  (`2026-01-31 07:00`) and `pending` the conversation's scheduled calls (`{scheduled_id, rings_at, text}`, the text
+  shortened). `mode` is ignored: the reply arrives as a `[Voice]` message. A time that can't be used answers
+  `{error}` and says what is accepted.
+- **Policy.** Who may schedule is checked then, with the scheduling conversation's origin (cron, subagent, group
+  and source rules as for a ring now), so a ring that would be refused is refused at once (`status:
+  "not_allowed"`). At its time the call is the one the user asked for: quiet hours and the ring rate limits are not
+  asked again. The ring is in the ring log with its `scheduled` id, and counts for the limits of the rings after it.
+  The result warns when the phone can't be rung as things are (no APNs key, no registered phone).
+- **The file.** `<HERMES_HOME>/hermes-voice/scheduled.json`, 0600, written atomically under a file lock
+  (`scheduled.lock`). **It holds the line to speak**, the time, and the conversation's ids and title, until the call
+  is answered, given up, cancelled or dropped; with nothing scheduled the file is gone. A file that can't be read
+  is set aside as `scheduled.json.broken`.
+- **Who rings.** The dashboard process (`hermes serve`), once it serves: it looks at the file every second and
+  rings what is due, with no chat, desktop or agent turn open, and after a restart. One dashboard per home rings
+  (`scheduled.runner`, a lock held while it runs). Conversations in other Hermes processes schedule and cancel
+  through the hub socket (`schedule` / `cancel_scheduled`).
+- **The ring belongs to the conversation that scheduled it.** Answered, the line is spoken and the conversation
+  gets a `[Voice call started]` notice naming the scheduled call; what the user says is injected into it like any
+  call's turns. A conversation nobody has open is reopened by the dashboard (`session.resume`), whichever process
+  it was scheduled from (a messaging chat excepted, see below); one another process holds goes the way of "A chat
+  another Hermes process holds". If the user is
+  on a call with that conversation at the time, the line is said into it without a ring (`[Voice line spoken:
+  …]`).
+- **Busy.** The user is on a call with another conversation: tried again every 30 s, six times, then dropped.
+- **Not answered** (`no_answer`, `unreachable`, `push_failed`): it rings again `retry_after_s` later, `retries`
+  times (default once, after 5 minutes). Only the last ring tells the conversation: the usual notice, plus which
+  scheduled call it was, when it was tried and its line. A declined ring is not repeated.
+- **The host was down** (or asleep) at the time: a call at most `late_limit_s` late rings as soon as the dashboard
+  serves again, and its started notice says how late. An older one is dropped, and its conversation gets a `[Voice
+  call not placed: …]` notice with the reason and the line.
+- **List and cancel.** `end_call(scheduled_id)` cancels one of the conversation's scheduled calls, `"all"` all of
+  them, `"list"` only lists them; it returns `{cancelled, pending, note}` and hangs nothing up. `end_call` with no
+  call running also lists what is scheduled.
+- `GET /status` counts them (`scheduled`), never their text. Disabling the plugin stops the ringing; the calls stay
+  on file and ring (or are dropped as late) once it is enabled again.
+
+Not covered yet: a call scheduled from a **messaging chat** rings and speaks its line, but what the user says on
+it can't be put into that chat (the dashboard never reopens a messaging chat, and the gateway isn't told when the
+ring starts); the scheduling result says so. A chat that its own process (a CLI, say) still holds at the time gets
+the turns only once that process lets go, as described under "A chat another Hermes process holds".
 
 **Other profiles.** A profile with no dashboard of its own finds the root profile's hub socket. Its processes ring
 only when `allowed_profiles` lists the profile, and then their DMs count as the owner's only through `owner_ids`:
@@ -127,7 +191,7 @@ The plugin puts two kinds of message into the conversation that owns a call (tex
 | Message | What it is |
 |---|---|
 | `[Voice] <said> (…)`, `[Voice, cut off] …`, `[Voice, hung up] …`, `[Voice, muted] …`, `[Voice, line dropped] …` | A turn of the user's: their words, then one of the plugin's two hints in parentheses (`inject.REPLY_HINT`, `inject.HUNG_UP_HINT`). A `[Voice, speech recognition failed…]` turn may have no words. |
-| `[Voice call started] …`, `[Voice call not answered] …`, `[Voice call ended by user] …`, `[Voice call ended: …] …`, `[Voice line not delivered: …] …` | An automated notice about one call. Nothing in it was said by the user. |
+| `[Voice call started] …`, `[Voice call not answered] …`, `[Voice call ended by user] …`, `[Voice call ended: …] …`, `[Voice line not delivered: …] …`, and for scheduled calls `[Voice call not placed: …] …`, `[Voice line spoken: …] …` | An automated notice about one call. Nothing in it was said by the user. |
 
 Every notice is worded as an event of one call, never as an instruction from the user or a standing preference
 (a hang-up notice that said "reply in text from now on" was once stored by a memory system as the user's wish). A
@@ -400,7 +464,7 @@ HTTP 403 on the handshake and no close code, which the app treats like 4401. VoI
 - A hello for a call that is over gets `cancel {reason}` (never answered) or `ended {outcome}`, then close 1000; a
   push hello for a call the plugin doesn't know gets `cancel {reason: "unknown_call"}`.
 - `GET /status` → `{calls, tts: "elevenlabs" | "fake", h2, apns_configured, scribe_configured, active_call,
-  hub_socket: "open" | "waiting" | "taken" | "paused" | "failed" | "off", alerts}`,
+  hub_socket: "open" | "waiting" | "taken" | "paused" | "failed" | "off", scheduled, alerts}`,
   where `active_call` is `{call_id, session_id, title, state, initiated_by: "push" | "user"}` or null (the app's
   call button joins a call Hermes holds for the same chat) and `alerts` is `{enabled, kinds, watching, devices,
   sent}`. HTTP errors are `{detail}`.
@@ -465,6 +529,10 @@ HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
   session, and its agent answers into the call. Then a process without the plugin holds a chat's lease: the phone
   hears that the chat can't be reached, and once that process is gone the notice and the kept turn arrive in order,
   marked as delayed.
+- `test_scheduled_calls.py`: a dashboard conversation schedules a call a few seconds ahead and goes idle with no
+  client attached; the phone rings on time, the line is spoken, and the reply becomes a stored turn of the reopened
+  conversation, answered into the call. A ring nobody answers is repeated once and the conversation told; and a
+  scheduled call rings on time after the dashboard was restarted.
 - `test_alerts_real_hermes.py`, with turns in the dashboard and under `turn_isolation`: approval and question
   alerts once the client leaves, answered with `request.answer` from the alert's ids; a turn the provider fails
   alerts that it failed; and through the real APNs

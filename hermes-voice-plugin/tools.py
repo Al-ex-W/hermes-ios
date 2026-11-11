@@ -3,7 +3,10 @@ because plugin skills are not listed in the system prompt; the ``voice-calls`` s
 
 They work from any session: in the dashboard process (which serves the phone) they use its call hub directly;
 anywhere else (CLI, Ink TUI, messaging gateway, cron, compute-host children) they go through the hub's socket
-(``remote.py``). Where there is no dashboard to reach, ``start_call`` says so (``not_available``)."""
+(``remote.py``). Where there is no dashboard to reach, ``start_call`` says so (``not_available``).
+
+``start_call`` with ``in_minutes`` or ``at`` rings later: the hub keeps the call and rings at its time by itself
+(``schedule.py``); ``end_call`` with ``scheduled_id`` cancels or lists such calls."""
 
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ import logging
 import time
 from typing import Any
 
-from . import guidance, hermes, hub, remote
+from . import guidance, hermes, hub, remote, schedule
 
 logger = logging.getLogger("hermes_voice")
 
@@ -43,6 +46,11 @@ _WHEN = (
     "means their call settings refuse it; \"not_available\" means calls can't be placed from here (the note says "
     "why)."
 )
+_LATER = (
+    "To ring later (\"call me in ten\", a wake-up call), add in_minutes or at: the plugin rings on time by itself "
+    "and returns {status: \"scheduled\", scheduled_id, rings_at}; never wait inside a turn or use a cron job for "
+    "that, and cancel with end_call's scheduled_id."
+)
 _AFTER = (
     "Messages starting with \"[Voice call\" or \"[Voice line\" are automated notices about one call: not the "
     "user's words, and never a preference to remember. After \"[Voice call ended by user]\", a declined or "
@@ -65,7 +73,7 @@ _BETA = (
 
 START_CALL: dict[str, Any] = {
     "name": "start_call",
-    "description": " ".join((_WHAT, _HOW, _WHEN, _AFTER, _STYLE, _BETA)),
+    "description": " ".join((_WHAT, _HOW, _WHEN, _LATER, _AFTER, _STYLE, _BETA)),
     "parameters": {
         "type": "object",
         "properties": {
@@ -84,6 +92,17 @@ START_CALL: dict[str, Any] = {
                     "\"sync\": wait for the user's spoken reply and return it."
                 ),
             },
+            "in_minutes": {
+                "type": "number",
+                "description": "Ring later instead of now: in this many minutes (10 = in ten minutes).",
+            },
+            "at": {
+                "type": "string",
+                "description": (
+                    "Ring later instead of now, at a clock time on the Hermes host: \"07:00\" (24-hour; the next "
+                    "time it is 07:00) or an ISO date-time like \"2026-01-31T07:00\". Use in_minutes or at, not both."
+                ),
+            },
         },
         "required": ["text"],
     },
@@ -93,12 +112,21 @@ END_CALL: dict[str, Any] = {
     "name": "end_call",
     "description": (
         "Hang up this conversation's voice call, optionally saying `text` (a short goodbye) first. Use it when the "
-        "conversation is done or the user asks you to hang up. Returns {call_id, outcome}."
+        "conversation is done or the user asks you to hang up. Returns {call_id, outcome}. With `scheduled_id` it "
+        "hangs nothing up: it cancels a call scheduled with start_call (in_minutes / at) and returns {cancelled, "
+        "pending}."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "text": {"type": "string", "description": "Optional goodbye, spoken before hanging up."},
+            "scheduled_id": {
+                "type": "string",
+                "description": (
+                    "Cancel a scheduled call instead of hanging up: its scheduled_id, \"all\" for every call this "
+                    "conversation scheduled, or \"list\" to only list them."
+                ),
+            },
         },
     },
 }
@@ -113,7 +141,7 @@ def start_call_schema() -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - registering the tool must not fail over the style
         logger.debug("hermes_voice: could not read the call style for the tool description")
         style = _STYLE
-    return {**START_CALL, "description": " ".join((_WHAT, _HOW, _WHEN, _AFTER, style, _BETA))}
+    return {**START_CALL, "description": " ".join((_WHAT, _HOW, _WHEN, _LATER, _AFTER, style, _BETA))}
 
 
 def available() -> bool:
@@ -139,6 +167,12 @@ def start_call(args: Any, session_id: Any = None, task_id: Any = None, **_: Any)
         text = args.get("text")
         if not isinstance(text, str) or not text.strip():
             return _answer({"error": "text is required: the words to say out loud."})
+        in_minutes, at = args.get("in_minutes"), args.get("at")
+        if schedule.wants_later(in_minutes, at):
+            # A call for later: the hub keeps it and rings at its time (schedule.py); mode plays no part.
+            if not hub.routes_mounted():
+                return _answer(remote.schedule_call(session_id, text, in_minutes, at))
+            return _answer(hub.get_hub().schedule.schedule(hermes.origin(session_id), text, in_minutes, at))
         if mode not in ("async", "sync"):
             return _answer({"error": 'mode must be "async" or "sync".'})
         # The call style is read here, in the conversation's own process and profile (not in the hub's).
@@ -159,6 +193,12 @@ def end_call(args: Any, session_id: Any = None, task_id: Any = None, **_: Any) -
     try:
         text = args.get("text")
         text = text if isinstance(text, str) else ""
+        which = args.get("scheduled_id")
+        if schedule.given(which):
+            # Cancel (or list) scheduled calls; nothing is hung up.
+            if not hub.routes_mounted():
+                return _answer(remote.cancel_scheduled(session_id, str(which)))
+            return _answer(hub.get_hub().schedule.cancel(hermes.origin(session_id), which))
         if not hub.routes_mounted():
             return _answer(remote.end_call(session_id, text))
         origin = hermes.origin(session_id)

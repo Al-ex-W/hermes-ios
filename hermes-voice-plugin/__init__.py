@@ -113,6 +113,7 @@ def _register_alerts(ctx: Any) -> None:
     try:
         _core("notify").resume()  # loaded again (disabled, enabled) in the dashboard that serves the phone
         _core("hub").resume_socket()  # and the hub socket the unload closed
+        _core("hub").resume_schedule()  # and the scheduled calls ring again
     except Exception:  # noqa: BLE001
         logger.warning("hermes_voice: could not resume the alert watcher", exc_info=True)
 
@@ -165,6 +166,10 @@ def _pause_alerts() -> None:
         _core("hub").pause_socket()
     except Exception:  # noqa: BLE001
         logger.debug("hermes_voice: could not close the hub socket", exc_info=True)
+    try:
+        _core("hub").pause_schedule()  # a disabled plugin rings no scheduled call (they stay on file)
+    except Exception:  # noqa: BLE001
+        logger.debug("hermes_voice: could not stop the call schedule", exc_info=True)
     try:
         _core("remote").unattend()  # nor take a call's turns for the chats this process holds
     except Exception:  # noqa: BLE001
