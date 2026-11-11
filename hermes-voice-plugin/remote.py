@@ -11,6 +11,9 @@ conversation (``inject.deliver_here``).
 - The ``pre_llm_call`` / ``on_session_end`` hooks tell which conversations are mid-turn (``inject.Turns``, with the
   agent's own state winning), keep the call with its conversation when compression gives it a new id, and note
   when the user wrote (quiet hours).
+- A process that hosts sessions of its own (a Desktop backend, the Ink TUI) also attends the hub for the chats it
+  holds (``Attendant``): a call the user starts from the phone in such a chat belongs to a dashboard session the
+  dashboard may not write, so this process puts the call's notices and turns into its own live session.
 
 No dashboard (or no plugin there): ``start_call`` answers ``not_available``.
 """
@@ -19,13 +22,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import threading
 import time
 from collections import deque
 from typing import Any, Callable, Optional
 
-from . import hermes, inject, policy
+from . import hermes, hub, inject, policy
 from .hubsock import PROTOCOL, SOCKET_NAME, TOKEN_NAME, socket_path
 
 logger = logging.getLogger("hermes_voice")
@@ -531,7 +535,7 @@ class Subscription:
                            delivery.detail)
         client.send({"op": "delivered", "call_id": self.call_id, "seq": message.get("seq"), "ok": delivery.ok,
                      "via": delivery.via, "status": delivery.status, "detail": delivery.detail,
-                     "fallback": delivery.fallback})
+                     "fallback": delivery.fallback, "held": delivery.held})
 
     def _finish(self) -> None:
         self.ready.set()
@@ -541,5 +545,150 @@ class Subscription:
                 del _subscriptions[self.call_id]
 
 
-__all__ = ["Client", "NotAvailable", "SOCKET_NAME", "TURNS", "bind_context", "end_call", "note_turn_end",
-           "note_turn_start", "origin_for", "reachable", "start_call", "status", "subscribe"]
+# ── the chats this process holds ───────────────────────────────────────────────────────────────────────────
+
+# How often a process that hosts sessions looks for the dashboard's hub while it has no connection to it.
+ATTEND_IDLE_S = 5.0
+
+
+class Attendant:
+    """This process's standing connection to the dashboard's hub, for the chats it holds.
+
+    Hermes keeps one writer per conversation: a process that ran a turn in a chat holds it (a lease in
+    ``runtime/active_sessions.json``) for as long as it has the chat open, and every other process's
+    ``prompt.submit`` for it is refused. A Desktop backend holds every chat the Desktop app has open, so a call the
+    user starts from the phone in one of them can't be written by the dashboard. This process can write it: it
+    tells the hub it is there (``attend``), says whether it has a chat open when asked (``find``), and puts what the
+    call has for it into its own live session (``deliver``), the way the dashboard does for its own.
+
+    Runs wherever the plugin loads; connects only where this process hosts sessions and isn't the dashboard itself
+    (``eligible``), and keeps looking for a hub while there is none (the dashboard may start later, or restart)."""
+
+    def __init__(self, folders: Optional[list] = None, idle_s: float = ATTEND_IDLE_S) -> None:
+        self.folders = folders
+        self.idle_s = idle_s
+        self.stop = threading.Event()
+        self.attending = threading.Event()
+        self.client: Optional[Client] = None
+        self.injector = inject.TuiInjector()
+        self.unsupported = False
+
+    def start(self) -> None:
+        hermes.spawn_thread(self._run, name="hermes-voice-attend")
+
+    def close(self) -> None:
+        self.stop.set()
+        client = self.client
+        if client is not None:
+            client.close()
+
+    def eligible(self) -> bool:
+        """This process hosts sessions (``tui_gateway.server`` is loaded: a Desktop backend, the Ink TUI), isn't
+        the dashboard (its hub delivers into its own sessions) and isn't a compute-host child (whose sessions are
+        the dashboard's)."""
+        return hermes.methods() is not None and not hub.routes_mounted() and not hermes.is_compute_host_child()
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            if self.eligible():
+                try:
+                    self._serve()
+                except NotAvailable:
+                    pass  # no dashboard with the plugin (yet)
+                except RemoteError as error:
+                    if not self.unsupported:  # an older plugin in the dashboard: it can't ask this process
+                        logger.info("hermes_voice: the dashboard's hub doesn't take attending processes (%s)", error)
+                    self.unsupported = True
+                except (ConnectionError, OSError, TimeoutError) as error:
+                    logger.info("hermes_voice: lost the dashboard's hub (%s); looking for it again", error)
+                except Exception:  # noqa: BLE001 - never stop attending over one bad message
+                    logger.warning("hermes_voice: attending the dashboard's hub failed", exc_info=True)
+                finally:
+                    self.attending.clear()
+            self.stop.wait(self.idle_s * (12 if self.unsupported else 1))
+
+    def _serve(self) -> None:
+        client = self.client = Client.connect(self.folders)
+        try:
+            client.request("attend", {"pid": os.getpid()})
+            self.unsupported = False
+            self.attending.set()
+            logger.info("hermes_voice: attending the dashboard's hub for the chats this process holds")
+            while not self.stop.is_set():
+                message = client.recv(self.idle_s)
+                if message is None:
+                    if not self.eligible():
+                        return
+                    continue
+                seq, event = message.get("seq"), message.get("event")
+                if event == "find":
+                    client.send({"op": "attended", "seq": seq, **self.find(message.get("session_ids"))})
+                elif event == "deliver":
+                    delivery = self.deliver(message.get("session_id"), message.get("text"))
+                    client.send({"op": "attended", "seq": seq, "ok": delivery.ok, "via": delivery.via,
+                                 "status": delivery.status, "detail": delivery.detail, "held": delivery.held})
+        finally:
+            client.close()
+
+    def find(self, session_ids: Any) -> dict[str, Any]:
+        """Which of the chat's stored ids this process has open, and whether it holds the chat's lease."""
+        for session_id in session_ids if isinstance(session_ids, list) else []:
+            found = hermes.find_live(session_id) if isinstance(session_id, str) and session_id else None
+            if found is not None:
+                lease = found[1].get("active_session_lease")
+                return {"session_id": session_id,
+                        "holds": lease is not None and not getattr(lease, "released", False)}
+        return {"session_id": None}
+
+    def deliver(self, session_id: Any, text: Any) -> inject.Delivery:
+        """Into the session this process has open for the chat (never reopening one). A chat that isn't open here
+        any more, or that yet another process holds, is reported as held: the hub looks again."""
+        if not isinstance(session_id, str) or not isinstance(text, str) or not text:
+            return inject.Delivery(False, detail="bad delivery")
+        if hermes.find_live(session_id) is None:
+            return inject.Delivery(False, detail="the chat isn't open in this process any more", held=True)
+        try:
+            delivery = self.injector.deliver_live(inject.LocalOwner(session_id), text)
+        except Exception as error:  # noqa: BLE001 - it may have been taken: reported, never retried
+            logger.warning("hermes_voice: delivering into a chat this process holds failed", exc_info=True)
+            return inject.Delivery(False, detail=type(error).__name__)
+        if not delivery.ok and not delivery.held and hermes.find_live(session_id) is None:
+            return inject.Delivery(False, delivery.via, delivery.status, delivery.detail, held=True)
+        if delivery.ok:
+            logger.info("hermes_voice: put a call's text into %s, which this process holds (%s)", session_id,
+                        delivery.via)
+        return delivery
+
+
+_attendant: Optional[Attendant] = None
+
+
+def attend() -> None:
+    """Start this process's attendant (once; ``register(ctx)`` calls this in every process the plugin loads in).
+    ``HERMES_VOICE_HUB_SOCKET=0`` turns it off, like the hub's socket itself."""
+    global _attendant
+    if os.environ.get("HERMES_VOICE_HUB_SOCKET", "").strip() == "0":
+        return
+    with _lock:
+        if _attendant is not None:
+            return
+        attendant = _attendant = Attendant()
+    try:
+        attendant.start()
+    except RuntimeError:
+        with _lock:
+            _attendant = None
+
+
+def unattend() -> None:
+    """The plugin unloads: stop taking deliveries (``attend`` starts again if it loads again)."""
+    global _attendant
+    with _lock:
+        attendant, _attendant = _attendant, None
+    if attendant is not None:
+        attendant.close()
+
+
+__all__ = ["Attendant", "Client", "NotAvailable", "SOCKET_NAME", "TURNS", "attend", "bind_context", "end_call",
+           "note_turn_end", "note_turn_start", "origin_for", "reachable", "start_call", "status", "subscribe",
+           "unattend"]

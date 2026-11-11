@@ -14,8 +14,8 @@ import pytest
 import websockets
 
 from fakeclient import CONTRACT_PATH, Contract, Gateway, serving, signed_in, until
-from fake_voice_plugin import ASYNC_LINE, ENDED_BY_USER, HELLO_TEXT, NOT_ANSWERED, PREFIX, REPLY_HINT, SAMPLE_RATE, \
-    SYNC_LINE
+from fake_voice_plugin import AFTER_CALL, ASYNC_LINE, ENDED_BY_USER, HELLO_TEXT, NOT_ANSWERED, NOTICE_HEAD, \
+    OUTCOME_NOTES, PREFIX, REPLY_HINT, SAMPLE_RATE, SYNC_LINE
 
 STATUS = f"{PREFIX}/status"
 # The real plugin's notes on async start_call results (hermes-voice-plugin/hub.py start_call).
@@ -177,9 +177,11 @@ def test_a_user_initiated_call_announces_itself_and_every_turn_is_injected():
     assert ended == {"type": "ended", "outcome": "ended_by_user"} and close_code == 1000
     assert goodbye == {"text": "Call ended.", "tools": []}
     assert after["calls"] == 0 and after["active_call"] is None
-    assert rows[0].startswith(f"[Voice call started] The user is calling you from the HermesVoice app (call {call_id}).")
+    assert rows[0].startswith(f"[Voice call started] {NOTICE_HEAD} The user is calling you from the HermesVoice app "
+                              f"(call {call_id}) ")
     assert rows[1] == f"[Voice] what time is it {REPLY_HINT}"
-    assert rows[2].startswith(f"{ENDED_BY_USER} Reply in text")
+    assert rows[2] == f"{ENDED_BY_USER} {NOTICE_HEAD} {AFTER_CALL['ended_by_user']}"
+    assert "from now on" not in rows[2] and "Reply in text" not in rows[2]
     assert problems == []
 
 
@@ -332,9 +334,11 @@ def test_a_declined_call_returns_declined_to_sync_and_notifies_async():
     assert notified == {"text": "The call was not answered.", "tools": []}
     assert late_cancel == {"type": "cancel", "reason": "declined"} and late_close == 1000
     assert rows == ["call me sync", "call me async",
-                    f"{NOT_ANSWERED} The user didn't take the call (they declined it). Reply in text.",
+                    f"{NOT_ANSWERED} {NOTICE_HEAD} The user didn't take the call (they declined it). "
+                    f"{AFTER_CALL['declined']}",
                     "call me async",
-                    f"{NOT_ANSWERED} The user didn't take the call (they didn't pick up). Reply in text."]
+                    f"{NOT_ANSWERED} {NOTICE_HEAD} The user didn't take the call (they didn't pick up). "
+                    f"{AFTER_CALL['no_answer']}"]
 
 
 def test_an_unanswered_call_is_cancelled_after_the_ring_timeout():
@@ -368,9 +372,10 @@ def test_an_unanswered_call_is_cancelled_after_the_ring_timeout():
     [(_, args, result)] = unreached["tools"]
     assert args == {"text": "are you there?", "mode": "sync"}
     assert result == {"said": "", "ending": None, "outcome": "unreachable", "call_id": pushes[-1]["call_id"],
-                      "note": "The phone never answered the ring (it may be offline). Reply in text."}
+                      "note": OUTCOME_NOTES["unreachable"]}
     assert unreached["text"] == "The call ended without a reply (unreachable)."
-    assert rows[1] == f"{NOT_ANSWERED} The user didn't take the call (they didn't pick up). Reply in text."
+    assert rows[1] == (f"{NOT_ANSWERED} {NOTICE_HEAD} The user didn't take the call (they didn't pick up). "
+                       f"{AFTER_CALL['no_answer']}")
     assert len(rows) == 3  # the sync outcome was returned, not injected
 
 
@@ -494,7 +499,9 @@ def test_a_tts_error_and_a_link_that_never_comes_back_are_injected():
     start, failed, undelivered, lost, rows, status = asyncio.run(scenario())
     assert failed == {"type": "speech_end", "id": start["id"], "error": "voice quota exceeded"}
     assert undelivered["text"] == "That line was not delivered."
-    assert rows[1] == "[Voice line not delivered: text-to-speech failed (voice quota exceeded)]"
+    assert rows[1] == ("[Voice line not delivered: text-to-speech failed (voice quota exceeded)] Automated notice "
+                       "from HermesVoice, not something the user said. It is about that one line only and is not a "
+                       "preference, so don't store it.")
     assert lost["text"] == "The call was lost."
     assert rows[2].startswith("[Voice call ended: the phone's connection was lost")
     assert status["calls"] == 0

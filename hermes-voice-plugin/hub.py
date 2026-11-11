@@ -24,6 +24,14 @@ The hub lives in the dashboard process. Conversations in other Hermes processes 
 (``hubsock.py``, opened once the dashboard serves): their calls carry a ``route`` that hands each turn to the
 conversation's own process, which injects it there (``remote.py``).
 
+A chat another Hermes process holds (Hermes keeps one writer per conversation; typically a Desktop backend that
+has the chat open while the user calls from the app): this process's ``prompt.submit`` is refused (``Delivery.held``).
+The turn then goes to the process that holds the chat, when it runs this plugin (``holders``: it attends on the hub
+socket and injects into its own live session). Otherwise it stays at the head of the call's queue and is tried again
+every ``HELD_RETRY_S`` for ``HELD_RETRY_LIMIT_S`` (later turns wait behind it, so order holds and nothing is put in
+twice), the user hears once per call that the chat can't be reached (``inject.CHAT_HELD_SPOKEN``, the hub's own
+line), and the ring log says ``chat_held``, then ``delivered_late`` or ``undelivered``: never silence.
+
 Threads: tool handlers run on agent threads, the socket on the dashboard's event loop (captured on the first
 request). Call state is guarded by ``lock``; links and speech run on the loop only.
 """
@@ -45,7 +53,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from . import hermes, inject, push
+from . import guidance, hermes, inject, push
 from .config import Settings
 from .config import current as current_settings
 from .policy import Policy, is_messaging, users_own_message
@@ -83,6 +91,13 @@ TURN_CLOCK_SLACK = 1.0
 HISTORY_LIMIT = 50
 # How long after the dashboard's import the hub waits for it to serve before opening its socket.
 SOCKET_WAIT_LIMIT = 600.0
+# A delivery refused because another Hermes process holds the chat is tried again this often, for this long after
+# it was queued (the lease goes when that process closes the chat or exits); then it is given up and logged.
+HELD_RETRY_S = 3.0
+HELD_RETRY_LIMIT_S = 120.0
+# How long the line that tells the user waits for the phone's link (a call the user starts fails its first
+# delivery while the link is still coming up).
+HELD_LINK_WAIT = 5.0
 
 OUTCOMES = frozenset({
     "answered", "no_answer", "declined", "push_failed", "unreachable", "lost", "tts_failed", "ended_by_user",
@@ -91,10 +106,18 @@ OUTCOMES = frozenset({
 # Ended by the phone itself: nothing to tell it.
 PHONE_ENDED = frozenset({"declined", "ended_by_user"})
 
-CALL_ENDED = "The call ended while speaking; the user may not have heard all of it. Reply in text."
+# Ended without the user hearing a line to the end (the call's own notice or result says what to do next).
+UNHEARD_OUTCOMES = frozenset({"ended_by_user", "lost"})
+# Ended before anyone answered: whatever the agent was to offer on this call is still to be offered on the next.
+NEVER_ANSWERED = frozenset({"no_answer", "declined", "push_failed", "unreachable"})
+
+CALL_ENDED = (
+    "The call ended while this line was being spoken, so the user may not have heard all of it. They can't hear "
+    "you now: put what matters in a short text recap."
+)
 CALL_DROPPED = (
-    "The phone lost its connection while speaking, so the user may not have heard all of it. Reply in text; "
-    "the phone reconnects by itself, so you can use start_call again on the next [Voice] message."
+    "The phone lost its connection while this line was being spoken, so the user may not have heard all of it. "
+    "The phone reconnects by itself: say it again with start_call on the next [Voice] message."
 )
 
 CALL_ID = re.compile(r"[0-9a-f]{32}")
@@ -329,9 +352,18 @@ class Call:
         self.waiter: Optional[Waiter] = None
         self.ring_timer: Optional[threading.Timer] = None
         self.hang_up_turn = False  # an injected "[Voice, hung up]" turn already told the agent
+        # The lines the user did not hear to the end when the call ended (told to the agent, then offered on the
+        # conversation's next call), and what an earlier call left to offer on this one (`offer_pending`: the
+        # agent hasn't been reminded yet).
+        self.unheard: list[str] = []
+        self.offer: list[str] = []
+        self.offer_pending = False
         # Where turns go when the conversation runs in another process (hubsock.Route): deliver(text), close().
         self.route: Any = None
         self.inbox = InjectQueue(hub, self)
+        # Another Hermes process holds the call's chat: logged (once), and said into the call (once).
+        self.held_logged = False
+        self.held_announced = False
 
     def info(self) -> dict[str, Any]:
         """The call as ``GET /status`` shows it (``active_call``), so the app's call button can join it.
@@ -343,14 +375,24 @@ class Call:
 class InjectQueue:
     """Deliveries into the owner's conversation, one at a time and in order, off the event loop. For a call the
     user started, the "[Voice call started]" notice goes first, so turns wait until it is delivered. Once the call
-    is over, its route (if any) hears so after the last delivery."""
+    is over, its route (if any) hears so after the last delivery.
+
+    A delivery refused because another Hermes process holds the chat (``Delivery.held``: nothing was written) is
+    tried again here until it is in or ``HELD_RETRY_LIMIT_S`` old, with everything queued after it waiting its
+    turn. What gets in late says so (``inject.delayed``)."""
 
     END = None
 
     def __init__(self, hub: "CallHub", call: Call) -> None:
         self.hub = hub
         self.call = call
-        self.items: deque[Optional[str]] = deque()
+        # (text, when it was queued: time.monotonic()), or END.
+        self.items: deque[Optional[tuple[str, float]]] = deque()
+        # Since when the chat has refused as held (None: it takes deliveries), when it last took one again, and
+        # how many deliveries were given up meanwhile. Only the queue's own thread touches these.
+        self.held_since: Optional[float] = None
+        self.freed_at = 0.0
+        self.lost = 0
         self.lock = threading.Lock()
         self.running = False
         # Everything the call had to deliver is done (a route attached after this hears the end at once).
@@ -369,7 +411,7 @@ class InjectQueue:
                 return False
             if text is InjectQueue.END:
                 self.closing = True
-            self.items.append(text)
+            self.items.append(None if text is InjectQueue.END else (text, time.monotonic()))
             if self.running:
                 return True
             self.running = True
@@ -387,8 +429,8 @@ class InjectQueue:
                 if not self.items:
                     self.running = False
                     return
-                text = self.items.popleft()
-            if text is InjectQueue.END:
+                item = self.items.popleft()
+            if item is InjectQueue.END:
                 with self.hub.lock:
                     self.finished = True
                     route = self.call.route
@@ -398,12 +440,38 @@ class InjectQueue:
                 except Exception:  # noqa: BLE001
                     logger.debug("hermes_voice: closing a call's route failed", exc_info=True)
                 continue
+            self._deliver(*item)
+
+    def _deliver(self, text: str, queued: float) -> None:
+        """One delivery. While another Hermes process holds the chat it is tried again (what is queued behind it
+        waits), until it is in or too old; anything else that fails is final (it may have been taken)."""
+        hub, call = self.hub, self.call
+        refused = False
+        while True:
+            # Late: refused before, or it waited behind something that was.
+            late = refused or self.held_since is not None or queued < self.freed_at
+            waited = time.monotonic() - queued
             try:
-                delivery = self.hub.deliver(self.call, text)
+                sent = inject.delayed(text, waited, call.state == "ended", self.lost) if late else text
+                delivery = hub.deliver(call, sent)
             except Exception as error:  # noqa: BLE001
                 logger.warning("hermes_voice: injection failed", exc_info=True)
                 delivery = inject.Delivery(False, detail=type(error).__name__)
-            self.hub.delivered(self.call, text, delivery)
+            if delivery.ok:
+                if self.held_since is not None:
+                    self.held_since, self.freed_at, self.lost = None, time.monotonic(), 0
+                break
+            if not delivery.held:
+                break
+            refused = True
+            if self.held_since is None:
+                self.held_since = time.monotonic()
+            hub.chat_held(call, delivery)
+            if time.monotonic() - queued >= HELD_RETRY_LIMIT_S:
+                self.lost += 1
+                break
+            time.sleep(HELD_RETRY_S)
+        hub.delivered(call, text, delivery, waited=time.monotonic() - queued, late=late)
 
 
 # ── phone links (event loop only) ──────────────────────────────────────────────────────────────────────────
@@ -465,6 +533,11 @@ class CallHub:
         # Conversations with a turn running now (pre_llm_call .. on_session_end).
         self.busy: dict[str, float] = {}
         self.deliveries: deque[tuple[str, str, inject.Delivery]] = deque(maxlen=200)
+        # What each conversation's user did not hear to the end on its last call (memory only).
+        self.missed = guidance.Missed()
+        # Asks the Hermes processes that attend on the hub socket to put a text into a chat one of them holds:
+        # (the chat's stored ids, text) -> how it went, or None when none of them has it (``hubsock.HubServer``).
+        self.holders: Optional[Callable[[list[str], str], Optional[inject.Delivery]]] = None
 
     # ── loop plumbing ────────────────────────────────────────────────────────────────────────────────────
 
@@ -564,10 +637,10 @@ class CallHub:
     def problem(self, call: Call) -> str:
         """Why nothing can be spoken on the call right now."""
         if call.state == "ended":
-            return (f"Voice call {call.call_id} has ended, so nothing was spoken. Reply in text; start_call would "
-                    "ring the user again.")
+            return (f"Voice call {call.call_id} has ended, so nothing was spoken. Put it in a short text recap; "
+                    "start_call would ring the user again.")
         return (f"The phone on voice call {call.call_id} is not connected right now (it may be reconnecting), so "
-                "nothing was spoken. Reply in text; you can use start_call again on the next [Voice] message.")
+                "nothing was spoken. Say it again with start_call on the next [Voice] message.")
 
     # ── calls ────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -594,18 +667,26 @@ class CallHub:
                 self.slot = None
             self._remember(call)
             timer, call.ring_timer = call.ring_timer, None
+            if outcome in UNHEARD_OUTCOMES:
+                # Still queued or playing: the phone never confirmed it heard these out.
+                call.unheard = [line.text for line in call.lines if line.played_at is None]
             for line in [line for line in call.lines if line.state == "queued"]:
                 self._settle(call, line, SpeakResult("not_delivered", self.problem(call)))
             waiting = call.waiter is not None
-            quiet = outcome == "ended_by_user" and call.hang_up_turn
+            # A "[Voice, hung up]" turn already said the call is over, but not what went unheard.
+            quiet = outcome == "ended_by_user" and call.hang_up_turn and not call.unheard
+            unheard = list(call.unheard)
+            still_to_offer = call.offer if call.offer_pending or outcome in NEVER_ANSWERED else []
+            call.offer, call.offer_pending = [], False
             self.changed.notify_all()
+        self.missed.note(call.owner, still_to_offer + unheard)
         if timer is not None:
             timer.cancel()
         logger.info("hermes_voice: call %s ended: %s", call.call_id[:8], outcome)
         self.policy.log({"event": "ended", "call_id": call.call_id, "session_id": call.owner.session_id,
                          "outcome": outcome, **({"detail": detail[:200]} if detail else {})})
         if not waiting and not quiet:
-            notice = inject.outcome_notice(outcome, detail)
+            notice = inject.outcome_notice(outcome, detail, unheard)
             if notice:
                 call.inbox.put(notice)
         call.inbox.close()
@@ -675,6 +756,8 @@ class CallHub:
         call this starts for a conversation in another process (``hubsock.py``)."""
         settings = self.settings()
         text, clip_note = clip(text, settings.max_chars)
+        # What the result says about the line itself: that it was cut, and that it is long for a phone call.
+        line_note = f"{clip_note}{guidance.long_line_note(text)}"
         with self.lock:
             call = self.slot
             if call is not None and not call.owner.matches(origin):
@@ -707,10 +790,14 @@ class CallHub:
                     call.ring_timer = timer
                     timer.start()
                     rang = True
+                    # What this conversation's last call left unheard: the agent is reminded with this call's
+                    # first result (now for an async call, with the reply for a sync one).
+                    call.offer = self.missed.take(lambda owner: owner.matches(origin))
+                    call.offer_pending = bool(call.offer)
             if rang:
                 self.policy.record_ring(origin, call.call_id)
                 logger.info("hermes_voice: ringing for %s (call %s)", origin.session_id, call.call_id[:8])
-        _, waiter = self.enqueue_line(call, text, mode, clip_note, wait=mode == "sync")
+        _, waiter = self.enqueue_line(call, text, mode, line_note, wait=mode == "sync")
         if rang:
             if mode == "sync":
                 self._push(call, mode)
@@ -720,13 +807,21 @@ class CallHub:
             return Begun({"call_id": call.call_id, "status": "waiting"}, call, waiter)
         with self.lock:
             status = "speaking" if call.state == "live" else "ringing" if call.state == "ringing" else "ended"
+            reminder = self._offer_reminder(call) if status != "ended" else ""
         note = {
             "ringing": "The phone is ringing; your line is spoken once the user answers.",
             "speaking": "Your line is being spoken.",
             "ended": "The call ended before your line could be spoken.",
         }[status]
         note += " What the user says arrives as [Voice] messages; answer them with start_call."
-        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{clip_note}"}, call)
+        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{line_note}{reminder}"}, call)
+
+    def _offer_reminder(self, call: Call) -> str:
+        """Once per call (under lock): the reminder to offer what the conversation's last call left unheard."""
+        if not call.offer_pending:
+            return ""
+        call.offer_pending = False
+        return guidance.missed_reminder(call.offer)
 
     def end_call(self, origin: hermes.Origin, text: str = "", signals: Optional[Signals] = None) -> dict[str, Any]:
         signals = signals or Signals()
@@ -812,6 +907,12 @@ class CallHub:
                     if result is not None:
                         if call.waiter is waiter:
                             call.waiter = None
+                        about_line = line.note.strip()
+                        if about_line and line.sent_at is not None and about_line not in (result.get("note") or ""):
+                            # However the wait ended, a line that went out long (or cut) is said to be so.
+                            result["note"] = f"{result.get('note') or ''} {about_line}".strip()
+                        if call.state != "ended" and (reminder := self._offer_reminder(call)):
+                            result["note"] = f"{result.get('note') or ''}{reminder}".strip()
                         self.changed.notify_all()
                         break
                     self.changed.wait(0.25)
@@ -833,13 +934,16 @@ class CallHub:
         line = waiter.line
         if waiter.turn is not None:
             turn = waiter.turn
-            outcome = "ended_by_user" if turn.ending == "hang_up" else "answered"
-            return _sync(call, " ".join(turn.text.split()), turn.ending, outcome, line.note.strip())
+            if turn.ending == "hang_up":
+                note = f"{_outcome_note('ended_by_user', '')} {line.note.strip()}".strip()
+                return _sync(call, " ".join(turn.text.split()), turn.ending, "ended_by_user", note)
+            return _sync(call, " ".join(turn.text.split()), turn.ending, "answered", line.note.strip())
         if waiter.superseded:
             return {"call_id": call.call_id, "status": "superseded",
                     "note": "A newer start_call on this call took over waiting for the reply."}
         if call.state == "ended":
-            return _sync(call, "", None, call.outcome or "lost", _outcome_note(call.outcome or "", call.detail))
+            return _sync(call, "", None, call.outcome or "lost",
+                         _outcome_note(call.outcome or "", call.detail, call.unheard))
         if line.state == "failed":
             return _sync(call, "", None, "tts_failed", line.result.message if line.result else "")
         if line.state in ("not_connected", "cut_off", "cancelled", "not_delivered") and not interrupted:
@@ -1119,7 +1223,8 @@ class CallHub:
         logger.info("hermes_voice: the user started call %s in %s", started.call_id[:8], hello.session_id)
         self.policy.log({"event": "start", "call_id": started.call_id, "session_id": hello.session_id,
                          "source": "phone"})
-        started.inbox.put(inject.started_notice(started.call_id))
+        missed = self.missed.take(lambda owner: owner.owns(hello.session_id))
+        started.inbox.put(inject.started_notice(started.call_id, missed, _style_for(started)))
         return "attach", started
 
     def _log_phone(self, call_id: str, what: str) -> None:
@@ -1157,7 +1262,25 @@ class CallHub:
         call.inbox.put(text)
 
     def deliver(self, call: Call, text: str) -> inject.Delivery:
-        """Put `text` into the call owner's conversation (InjectQueue thread). A conversation in another process
+        """Put `text` into the call owner's conversation (InjectQueue thread). When Hermes refuses it here because
+        another Hermes process holds the chat, that process puts it in, if it attends on the hub socket
+        (``holders``, set by ``hubsock.HubServer``); else the refusal stands and the queue tries again."""
+        delivery = self._deliver(call, text)
+        holders = self.holders
+        if delivery.ok or not delivery.held or holders is None:
+            return delivery
+        owner = call.owner
+        with owner.lock:
+            ids = [owner.session_id, *sorted(owner.lineage - {owner.session_id})]
+        try:
+            through = holders([sid for sid in ids if sid], text)
+        except Exception:  # noqa: BLE001 - the refusal stands
+            logger.warning("hermes_voice: asking the process that holds the chat failed", exc_info=True)
+            through = None
+        return delivery if through is None else through
+
+    def _deliver(self, call: Call, text: str) -> inject.Delivery:
+        """Into a conversation of this process through its session host. A conversation in another process
         gets it there, through the call's route. What that process can't deliver while the conversation is idle
         is tried here too, but only into a session this process has open (turns that run in compute-host
         children belong to dashboard sessions); a messaging chat is never reopened here."""
@@ -1170,7 +1293,7 @@ class CallHub:
             return delivery
         live = getattr(self.injector, "deliver_live", None)
         local = live(call.owner, text) if callable(live) else self.injector.deliver(call.owner, text)
-        if local.ok:
+        if local.ok or local.held:
             return local
         return inject.Delivery(False, delivery.via, delivery.status, delivery.detail)
 
@@ -1191,10 +1314,43 @@ class CallHub:
         except RuntimeError:
             logger.warning("hermes_voice: a voice turn handed back after the call ended was lost")
 
-    def delivered(self, call: Call, text: str, delivery: inject.Delivery) -> None:
+    def delivered(self, call: Call, text: str, delivery: inject.Delivery, waited: float = 0.0,
+                  late: bool = False) -> None:
+        """How a delivery ended. One that failed, or got in late, goes into the ring log (what it was, never its
+        text): nothing a call had for its chat is lost without a record."""
         self.deliveries.append((call.call_id, text, delivery))
+        entry = {"call_id": call.call_id, "session_id": call.owner.session_id, "what": inject.kind_of(text)}
         if not delivery.ok:
             logger.warning("hermes_voice: couldn't deliver to %s: %s", call.owner.session_id, delivery.detail)
+            reason = "chat_held" if delivery.held else " ".join((delivery.detail or "unknown").split())[:160]
+            self.policy.log({"event": "undelivered", **entry, "reason": reason,
+                             **({"waited_s": round(waited)} if delivery.held else {})})
+        elif late:
+            logger.info("hermes_voice: delivered to %s after %.0fs (the chat was held by another Hermes process)",
+                        call.owner.session_id, waited)
+            self.policy.log({"event": "delivered_late", **entry, "waited_s": round(waited)})
+
+    def chat_held(self, call: Call, delivery: inject.Delivery) -> None:
+        """Another Hermes process holds the call's chat, and what the call has for it can't be put in (InjectQueue
+        thread, on every refusal). The user hears so through the hub's own speech, once per call and only while
+        they are on it; the ring log gets it when first seen and when it is said."""
+        with self.lock:
+            announce = call.state == "live" and not call.held_announced
+            first = not call.held_logged
+            call.held_announced = call.held_announced or announce
+            call.held_logged = True
+        if announce:
+            # A call the user starts fails its first delivery while the phone's link is still coming up.
+            deadline = time.monotonic() + HELD_LINK_WAIT
+            while not call.connected and call.state == "live" and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.enqueue_line(call, inject.CHAT_HELD_SPOKEN, mode="hub")  # "hub": no notice for the chat if it fails
+        if first or announce:
+            holder = re.search(r"opened by ([\w:.-]+)", delivery.detail or "")
+            logger.warning("hermes_voice: call %s can't reach its chat %s: another Hermes process holds it%s",
+                           call.call_id[:8], call.owner.session_id, " (told the user)" if announce else "")
+            self.policy.log({"event": "chat_held", "call_id": call.call_id, "session_id": call.owner.session_id,
+                             "holder": holder.group(1) if holder else "", "announced": announce})
 
     # ── hooks ────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -1279,18 +1435,35 @@ def _refusal(mode: str, outcome: str, note: str) -> dict[str, Any]:
     return {"call_id": None, "status": outcome, "note": note}
 
 
-def _outcome_note(outcome: str, detail: str) -> str:
-    return {
-        "no_answer": "The user didn't pick up. Reply in text; don't ring again unless they ask.",
-        "declined": "The user declined the call. Reply in text; don't ring again unless they ask.",
-        "push_failed": (f"The phone couldn't be rung: {detail or 'the push failed'}. Reply in text; don't ring "
-                        "again unless they ask, and tell them it failed."),
-        "unreachable": ("The phone never answered the ring (it may be offline). Reply in text; don't ring again "
-                        "unless they ask, and tell them the ring didn't get through."),
-        "lost": "The call's connection was lost. Reply in text.",
-        "ended_by_user": "The user hung up. Reply in text.",
-        "ended_by_agent": "The call was ended with end_call.",
-    }.get(outcome, detail)
+def _outcome_note(outcome: str, detail: str, unheard: Any = ()) -> str:
+    """How a call ended, for a sync start_call's result: what happened, that it is no preference of the user's,
+    what they did not hear, and what to do now (the same as the notice an async call gets)."""
+    if outcome == "ended_by_agent":
+        return "The call was ended with end_call."
+    what = {
+        "no_answer": "The user didn't pick up.",
+        "declined": "The user declined the call.",
+        "push_failed": f"The phone couldn't be rung: {detail or 'the push failed'}.",
+        "unreachable": "The phone never answered the ring (it may be offline).",
+        "lost": "The call's connection was lost.",
+        "ended_by_user": "The user hung up.",
+    }.get(outcome)
+    if what is None:
+        return detail
+    return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard)} {inject.after_call(outcome)}"
+
+
+def _style_for(call: Call) -> str:
+    """The user's call style for the notice that opens a call they placed ("" without one, or if it can't be
+    read), from the conversation's own profile. The call's first start_call result then doesn't repeat it."""
+    try:
+        style = guidance.style_text(call.owner.profile_home)
+    except Exception:  # noqa: BLE001 - the style is an extra: a call never fails over it
+        logger.debug("hermes_voice: could not read the call style")
+        return ""
+    if style:
+        guidance.mark_style_given(call.call_id)
+    return style
 
 
 def _previews() -> bool:
@@ -1321,8 +1494,8 @@ def clip(text: str, limit: int) -> tuple[str, str]:
     cut = text.rfind(" ", 0, limit + 1)
     clipped = text[: cut if cut > limit // 2 else limit].rstrip()
     return clipped, (
-        f" Only the first {len(clipped)} of {len(text)} characters were spoken; the rest was cut, "
-        "so put it in your text reply."
+        f" Only the first {len(clipped)} of {len(text)} characters were spoken; the rest was cut. Say what still "
+        "matters in a short next line."
     )
 
 

@@ -43,7 +43,9 @@ def _core(name: str) -> Any:
 
 def register(ctx: Any) -> None:
     tools = _core("tools")
-    for schema, handler, emoji in ((tools.START_CALL, tools.start_call, "📞"), (tools.END_CALL, tools.end_call, "📵")):
+    # start_call's description carries the user's call style as it is now (tools.start_call_schema).
+    for schema, handler, emoji in ((tools.start_call_schema(), tools.start_call, "📞"),
+                                   (tools.END_CALL, tools.end_call, "📵")):
         spec = {"name": schema["name"], "toolset": tools.TOOLSET, "schema": schema, "handler": handler,
                 "check_fn": tools.available}
         try:
@@ -150,15 +152,23 @@ def _pause_alerts() -> None:
         _core("hub").pause_socket()
     except Exception:  # noqa: BLE001
         logger.debug("hermes_voice: could not close the hub socket", exc_info=True)
+    try:
+        _core("remote").unattend()  # nor take a call's turns for the chats this process holds
+    except Exception:  # noqa: BLE001
+        logger.debug("hermes_voice: could not stop attending the hub", exc_info=True)
 
 
 # ── calls from other processes (remote.py) ─────────────────────────────────────────────────────────────────
 
 
 def _bind_remote_calls(ctx: Any) -> None:
-    """Outside the dashboard, a call's turns start a turn in this process with ``ctx.inject_message``."""
+    """Outside the dashboard, a call's turns start a turn in this process with ``ctx.inject_message``; and a process
+    that hosts sessions of its own (a Desktop backend, the Ink TUI) takes what a call has for the chats it holds
+    (``remote.Attendant``: Hermes lets only the process that has a chat open write it)."""
     try:
-        _core("remote").bind_context(ctx)
+        remote = _core("remote")
+        remote.bind_context(ctx)
+        remote.attend()
     except Exception:  # noqa: BLE001
         logger.warning("hermes_voice: could not set up calls from this process", exc_info=True)
 

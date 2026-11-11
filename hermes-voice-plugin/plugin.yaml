@@ -44,6 +44,9 @@ config_schema:
     type: int
     default: 1000
     description: "Longest line spoken at once; the rest is cut and the agent is told"
+  call_style_path:
+    type: str
+    description: "The user's call style file (default: <HERMES_HOME>/hermes-voice/call-style.md): free text on how Hermes should speak on calls, given to the agent with each call; a relative path is inside the Hermes home"
   ring_timeout_s:
     type: number
     default: 45

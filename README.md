@@ -62,6 +62,11 @@ direct messages to Hermes on a messaging platform), an agent can call `start_cal
   local hub socket; a new turn there is started with Hermes' `inject_message`, which a gateway conversation allows
   only with `allow_gateway_injection` (see the setup).
 - `end_call(text?)` says an optional goodbye and hangs up.
+- Hermes is told to speak as on the phone: the answer first, two sentences at most, no codes, ids, URLs or paths
+  read out. A line that takes longer than about 15 seconds to say is flagged in the `start_call` result.
+- How you want to be spoken to (tone, form of address, humour, ElevenLabs audio tags) lives in
+  `<HERMES_HOME>/hermes-voice/call-style.md`. Hermes gets it with every call, and edits it when you state a lasting
+  preference (see the [plugin README](hermes-voice-plugin/README.md), "Call style").
 
 **You call Hermes.** Tap the phone button in a chat. Hermes gets a `[Voice call started] …` notice in that chat
 and answers with `start_call`. If Hermes is already ringing you from this chat, the button joins that call.
@@ -74,8 +79,14 @@ What the conversation sees (the chat itself shows only what you said, or a short
 | `[Voice, cut off] …`, `[Voice, hung up] …`, `[Voice, muted] …` | the same, when the turn didn't end on its own |
 | `[Voice call started] …` | you started the call (your turns wait until this is delivered) |
 | `[Voice call not answered] …` | an async call was declined or rang out |
-| `[Voice line not delivered: …]` | the phone couldn't be rung or reached, or a line couldn't be spoken |
-| `[Voice call ended by user] …` | you hung up (unless your last turn already said so) |
+| `[Voice line not delivered: …] …` | the phone couldn't be rung or reached, or a line couldn't be spoken |
+| `[Voice call ended by user] …` | you hung up (unless your last turn already said so and you had heard everything) |
+
+The `[Voice call …]` and `[Voice line …]` messages are automated notices: each says so (`Automated notice from
+HermesVoice, not something the user said.`), so that neither Hermes nor a memory plugin takes one for your words
+or for a preference of yours. After a hang-up Hermes is told that you can't hear it and are probably not reading
+the chat: it finishes the task and leaves one short recap in text. If you hung up while it was still speaking, it
+is told what you did not hear, and reminded to offer that part when your next call in that chat starts.
 
 There is one call at a time. A call belongs to the conversation that started it (and follows it through context
 compression); `start_call` from another conversation returns `busy`. Who may ring you is set in the plugin's policy
@@ -257,6 +268,16 @@ settings any more):
 - **Steer timing.** During a long tool batch, Hermes reads an injected turn after the batch. A redirect Hermes
   accepts in the very moment its last model reply completes is dropped with that turn (a steer would be carried
   into the next turn), so that one thing you said never reaches the conversation.
+- **A chat that is open in another Hermes process.** Hermes lets one process write a conversation: the one that
+  ran a turn in it, for as long as it has it open (the Desktop app's backend keeps its chats, also after their tab
+  is closed). A call you start from the phone in such a chat belongs to a dashboard session, and Hermes refuses
+  the dashboard ("This chat is open in another Hermes window/terminal"). When the process that holds the chat
+  hosts its own sessions and runs this plugin (a Desktop backend, the Ink TUI), it puts the call's notice and what
+  you say into its own session, and its agent answers into the call. Otherwise (the classic CLI, a Hermes with an
+  older plugin or none) the call says once "I can't reach this chat right now: it's open in another Hermes window.
+  Close it there, or call from another chat.", keeps each thing you say for up to two minutes, and puts it in, in
+  order and marked as delayed, once the chat is free; what never got in is in `rings.jsonl` (`undelivered`).
+  Hermes refuses what you type in that chat from the app in the same way.
 - Calls from other processes need the dashboard running (it holds the phone's socket and the one call); without
   it `start_call` answers `not_available`. A call whose process goes away for more than 30 s is hung up.
 - From a messaging chat, a sync `start_call` waits at most Hermes' bound on one human wait inside a tool call
@@ -346,7 +367,10 @@ that calls `start_call`, and play the phone on `/phone`: a sync call that return
 whose turns are injected (a new turn while idle, a redirect while a turn runs), a declined call, one that rings
 out, `busy`, an unreachable phone, and the dashboard's auth on the socket. A second Hermes process in the same home
 (`hermes chat -Q -q`, whose turn runs in the gateway Hermes starts) calls through the hub socket: its sync call
-gets the reply, and its async call's reply becomes a stored turn of that session. Approvals and questions waiting
+gets the reply, and its async call's reply becomes a stored turn of that session. A call started from the phone in
+a chat another process holds: a backend started the way the Desktop app starts its own takes the call's turns and
+answers into the call; with a holder that can't be asked, the phone hears that the chat can't be reached, and the
+turns arrive in order once the holder is gone. Approvals and questions waiting
 on a conversation nobody has open send alert pushes, answered with `request.answer`, with turns in the dashboard
 and under `turn_isolation`; through the plugin's real APNs sender and a mock APNs, an approval reaches each phone
 that takes approval alerts exactly once. APNs itself is replaced by a recorder or that mock. They look for Hermes
