@@ -165,3 +165,24 @@ def test_phone_socket_auth_never_raises(core, fake, monkeypatch, case, expected)
     elif case == "no dashboard auth in this Hermes":
         monkeypatch.setitem(sys.modules, "hermes_cli.web_server_chat", None)
     assert asyncio.run(core.api.authorize(socket)) == expected
+
+
+def test_an_unavailable_config_backend_ends_no_thread_and_keeps_the_last_settings(core, fake, monkeypatch, caplog):
+    """Hermes raises ConfigBackendUnavailable, a SystemExit, when the selected config backend can't serve: past
+    ``except Exception``, it would end the thread that asked (the alert watcher, the dashboard's loop) silently."""
+
+    class ConfigBackendUnavailable(SystemExit):
+        pass
+
+    def unavailable():
+        raise ConfigBackendUnavailable("remote config is down")
+
+    fake.config = {"plugins": {"entries": {"hermes_voice": {"settings": {"max_chars": 321}}}}}
+    assert core.hermes.plugin_settings() == {"max_chars": 321}
+    monkeypatch.setattr(sys.modules["hermes_cli.config"], "load_config_readonly", unavailable)
+    with caplog.at_level(logging.WARNING, logger="hermes_voice"):
+        assert core.hermes.plugin_settings() == {"max_chars": 321}
+    assert "config backend is unavailable" in caplog.text and "remote config is down" not in caplog.text
+    # A profile nothing was ever read for has no settings to keep.
+    monkeypatch.setattr(sys.modules["hermes_constants"], "get_hermes_home", lambda: fake.home / "other")
+    assert core.hermes.load_config() == {}

@@ -95,11 +95,31 @@ def load_config() -> dict:
     except ImportError:
         return _read_yaml(hermes_home() / "config.yaml")
     try:
+        home = str(hermes_home())
+    except Exception:  # noqa: BLE001
+        home = ""
+    try:
         config = load_config_readonly()
     except Exception:  # noqa: BLE001 - a broken config must not break calls
         logger.warning("hermes_voice: could not read config.yaml", exc_info=True)
         return {}
-    return config if isinstance(config, dict) else {}
+    except SystemExit as error:
+        # Hermes' ConfigBackendUnavailable (0.22.6 and later: the selected config backend can't serve this
+        # profile) is a SystemExit, so that no reader quietly serves defaults. Let through, it would end
+        # whichever thread asked without a trace: the alert watcher, a call's delivery thread, or the
+        # dashboard's event loop from a route. The plugin keeps the settings it last read for this profile
+        # (quiet hours and the ring policy stay the user's), and has none only if it never read any.
+        logger.warning("hermes_voice: Hermes' config backend is unavailable (%s); keeping the last settings read",
+                       type(error).__name__)
+        return _last_config.get(home, {})
+    if not isinstance(config, dict):
+        return {}
+    _last_config[home] = config
+    return config
+
+
+# Hermes home -> the config last read for it (Hermes' own cached object: never changed here).
+_last_config: dict[str, dict] = {}
 
 
 def _read_yaml(path: Path) -> dict:
@@ -387,7 +407,7 @@ def uses_compute_host(record: Optional[dict]) -> bool:
     if callable(check):
         try:
             return bool(check(record))
-        except Exception:  # noqa: BLE001
+        except (Exception, SystemExit):  # noqa: BLE001 - SystemExit: Hermes' config backend is unavailable
             pass
     return bool(record.get("_compute_host_active")) and turn_isolation()
 
@@ -399,6 +419,8 @@ def turn_isolation() -> bool:
     if callable(reader):
         try:
             return bool((reader() or {}).get("turn_isolation"))
+        except SystemExit:  # Hermes' config backend is unavailable: the config last read says (load_config)
+            pass
         except Exception:  # noqa: BLE001
             return False
     dashboard = load_config().get("dashboard") or {}
@@ -527,7 +549,7 @@ def _sequential_tool_deadline() -> Optional[float]:
         else:
             from agent.deadline import resolve_timeout
             value = resolve_timeout("tools.sequential_call", default=420.0)
-    except Exception:  # noqa: BLE001 - outside Hermes (or an older one): no deadline known
+    except (Exception, SystemExit):  # noqa: BLE001 - outside Hermes, an older one, no config: no deadline known
         return None
     try:
         value = float(value) if value is not None else None
@@ -545,7 +567,7 @@ def human_wait_ceiling() -> Optional[float]:
         return None
     try:
         value = float(ceiling())
-    except Exception:  # noqa: BLE001
+    except (Exception, SystemExit):  # noqa: BLE001 - SystemExit: Hermes' config backend is unavailable
         return None
     return value if value > 0 else None
 
@@ -606,6 +628,81 @@ def gateway_injection_allowed() -> bool:
     messaging (or Ink TUI / desktop) session with ``ctx.inject_message``."""
     entry = ((load_config().get("plugins") or {}).get("entries") or {}).get(PLUGIN_ID) or {}
     return isinstance(entry, dict) and entry.get("allow_gateway_injection") is True
+
+
+RESTORE_TIMEOUT_S = 10.0
+
+
+def restore_retired_session(ctx: Any, session_key: str, timeout: float = RESTORE_TIMEOUT_S) -> bool:
+    """Bring a local conversation the gateway let go of back into its memory, so that ``ctx.inject_message`` can
+    start a turn in it. True when it is back.
+
+    Since Hermes 0.22.6 the gateway drops a local (CLI / TUI) conversation from ``authority.sessions`` once its last
+    viewer closed and nothing runs in it (``gateway/session_retirement.py``), and restores it wherever it is needed
+    again (an attach, a cron delivery, a background completion). The check in front of a plugin's keyed injection
+    doesn't (``gateway/run_plugin_injection.py``: ``_plugin_local_session`` reads ``authority.sessions`` as it is),
+    so the injection is refused as "not a live local session". This runs Hermes' own restore
+    (``restore_retired``) on the gateway's loop, for a conversation of the plugin's own profile that retirement
+    let go and for nothing else; it retires again after 30 s with nothing running in it. False on a Hermes
+    without retirement, outside the gateway, or when the conversation was not retired (the refusal then has
+    another reason)."""
+    manager = getattr(ctx, "_manager", None) if ctx is not None else None
+    host = getattr(manager, "_gateway_message_injector", None)
+    runner = host[0] if isinstance(host, tuple) and host else None
+    home = getattr(manager, "home_path", None)
+    loop = getattr(runner, "_gateway_loop", None)
+    if not session_key or runner is None or home is None or loop is None:
+        return False
+    try:
+        from gateway.session_authorities import authority_for_home
+        from gateway.session_retirement import restore_retired
+    except ImportError:
+        return False
+
+    def restore() -> bool:
+        authority = authority_for_home(runner, home)
+        sessions = getattr(authority, "sessions", None)
+        routes = getattr(authority, "retired_routes", None)
+        if not isinstance(sessions, dict) or not isinstance(routes, dict):
+            return False
+        sid = next((sid for sid, route in list(routes.items()) if route == session_key), None)
+        if sid is None or sid in sessions or sid not in getattr(authority, "retired_local", ()):
+            return False
+        with _owner_scope(authority):
+            restore_retired(authority, sid)
+        return sid in sessions
+
+    async def on_loop() -> bool:
+        return restore()
+
+    try:
+        import asyncio
+        try:
+            running: Any = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            return restore()
+        if loop.is_closed():
+            return False
+        future = asyncio.run_coroutine_threadsafe(on_loop(), loop)
+        try:
+            return bool(future.result(timeout))
+        finally:
+            future.cancel()  # no-op once done; a restore that never got to run must not run later
+    except Exception as error:  # noqa: BLE001 - a receipt Hermes refuses, a loop that stopped: the refusal stands
+        logger.info("hermes_voice: couldn't restore the conversation in the gateway (%s)", type(error).__name__)
+        return False
+
+
+def _owner_scope(authority: Any) -> Any:
+    """The runtime scope of the profile that owns `authority` (Hermes enters one under ``multiplex_profiles``
+    only), as Hermes' own owner-side handlers do around a restore."""
+    try:
+        from gateway.session_authorities import owner_scope
+        return owner_scope(authority)
+    except Exception:  # noqa: BLE001 - an older Hermes: the ambient scope
+        return contextlib.nullcontext()
 
 
 def gateway_allowed_users(platform: str) -> list[str]:

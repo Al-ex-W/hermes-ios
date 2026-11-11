@@ -36,7 +36,9 @@ gets its turns over the hub's socket, and ``deliver_here`` puts them in in that 
 3. Idle: ``ctx.inject_message`` with the conversation's route key (``get_current_session_key()``, captured when
    the call started) starts a turn. Hermes allows that in a messaging or Ink TUI session only with
    ``plugins.entries.hermes_voice.allow_gateway_injection: true``; the classic CLI needs nothing. A compute-host
-   child (``dashboard.turn_isolation``) doesn't start one itself.
+   child (``dashboard.turn_isolation``) doesn't start one itself. A local (CLI / TUI) conversation the gateway
+   dropped from memory once its window closed (Hermes 0.22.6 and later) is refused there until Hermes restores
+   it: ``hermes.restore_retired_session``, then once more.
 
 What can't be delivered there is marked ``fallback``: the dashboard's hub then tries its own session host, which
 holds the session when turns run in compute-host children (its ``prompt.submit`` sends the turn to the child).
@@ -682,15 +684,23 @@ def inject_idle(target: AgentTarget, text: str) -> Delivery:
     inject = getattr(ctx, "inject_message", None) if ctx is not None else None
     if not callable(inject):
         return Delivery(False, "inject", detail="this Hermes can't start a turn for a plugin", fallback=True)
-    try:
-        accepted = bool(inject(text, session_key=target.session_key or None))
-    except Exception as error:  # noqa: BLE001
-        logger.warning("hermes_voice: inject_message failed: %s", type(error).__name__)
-        accepted = False
-    if accepted:
+
+    def attempt() -> bool:
+        try:
+            return bool(inject(text, session_key=target.session_key or None))
+        except Exception as error:  # noqa: BLE001
+            logger.warning("hermes_voice: inject_message failed: %s", type(error).__name__)
+            return False
+
+    if attempt():
         return Delivery(True, "inject", "submitted")
     if not classic_cli(ctx) and not hermes.gateway_injection_allowed():
         return Delivery(False, "inject", detail=INJECTION_OFF, fallback=True)
+    # Hermes 0.22.6 and later: the gateway let go of a local conversation whose last viewer closed (the CLI or
+    # TUI window, a finished `chat -q`), and refuses a plugin's turn for it until something brings it back.
+    if hermes.restore_retired_session(ctx, target.session_key) and attempt():
+        logger.info("hermes_voice: brought %s back in the gateway to start a turn in it", target.session_id)
+        return Delivery(True, "inject", "submitted")
     return Delivery(False, "inject", detail="Hermes has no live session here to take it", fallback=True)
 
 
