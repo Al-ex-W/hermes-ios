@@ -406,9 +406,9 @@ def schedule_call(session_id: Any, text: str, in_minutes: Any, at: Any) -> dict[
     return _scheduling("schedule", session_id, {"text": text, "in_minutes": in_minutes, "at": at})
 
 
-def cancel_scheduled(session_id: Any, scheduled_id: str) -> dict[str, Any]:
-    """``end_call`` with ``scheduled_id`` from this process."""
-    return _scheduling("cancel_scheduled", session_id, {"scheduled_id": scheduled_id})
+def scheduled_calls(session_id: Any, cancel: Any = None) -> dict[str, Any]:
+    """The ``scheduled_calls`` tool from this process: list this conversation's scheduled calls, or cancel."""
+    return _scheduling("scheduled_calls", session_id, {"cancel": cancel})
 
 
 def _scheduling(op: str, session_id: Any, params: dict[str, Any]) -> dict[str, Any]:

@@ -7,7 +7,7 @@ places through the hub's socket), and ``post_llm_call`` / ``on_session_end`` tel
 when a turn ended. It also adds ``get_location`` (``location.py``: where the phone is, when the user shares
 that). The phone's socket and the device, location, Scribe-token and status routes live in
 ``dashboard/plugin_api.py``. Both halves share one call hub per process through ``loader.py``, which both load by
-path.
+path. A third call tool, ``scheduled_calls``, lists and cancels the calls ``start_call`` scheduled for later.
 """
 
 from __future__ import annotations
@@ -46,7 +46,8 @@ def register(ctx: Any) -> None:
     tools = _core("tools")
     # start_call's description carries the user's call style as it is now (tools.start_call_schema).
     for schema, handler, emoji in ((tools.start_call_schema(), tools.start_call, "📞"),
-                                   (tools.END_CALL, tools.end_call, "📵")):
+                                   (tools.END_CALL, tools.end_call, "📵"),
+                                   (tools.SCHEDULED_CALLS, tools.scheduled_calls, "⏰")):
         spec = {"name": schema["name"], "toolset": tools.TOOLSET, "schema": schema, "handler": handler,
                 "check_fn": tools.available}
         try:

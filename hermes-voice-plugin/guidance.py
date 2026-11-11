@@ -194,9 +194,10 @@ def style_text(home: Any = None) -> str:
 def style_brief(home: Any = None) -> str:
     """The call-style sentence of the ``start_call`` description: where the file is, and a short copy of what it
     says now. Read when the plugin loads, so the first line of a call the agent starts already follows it."""
-    where = ("When the user states a lasting preference about how you speak on calls (tone, form of address, "
-             f"humour, audio tags), write it to {style_path(home)} with your file tools and follow that file; a "
-             "call's first result carries its current text.")
+    where = ("When the user states a lasting preference for how you speak on calls (tone, form of address, "
+             "humour, audio tags; not a one-off like \"shorter this time\"), write it to their call style file "
+             f"{style_path(home)} with your file tools and follow it; a call's first result has its text as "
+             "call_style.")
     text, cut = read_style(home, STYLE_BRIEF_LIMIT)
     text = " ".join(text.split())
     if not text:

@@ -184,7 +184,9 @@ def test_scheduling_returns_at_once_and_keeps_the_call_in_a_private_file(world):
                                   "text": "Good morning, it is seven."}]
     note = result["note"]
     assert "mode is ignored for a scheduled call" in note and "[Voice] messages" in note
-    assert "rings again after 5 min" in note and f'scheduled_id "{result["scheduled_id"]}"' in note
+    assert "rings again after 5 min" in note
+    assert f'List or cancel with scheduled_calls (cancel: "{result["scheduled_id"]}").' in note
+    assert 'tell the user the time the way people say it ("tomorrow at seven")' in note
     assert world.pusher.payloads == []  # nothing rings now
     path = world.folder / "scheduled.json"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -205,17 +207,23 @@ def test_the_tool_schedules_with_in_minutes_or_at_and_ignores_mode(world):
     schema = core.tools.start_call_schema()
     assert {"in_minutes", "at"} <= set(schema["parameters"]["properties"])
     assert schema["parameters"]["required"] == ["text"]
-    assert ('To ring later ("call me in ten", a wake-up call), add in_minutes or at: the plugin rings on time by '
-            'itself and returns {status: "scheduled", scheduled_id, rings_at}; never wait inside a turn or use a '
-            "cron job for that, and cancel with end_call's scheduled_id.") in schema["description"]
-    assert "scheduled_id" in core.tools.END_CALL["parameters"]["properties"]
+    assert ('To ring later ("call me in ten", a wake-up), set in_minutes or at; the plugin rings on time itself. '
+            "Never wait in a turn or use cron. List or cancel with scheduled_calls.") in schema["description"]
+    # Hanging up and the schedule are two tools: end_call has no argument that could be read as "hang up all".
+    assert set(core.tools.END_CALL["parameters"]["properties"]) == {"text"}
+    assert "scheduled" not in core.tools.END_CALL["description"]
+    assert set(core.tools.SCHEDULED_CALLS["parameters"]["properties"]) == {"cancel"}
+    assert "required" not in core.tools.SCHEDULED_CALLS["parameters"]
+    assert core.tools.SCHEDULED_CALLS["description"] == (
+        "List the calls this conversation scheduled with start_call (in_minutes / at), or cancel them: pass "
+        '`cancel` with a scheduled_id, or "all". Returns {pending, cancelled, note}; it never rings or hangs up.')
 
     async def scenario():
         first = await tool(core.tools.start_call, {"text": "Ten minutes are up.", "in_minutes": 10, "mode": "sync"})
         second = await tool(core.tools.start_call, {"text": "Wake up.", "at": "07:00", "in_minutes": None})
         both = await tool(core.tools.start_call, {"text": "x", "at": "07:00", "in_minutes": 5})
         bad = await tool(core.tools.start_call, {"text": "x", "at": "next week"})
-        listed = await tool(core.tools.end_call, {"scheduled_id": "list"})
+        listed = await tool(core.tools.scheduled_calls, {})
         hang_up = await tool(core.tools.end_call, {})
         return first, second, both, bad, listed, hang_up
 
@@ -225,9 +233,11 @@ def test_the_tool_schedules_with_in_minutes_or_at_and_ignores_mode(world):
     assert both == {"error": "Give either in_minutes or at, not both."}
     assert "Can't read the time 'next week'" in bad["error"] and "It is now" in bad["error"]
     assert [entry["scheduled_id"] for entry in second["pending"]] == [first["scheduled_id"], second["scheduled_id"]]
-    assert listed["cancelled"] == [] and listed["pending"] == second["pending"]
-    # end_call without scheduled_id still means "hang up", and points at what is scheduled.
+    assert listed == {"pending": second["pending"], "cancelled": [],
+                      "note": "2 calls scheduled in this conversation. Nothing was changed."}
+    # end_call only hangs up; with no call running it points at what is scheduled, and at the tool for it.
     assert hang_up["outcome"] is None and "2 scheduled for later" in hang_up["note"]
+    assert "scheduled_calls cancels them" in hang_up["note"]
     assert hang_up["pending"] == second["pending"]
     assert world.pusher.payloads == []
 
@@ -347,6 +357,8 @@ def test_the_ring_is_answered_the_line_spoken_and_the_reply_injected(world):
             f"{scheduled['scheduled_id']}, call {payload['call_id']}) and is hearing the line you gave then: "
             '"Time to get up.".') in started
     assert "late" not in started and "Don't speak yet" in started
+    assert ("The line is as old as its scheduling: check anything that may have changed since before you say more."
+            in started)
     assert turn.startswith("[Voice] I'm up, thanks. (Reply out loud with start_call")
     assert ended.startswith("[Voice call ended by user]") and "scheduled" not in ended
     assert not (world.folder / "scheduled.json").exists()  # done: nothing of it stays on disk
@@ -640,22 +652,54 @@ def test_a_ring_the_dashboard_died_during_is_due_again_when_it_is_back(world):
 # ── cancelling and listing ─────────────────────────────────────────────────────────────────────────────────
 
 
-def test_cancel_one_all_or_only_list(world):
-    schedule = world.schedule
+def test_scheduled_calls_lists_cancels_one_or_all(world):
+    core = world.core
     first, second, third = (world.later(in_minutes=minutes) for minutes in (10, 20, 30))
     other = world.later(session_id="s2")
-    mine = world.origin()
-    listed = schedule.cancel(mine, "list")
-    assert listed["cancelled"] == [] and len(listed["pending"]) == 3 and "3 calls scheduled" in listed["note"]
-    assert schedule.cancel(mine, other["scheduled_id"])["cancelled"] == []  # another conversation's call
-    unknown = schedule.cancel(mine, "sc-nope")
-    assert unknown["cancelled"] == [] and "no scheduled call 'sc-nope'" in unknown["note"]
-    one = schedule.cancel(mine, f" {second['scheduled_id'].upper()} ")
-    assert one["cancelled"] == [second["scheduled_id"]] and "nothing was hung up" in one["note"]
+    world.fake.host.add("s3")
+
+    async def scenario():
+        async def calls(args=None, session_id="s1"):
+            return await tool(core.tools.scheduled_calls, args, session_id)
+
+        return [
+            await calls(),  # no argument: only list
+            await calls({"cancel": None}),
+            await calls({"cancel": ""}),
+            await calls({"cancel": other["scheduled_id"]}),  # another conversation's call
+            await calls({"cancel": "sc-nope"}),
+            await calls({"cancel": f" {second['scheduled_id'].upper()} "}),
+            await calls({"cancel": "all"}),
+            await calls({"cancel": "all"}),
+            await calls({}, session_id="s3"),  # a conversation with nothing scheduled
+            await calls({"cancel": "all"}, session_id="s3"),
+            await calls({"cancel": "sc-1234abcd"}, session_id="s3"),
+        ]
+
+    listed, null, empty, foreign, unknown, one, rest, again, nothing, nothing_all, nothing_one = asyncio.run(scenario())
+    schedule = world.schedule
+    assert list(listed) == ["pending", "cancelled", "note"]
+    assert [entry["scheduled_id"] for entry in listed["pending"]] == [
+        first["scheduled_id"], second["scheduled_id"], third["scheduled_id"]]
+    assert listed["cancelled"] == [] and listed["note"] == ("3 calls scheduled in this conversation. Nothing was "
+                                                            "changed.")
+    assert null == listed and empty == listed
+    assert foreign["cancelled"] == [] and len(foreign["pending"]) == 3
+    assert unknown["cancelled"] == [] and len(unknown["pending"]) == 3
+    assert unknown["note"] == ("This conversation has no scheduled call 'sc-nope'; nothing was cancelled. 3 calls "
+                               "scheduled here (see pending).")
+    assert one["cancelled"] == [second["scheduled_id"]]
+    assert one["note"] == "Cancelled 1 call; nothing was hung up. 2 calls still scheduled in this conversation."
     assert [entry["scheduled_id"] for entry in one["pending"]] == [first["scheduled_id"], third["scheduled_id"]]
-    rest = schedule.cancel(mine, "all")
     assert sorted(rest["cancelled"]) == sorted([first["scheduled_id"], third["scheduled_id"]])
-    assert rest["pending"] == [] and schedule.cancel(mine, "all")["note"] == "This conversation has no calls scheduled."
+    assert rest["pending"] == [] and rest["note"] == ("Cancelled 2 calls; nothing was hung up. Nothing else is "
+                                                      "scheduled in this conversation.")
+    assert again == {"pending": [], "cancelled": [], "note": "This conversation has no calls scheduled."}
+    assert nothing == {"pending": [], "cancelled": [],
+                       "note": "No calls scheduled in this conversation. Nothing was changed."}
+    assert nothing_all == again
+    assert nothing_one["cancelled"] == [] and "no scheduled call 'sc-1234abcd'" in nothing_one["note"]
+    assert "No calls scheduled here" in nothing_one["note"]
     assert schedule.count() == 1  # the other conversation's call stays
     world.now = NOW + 600
     assert schedule.tick() == 1 and world.hub.slot.owner.session_id == "s2"
@@ -663,19 +707,39 @@ def test_cancel_one_all_or_only_list(world):
         [first["scheduled_id"], second["scheduled_id"], third["scheduled_id"]])
 
 
-def test_end_call_with_scheduled_id_cancels_and_hangs_nothing_up(world):
+def test_cancelling_hangs_nothing_up_and_end_call_cancels_nothing(world):
     core, hub = world.core, world.hub
     scheduled = world.later()
+    kept = world.later(in_minutes=20)
     call = hub.begin_call(world.origin(), "Hello.").call  # the conversation is ringing the phone meanwhile
 
     async def scenario():
-        return await tool(core.tools.end_call, {"scheduled_id": scheduled["scheduled_id"], "text": "Bye."})
+        cancelled = await tool(core.tools.scheduled_calls, {"cancel": scheduled["scheduled_id"]})
+        ringing = hub.slot is call and call.state == "ringing"
+        # An end_call that still carries the old argument just hangs up: it is no way to cancel any more.
+        hung_up = await tool(core.tools.end_call, {"scheduled_id": "all"})
+        return cancelled, ringing, hung_up
 
-    result = asyncio.run(scenario())
-    assert result["cancelled"] == [scheduled["scheduled_id"]] and result["pending"] == []
-    assert hub.slot is call and call.state == "ringing"  # the call goes on
+    cancelled, ringing, hung_up = asyncio.run(scenario())
+    assert cancelled["cancelled"] == [scheduled["scheduled_id"]] and ringing  # the call went on
+    assert [entry["scheduled_id"] for entry in cancelled["pending"]] == [kept["scheduled_id"]]
+    assert hung_up["outcome"] == "ended_by_agent" and hub.slot is None
+    assert world.schedule.count() == 1  # the other scheduled call is untouched
     world.now = NOW + 600
     assert world.schedule.tick() == 0
+
+
+def test_the_skill_says_how_to_list_and_cancel_and_that_a_missed_call_is_always_told(core):
+    skill = " ".join((PLUGIN_DIR / "skills" / "voice-calls" / "SKILL.md").read_text(encoding="utf-8").split())
+    later = skill[skill.index("## Calling later"):skill.index("## When a call ends")]
+    for said in ("`scheduled_calls` lists this conversation's scheduled calls (`pending`)",
+                 '`cancel: "all"` cancels them all', "never rings or hangs up (`end_call` only hangs up)",
+                 "write one that still makes sense then", "This is your wake-up call",
+                 "check anything time-dependent", "A scheduled call never fails silently",
+                 "reply in text, and schedule again only if the user asks",
+                 'say `rings_at` the way people say times ("tomorrow at seven")'):
+        assert said in later, said
+    assert "with `scheduled_id` cancels" not in skill and '"list"' not in later
 
 
 def test_a_call_cancelled_while_it_rings_is_not_repeated(world):
@@ -683,8 +747,9 @@ def test_a_call_cancelled_while_it_rings_is_not_repeated(world):
     world.now = NOW + 600
     world.schedule.tick()
     call = world.hub.slot
-    cancelled = world.schedule.cancel(world.origin(), "all")
-    assert cancelled["cancelled"] == [scheduled["scheduled_id"]] and "ringing right now" in cancelled["note"]
+    cancelled = world.schedule.calls(world.origin(), "all")
+    assert cancelled["cancelled"] == [scheduled["scheduled_id"]]
+    assert "One of them is ringing right now: end_call hangs up." in cancelled["note"]
     world.hub.finish(call, "no_answer")
     assert world.schedule.count() == 0 and world.log("scheduled_retry") == []
     notice, = world.wait_notices(1)
@@ -698,7 +763,7 @@ def test_scheduled_calls_follow_the_conversation_through_compression(world):
     entry = world.file()["calls"][0]
     assert entry["session_id"] == "s1-compressed" and entry["session_ids"] == ["s1", "s1-compressed"]
     assert world.schedule.pending(world.origin("s1-compressed")) == scheduled["pending"]
-    assert world.schedule.cancel(world.origin("s1-compressed"), "all")["cancelled"] == [scheduled["scheduled_id"]]
+    assert world.schedule.calls(world.origin("s1-compressed"), "all")["cancelled"] == [scheduled["scheduled_id"]]
 
 
 # ── other processes: the hub socket ────────────────────────────────────────────────────────────────────────
@@ -724,7 +789,13 @@ def test_a_conversation_in_another_process_schedules_and_cancels_through_the_soc
     assert entry["session_id"] == "cli-7" and entry["source"] == "cli" and entry["session_key"] == "cli-7"
     assert remote.status()["scheduled"] == 1
     assert remote.schedule_call("cli-7", "x", None, "yesterday")["error"].startswith("Can't read the time")
-    assert remote.cancel_scheduled("cli-7", "list")["pending"] == scheduled["pending"]
+    assert remote.scheduled_calls("cli-7") == {"pending": scheduled["pending"], "cancelled": [],
+                                               "note": "1 call scheduled in this conversation. Nothing was changed."}
+    fake.env["HERMES_SESSION_KEY"] = "cli-8"  # another conversation: nothing of this one is its to see or cancel
+    assert remote.scheduled_calls("cli-8")["pending"] == []
+    assert remote.scheduled_calls("cli-8", "all")["note"] == "This conversation has no calls scheduled."
+    fake.env["HERMES_SESSION_KEY"] = "cli-7"
+    assert remote.scheduled_calls("cli-7", "sc-nope")["cancelled"] == [] and world.schedule.count() == 1
     # The ring belongs to that conversation; with its process gone, the dashboard reopens the stored session.
     world.now = NOW + 600
     assert world.schedule.tick() == 1 and world.pusher.pushed.wait(5)
@@ -733,7 +804,7 @@ def test_a_conversation_in_another_process_schedules_and_cancels_through_the_soc
     world.hub.finish(call, "declined")
     assert world.wait_notices(1, "cli-7")[0].startswith("[Voice call not answered]")
     again = remote.schedule_call("cli-7", "Later.", None, "07:00")
-    assert remote.cancel_scheduled("cli-7", again["scheduled_id"])["cancelled"] == [again["scheduled_id"]]
+    assert remote.scheduled_calls("cli-7", again["scheduled_id"])["cancelled"] == [again["scheduled_id"]]
     assert world.schedule.count() == 0
 
 
@@ -800,11 +871,13 @@ def test_the_tools_schedule_through_the_socket_outside_the_dashboard(core, world
 
     async def scenario():
         scheduled = await tool(core.tools.start_call, {"text": "Stand-up in five.", "in_minutes": 5}, "tui-1")
-        cancelled = await tool(core.tools.end_call, {"scheduled_id": "all"}, "tui-1")
-        return scheduled, cancelled
+        listed = await tool(core.tools.scheduled_calls, {}, "tui-1")
+        cancelled = await tool(core.tools.scheduled_calls, {"cancel": "all"}, "tui-1")
+        return scheduled, listed, cancelled
 
-    scheduled, cancelled = asyncio.run(scenario())
-    assert scheduled["status"] == "scheduled" and cancelled["cancelled"] == [scheduled["scheduled_id"]]
+    scheduled, listed, cancelled = asyncio.run(scenario())
+    assert scheduled["status"] == "scheduled" and listed["pending"] == scheduled["pending"]
+    assert cancelled["cancelled"] == [scheduled["scheduled_id"]] and cancelled["pending"] == []
     assert [entry["event"] for entry in world.log("scheduled", "scheduled_cancelled")] == ["scheduled",
                                                                                            "scheduled_cancelled"]
 

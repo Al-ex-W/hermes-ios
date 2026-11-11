@@ -81,9 +81,12 @@ NOTICE_HEAD = f"{NOTICE_MARKER} {THIS_CALL_ONLY}"
 RESULT_SCOPE = "This is about this call only and is not a preference, so don't store it."
 # What to do when the user is no longer on the line.
 AWAY = (
-    "The user can't hear you now and is probably not reading this chat. Finish the task you were given, then reply "
-    "once in text with a short recap; if you were waiting for an answer, say what you still need."
+    "The user can't hear you now and is probably not reading this chat. Finish the task you were given. Don't take "
+    "actions that needed their answer. Then reply once in text with a short recap, for when they look; if you were "
+    "waiting for an answer, say what you still need."
 )
+# After a hang-up: no call to ask what it meant.
+DELIBERATE = "The hang-up may have been deliberate: don't ring to ask why."
 NEXT_CALL = "When they next call or ask for a call, speak as usual"
 INJECTION_OFF = (
     "Hermes doesn't let hermes_voice start a turn in this conversation (plugins.entries.hermes_voice."
@@ -126,8 +129,9 @@ def started_notice(call_id: str, missed: Iterable[str] = (), style: str = "") ->
     )
 
 
-def after_call(outcome: str) -> str:
-    """What to do once a call is over or never happened. The notices and the sync results say the same."""
+def after_call(outcome: str, unheard: Iterable[str] = ()) -> str:
+    """What to do once a call is over or never happened. The notices and the sync results say the same.
+    `unheard`: the lines a hang-up cut; a long one among them (``guidance.LONG_LINE_S``) is worth saying."""
     if outcome in ("no_answer", "declined"):
         return f"{AWAY} Don't ring again unless it is urgent or the user asks. {NEXT_CALL}."
     if outcome == "push_failed":
@@ -138,8 +142,10 @@ def after_call(outcome: str) -> str:
         return (f"{AWAY} Ring again with start_call only if it's worth it. {NEXT_CALL} and first offer anything "
                 "they missed.")
     if outcome == "ended_by_user":
-        return (f"{AWAY} Don't ring back unless the user asked in this conversation to be called when you're done. "
-                f"{NEXT_CALL} and first offer anything they missed.")
+        long = any(guidance.speech_seconds(str(text)) > guidance.LONG_LINE_S for text in unheard)
+        return (f"{AWAY} {DELIBERATE} Don't ring back unless the user asked in this conversation to be called when "
+                f"you're done. {NEXT_CALL} and first offer anything they missed."
+                f"{' A line they hung up on was long: keep lines shorter next time.' if long else ''}")
     return ""
 
 
@@ -160,7 +166,9 @@ def outcome_notice(outcome: str, detail: str = "", unheard: Iterable[str] = ()) 
         return (f"[Voice call ended: the phone's connection was lost and didn't come back] {NOTICE_HEAD}"
                 f"{guidance.unheard_note(unheard)} {after_call(outcome)}")
     if outcome == "ended_by_user":
-        return f"[Voice call ended by user] {NOTICE_HEAD}{guidance.unheard_note(unheard)} {after_call(outcome)}"
+        unheard = list(unheard)
+        return (f"[Voice call ended by user] {NOTICE_HEAD}{guidance.unheard_note(unheard)} "
+                f"{after_call(outcome, unheard)}")
     return None
 
 

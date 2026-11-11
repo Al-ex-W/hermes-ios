@@ -147,10 +147,22 @@ def test_the_hang_up_notice_says_what_to_do_and_what_was_not_heard(core):
         "[Voice call ended by user] Automated notice from HermesVoice, not something the user said. It applies to "
         "this call only and is not a preference, so don't store it. The user did not hear all of what you were "
         'saying when the call ended: "I found three flights. The cheapest one leaves at". The user can\'t hear you '
-        "now and is probably not reading this chat. Finish the task you were given, then reply once in text with a "
-        "short recap; if you were waiting for an answer, say what you still need. Don't ring back unless the user "
-        "asked in this conversation to be called when you're done. When they next call or ask for a call, speak as "
-        "usual and first offer anything they missed.")
+        "now and is probably not reading this chat. Finish the task you were given. Don't take actions that needed "
+        "their answer. Then reply once in text with a short recap, for when they look; if you were waiting for an "
+        "answer, say what you still need. The hang-up may have been deliberate: don't ring to ask why. Don't ring "
+        "back unless the user asked in this conversation to be called when you're done. When they next call or ask "
+        "for a call, speak as usual and first offer anything they missed.")
+    # A line over about 15 s of speech that the hang-up cut: said once, for the next call.
+    long = core.inject.outcome_notice("ended_by_user", "", ["word " * 60])
+    assert long.endswith("first offer anything they missed. A line they hung up on was long: keep lines shorter "
+                         "next time.")
+    assert "keep lines shorter" not in core.inject.after_call("lost", ["word " * 60])
+    assert core.hub._outcome_note("ended_by_user", "", ["word " * 60]).endswith("keep lines shorter next time.")
+    assert "keep lines shorter" not in core.hub._outcome_note("ended_by_user", "", ["A short line."])
+    for outcome in ("no_answer", "declined", "push_failed", "unreachable", "lost", "ended_by_user"):
+        after = core.inject.after_call(outcome)
+        assert "Don't take actions that needed their answer." in after and "for when they look" in after
+        assert ("The hang-up may have been deliberate" in after) == (outcome == "ended_by_user")
     # Long lines are shortened, and only the first few are quoted: the agent has its own words in the tool calls.
     many = core.inject.outcome_notice("ended_by_user", "", ["x" * 500, "two", "three", "four", "  "])
     assert f'"{"x" * 200}…", "two", "three" (and 1 more).' in many

@@ -8,8 +8,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
   spoken reply and returns `{said, ending, outcome, call_id}`; `async` returns `{call_id, status}` at once and your
   reply arrives in the conversation as a `[Voice] …` message. `end_call(text?)` hangs up. With `in_minutes` or `at`,
   `start_call` schedules the call instead and the plugin rings at that time by itself (see "Calls that ring
-  later"); `end_call(scheduled_id)` cancels one. `get_location(max_age_s?)` asks the phone where it is, when the
-  user shares that (see "Location").
+  later"); `scheduled_calls(cancel?)` lists or cancels those. `get_location(max_age_s?)` asks the phone where it
+  is, when the user shares that (see "Location").
 - **Skill** `voice-calls`: the longer rules (`skill_view("hermes_voice:voice-calls")`).
 - **Call style** `<HERMES_HOME>/hermes-voice/call-style.md`: the user's own preferences for how Hermes speaks on
   calls, which the agent reads at every call and edits itself (see "Call style").
@@ -159,7 +159,7 @@ refuses when it fires. So the plugin keeps the schedule itself (`schedule.py`):
 - **Who rings.** The dashboard process (`hermes serve`), once it serves: it looks at the file every second and
   rings what is due, with no chat, desktop or agent turn open, and after a restart. One dashboard per home rings
   (`scheduled.runner`, a lock held while it runs). Conversations in other Hermes processes schedule and cancel
-  through the hub socket (`schedule` / `cancel_scheduled`).
+  through the hub socket (`schedule` / `scheduled_calls`).
 - **The ring belongs to the conversation that scheduled it.** Answered, the line is spoken and the conversation
   gets a `[Voice call started]` notice naming the scheduled call; what the user says is injected into it like any
   call's turns. A conversation nobody has open is reopened by the dashboard (`session.resume`), whichever process
@@ -174,9 +174,9 @@ refuses when it fires. So the plugin keeps the schedule itself (`schedule.py`):
 - **The host was down** (or asleep) at the time: a call at most `late_limit_s` late rings as soon as the dashboard
   serves again, and its started notice says how late. An older one is dropped, and its conversation gets a `[Voice
   call not placed: …]` notice with the reason and the line.
-- **List and cancel.** `end_call(scheduled_id)` cancels one of the conversation's scheduled calls, `"all"` all of
-  them, `"list"` only lists them; it returns `{cancelled, pending, note}` and hangs nothing up. `end_call` with no
-  call running also lists what is scheduled.
+- **List and cancel.** `scheduled_calls()` lists the conversation's scheduled calls; `cancel` set to a
+  `scheduled_id` cancels that one, `"all"` all of them. It returns `{pending, cancelled, note}` and never rings or
+  hangs up; `end_call` only hangs up (with no call running it also lists what is scheduled).
 - `GET /status` counts them (`scheduled`), never their text. Disabling the plugin stops the ringing; the calls stay
   on file and ring (or are dropped as late) once it is enabled again.
 
@@ -205,8 +205,10 @@ The plugin puts two kinds of message into the conversation that owns a call (tex
 Every notice is worded as an event of one call, never as an instruction from the user or a standing preference
 (a hang-up notice that said "reply in text from now on" was once stored by a memory system as the user's wish). A
 notice about a call that is over tells the agent that the user can't hear it and is probably not reading the chat:
-finish the task, reply once in text with a short recap, don't ring back unless they asked to be called, and speak
-as usual on the next call. A sync `start_call` result says the same in its `note`.
+finish the task without actions that needed their answer, reply once in text with a short recap for when they
+look, don't ring back unless they asked to be called (a hang-up may have been deliberate: no ringing to ask why),
+and speak as usual on the next call. A hang-up that cut a line of more than about 15 s of speech adds "keep lines
+shorter next time". A sync `start_call` result says the same in its `note`.
 
 **For memory plugins.** Hermes has no flag a plugin can set that memory providers see on every path a notice
 takes. `sync_turn` gets the turn's text as `user_content` whatever started the turn. `display_kind`, Hermes' type

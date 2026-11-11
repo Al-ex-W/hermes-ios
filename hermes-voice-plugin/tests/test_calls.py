@@ -23,10 +23,11 @@ from support import PLUGIN_DIR, PREFIX, FakePusher, Phone, bound_agent, iso, say
 HUNG_UP_NOTICE = (
     "[Voice call ended by user] Automated notice from HermesVoice, not something the user said. It applies to this "
     "call only and is not a preference, so don't store it. The user can't hear you now and is probably not reading "
-    "this chat. Finish the task you were given, then reply once in text with a short recap; if you were waiting "
-    "for an answer, say what you still need. Don't ring back unless the user asked in this conversation to be "
-    "called when you're done. When they next call or ask for a call, speak as usual and first offer anything they "
-    "missed."
+    "this chat. Finish the task you were given. Don't take actions that needed their answer. Then reply once in "
+    "text with a short recap, for when they look; if you were waiting for an answer, say what you still need. The "
+    "hang-up may have been deliberate: don't ring to ask why. Don't ring back unless the user asked in this "
+    "conversation to be called when you're done. When they next call or ask for a call, speak as usual and first "
+    "offer anything they missed."
 )
 
 
@@ -213,9 +214,9 @@ def test_a_declined_call(core, fake, make_hub, mode):
             "[Voice call not answered] Automated notice from HermesVoice, not something the user said. It applies "
             "to this call only and is not a preference, so don't store it. The user didn't take the call (they "
             "declined it). The user can't hear you now and is probably not reading this chat. Finish the task you "
-            "were given, then reply once in text with a short recap; if you were waiting for an answer, say what "
-            "you still need. Don't ring again unless it is urgent or the user asks. When they next call or ask "
-            "for a call, speak as usual."]
+            "were given. Don't take actions that needed their answer. Then reply once in text with a short recap, "
+            "for when they look; if you were waiting for an answer, say what you still need. Don't ring again "
+            "unless it is urgent or the user asks. When they next call or ask for a call, speak as usual."]
 
 
 @pytest.mark.parametrize(("reason", "outcome"), [("no_answer", "no_answer"), ("declined", "declined"),
@@ -301,8 +302,9 @@ def test_a_ring_the_phone_never_picks_up_is_unreachable_and_late_hellos_are_canc
         "[Voice line not delivered: the phone never answered the ring] Automated notice from HermesVoice, not "
         "something the user said. It applies to this call only and is not a preference, so don't store it. Nothing "
         "was spoken. The user can't hear you now and is probably not reading this chat. Finish the task you were "
-        "given, then reply once in text with a short recap; if you were waiting for an answer, say what you still "
-        "need. Tell them the ring didn't get through, and don't ring again unless the user asks."]
+        "given. Don't take actions that needed their answer. Then reply once in text with a short recap, for when "
+        "they look; if you were waiting for an answer, say what you still need. Tell them the ring didn't get "
+        "through, and don't ring again unless the user asks."]
     assert late == {"type": "cancel", "reason": "unreachable"} and code == 1000
     # The ring log says what APNs took and what the phone did, so an unreachable ring can be diagnosed.
     entries = [json.loads(line) for line in (fake.home / "hermes-voice" / "rings.jsonl").read_text().splitlines()]
@@ -590,7 +592,7 @@ def test_register_adds_tools_skill_and_hooks(core, fake, make_hub):
 
     ctx = Ctx()
     plugin.register(ctx)
-    assert set(ctx.tools) == {"start_call", "end_call", "get_location"}
+    assert set(ctx.tools) == {"start_call", "end_call", "scheduled_calls", "get_location"}
     for name, entry in ctx.tools.items():
         assert entry["toolset"] == "voice" and entry["schema"]["name"] == name
         assert entry["check_fn"] is core.tools.available and entry["description"] == entry["schema"]["description"]
