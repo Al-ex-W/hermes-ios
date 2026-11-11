@@ -62,6 +62,15 @@ direct messages to Hermes on a messaging platform), an agent can call `start_cal
   local hub socket; a new turn there is started with Hermes' `inject_message`, which a gateway conversation allows
   only with `allow_gateway_injection` (see the setup).
 - `end_call(text?)` says an optional goodbye and hangs up.
+- **Calls that ring later.** "Call me in ten", "wake me at seven": `start_call` with `in_minutes` or `at`
+  (`"07:00"`, or an ISO date-time) schedules the call and returns at once with `{status: "scheduled",
+  scheduled_id, rings_at}`. The plugin keeps it in `<HERMES_HOME>/hermes-voice/scheduled.json` (which holds the
+  line to speak until the call is done) and `hermes serve` rings at that time by itself: after a restart, with no
+  chat or desktop open, and during quiet hours, since it is a call you asked for. Who may schedule is checked when
+  scheduling. A ring you don't answer is repeated once after five minutes, then the conversation is told; a call
+  the host slept through rings up to 15 minutes late and says so, else the conversation is told it was not placed.
+  `end_call(scheduled_id)` cancels. Details and settings: [plugin README](hermes-voice-plugin/README.md), "Calls
+  that ring later".
 - Hermes is told to speak as on the phone: the answer first, two sentences at most, no codes, ids, URLs or paths
   read out. A line that takes longer than about 15 seconds to say is flagged in the `start_call` result.
 - How you want to be spoken to (tone, form of address, humour, ElevenLabs audio tags) lives in
@@ -77,7 +86,8 @@ What the conversation sees (the chat itself shows only what you said, or a short
 |---|---|
 | `[Voice] <said> (Reply out loud with start_call; …)` | a turn of yours that no waiting `start_call` took |
 | `[Voice, cut off] …`, `[Voice, hung up] …`, `[Voice, muted] …` | the same, when the turn didn't end on its own |
-| `[Voice call started] …` | you started the call (your turns wait until this is delivered) |
+| `[Voice call started] …` | you started the call (your turns wait until this is delivered), or answered one Hermes had scheduled |
+| `[Voice call not placed: …] …` | a scheduled call never rang (the host was down too long, or you were on another call) |
 | `[Voice call not answered] …` | an async call was declined or rang out |
 | `[Voice line not delivered: …] …` | the phone couldn't be rung or reached, or a line couldn't be spoken |
 | `[Voice call ended by user] …` | you hung up (unless your last turn already said so and you had heard everything) |
@@ -214,7 +224,9 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
    switch, a `*` wildcard or a role-based grant makes nobody the owner, so set `owner_ids` then. The rate limits
    and quiet hours count every ring on the host, whichever process it came from. Runs nobody sits at
    (`hermes chat -q`, `hermes -z`, `--source tool`) don't ring unless `policy.allowed_sources` adds `oneshot` /
-   `tool`, and another profile's processes only when `policy.allowed_profiles` lists it.
+   `tool`, and another profile's processes only when `policy.allowed_profiles` lists it. For a call at a set time
+   don't use a Hermes cron job (it is a scheduled job, and refused): ask in a chat, and the agent schedules the
+   call with `start_call` and `at` / `in_minutes`.
 
    ```yaml
    plugins:
@@ -283,6 +295,10 @@ settings any more):
   Hermes refuses what you type in that chat from the app in the same way.
 - Calls from other processes need the dashboard running (it holds the phone's socket and the one call); without
   it `start_call` answers `not_available`. A call whose process goes away for more than 30 s is hung up.
+- **Scheduled calls** ring from `hermes serve` only, so it has to be running at the time (a call it missed by up
+  to 15 minutes still rings, late). A call scheduled from a messaging chat rings and speaks its line, but what you
+  say on it can't be put into that chat yet. A call scheduled from a chat that another process (a CLI, say) still
+  holds at the time behaves as in the point above.
 - From a messaging chat, a sync `start_call` waits at most Hermes' bound on one human wait inside a tool call
   (`approvals.timeout` + 60 s); after that your reply arrives as a `[Voice]` message.
 - The VoIP push's `session_id` can name a conversation of another process (a `local-…` CLI session, a messaging
@@ -385,7 +401,9 @@ out, `busy`, an unreachable phone, and the dashboard's auth on the socket. A sec
 gets the reply, and its async call's reply becomes a stored turn of that session. A call started from the phone in
 a chat another process holds: a backend started the way the Desktop app starts its own takes the call's turns and
 answers into the call; with a holder that can't be asked, the phone hears that the chat can't be reached, and the
-turns arrive in order once the holder is gone. Approvals and questions waiting
+turns arrive in order once the holder is gone. A call scheduled a few seconds ahead rings on time once its
+conversation is idle with no client attached, the reply becomes a stored turn of it, an unanswered ring is repeated
+once, and a scheduled call survives a restart of the dashboard. Approvals and questions waiting
 on a conversation nobody has open send alert pushes, answered with `request.answer`, with turns in the dashboard
 and under `turn_isolation`; through the plugin's real APNs sender and a mock APNs, an approval reaches each phone
 that takes approval alerts exactly once. APNs itself is replaced by a recorder or that mock. They look for Hermes

@@ -5,7 +5,8 @@ conversation (``inject.deliver_here``).
 
 - ``start_call`` sends ``ring`` (and, for a sync call, waits with ``await_turn`` inside Hermes' human-wait window
   while this tool thread watches for Stop and yield requests; the wait ends before Hermes' tool deadline would,
-  ``hermes.tool_wait_cap``).
+  ``hermes.tool_wait_cap``). With ``in_minutes`` / ``at`` it sends ``schedule`` instead: the hub keeps the call
+  and rings at its time (``schedule.py``); nothing of it stays in this process.
 - Every call this process starts or speaks into gets a subscription: a connection that takes the call's turns and
   puts each into the conversation (steering the running turn, or starting one).
 - The ``pre_llm_call`` / ``on_session_end`` hooks tell which conversations are mid-turn (``inject.Turns``, with the
@@ -392,6 +393,41 @@ def end_call(session_id: Any, text: str) -> dict[str, Any]:
     except (ConnectionError, OSError, TimeoutError, RemoteError) as error:
         logger.warning("hermes_voice: end_call through the hub failed: %s", error)
         return {"error": "Couldn't hang up: the voice call service stopped answering."}
+
+
+# A dashboard whose plugin is older than this one doesn't know the op (``unknown_op``): it must not ring now instead.
+SCHEDULE_UNKNOWN = ("The Hermes dashboard runs an older hermes_voice that can't schedule calls; restart `hermes "
+                    "serve`. Nothing was scheduled or cancelled: tell the user.")
+
+
+def schedule_call(session_id: Any, text: str, in_minutes: Any, at: Any) -> dict[str, Any]:
+    """``start_call`` with ``in_minutes`` / ``at`` from this process: the dashboard's hub keeps the call and rings
+    at its time (``schedule.py``)."""
+    return _scheduling("schedule", session_id, {"text": text, "in_minutes": in_minutes, "at": at})
+
+
+def cancel_scheduled(session_id: Any, scheduled_id: str) -> dict[str, Any]:
+    """``end_call`` with ``scheduled_id`` from this process."""
+    return _scheduling("cancel_scheduled", session_id, {"scheduled_id": scheduled_id})
+
+
+def _scheduling(op: str, session_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    origin = origin_for(session_id)
+    if not origin.session_id:
+        return {"status": "not_allowed", "scheduled_id": None, "note": "This conversation can't place a call."}
+    try:
+        with Client.connect() as client:
+            return client.request(op, {"origin": payload(origin), **params})
+    except NotAvailable:
+        return {"status": "not_available", "scheduled_id": None, "note": NOT_AVAILABLE, "error": "not_available"}
+    except RemoteError as error:
+        logger.warning("hermes_voice: %s through the hub failed: %s", op, error)
+        if error.error == "unknown_op":
+            return {"error": SCHEDULE_UNKNOWN}
+        return {"error": f"The voice call service refused that ({error}). Nothing was scheduled or cancelled."}
+    except (ConnectionError, OSError, TimeoutError) as error:
+        logger.warning("hermes_voice: %s through the hub failed: %s", op, error)
+        return {"error": "The voice call service stopped answering. Nothing was scheduled or cancelled: tell the user."}
 
 
 def status() -> Optional[dict[str, Any]]:

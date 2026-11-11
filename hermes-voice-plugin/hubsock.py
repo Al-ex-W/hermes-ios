@@ -20,6 +20,8 @@ Protocol: one JSON object per line (UTF-8, at most 64 KiB). The client starts wi
 - ``await_turn {waiter, cap_s?}``: wait for the reply (``{said, ending, outcome, call_id, note?}``, as a sync
   ``start_call`` returns it). ``cap_s`` bounds the wait.
 - ``end {origin, text?}``: ``end_call`` (the goodbye is spoken first, up to a minute).
+- ``schedule {origin, text, in_minutes?, at?}``: ``start_call`` with a time: the hub keeps the call and rings at
+  its time (``schedule.py``). ``cancel_scheduled {origin, scheduled_id}``: ``end_call`` with ``scheduled_id``.
 - ``subscribe_turns {call_id, origin}``: the conversation's process takes the call's turns from now on. Events
   follow on this connection: ``{"event": "turn", call_id, seq, text}`` (the client answers
   ``{"op": "delivered", seq, ok, via?, status?, detail?, fallback?, held?}``) and ``{"event": "ended", call_id,
@@ -628,6 +630,14 @@ class HubServer:
             text = message.get("text")
             return self.hub.end_call(origin_from(message.get("origin")), text if isinstance(text, str) else "",
                                      signals)
+        if op == "schedule":
+            origin, text = origin_from(message.get("origin")), _speech(message.get("text"))
+            refused = self._foreign(origin, "async")
+            if refused is not None:
+                return refused
+            return self.hub.schedule.schedule(origin, text, message.get("in_minutes"), message.get("at"))
+        if op == "cancel_scheduled":
+            return self.hub.schedule.cancel(origin_from(message.get("origin")), message.get("scheduled_id"))
         if op == "subscribe_turns":
             return self._subscribe(conn, message)
         if op == "attend":
