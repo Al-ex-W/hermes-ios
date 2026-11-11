@@ -5,6 +5,13 @@
   alert pushes (``notify.py``) to the alert token. ``alerts`` turns kinds off or back on for this phone
   (``{"approval": bool, "clarify": bool, "turn_done": bool}``; a kind it never names stays on). A registration
   without ``alert_token`` keeps the one stored for the phone; ``"alert_token": null`` clears it.
+- ``POST /devices/test {voip_token?, alert_token?, kind?, delay_s?}``: a test alert push (``notify.TestAlerts``) to
+  the phone with these tokens and no other: ``kind`` is ``approval`` (the default), ``clarify`` or ``turn_done``,
+  ``delay_s`` (0-30) lets the user lock the phone first. It answers ``{ok, test_id, kind, status: "sent" |
+  "scheduled" | "failed" | "answered", code, message, delay_s, action}``: ``code`` says what APNs answered or why
+  nothing went out, ``message`` says it in words the app shows. ``GET /devices/test/{test_id}`` answers the same
+  later (a delayed test's outcome), and ``POST /devices/test/{test_id}/answer {action}`` is the phone saying what
+  the user did with the notification (an approval choice, ``reply`` or ``open``).
 - ``POST /scribe-token``: a single-use ElevenLabs Scribe token for on-phone speech recognition; the API key stays
   on this host.
 - ``GET /status``: what works here (TTS, h2, APNs, Scribe), the call in progress and the alert watcher.
@@ -22,6 +29,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -44,6 +52,10 @@ SCRIBE_TIMEOUT_S = 15.0
 # A phone mints a Scribe token per call (and on reconnects): allow bursts, stop a looping client.
 SCRIBE_LIMIT, SCRIBE_WINDOW_S = 20, 60.0
 DEVICE_LIMIT, DEVICE_WINDOW_S = 20, 60.0
+# A test alert is a real push with sound: a handful a minute is plenty. Its outcome may be polled while it waits.
+TEST_LIMIT, TEST_WINDOW_S = 6, 60.0
+TEST_POLL_LIMIT, TEST_POLL_WINDOW_S = 120, 60.0
+TEST_ID = re.compile(r"[0-9a-f]{16}")
 # Tests swap in an httpx.MockTransport for ElevenLabs.
 SCRIBE_TRANSPORT: Optional[httpx.AsyncBaseTransport] = None
 
@@ -95,6 +107,8 @@ class _Limiter:
 
 _scribe_limiter = _Limiter(SCRIBE_LIMIT, SCRIBE_WINDOW_S)
 _device_limiter = _Limiter(DEVICE_LIMIT, DEVICE_WINDOW_S)
+_test_limiter = _Limiter(TEST_LIMIT, TEST_WINDOW_S)
+_test_poll_limiter = _Limiter(TEST_POLL_LIMIT, TEST_POLL_WINDOW_S)
 
 
 def _hub() -> Any:
@@ -161,6 +175,81 @@ async def devices(request: Request) -> Any:
     logger.info("hermes_voice: registered a %s device for %s (%s)", stored.environment, stored.bundle_id,
                 "no alerts" if not stored.alert_token else f"alerts off: {', '.join(off)}" if off else "alerts on")
     return {"ok": True}
+
+
+async def _json_object(request: Request) -> Any:
+    """The request's JSON object, or the error to answer."""
+    raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        return _error(413, "Body too large")
+    try:
+        body = json.loads(raw or b"null")
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    return body if isinstance(body, dict) else _error(400, "Body must be a JSON object")
+
+
+def _test_view(test: Any) -> JSONResponse:
+    return JSONResponse(test.view(), headers={"Cache-Control": "no-store"})
+
+
+@router.post("/devices/test")
+async def test_alert(request: Request) -> Any:
+    _hub()
+    if not _test_limiter.allow():
+        return _error(429, "Too many test notifications; try again in a minute")
+    body = await _json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    kind = body.get("kind", "approval")
+    if kind not in push.ALERT_KINDS:
+        return _error(400, f"kind must be one of {', '.join(push.ALERT_KINDS)}")
+    tokens = []
+    for name in ("voip_token", "alert_token"):
+        token = body.get(name) or ""
+        if token and not (isinstance(token, str) and push.DEVICE_TOKEN.fullmatch(token.strip())):
+            return _error(400, f"{name} must be the hex APNs token")
+        tokens.append(token.strip().lower())
+    if not any(tokens):
+        return _error(400, "voip_token or alert_token must name the phone that asks")
+    delay = body.get("delay_s", 0)
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not 0 <= delay <= notify.TEST_MAX_DELAY_S:
+        return _error(400, f"delay_s must be a number of seconds from 0 to {notify.TEST_MAX_DELAY_S:g}")
+    tests = notify.test_alerts()
+    test = await run_in_threadpool(tests.begin, kind, tokens[0], tokens[1], float(delay))
+    if test.status == "scheduled":
+        if test.delay_s > 0:
+            tests.send_later(test)
+        else:
+            await run_in_threadpool(tests.send, test)
+    return _test_view(test)
+
+
+@router.get("/devices/test/{test_id}")
+async def test_alert_status(test_id: str) -> Any:
+    if not _test_poll_limiter.allow():
+        return _error(429, "Too many requests; try again shortly")
+    test = notify.test_alerts().get(test_id) if TEST_ID.fullmatch(test_id) else None
+    if test is None:
+        return _error(404, "No such test notification (the host keeps the latest ones only)")
+    return _test_view(test)
+
+
+@router.post("/devices/test/{test_id}/answer")
+async def test_alert_answer(test_id: str, request: Request) -> Any:
+    if not _test_poll_limiter.allow():
+        return _error(429, "Too many requests; try again shortly")
+    body = await _json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    action = body.get("action")
+    if not isinstance(action, str) or action not in notify.TEST_ACTIONS:
+        return _error(400, f"action must be one of {', '.join(notify.TEST_ACTIONS)}")
+    tests = notify.test_alerts()
+    test = await run_in_threadpool(tests.answered, test_id, action) if TEST_ID.fullmatch(test_id) else None
+    if test is None:
+        return _error(404, "No such test notification (the host keeps the latest ones only)")
+    return _test_view(test)
 
 
 @router.post("/scribe-token")

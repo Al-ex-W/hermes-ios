@@ -39,6 +39,14 @@ Payload (``push.Apns.push_alert`` sends it as ``apns-push-type: alert`` to the a
 "thread-id": <stored session id>, "sound": "default"}, "hermes": {"kind", "session_id", "profile", "request_id",
 "choices" (approval), "questions" (clarify)}}``; a silent one has ``"interruption-level": "passive"`` instead of
 ``sound``.
+
+**Test alerts** (``TestAlerts``, ``POST /devices/test``): the phone asks for a sample alert of one kind, to check
+that pushes reach it and can be answered. It goes through the same sender to that phone alone, at once or a few
+seconds later (so the user can lock the phone first), always with sound, and outside the budget. Its payload is a
+real one's with ``"test": true`` and ``"test_id"`` under ``hermes``, a made-up ``request_id`` (``test-<id>``) and
+the thread ``hermes-voice-test``: the app answers it without ``request.answer`` and tells the route what the user
+chose. The ring log gets ``test_alert`` / ``test_alert_answered`` lines (kind, result, APNs' reason; never a
+token or a text).
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -809,6 +818,217 @@ def _hub_pusher() -> Any:
     return hub_module.get_hub().pusher
 
 
+# ── test alerts ────────────────────────────────────────────────────────────────────────────────────────────
+
+# The session and thread a test alert names: no conversation has this id.
+TEST_SESSION = "hermes-voice-test"
+TEST_MAX_DELAY_S = 30.0
+TESTS_KEPT = 50
+TEST_TITLE = "Hermes test"
+TEST_BODIES = {
+    "approval": "Test approval: nothing will run, whatever you choose.",
+    "clarify": "Test question: reply with anything.",
+    "turn_done": "Test: this is how a finished turn looks.",
+}
+TEST_QUESTION = {"qid": "test", "question": TEST_BODIES["clarify"], "choices": None, "multi_select": False}
+# What the phone may report it did with a test alert: an approval choice, a typed reply (never its text), a tap.
+TEST_ACTIONS = (*APPROVAL_CHOICES, "reply", "open")
+KIND_NAMES = {"approval": "approval", "clarify": "question", "turn_done": "turn-finished"}
+NO_ALERT_TOKEN = ("This iPhone has no notification token on the Hermes host: allow notifications for the app in "
+                  "iOS Settings, then open the app again.")
+# APNs' reasons, by what the user can do about them.
+_TOKEN_REASONS = frozenset({"BadDeviceToken", "Unregistered", "ExpiredToken"})
+_TOPIC_REASONS = frozenset({"DeviceTokenNotForTopic", "BadTopic", "TopicDisallowed", "MissingTopic"})
+_APNS_ANSWER = re.compile(r"APNs (\d{3})(?: ([A-Za-z]+))?")
+
+
+def test_payload(kind: str, test_id: str, profile: str) -> dict[str, Any]:
+    """A test alert: a real one's shape and category, marked ``"test": true`` (see the module doc)."""
+    payload = build(kind, title=TEST_TITLE, body=TEST_BODIES[kind], session_id=TEST_SESSION, profile=profile,
+                    request_id=f"test-{test_id}", choices=list(APPROVAL_CHOICES), questions=[dict(TEST_QUESTION)])
+    payload["hermes"].update(test=True, test_id=test_id)
+    return payload
+
+
+def test_failure(reason: str, environment: str) -> tuple[str, str]:
+    """Why a test alert didn't go out, as (code, a sentence the app shows), from the sender's reason."""
+    found = _APNS_ANSWER.fullmatch(reason.strip())
+    status, name = (int(found.group(1)), found.group(2) or "") if found else (0, "")
+    said = f" (APNs answered {status}{' ' + name if name else ''})" if found else ""
+    if name == "BadEnvironmentKeyInToken":
+        return "wrong_environment", (f"The host's APNs key isn't valid for the {environment} environment this app "
+                                     f"build registered{said}. Use a key that covers both environments.")
+    if name in _TOKEN_REASONS or status == 410:
+        return "bad_token", (f"APNs doesn't know this iPhone's notification token in its {environment} environment"
+                             f"{said}: the app was reinstalled, or it registered the wrong environment (a build "
+                             "from Xcode is sandbox, TestFlight and App Store builds are production). The host "
+                             "dropped the token; open the app again to register a new one.")
+    if name in _TOPIC_REASONS:
+        return "wrong_topic", (f"APNs refused the app's bundle id{said}: the host's APNs key belongs to another "
+                               "app or team than this build.")
+    if status == 403:
+        return "bad_key", (f"APNs refused the host's key{said}: check HERMES_VOICE_APNS_KEY_ID, _TEAM_ID and the "
+                           ".p8 file on the Hermes host.")
+    if reason.startswith("APNs unreachable") or status == 429 or status >= 500:
+        return "apns_unreachable", f"The Hermes host couldn't reach APNs just now ({reason}). Try again."
+    if reason.startswith("no iPhone takes"):
+        return "no_alert_token", NO_ALERT_TOKEN
+    return "refused", f"The test notification wasn't sent: {reason or 'APNs refused it'}."
+
+
+@dataclass
+class TestAlert:
+    """One test alert, from the phone's request to what the user did with it."""
+
+    __test__ = False  # not a pytest class
+
+    test_id: str
+    kind: str
+    delay_s: float = 0.0
+    alert_token: str = ""
+    environment: str = ""
+    status: str = "scheduled"  # scheduled | sent | failed | answered
+    code: str = "scheduled"  # scheduled | sent | answered, or why it failed
+    message: str = ""
+    action: str = ""  # what the phone said the user did (TEST_ACTIONS)
+    claimed: bool = False  # a sender took it
+
+    def view(self) -> dict[str, Any]:
+        """What the routes answer."""
+        return {"ok": self.status != "failed", "test_id": self.test_id, "kind": self.kind, "status": self.status,
+                "code": self.code, "message": self.message, "delay_s": self.delay_s, "action": self.action or None}
+
+
+class TestAlerts:
+    """Test alerts a phone asked for (``POST /devices/test``): the checks, the push, and what became of each."""
+
+    __test__ = False
+
+    def __init__(
+        self,
+        pusher: Optional[Callable[[], Any]] = None,
+        settings: Callable[[], AlertSettings] = current_settings,
+        ring_log: Optional[Callable[[dict[str, Any]], None]] = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.pusher = pusher or _hub_pusher
+        self.settings = settings
+        self.ring_log = ring_log or _ring_log
+        self.sleep = sleep
+        self.lock = threading.Lock()
+        self.tests: OrderedDict[str, TestAlert] = OrderedDict()
+
+    def begin(self, kind: str, voip_token: str = "", alert_token: str = "", delay_s: float = 0.0) -> TestAlert:
+        """Check that a `kind` test can go to the phone with these tokens (found as a registration finds it: by
+        its VoIP token, else its alert token). The test comes back ``scheduled`` (``send`` it, or ``send_later``),
+        or ``failed`` with the reason."""
+        test = TestAlert(uuid.uuid4().hex[:16], kind, delay_s=max(0.0, min(TEST_MAX_DELAY_S, delay_s)))
+        pusher = self.pusher()
+        store = getattr(pusher, "store", None)
+        devices = store.devices() if store is not None else []
+        device = next((d for d in devices if voip_token and d.voip_token == voip_token), None) or next(
+            (d for d in devices if alert_token and d.alert_token == alert_token), None)
+        ready = getattr(pusher, "ready", None)
+        usable, why = ready() if callable(ready) else (False, "it has no alert sender")
+        settings = self.settings()
+        name = KIND_NAMES[kind]
+        if device is None:
+            self._fail(test, "not_registered", "This iPhone isn't registered with the Hermes host yet. Open the "
+                                               "app while signed in, then try again.")
+        elif not usable:
+            self._fail(test, "apns_not_configured", f"The Hermes host can't send pushes: {why}.", why)
+        elif not settings.enabled or kind not in settings.kinds:
+            self._fail(test, "off_on_host", f"The Hermes host has {name} notifications turned off "
+                                            "(plugins.entries.hermes_voice.settings.alerts).")
+        elif not device.alert_token:
+            self._fail(test, "no_alert_token", NO_ALERT_TOKEN)
+        elif not device.wants(kind):
+            self._fail(test, "off_on_phone", f"This iPhone has {name} notifications turned off.")
+        else:
+            test.alert_token, test.environment = str(device.alert_token), device.environment
+            if test.delay_s > 0:
+                test.message = (f"The test notification goes out in {test.delay_s:g} s. Lock the iPhone or leave "
+                                "the app now.")
+        with self.lock:
+            self.tests[test.test_id] = test
+            while len(self.tests) > TESTS_KEPT:
+                self.tests.popitem(last=False)
+        return test
+
+    def send_later(self, test: TestAlert) -> None:
+        """Push a scheduled test after its delay, on a thread with the caller's profile and secret scope."""
+        hermes.spawn_thread(self._later, test, name="hermes-voice-test-alert")
+
+    def _later(self, test: TestAlert) -> None:
+        self.sleep(test.delay_s)
+        self.send(test)
+
+    def send(self, test: TestAlert) -> TestAlert:
+        """Push a scheduled test now (blocking: one APNs request) and note what APNs answered."""
+        with self.lock:
+            if test.status != "scheduled" or test.claimed:
+                return test
+            test.claimed = True
+        try:
+            payload = test_payload(test.kind, test.test_id, hermes.profile_name())
+            result = self.pusher().push_alert(test.kind, payload, collapse_id=f"test-{test.test_id}",
+                                              only=test.alert_token)
+        except Exception as error:  # noqa: BLE001 - the phone hears that it failed; the type only (see Alerts._send)
+            self._fail(test, "refused", "The Hermes host failed to send the test notification "
+                                        f"({type(error).__name__}).", type(error).__name__)
+            return test
+        if getattr(result, "ok", False):
+            with self.lock:
+                if test.status == "scheduled":  # unless the phone's answer got here first
+                    test.status, test.code = "sent", "sent"
+                    test.message = ("APNs accepted the test notification. If it doesn't show within a few "
+                                    "seconds, check Focus and the app's notification settings on the iPhone.")
+            self._log(test.kind, "sent")
+            return test
+        reason = str(getattr(result, "reason", "") or "")
+        code, message = test_failure(reason, test.environment)
+        self._fail(test, code, message, reason)
+        return test
+
+    def get(self, test_id: str) -> Optional[TestAlert]:
+        with self.lock:
+            return self.tests.get(test_id)
+
+    def answered(self, test_id: str, action: str) -> Optional[TestAlert]:
+        """The phone says what the user did with the test alert (which therefore arrived)."""
+        with self.lock:
+            test = self.tests.get(test_id)
+            if test is None or test.status == "failed":
+                return test
+            test.status, test.code, test.action = "answered", "answered", action
+            test.message = f"The iPhone answered the test notification ({action})."
+        logger.info("hermes_voice: the phone answered a test %s alert (%s)", test.kind, action)
+        self.ring_log({"event": "test_alert_answered", "kind": test.kind, "action": action})
+        return test
+
+    def _fail(self, test: TestAlert, code: str, message: str, detail: str = "") -> None:
+        with self.lock:
+            test.status, test.code, test.message = "failed", code, message
+        self._log(test.kind, code, detail)
+
+    def _log(self, kind: str, result: str, detail: str = "") -> None:
+        """Kind, result and the sender's reason: never a token, never the payload."""
+        logger.info("hermes_voice: test %s alert: %s%s", kind, result, f" ({detail})" if detail else "")
+        entry: dict[str, Any] = {"event": "test_alert", "kind": kind, "result": result}
+        if detail:
+            entry["detail"] = detail
+        self.ring_log(entry)
+
+
+def _ring_log(entry: dict[str, Any]) -> None:
+    """A line in the hub's ring log (``rings.jsonl``)."""
+    try:
+        from . import hub as hub_module
+        hub_module.get_hub().policy.log(entry)
+    except Exception:  # noqa: BLE001 - the log must never fail a test alert
+        logger.debug("hermes_voice: ring log unavailable", exc_info=True)
+
+
 # ── one watcher per process ────────────────────────────────────────────────────────────────────────────────
 
 _KEY = "_hermes_voice_alerts"
@@ -832,6 +1052,27 @@ def install(instance: Optional[Alerts]) -> None:
             old.stop()
         if instance is not None:
             sys.__dict__[_KEY] = instance
+
+
+_TESTS_KEY = "_hermes_voice_test_alerts"
+
+
+def test_alerts() -> TestAlerts:
+    """The process's test alerts."""
+    with _LOCK:
+        found = sys.__dict__.get(_TESTS_KEY)
+        if found is None:
+            found = TestAlerts()
+            sys.__dict__[_TESTS_KEY] = found
+        return found
+
+
+def install_test_alerts(instance: Optional[TestAlerts]) -> None:
+    """Replace the process's test alerts (tests)."""
+    with _LOCK:
+        sys.__dict__.pop(_TESTS_KEY, None)
+        if instance is not None:
+            sys.__dict__[_TESTS_KEY] = instance
 
 
 def start() -> None:

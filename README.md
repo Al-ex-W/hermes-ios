@@ -243,7 +243,10 @@ The checklist for the machine (a Linux VM with systemd here) that runs Hermes. D
    same APNs key as the calls (`apns-push-type: alert`, topic = the app's bundle id), pass Hermes' secret
    redaction, go silently during `policy.quiet_hours`, and with `alerts.previews: false` carry no conversation
    text (nor does the call push's title). The app answers an approval or a question from the
-   notification through the dashboard (`request.answer`).
+   notification through the dashboard (`request.answer`). Because an open chat gets no pushes, check them with
+   **Settings → Notifications → Send test notification** instead of asking Hermes for an approval: it has the
+   plugin push a sample alert to that iPhone alone (`POST /api/plugins/hermes_voice/devices/test`) and shows what
+   APNs answered.
 
 ### Cutover from hermes-voice-mcp
 
@@ -286,8 +289,8 @@ settings any more):
   chat), which the app may not be able to open; the call itself works the same.
 - Alert pushes cover only conversations the dashboard hosts. A suspended app counts as attached until Hermes
   notices its socket is gone, and an alert APNs refuses isn't retried.
-- Half duplex: the mic is off while Hermes speaks. If you're mid-sentence when Hermes starts, it waits up to 3 s,
-  then what it heard so far goes in as `cut_off`.
+- Half duplex: the mic is off while Hermes speaks. If you're mid-sentence when Hermes starts, it waits for
+  your pause setting plus 2 s (at most 10 s), then what it heard so far goes in as `cut_off`.
 - The Simulator has no VoIP pushes, CallKit audio or microphone: there calls ring inside the app only, Hermes can
   be heard, and you answer by typing. Debug builds take `hermesvoice://ring?call_id=…&session_id=…` as a push.
 
@@ -309,6 +312,18 @@ this app's **Connection** page, and **Calls** is this app's own.
   (`POST /api/plugins/hermes_voice/devices`). Approvals can be answered from the notification (Run, Allow for
   session, Reject), a single question with a typed reply, and tapping a notification opens its chat. The plugin
   must support alert pushes for these to arrive; with an older plugin only the registration happens.
+
+  Hermes pushes these only for a conversation nobody has open (after about 5 s), so you can't see one by asking
+  for an approval in the chat you are looking at. **Send test notification** on the same page checks the whole
+  path instead: pick the kind (approval, question, turn finished) and tap it; the plugin sends a real push through
+  APNs to this iPhone only, 5 s later, so you can lock the phone or leave the app first (in the app it shows as a
+  banner). The line under the button says what happened: that APNs accepted it, or why nothing went out (this
+  iPhone isn't registered or has no notification token, APNs isn't set up on the host, the kind is turned off on
+  the host or the phone, APNs doesn't know the token or it is for the other environment, the key or bundle id is
+  wrong). Answer the test like a real one (Run, Allow for session or Reject; a typed reply for a question): it
+  runs nothing and touches no conversation. The app confirms with "Test approval answered: Run", tells the plugin
+  which button it was, and the row shows it. With a plugin that has no test route, the app shows a local
+  notification and says so.
 
 ## Files, review, messaging, agents and kanban
 
@@ -384,7 +399,10 @@ the app's end-to-end tests against it. Add `-test-timeouts-enabled YES -default-
 after a failure xcodebuild otherwise gathers `simctl diagnose`, which can hold the run for ten minutes or more once
 the tests are done. The fake serves the plugin's routes too: typing `call me sync: …` in a chat
 makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/ring` returns a push payload for
-`xcrun simctl openurl booted "hermesvoice://ring?…"` (see `devtools/fake_voice_plugin.py`).
+`xcrun simctl openurl booted "hermesvoice://ring?…"` (see `devtools/fake_voice_plugin.py`). It answers the test
+alert routes as the plugin does without pushing anything; `GET /api/plugins/hermes_voice/debug/test-alerts` has
+each test's payload, which `xcrun simctl push booted <bundle id> payload.json` shows in the Simulator with its
+actions (see [`devtools/README.md`](devtools/README.md)).
 
 ## How the pieces talk
 
@@ -412,6 +430,11 @@ makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/rin
   thread-id: <session id>, sound}, "hermes": {kind, session_id, profile, request_id?, choices?, questions?}}` to
   the alert token the app registered; the notification's actions answer with `request.answer {id: request_id,
   result}` over `/api/ws`.
+- **Test alerts**: `POST /api/plugins/hermes_voice/devices/test {voip_token, alert_token, kind, delay_s}` pushes
+  the same payload with `"test": true` and `"test_id"` under `hermes` to that phone, and answers `{ok, test_id,
+  kind, status, code, message, delay_s, action}`; the app reads a delayed test's outcome with `GET
+  …/devices/test/{test_id}`. A test alert's actions send no `request.answer`: the app confirms on the phone and
+  posts `…/devices/test/{test_id}/answer {action}`.
 
 ## Legacy: the hermes-voice-mcp server
 

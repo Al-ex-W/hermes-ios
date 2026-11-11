@@ -170,3 +170,11 @@ routine updates. You can call from any conversation on this host (dashboard, des
 direct messages to Hermes); calls from scheduled jobs, subagents, group chats and other people's chats are refused
 by default, and the user may have quiet hours: with `not_allowed` the note says what to do (sometimes: ask in text
 first, then call again).
+
+## Notifications the app sends (not calls)
+
+The app can notify the user with three pushes: an approval waiting, a question waiting, and a turn that finished.
+They are sent only for conversations the dashboard hosts, and only while no client (phone app, Desktop, dashboard
+chat) has that conversation open, after a grace period of about 5 s; so an approval you trigger in the chat the user
+is looking at never arrives as a push. During quiet hours and past the alert budget they arrive silently. To check
+that pushes reach the phone, tell the user to use Settings → Notifications → Send test notification in the app.

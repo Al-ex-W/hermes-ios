@@ -403,6 +403,201 @@ final class NotificationTests: XCTestCase {
         XCTAssertFalse(AlertNotifications.onScreen("s1", chat: nil, active: true, covered: false))
     }
 
+    // MARK: Test alerts
+
+    /// The plugin's test approval (`notify.test_payload`).
+    private let testApprovalJSON = """
+    {"aps": {"alert": {"title": "Hermes test", "body": "Test approval: nothing will run, whatever you choose."},
+             "category": "HERMES_APPROVAL", "thread-id": "hermes-voice-test", "sound": "default"},
+     "hermes": {"kind": "approval", "session_id": "hermes-voice-test", "profile": "default",
+                "request_id": "test-0123456789abcdef", "choices": ["once", "session", "always", "deny"],
+                "test": true, "test_id": "0123456789abcdef"}}
+    """
+
+    private func testPush(_ kind: AlertPush.Kind = .approval, id: String? = "t1") -> AlertPush {
+        AlertPush(kind: kind, sessionID: "hermes-voice-test", profile: "default",
+                  requestID: kind == .turnDone ? nil : "test-\(id ?? "x")", choices: ApprovalChoice.allCases,
+                  questions: kind == .clarify ? [ClarifyQuestion(qid: "test", question: "Test question", choices: nil, multiSelect: false)] : [],
+                  title: "Hermes test", body: "Test", isTest: true, testID: id)
+    }
+
+    func testTestAlertPayloadDecodesWithItsMarks() throws {
+        let push = try XCTUnwrap(AlertPush(userInfo: userInfo(testApprovalJSON)))
+        XCTAssertTrue(push.isTest)
+        XCTAssertEqual(push.testID, "0123456789abcdef")
+        XCTAssertEqual(push.kind, .approval)
+        XCTAssertEqual(push.category, "HERMES_APPROVAL")
+        XCTAssertEqual(push.requestID, "test-0123456789abcdef")
+        XCTAssertEqual(push.choices, [.once, .session, .always, .deny])
+        // Posted again (an empty reply, say), it is still a test.
+        XCTAssertEqual(AlertPush(userInfo: push.userInfo), push)
+        XCTAssertEqual(testPush(.clarify).asking([]).testID, "t1")
+        // A real alert is none, whatever id it carries.
+        let real = try XCTUnwrap(AlertPush(userInfo: userInfo(approvalJSON)))
+        XCTAssertFalse(real.isTest)
+        XCTAssertNil(real.testID)
+        XCTAssertNil(AlertPush(kind: .approval, sessionID: "s1", testID: "t9").testID)
+        let unmarked = try XCTUnwrap(AlertPush(userInfo: userInfo("""
+        {"aps": {"alert": "b"}, "hermes": {"kind": "approval", "session_id": "s1", "request_id": "r", "test": "yes",
+                                           "test_id": "t9"}}
+        """)))
+        XCTAssertFalse(unmarked.isTest)
+    }
+
+    func testTestAlertShowsInTheForegroundWhateverIsOnScreen() {
+        XCTAssertEqual(AlertNotifications.presentation(for: testPush(), sessionOnScreen: true), [.banner, .list, .sound])
+        XCTAssertEqual(AlertNotifications.presentation(for: testPush(.turnDone), sessionOnScreen: false), [.banner, .list, .sound])
+    }
+
+    func testTestAlertAnswersNameTheActionAndNeverTheReply() {
+        func answer(_ action: String, text: String? = nil, _ push: AlertPush) -> TestAlertAnswer? {
+            TestAlertAnswer.of(AlertIntent.of(action: action, text: text, push: push))
+        }
+        XCTAssertEqual(answer(AlertAction.run, testPush()),
+                       TestAlertAnswer(action: "once", summary: "Test approval answered: Run. Nothing was run."))
+        XCTAssertEqual(answer(AlertAction.allowSession, testPush())?.summary,
+                       "Test approval answered: Allow for session. Nothing was run.")
+        XCTAssertEqual(answer(AlertAction.reject, testPush()),
+                       TestAlertAnswer(action: "deny", summary: "Test approval answered: Reject. Nothing was run."))
+        XCTAssertEqual(answer(AlertAction.reply, text: " blue ", testPush(.clarify)),
+                       TestAlertAnswer(action: "reply", summary: "Test question answered: “blue”."))
+        let long = answer(AlertAction.reply, text: String(repeating: "x", count: 200), testPush(.clarify))
+        XCTAssertEqual(long?.action, "reply")
+        XCTAssertLessThan(long?.summary.count ?? 0, 120)
+        XCTAssertEqual(answer(UNNotificationDefaultActionIdentifier, testPush(.turnDone))?.action, "open")
+        XCTAssertEqual(answer(AlertAction.open, testPush(.clarify))?.action, "open")
+        // An empty reply answers nothing (the alert is posted again), nor does another kind's action.
+        XCTAssertNil(answer(AlertAction.reply, text: "  ", testPush(.clarify)))
+        XCTAssertNil(answer(AlertAction.run, testPush(.clarify)))
+    }
+
+    func testTestAlertIsAnsweredOnThisPhoneAndNeverThroughTheGateway() async throws {
+        let notifications = AlertNotifications()
+        var connected = 0
+        notifications.connect = { client in
+            connected += 1
+            return GatewayConnection(client: client)
+        }
+        var asked = 0
+        notifications.testClient = {
+            asked += 1
+            throw DashboardError.signedOut
+        }
+        await notifications.handle(action: AlertAction.run, text: nil, push: testPush())
+        XCTAssertEqual(connected, 0, "a test approval never opens a gateway connection: no request.answer")
+        XCTAssertEqual(asked, 1, "the plugin is told through the dashboard sign-in")
+        let state = try XCTUnwrap(notifications.test)
+        XCTAssertEqual(state.phase, .answered)
+        XCTAssertEqual(state.id, "t1")
+        XCTAssertEqual(state.kind, .approval)
+        XCTAssertTrue(state.message.hasPrefix("Test approval answered: Run. Nothing was run. Hermes wasn't told: "), state.message)
+        XCTAssertNil(notifications.openRequest)
+
+        // A tap opens no session; a reply is confirmed without its request.
+        await notifications.handle(action: UNNotificationDefaultActionIdentifier, text: nil, push: testPush(.turnDone, id: "t2"))
+        XCTAssertNil(notifications.openRequest, "a test alert belongs to no session")
+        XCTAssertEqual(notifications.test?.id, "t2")
+        XCTAssertTrue(notifications.test?.message.hasPrefix("Test notification opened.") == true)
+        await notifications.handle(action: AlertAction.reply, text: "green", push: testPush(.clarify, id: "t3"))
+        XCTAssertTrue(notifications.test?.message.hasPrefix("Test question answered: “green”.") == true)
+        XCTAssertEqual(connected, 0)
+        XCTAssertEqual(asked, 3)
+
+        // An empty reply is asked again, and a test without an id is confirmed without telling anyone.
+        await notifications.handle(action: AlertAction.reply, text: " ", push: testPush(.clarify, id: "t4"))
+        XCTAssertEqual(notifications.test?.id, "t3")
+        await notifications.handle(action: AlertAction.reject, text: nil, push: testPush(.approval, id: nil))
+        XCTAssertEqual(notifications.test?.message, "Test approval answered: Reject. Nothing was run.")
+        XCTAssertEqual(asked, 3)
+
+        // A real alert's tap still opens its session.
+        await notifications.handle(action: UNNotificationDefaultActionIdentifier, text: nil, push: approval())
+        XCTAssertEqual(notifications.openRequest, AlertNotifications.SessionTarget(id: "s1", profile: "work"))
+    }
+
+    func testTestRowShowsTheHintThenWhatBecameOfTheTest() {
+        let idle = TestAlertRow(nil, delay: 5)
+        XCTAssertFalse(idle.busy || idle.isError)
+        XCTAssertTrue(idle.message.contains("5 s after you tap"), idle.message)
+        XCTAssertTrue(idle.message.contains("lock it"), idle.message)
+        let asking = TestAlertRow(.asking(.approval), delay: 5)
+        XCTAssertTrue(asking.busy)
+        XCTAssertFalse(asking.isError)
+        let failed = TestAlertRow(.failed(.clarify, "APNs is not configured."), delay: 5)
+        XCTAssertEqual(failed, TestAlertRow(TestAlertState(kind: .clarify, id: nil, phase: .failed, message: "APNs is not configured."), delay: 5))
+        XCTAssertTrue(failed.isError)
+        XCTAssertFalse(failed.busy)
+        XCTAssertEqual(failed.message, "APNs is not configured.")
+        XCTAssertEqual(AlertPush.Kind.allCases.map(TestAlertRow.title), ["Approval", "Question", "Turn finished"])
+    }
+
+    func testTestStateFollowsThePluginAndKeepsWhatThisPhoneSaw() {
+        func result(_ status: TestAlertResult.Status, id: String = "t1", message: String = "m") -> TestAlertResult {
+            TestAlertResult(id: id, kind: .approval, status: status, code: status.rawValue, message: message, delay: 5)
+        }
+        let scheduled = TestAlertState.asking(.approval).applying(result(.scheduled, message: "Lock the iPhone now."))
+        XCTAssertEqual(scheduled, TestAlertState(kind: .approval, id: "t1", phase: .scheduled, message: "Lock the iPhone now."))
+        XCTAssertTrue(scheduled.busy)
+        let sent = scheduled.applying(result(.sent, message: "APNs accepted it."))
+        XCTAssertEqual(sent.phase, .sent)
+        XCTAssertFalse(sent.busy || sent.failed)
+        XCTAssertEqual(sent.message, "APNs accepted it.")
+        XCTAssertTrue(scheduled.applying(result(.failed, message: "APNs refused.")).failed)
+        // Another test's outcome changes nothing.
+        XCTAssertEqual(scheduled.applying(result(.failed, id: "t0")), scheduled)
+
+        // The push showed here before the plugin said "sent": it arrived, and stays so.
+        let arrived = scheduled.arrived(testPush())
+        XCTAssertEqual(arrived, TestAlertState(kind: .approval, id: "t1", phase: .arrived, message: TestAlertState.arrived))
+        XCTAssertEqual(arrived.applying(result(.sent)), arrived)
+        XCTAssertEqual(TestAlertState.asking(.approval).arrived(testPush()).id, "t1")
+        XCTAssertEqual(scheduled.arrived(testPush(id: "t0")), scheduled, "an earlier test's push")
+        XCTAssertEqual(scheduled.arrived(approval()), scheduled, "a real alert")
+        let answered = TestAlertState(kind: .approval, id: "t1", phase: .answered, message: "Test approval answered: Run.")
+        XCTAssertEqual(answered.applying(result(.sent)), answered)
+        XCTAssertEqual(answered.applying(result(.answered)), answered)
+        XCTAssertEqual(answered.arrived(testPush()), answered)
+        XCTAssertEqual(sent.applying(result(.answered, message: "The iPhone answered.")).phase, .answered)
+    }
+
+    func testTestRequestAndResultShapes() throws {
+        XCTAssertEqual(body(try XCTUnwrap(VoicePluginAPI.testAlertBody(kind: .turnDone, voipToken: "aa", alertToken: "bb", delay: 5))),
+                       ["kind": "turn_done", "delay_s": 5.0, "voip_token": "aa", "alert_token": "bb"])
+        XCTAssertEqual(body(try XCTUnwrap(VoicePluginAPI.testAlertBody(kind: .approval, voipToken: nil, alertToken: "bb", delay: 0))),
+                       ["kind": "approval", "delay_s": 0.0, "alert_token": "bb"])
+        XCTAssertNil(VoicePluginAPI.testAlertBody(kind: .approval, voipToken: nil, alertToken: "", delay: 5),
+                     "without a token the plugin can't tell which phone asks")
+
+        let scheduled = try XCTUnwrap(TestAlertResult(["ok": true, "test_id": "t1", "kind": "clarify", "status": "scheduled",
+                                                       "code": "scheduled", "message": "Lock the iPhone now.",
+                                                       "delay_s": 5, "action": NSNull()]))
+        XCTAssertEqual(scheduled, TestAlertResult(id: "t1", kind: .clarify, status: .scheduled, code: "scheduled",
+                                                  message: "Lock the iPhone now.", delay: 5))
+        let failed = try XCTUnwrap(TestAlertResult(["ok": false, "test_id": "t2", "kind": "approval", "status": "failed",
+                                                    "code": "bad_token", "message": "APNs doesn't know this token."]))
+        XCTAssertEqual(failed.code, "bad_token")
+        XCTAssertEqual(failed.status, .failed)
+        XCTAssertEqual(TestAlertResult(["test_id": "t3", "kind": "approval", "status": "answered", "action": "once"])?.action, "once")
+        XCTAssertNil(TestAlertResult(["test_id": "t4", "kind": "approval", "status": "exploded"]))
+        XCTAssertNil(TestAlertResult(["kind": "approval", "status": "sent"]))
+        XCTAssertNil(TestAlertResult(nil))
+        XCTAssertEqual(VoicePluginAPI.Failure.refused("Too many test notifications; try again in a minute").errorDescription,
+                       "Too many test notifications; try again in a minute")
+    }
+
+    func testTestWithoutAPushTokenSaysSoWithoutAskingHermes() async throws {
+        let notifications = AlertNotifications()
+        let nowhere = try DashboardClient(settings: ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "test",
+                                                                       password: "test"))
+        await notifications.requestTest(.approval, client: nowhere, voipToken: nil, alertToken: nil)
+        XCTAssertEqual(notifications.test, .failed(.approval, TestAlertState.noToken))
+        // A host that can't be reached is said in place too.
+        await notifications.requestTest(.clarify, client: nowhere, voipToken: "aa", alertToken: nil)
+        XCTAssertEqual(notifications.test?.phase, .failed)
+        XCTAssertEqual(notifications.test?.kind, .clarify)
+        XCTAssertFalse(notifications.test?.message.isEmpty ?? true)
+    }
+
     // MARK: Signing out
 
     func testSignOutStopsWaitingForASlowWithdrawal() async {
