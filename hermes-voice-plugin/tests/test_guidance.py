@@ -15,7 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from support import PLUGIN_DIR, FakePusher, PacedSpeech, Phone, serving, tool, until
+from support import PLUGIN_DIR, FakePusher, PacedSpeech, Phone, heard_part, serving, tool, until
 
 LONG = " ".join(["word"] * 40)
 REMINDER = (f' On the last call in this conversation the user did not hear all of this: "{LONG}". Offer it first, '
@@ -65,7 +65,9 @@ def test_what_was_not_heard_is_offered_once_when_the_agent_calls_again(core, fak
             return notice, again, more, later[1], third
 
     notice, again, more, ended, third = asyncio.run(scenario())
+    notice, heard = heard_part(notice)
     assert notice.startswith("[Voice call ended by user] ") and f'when the call ended: "{LONG}".' in notice
+    assert len(heard) == 1, heard  # how much of the line they did hear (test_playback.py)
     assert again["status"] == "ringing" and again["note"].endswith(REMINDER), again
     assert "did not hear" not in more["note"]  # once per call
     # They heard both lines of the second call out: nothing to say about it, and nothing left for a third call.
@@ -119,7 +121,7 @@ def test_a_sync_call_says_what_was_not_heard_and_the_next_one_reminds_with_the_r
 
     first, second, texts = asyncio.run(scenario())
     assert first["outcome"] == "ended_by_user" and first["said"] == ""
-    assert first["note"] == (
+    assert heard_part(first["note"])[0] == (
         "The user hung up. This is about this call only and is not a preference, so don't store it. The user did "
         f'not hear all of what you were saying when the call ended: "{LONG}". The user can\'t hear you now and is '
         "probably not reading this chat. Finish the task you were given, then reply once in text with a short "
@@ -189,7 +191,8 @@ def test_a_hung_up_turn_is_followed_by_the_notice_when_a_line_went_unheard(core,
 
     texts = asyncio.run(scenario())
     assert texts[1] == f"[Voice, hung up] never mind I {core.inject.HUNG_UP_HINT}"
-    assert texts[2].startswith("[Voice call ended by user] ") and f'when the call ended: "{LONG}".' in texts[2]
+    ended = heard_part(texts[2])[0]
+    assert ended.startswith("[Voice call ended by user] ") and f'when the call ended: "{LONG}".' in ended
 
 
 def test_missed_speech_is_kept_in_memory_only_and_not_for_ever(core, fake, make_hub, monkeypatch):

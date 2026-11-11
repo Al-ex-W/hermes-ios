@@ -157,6 +157,37 @@ result's `note`) quotes what they did not hear to the end. Put it in your recap.
 conversation starts, the `[Voice call started]` notice or your first `start_call` result reminds you once: offer
 the missed part first ("You hung up before I finished. Want the rest?"), unless they have had it since.
 
+**How much they heard.** After each quoted line the notice says how much of it had played: `"…" (they heard about
+2 of 9 s)`, `(they heard none of it)` or `(they heard nearly all of it)`. A little of a long line: it was too
+long, so be shorter next time. Nearly all of it: they heard it and left; don't offer it again as missed.
+
+## When a line may not have been heard
+
+The phone reports how each of your lines really played. When that went badly you are told once, with the next
+thing the call hands you: in the `note` of a `start_call` result, or at the end of a `[Voice]` message as
+`(HermesVoice playback note, not the user's words: …)`. When playback was fine, nothing is added. The note
+names the line: `Your last line …`; in the result of your next `start_call`, `Your line before this one …` (the
+line you said before, not the one that result is for); or `An earlier line of yours …` when you have said more
+since.
+
+| Note | What happened | What to do |
+| --- | --- | --- |
+| `Your last line may not have been heard well: playback stalled twice (1.8 s of gaps).` | The audio broke up on its way to the phone | If it mattered, say it again: shorter and plainer, without quiet tags |
+| `… the phone's audio restarted while it played.` / `… the phone's audio output changed while it played.` | The user switched to the speaker or a headset mid-line; a moment may be missing | The same |
+| `… part of its audio was not played.` | The phone lost some of the line | The same |
+| `… the phone's volume is very low.` (once per call) | They can barely hear you | Ask them to turn the volume up |
+| `Your last line was not played to the end on the phone (they heard about 1 of 4 s).` / `Your last line may not have been heard: the phone did not confirm it played it.` | The line did not get through | Say it again |
+| `The user replayed your last line on their phone: …` | They pressed Repeat; the phone played your last line again from its own copy | They have heard it now: don't say it again. Say important things shorter and plainer from here on |
+
+- If these notes keep coming (two or three lines in a row), tell the user in a few words that their audio is
+  breaking up, and suggest the speaker or a better connection.
+- **The same text again is a replay.** `start_call` with exactly the text of your last line makes no new speech:
+  the plugin sends the audio it kept, at once, and the result says `Same text as your last line, so the audio kept
+  from it is replayed (no new speech).` Use that only when the user wants the very same words; if they did not
+  understand, new words help more.
+- The phone evens out loudness, so a line with a quiet tag is not quieter than a normal one. It is still harder
+  to understand: when the user asks you to repeat, leave quiet tags out.
+
 ## Speaking well
 
 A phone call is not a chat window: the user can't skim, scroll back or copy what they hear.
@@ -169,7 +200,8 @@ A phone call is not a chat window: the user can't skim, scroll back or copy what
   numbers or exact timestamps. Say the human name ("the databases course", "the login bug", "this morning"); the
   exact identifiers go in the text recap.
 - **Numbers.** Round them ("about forty", "just under two hours") unless the user asked for precision.
-- **Asked to repeat** ("what did you say?"): say it shorter and plainer, not the same words again.
+- **Asked to repeat** ("what did you say?"): say it shorter and plainer, without quiet tags, not the same words
+  again (the same text would only replay the same audio).
 - Plain spoken sentences, the way you'd say them on the phone: no Markdown, lists, code or emoji. Say what the
   user needs to know; only links, code and exact identifiers go in the text recap.
 - **Length check.** The `start_call` result flags a line that takes longer than about 15 seconds to say (`Long
@@ -199,7 +231,8 @@ and don't count towards a line's length. They only work with ElevenLabs models t
 documents them for Eleven v3, model `eleven_v3`); with other models, the plugin's default `eleven_flash_v2_5`
 among them, a tag may be read out loud or dropped. So use tags only when the call style asks for them, and stop
 if the user says they hear the tags spoken. Quiet tags (`[whispers]`, low, flat) make a line hard to hear on a
-phone: keep them to a few words, or leave them out.
+phone: the phone evens out their loudness, but they stay harder to understand. Keep them to a few words, or leave
+them out.
 
 ## When to ring
 

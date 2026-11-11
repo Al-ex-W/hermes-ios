@@ -9,7 +9,12 @@ Phone protocol on ``/api/plugins/hermes_voice/phone`` (JSON text frames plus bin
 - phone ``hello {call_id, session_id?, title?, initiated_by, app_version}`` -> ``ready {call_id, state}``
 - phone ``ringing`` / ``answered`` / ``declined`` while ringing; plugin ``cancel {reason}`` ends a ring
 - plugin ``speech_start {id, text, sample_rate, format}``, PCM frames, ``speech_end {id}`` (or with
-  ``cancelled: true`` / ``error``); the phone answers a normal end with ``played {id}`` once it was heard
+  ``cancelled: true`` / ``error``); the phone answers a normal end with ``played {id, playback?}`` once it was heard
+- phone ``unplayed {id, reason, playback?}``: a line it did not play to the end (``hang_up``, sent before its
+  ``bye``; ``cancelled``; ``lost``: its audio never all reached the speaker; ``dropped``: the link went away under
+  it, sent on the next link). ``playback`` is what really happened to the line on the phone
+  (``guidance.Playback``: seconds received and played, stalls, audio restarts, route, volume)
+- phone ``replayed {id}``: the user had the phone play the last line again, from the audio it kept
 - phone ``user_turn {call_id, text, ending {kind, ...}, provider, language?, started_at, ended_at}``
 - phone ``ping`` -> ``pong``; phone ``bye {reason?}`` hangs up (``hang_up``, ``declined``, ``no_answer`` when its own
   ring timeout ran out, ``error``); plugin ``ended {outcome}`` when it ends the call
@@ -19,6 +24,13 @@ Phone protocol on ``/api/plugins/hermes_voice/phone`` (JSON text frames plus bin
 Turn routing: a sync ``start_call`` waiting on the call takes the first turn that reached the plugin after the
 phone confirmed its line played (``Waiter.accepts``); every other turn is force-injected into the owner's
 conversation (``inject.py``).
+
+Playback feedback: when the phone's facts say a line may not have been heard well, or the user replayed it, the
+agent gets a short note with the next thing the call hands it (a ``start_call`` result or a ``[Voice]`` turn;
+``Call.remarks``). Fine playback adds nothing. The facts, never the text, go to the ring log (``playback``). A
+call that ends in the middle of a line says how much of the line was heard (the phone's facts, else the host's
+own clock). The audio of the call's last fully spoken line is kept in memory (``Kept``, gone with the call), and a
+``start_call`` with exactly that text replays it instead of asking ElevenLabs again.
 
 The hub lives in the dashboard process. Conversations in other Hermes processes reach it over a local socket
 (``hubsock.py``, opened once the dashboard serves): their calls carry a ``route`` that hands each turn to the
@@ -102,6 +114,10 @@ HELD_RETRY_LIMIT_S = 120.0
 # How long the line that tells the user waits for the phone's link (a call the user starts fails its first
 # delivery while the link is still coming up).
 HELD_LINK_WAIT = 5.0
+# The audio of a call's last line is kept for a replay up to this size (16-bit mono at 24 kHz: about 3 minutes).
+KEPT_AUDIO_LIMIT = 8 * 1024 * 1024
+# A replayed line goes out in frames of this many bytes (0.2 s of audio).
+REPLAY_FRAME = 9600
 
 OUTCOMES = frozenset({
     "answered", "no_answer", "declined", "push_failed", "unreachable", "lost", "tts_failed", "ended_by_user",
@@ -115,16 +131,19 @@ UNHEARD_OUTCOMES = frozenset({"ended_by_user", "lost"})
 # Ended before anyone answered: whatever the agent was to offer on this call is still to be offered on the next.
 NEVER_ANSWERED = frozenset({"no_answer", "declined", "push_failed", "unreachable"})
 
+# `{heard}`: how much of the line they did hear, in parentheses (``CallHub.cut_off``).
 CALL_ENDED = (
-    "The call ended while this line was being spoken, so the user may not have heard all of it. They can't hear "
-    "you now: put what matters in a short text recap."
+    "The call ended while this line was being spoken, so the user may not have heard all of it{heard}. They can't "
+    "hear you now: put what matters in a short text recap."
 )
 CALL_DROPPED = (
-    "The phone lost its connection while this line was being spoken, so the user may not have heard all of it. "
-    "The phone reconnects by itself: say it again with start_call on the next [Voice] message."
+    "The phone lost its connection while this line was being spoken, so the user may not have heard all of "
+    "it{heard}. The phone reconnects by itself: say it again with start_call on the next [Voice] message."
 )
 
 CALL_ID = re.compile(r"[0-9a-f]{32}")
+# A line's id (``Line.id``), as the phone names it back.
+LINE_ID = re.compile(r"[0-9a-f]{12}")
 ENDINGS = frozenset(inject.MARKERS)
 
 # What a send on a socket the phone has dropped (or the server has closed) raises.
@@ -279,8 +298,31 @@ class Line:
         self.sent_at: Optional[float] = None
         self.heard_by: Optional[float] = None
         self.played_at: Optional[float] = None
+        # Its audio: when the first frame went out (host wall-clock), how many seconds went out so far, and whether
+        # that was all of it. With no facts from the phone, they say how much of the line was heard.
+        self.audio_at: Optional[float] = None
+        self.audio_s = 0.0
+        self.streamed = False
+        # What the phone reported about how the line played (``played`` / ``unplayed``).
+        self.playback: Optional[guidance.Playback] = None
+        # The audio to send instead of asking the voice service: the call's last line had exactly this text.
+        self.replay: Optional[bytes] = None
         self.done = threading.Event()
         self.task: Optional[asyncio.Task] = None
+
+
+@dataclass(frozen=True)
+class Kept:
+    """The audio of the last line a call spoke in full, for a replay of the same text. In memory only; it goes
+    with the next line that is spoken, and with the call."""
+
+    text: str
+    voice: tuple[str, str, bool]  # (voice id, model id, fake TTS): another voice or model is another audio
+    audio: bytes
+
+
+def _voice_of(settings: Settings) -> tuple[str, str, bool]:
+    return settings.voice_id, settings.model_id, bool(settings.fake_tts)
 
 
 class Waiter:
@@ -349,6 +391,7 @@ class Call:
         self.answered_at: Optional[float] = time.time() if state == "live" else None
         self.ended_at: Optional[float] = None
         self.connected = False  # a phone link said hello for this call
+        self.dropped_at: Optional[float] = None  # since when the phone's link is gone (None: it has one)
         self.pushed = 0  # phones APNs accepted the VoIP push for (0: not rung by a push, or not yet)
         self.rang = False  # the phone reported it is ringing
         self.lines: deque[Line] = deque()
@@ -360,6 +403,17 @@ class Call:
         # conversation's next call), and what an earlier call left to offer on this one (`offer_pending`: the
         # agent hasn't been reminded yet).
         self.unheard: list[str] = []
+        # For each unheard line, how much of it the user did hear (``guidance.heard_text``).
+        self.unheard_heard: list[str] = []
+        # What the agent is still to be told about how its lines played on the phone (``guidance.playback_note``,
+        # the user's own replay), by kind ("playback", "replayed"; a newer one of a kind replaces the older): handed
+        # over once, with the next start_call result or [Voice] turn. Each with the id of the line it is about;
+        # `last_line` is the agent's line that began to be spoken last.
+        self.remarks: dict[str, tuple[str, str]] = {}
+        self.last_line = ""
+        self.volume_told = False
+        # The audio of the last line spoken in full (``Kept``), for a replay of the same text.
+        self.kept: Optional[Kept] = None
         self.offer: list[str] = []
         self.offer_pending = False
         # Where turns go when the conversation runs in another process (hubsock.Route): deliver(text), close().
@@ -508,6 +562,11 @@ class PhoneLink:
         for event in self.played.values():
             event.set()
 
+    def give_up(self, speech_id: str) -> None:
+        """The phone is done with the line without having played it to the end: stop waiting for its ack."""
+        if (event := self.played.get(speech_id)) is not None:
+            event.set()
+
 
 # ── the hub ────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -600,6 +659,7 @@ class CallHub:
             return
         logger.info("hermes_voice: call %s dropped; keeping it %.0fs for a reconnect", link.call_id[:8],
                     DROP_RETENTION)
+        call.dropped_at = time.time()
         self.dropped[link.call_id] = link
         asyncio.get_running_loop().call_later(DROP_RETENTION, self._expire_link, link)
 
@@ -638,9 +698,14 @@ class CallHub:
                 return None
             await asyncio.sleep(0.05)
 
-    def cut_off(self, call: Call) -> str:
-        """The result for a line the call went away during."""
-        return CALL_ENDED if call.state == "ended" and call.outcome != "lost" else CALL_DROPPED
+    def cut_off(self, call: Call, line: Optional["Line"] = None) -> str:
+        """The result for a line the call went away during, with how much of `line` was heard by then."""
+        heard = ""
+        if line is not None:
+            with self.lock:
+                heard = f" ({self._heard(line, call.dropped_at or call.ended_at or time.time())})"
+        template = CALL_ENDED if call.state == "ended" and call.outcome != "lost" else CALL_DROPPED
+        return template.format(heard=heard)
 
     def problem(self, call: Call) -> str:
         """Why nothing can be spoken on the call right now."""
@@ -677,13 +742,19 @@ class CallHub:
             timer, call.ring_timer = call.ring_timer, None
             if outcome in UNHEARD_OUTCOMES:
                 # Still queued or playing: the phone never confirmed it heard these out.
-                call.unheard = [line.text for line in call.lines if line.played_at is None]
+                missed = [line for line in call.lines if line.played_at is None]
+                call.unheard = [line.text for line in missed]
+                # A lost call stopped playing when its link went away, not when the hub gave up on it.
+                stopped = call.dropped_at if outcome == "lost" and call.dropped_at else call.ended_at
+                call.unheard_heard = [self._heard(line, stopped) for line in missed]
+            call.kept = None
+            call.remarks = {}
             for line in [line for line in call.lines if line.state == "queued"]:
                 self._settle(call, line, SpeakResult("not_delivered", self.problem(call)))
             waiting = call.waiter is not None
             # A "[Voice, hung up]" turn already said the call is over, but not what went unheard.
             quiet = outcome == "ended_by_user" and call.hang_up_turn and not call.unheard
-            unheard = list(call.unheard)
+            unheard, heard = list(call.unheard), list(call.unheard_heard)
             still_to_offer = call.offer if call.offer_pending or outcome in NEVER_ANSWERED else []
             call.offer, call.offer_pending = [], False
             self.changed.notify_all()
@@ -696,7 +767,7 @@ class CallHub:
         # A scheduled ring nobody took rings again later (its conversation hears nothing yet), or is given up.
         over = self.schedule.ring_over(call, outcome) if call.scheduled is not None else schedule.Over()
         if not waiting and not quiet and not over.again:
-            notice = inject.outcome_notice(outcome, detail, unheard)
+            notice = inject.outcome_notice(outcome, detail, unheard, heard)
             if notice:
                 call.inbox.put(f"{notice}{over.note}")
         call.inbox.close()
@@ -820,7 +891,8 @@ class CallHub:
                                         **(self.schedule.ring_log(scheduled) if scheduled is not None else {}))
                 logger.info("hermes_voice: ringing for %s (call %s%s)", origin.session_id, call.call_id[:8],
                             f", scheduled {scheduled.id}" if scheduled is not None else "")
-        _, waiter = self.enqueue_line(call, text, mode, line_note, wait=mode == "sync")
+        line, waiter = self.enqueue_line(call, text, mode, line_note, wait=mode == "sync", reuse=True)
+        line_note = line.note  # says so when the line is a replay of the last one's audio
         if rang:
             if mode == "sync":
                 self._push(call, mode)
@@ -831,13 +903,46 @@ class CallHub:
         with self.lock:
             status = "speaking" if call.state == "live" else "ringing" if call.state == "ringing" else "ended"
             reminder = self._offer_reminder(call) if status != "ended" else ""
+            remarks = self._take_remarks(call, for_next_line=True)
         note = {
             "ringing": "The phone is ringing; your line is spoken once the user answers.",
             "speaking": "Your line is being spoken.",
             "ended": "The call ended before your line could be spoken.",
         }[status]
         note += " What the user says arrives as [Voice] messages; answer them with start_call."
-        return Begun({"call_id": call.call_id, "status": status, "note": f"{note}{line_note}{reminder}"}, call)
+        return Begun({"call_id": call.call_id, "status": status,
+                      "note": f"{note}{line_note}{reminder}{' ' + remarks if remarks else ''}"}, call)
+
+    def _take_remarks(self, call: Call, for_next_line: bool = False) -> str:
+        """Once (under lock): what the agent is still to be told about how its lines played on the phone. The notes
+        say "your last line"; where that would point at another line they name the right one: in the result for
+        the next line (`for_next_line`, which has not played yet) "your line before this one", and for a line the
+        agent has spoken past since, "an earlier line of yours"."""
+        remarks, call.remarks = call.remarks, {}
+        return " ".join(guidance.about_line(note, earlier=line_id != call.last_line, before_this=for_next_line)
+                        for line_id, note in remarks.values())
+
+    def _remark(self, call: Call, kind: str, line_id: str, note: str) -> None:
+        """Keep `note`, about the line `line_id`, for the next thing the call hands the agent (under lock). One of
+        a kind at a time: a newer note of the kind replaces the older one."""
+        if note and call.state != "ended":
+            call.remarks.pop(kind, None)
+            call.remarks[kind] = (line_id, note)
+
+    def _heard(self, line: Line, now: float) -> str:
+        """How much of a line the user heard when the call ended in the middle of it (under lock): what the phone
+        reported for it, else what the host's clock says was played since the line's first audio went out."""
+        facts = line.playback
+        total = max(line.audio_s, (facts.audio_s or 0.0) if facts is not None else 0.0)
+        if not line.streamed:
+            total = max(total, guidance.speech_seconds(line.text))  # not all of it was made yet
+        if facts is not None and facts.played_s is not None:
+            heard = facts.played_s
+        elif line.audio_at is None:
+            heard = 0.0
+        else:
+            heard = min(max(0.0, now - line.audio_at), line.audio_s)
+        return guidance.heard_text(heard, total)
 
     def _offer_reminder(self, call: Call) -> str:
         """Once per call (under lock): the reminder to offer what the conversation's last call left unheard."""
@@ -876,12 +981,20 @@ class CallHub:
         return {"call_id": call.call_id, "outcome": "ended_by_agent", "note": f"Hung up.{note}"}
 
     def enqueue_line(self, call: Call, text: str, mode: str = "async", note: str = "",
-                     wait: bool = False) -> tuple[Line, Optional[Waiter]]:
+                     wait: bool = False, reuse: bool = False) -> tuple[Line, Optional[Waiter]]:
         """Queue a line on the call (any thread); it is spoken once the call is live. With `wait`, a sync
-        waiter for the reply to it takes over the call's turns."""
+        waiter for the reply to it takes over the call's turns. With `reuse`, a line with exactly the text of the
+        call's last spoken one (and nothing else waiting to be said) replays that line's audio, and its note says
+        so."""
         line = Line(text, mode, note)
         waiter = Waiter(line) if wait else None
+        voice = _voice_of(self.settings()) if reuse else None
         with self.lock:
+            kept = call.kept
+            if (voice is not None and kept is not None and call.state != "ended" and kept.text == text
+                    and kept.voice == voice and all(other.text == text for other in call.lines)):
+                line.replay = kept.audio
+                line.note = f"{note}{guidance.SAME_AUDIO}"
             if call.state == "ended":
                 self._settle(call, line, SpeakResult("not_delivered", self.problem(call)))
                 if waiter is not None:
@@ -943,6 +1056,8 @@ class CallHub:
                             result["note"] = f"{result.get('note') or ''} {about_line}".strip()
                         if call.state != "ended" and (reminder := self._offer_reminder(call)):
                             result["note"] = f"{result.get('note') or ''}{reminder}".strip()
+                        if remarks := self._take_remarks(call):
+                            result["note"] = f"{result.get('note') or ''} {remarks}".strip()
                         self.changed.notify_all()
                         break
                     self.changed.wait(0.25)
@@ -973,7 +1088,7 @@ class CallHub:
                     "note": "A newer start_call on this call took over waiting for the reply."}
         if call.state == "ended":
             return _sync(call, "", None, call.outcome or "lost",
-                         _outcome_note(call.outcome or "", call.detail, call.unheard))
+                         _outcome_note(call.outcome or "", call.detail, call.unheard, call.unheard_heard))
         if line.state == "failed":
             return _sync(call, "", None, "tts_failed", line.result.message if line.result else "")
         if line.state in ("not_connected", "cut_off", "cancelled", "not_delivered") and not interrupted:
@@ -1013,6 +1128,8 @@ class CallHub:
                 if line is None:
                     return
                 line.state = "speaking"
+                if line.mode != "hub":  # the hub's own line is not one of the agent's
+                    call.last_line = line.id
             task = line.task = asyncio.ensure_future(self._speak_line(call, line))
             try:
                 await asyncio.wait({task})
@@ -1043,12 +1160,54 @@ class CallHub:
         return (line.mode == "async" and call.state != "ended"
                 and result.status in ("failed", "not_connected", "cut_off"))
 
-    def mark_played(self, call: Call, speech_id: str) -> None:
+    def mark_played(self, call: Call, speech_id: str, facts: Optional[guidance.Playback] = None) -> None:
+        """The phone heard the line to the end. `facts`: what it reports about how the line played; when that may
+        not have been well, the agent hears so with the next thing the call hands it."""
+        played = False
         with self.lock:
             for line in call.lines:
                 if line.id == speech_id and line.played_at is None:
                     line.played_at = time.time()
+                    played = True
+                    if facts is not None:
+                        line.playback = facts
+                        if line.mode != "hub":  # the hub's own line is not "your last line"
+                            self._remark(call, "playback", line.id,
+                                         guidance.playback_note(facts, call.volume_told))
+                            call.volume_told = call.volume_told or "low_volume" in facts.problems()
                     self.changed.notify_all()
+        if played and facts is not None:
+            self._log_playback(call, speech_id, facts)
+
+    def mark_unplayed(self, call: Call, link: PhoneLink, speech_id: str, facts: guidance.Playback) -> None:
+        """The phone did not play the line to the end (``unplayed``). Its facts say how much of it was heard if
+        the call ends now. ``lost`` (its audio never all reached the speaker, and the phone has moved on): the
+        line stops waiting for an ack and counts as unconfirmed from now."""
+        with self.lock:
+            line = next((item for item in call.lines if item.id == speech_id and item.played_at is None), None)
+            if line is not None:
+                line.playback = facts
+                if facts.ended == "lost":
+                    now = time.time()
+                    line.heard_by = now if line.heard_by is None else min(line.heard_by, now)
+        if line is not None and facts.ended == "lost":
+            link.give_up(speech_id)
+        if line is not None or LINE_ID.fullmatch(speech_id):
+            self._log_playback(call, speech_id, facts)
+
+    def note_replayed(self, call: Call, speech_id: str) -> None:
+        """The user had the phone play the last line again (``replayed``): the agent hears so with the next thing
+        the call hands it."""
+        with self.lock:
+            # The phone names the line it played again; one that names none means the last one.
+            self._remark(call, "replayed", speech_id if LINE_ID.fullmatch(speech_id) else call.last_line,
+                         guidance.REPLAYED_BY_USER)
+        self.policy.log({"event": "replayed", "call_id": call.call_id,
+                         **({"line": speech_id} if LINE_ID.fullmatch(speech_id) else {})})
+
+    def _log_playback(self, call: Call, speech_id: str, facts: guidance.Playback) -> None:
+        """A line's playback facts in the ring log (numbers and codes: never what was said)."""
+        self.policy.log({"event": "playback", "call_id": call.call_id, "line": speech_id, **facts.log()})
 
     async def _speak_line(self, call: Call, line: Line) -> SpeakResult:
         """Stream the line to the call and wait until the phone has played it."""
@@ -1072,7 +1231,16 @@ class CallHub:
                 sent = 0
                 audio_started: Optional[float] = None
                 carry = b""
-                async with aclosing(self.tts.stream(line.text, None)) as audio:
+                # The audio kept from the call's last line when this one has the same text; else the voice service,
+                # whose audio is kept in turn (in memory, while it fits) once all of it went out.
+                replayed = line.replay is not None
+                voice = _voice_of(self.settings())
+                keeping: Optional[list[bytes]] = None if replayed else []
+                if not replayed:
+                    with self.lock:
+                        call.kept = None  # the call's last spoken line is this one now
+                source = _frames(line.replay) if line.replay is not None else self.tts.stream(line.text, None)
+                async with aclosing(source) as audio:
                     async for chunk in audio:
                         chunk = carry + chunk
                         # Keep whole 16-bit samples per frame; hold back an odd trailing byte.
@@ -1082,11 +1250,23 @@ class CallHub:
                             continue
                         if audio_started is None:
                             audio_started = loop.time()
+                            with self.lock:
+                                line.audio_at = time.time()
                         if not await utterance.send(chunk[:cut]):
-                            return SpeakResult("cut_off", self.cut_off(call))
+                            return SpeakResult("cut_off", self.cut_off(call, line))
                         sent += cut
+                        line.audio_s = sent / 2 / SAMPLE_RATE
+                        if keeping is not None and sent <= KEPT_AUDIO_LIMIT:
+                            keeping.append(chunk[:cut])
+                        else:
+                            keeping = None
+                line.streamed = True
+                if keeping:
+                    with self.lock:
+                        if call.state != "ended":
+                            call.kept = Kept(line.text, voice, b"".join(keeping))
                 if not await utterance.send({"type": "speech_end", "id": speech_id}):
-                    return SpeakResult("cut_off", self.cut_off(call))
+                    return SpeakResult("cut_off", self.cut_off(call, line))
                 seconds = sent / 2 / SAMPLE_RATE
                 # The phone plays as audio arrives: it finishes `seconds` after the first frame, or just
                 # after the last one if the stream was slower than real time.
@@ -1101,10 +1281,17 @@ class CallHub:
                     pass
                 if speech_id in acked:
                     gap = " The connection dropped briefly, so they may have missed part." if utterance.resumed else ""
-                    return SpeakResult("played", f"Spoken to the user ({seconds:.1f}s of audio).{gap}", seconds,
+                    how = "Replayed" if replayed else "Spoken"
+                    return SpeakResult("played", f"{how} to the user ({seconds:.1f}s of audio).{gap}", seconds,
                                        utterance.resumed)
                 if call.call_id not in self.links:
-                    return SpeakResult("cut_off", self.cut_off(call), seconds)
+                    return SpeakResult("cut_off", self.cut_off(call, line), seconds)
+                # Nobody is told about an unconfirmed line by its own result (an async start_call returned long
+                # ago; a sync one goes on waiting for the reply): the next thing the call hands the agent says so.
+                with self.lock:
+                    facts = line.playback if line.playback is not None and line.playback.ended == "lost" else None
+                    if line.mode != "hub":
+                        self._remark(call, "playback", line.id, guidance.unplayed_note(facts, seconds))
                 return SpeakResult("unconfirmed",
                                    "The phone did not confirm it played the audio, so the user may not have heard it.",
                                    seconds)
@@ -1170,6 +1357,7 @@ class CallHub:
                 if call.state != "ended":
                     link, previous = self.connect_link(call.call_id, ws)
                     call.connected = True
+                    call.dropped_at = None
                 live = call.state == "live"
             if link is None:
                 await _turn_away(ws, call)
@@ -1186,7 +1374,13 @@ class CallHub:
                 kind = message.get("type")
                 if kind == "played":
                     if link.ack(str(message.get("id"))):
-                        self.mark_played(call, str(message.get("id")))
+                        self.mark_played(call, str(message.get("id")),
+                                         guidance.Playback.parse(message.get("playback")))
+                elif kind == "unplayed":
+                    # With or without facts: an empty report still says the phone is done with the line.
+                    facts = guidance.Playback.parse(message.get("playback") or {}, message.get("reason"))
+                    if facts is not None:
+                        self.mark_unplayed(call, link, str(message.get("id")), facts)
                 elif kind == "ping":
                     await ws.send_json({"type": "pong"})
                 elif link.ended.is_set():
@@ -1207,6 +1401,8 @@ class CallHub:
                     turn = Turn.parse(message, call.call_id)
                     if turn is not None:
                         self.on_turn(call, turn)
+                elif kind == "replayed":
+                    self.note_replayed(call, str(message.get("id")))
                 elif kind == "bye":
                     hung_up = True
                     bye_reason = str(message.get("reason") or "")
@@ -1301,6 +1497,9 @@ class CallHub:
                 return
             if turn.ending == "hang_up":
                 call.hang_up_turn = True
+            else:
+                # How the agent's last line played on the phone, if that is still to be told.
+                text = inject.with_playback_note(text, self._take_remarks(call))
         call.inbox.put(text)
 
     def deliver(self, call: Call, text: str) -> inject.Delivery:
@@ -1481,9 +1680,10 @@ def _refusal(mode: str, outcome: str, note: str) -> dict[str, Any]:
     return {"call_id": None, "status": outcome, "note": note}
 
 
-def _outcome_note(outcome: str, detail: str, unheard: Any = ()) -> str:
+def _outcome_note(outcome: str, detail: str, unheard: Any = (), heard: Any = ()) -> str:
     """How a call ended, for a sync start_call's result: what happened, that it is no preference of the user's,
-    what they did not hear, and what to do now (the same as the notice an async call gets)."""
+    what they did not hear (and how much of it they did), and what to do now (the same as the notice an async
+    call gets)."""
     if outcome == "ended_by_agent":
         return "The call was ended with end_call."
     what = {
@@ -1496,7 +1696,7 @@ def _outcome_note(outcome: str, detail: str, unheard: Any = ()) -> str:
     }.get(outcome)
     if what is None:
         return detail
-    return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard)} {inject.after_call(outcome)}"
+    return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard, heard)} {inject.after_call(outcome)}"
 
 
 def _style_for(call: Call) -> str:
@@ -1601,6 +1801,13 @@ class _Utterance:
             await asyncio.shield(sending)
         except asyncio.CancelledError:
             pass  # cancelled again: it still finishes in the background, bounded by NOTICE_TIMEOUT
+
+
+async def _frames(audio: bytes) -> Any:
+    """Kept audio as the frames of a line that is replayed: all at once, as fast as the link takes them."""
+    for start in range(0, len(audio), REPLAY_FRAME):
+        yield audio[start:start + REPLAY_FRAME]
+        await asyncio.sleep(0)
 
 
 class _Stalled(Exception):

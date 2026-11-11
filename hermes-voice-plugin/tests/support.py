@@ -13,6 +13,7 @@ import contextlib
 import contextvars
 import importlib.util
 import json
+import re
 import socket
 import sys
 import threading
@@ -385,6 +386,8 @@ class Phone:
         self.inbox: asyncio.Queue[dict] = asyncio.Queue()
         self.heard_audio = asyncio.Event()
         self.played_at: dict[str, float] = {}
+        # What the phone reports with its acks about how a line played (None: an app from before it did).
+        self.playback: Optional[dict] = None
         self.reader = asyncio.create_task(self._read())
 
     @classmethod
@@ -409,7 +412,9 @@ class Phone:
                 self.messages.append(message)
                 if self.auto_ack and message["type"] == "speech_end" and not message.keys() & {"cancelled", "error"}:
                     self.played_at[message["id"]] = time.time()
-                    await self.socket.send(json.dumps({"type": "played", "id": message["id"]}))
+                    await self.socket.send(json.dumps({
+                        "type": "played", "id": message["id"],
+                        **({"playback": self.playback} if self.playback is not None else {})}))
                 await self.inbox.put(message)
         except websockets.ConnectionClosed:
             pass
@@ -453,6 +458,13 @@ async def say_line(hub: Any, call: Any, text: str, timeout: float = 20) -> Any:
     await asyncio.to_thread(line.done.wait, timeout)
     assert line.done.is_set(), "line never finished"
     return line.result
+
+
+def heard_part(text: str) -> tuple[str, list[str]]:
+    """`text` without the "(they heard …)" that follows each quoted unheard line, and those parts. How much was
+    heard depends on when a test hangs up, so tests compare the rest and look at the parts on their own."""
+    pattern = re.compile(r'(?<=") \((they heard (?:none of it|nearly all of it|about \d+ of \d+ s))\)')
+    return pattern.sub("", text), pattern.findall(text)
 
 
 async def until(predicate: Callable[[], Any], timeout: float = 5) -> Any:
