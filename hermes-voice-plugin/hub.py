@@ -11,6 +11,8 @@ Phone protocol on ``/api/plugins/hermes_voice/phone`` (JSON text frames plus bin
 - plugin ``speech_start {id, text, sample_rate, format}``, PCM frames, ``speech_end {id}`` (or with
   ``cancelled: true`` / ``error``); the phone answers a normal end with ``played {id}`` once it was heard
 - phone ``user_turn {call_id, text, ending {kind, ...}, provider, language?, started_at, ended_at}``
+- plugin ``location_request {id}`` -> phone ``location {id, latitude, longitude, accuracy_m, fixed_at, ...}`` or
+  ``location {id, error}`` (``location.py``: the ``get_location`` tool, when the phone shares its location)
 - phone ``ping`` -> ``pong``; phone ``bye {reason?}`` hangs up (``hang_up``, ``declined``, ``no_answer`` when its own
   ring timeout ran out, ``error``); plugin ``ended {outcome}`` when it ends the call
 - close codes: 4401 auth, 4400 bad hello, 4409 replaced by a newer link for the call, 4429 another conversation
@@ -1177,6 +1179,9 @@ class CallHub:
                     turn = Turn.parse(message, call.call_id)
                     if turn is not None:
                         self.on_turn(call, turn)
+                elif kind == "location":
+                    from . import location  # the phone's answer to a location_request (location.py)
+                    location.locations().phone_frame(message)
                 elif kind == "bye":
                     hung_up = True
                     bye_reason = str(message.get("reason") or "")
