@@ -11,6 +11,10 @@ that one token and the same request path; only the headers differ:
   device's VoIP token.
 - Alert: ``apns-push-type: alert``, topic ``<bundle id>``, priority 10, an expiration a while ahead (APNs keeps it
   for a phone that is offline just now) and a collapse id, to the device's alert token; at most 4 KB.
+- Background: ``apns-push-type: background``, topic ``<bundle id>``, priority 5 (APNs refuses 10 for these),
+  ``{"aps": {"content-available": 1}, ...}`` with no alert, sound or badge, to the alert token of the phones that
+  share their location (``location.py``: "where are you?"). iOS hands these to the app when it sees fit: it
+  throttles them, holds them back in Low Power Mode and drops them for an app the user force-quit.
 
 Devices register with ``POST /api/plugins/hermes_voice/devices``; they are kept per profile in
 ``<HERMES_HOME>/hermes-voice/devices.json``, with the alert kinds each one turned off. APNs' ``410 Unregistered`` /
@@ -52,6 +56,9 @@ ALERT_KINDS = ("approval", "clarify", "turn_done")
 ALERT_TTL_S = {"approval": 900, "clarify": 900, "turn_done": 3600}
 # APNs refuses a larger alert payload (VoIP allows 5 KB).
 MAX_ALERT_BYTES = 4096
+# How long APNs keeps a background push for a phone it can't reach just now: the request it carries isn't worth
+# answering later than that.
+BACKGROUND_TTL_S = 30
 COLLAPSE_ID = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 
 
@@ -80,6 +87,10 @@ class Device:
     registered_at: float = field(default_factory=time.time)
     # Alert kinds this phone turned off or back on ({"turn_done": False}); a kind it never named is on.
     alerts: dict[str, bool] = field(default_factory=dict)
+    # The user turned "Share location with Hermes" on in the app (off by default), and whether iOS lets the app
+    # answer while it is in the background (Always authorization). See location.py.
+    location: bool = False
+    location_background: bool = False
 
     def wants(self, kind: str) -> bool:
         """Whether this phone takes alert pushes of `kind` (any needs an alert token)."""
@@ -108,8 +119,19 @@ def parse_device(body: Any) -> Device:
     bundle = str(body.get("bundle_id") or "").strip()
     if not BUNDLE_ID.fullmatch(bundle) or ".." in bundle:
         raise DeviceError("bundle_id must be the app's bundle identifier")
+    shares, background = _location_choice(body.get("location"))
     return Device(voip.lower(), environment, bundle, alert.lower() if alert else None,
-                  alerts=_alert_choices(body.get("alerts")))
+                  alerts=_alert_choices(body.get("alerts")), location=shares, location_background=background)
+
+
+def _location_choice(raw: Any) -> tuple[bool, bool]:
+    """A registration's ``location: {"enabled": bool, "background"?: bool}``: (shares, answers in the background)."""
+    if raw is None:
+        return False, False
+    if (not isinstance(raw, dict) or not isinstance(raw.get("enabled"), bool)
+            or not isinstance(raw.get("background", False), bool)):
+        raise DeviceError('location must be {"enabled": true or false, "background": true or false}')
+    return raw["enabled"], raw["enabled"] and raw.get("background", False)
 
 
 def _alert_choices(raw: Any) -> dict[str, bool]:
@@ -122,9 +144,10 @@ def _alert_choices(raw: Any) -> dict[str, bool]:
 
 def kept_fields(body: Any) -> frozenset[str]:
     """What a registration leaves as stored because the body doesn't name it: ``alert_token`` (an explicit null
-    clears it). Alert choices are always merged kind by kind."""
+    clears it) and ``location`` (whether the phone shares its location). Alert choices are always merged kind by
+    kind."""
     named = body if isinstance(body, dict) else {}
-    return frozenset(name for name in ("alert_token",) if name not in named)
+    return frozenset(name for name in ("alert_token", "location") if name not in named)
 
 
 class DeviceStore:
@@ -154,6 +177,8 @@ class DeviceStore:
                 continue
             alerts = device.alerts if isinstance(device.alerts, dict) else {}
             device.alerts = {k: v for k, v in alerts.items() if k in ALERT_KINDS and isinstance(v, bool)}
+            device.location = device.location is True
+            device.location_background = device.location and device.location_background is True
             devices.append(device)
         return devices
 
@@ -176,6 +201,8 @@ class DeviceStore:
             if earlier is not None:
                 if "alert_token" in keep:
                     device.alert_token = earlier.alert_token
+                if "location" in keep:
+                    device.location, device.location_background = earlier.location, earlier.location_background
                 device.alerts = {**earlier.alerts, **device.alerts}
             # A phone whose VoIP token changed but not its alert token is the same phone: one entry, one alert.
             others = [d for d in devices if d.voip_token != device.voip_token
@@ -338,6 +365,43 @@ class Apns:
         if delivered:
             return PushResult(True, "", delivered)
         return PushResult(False, "; ".join(dict.fromkeys(failures)) or "APNs refused the alert", retry=transient)
+
+    def push_background(self, payload: dict[str, Any], collapse_id: str = "") -> PushResult:
+        """Wake the app on every phone of this profile that shares its location, with a background push
+        (``content-available``; nothing is shown). OK when APNs accepted at least one, which says nothing about
+        when iOS hands it to the app, or whether it does."""
+        key, reason = self._ready()
+        if key is None:
+            return PushResult(False, reason)
+        devices = [device for device in self.store.devices() if device.location and device.alert_token]
+        if not devices:
+            return PushResult(False, "no iPhone that shares its location has a notification token")
+        body = encode_alert({**payload, "aps": {"content-available": 1}})
+        if len(body) > MAX_ALERT_BYTES:
+            return PushResult(False, f"the push is larger than APNs allows ({len(body)} bytes)")
+        headers = {"apns-push-type": "background", "apns-priority": "5",
+                   "apns-expiration": str(int(self.clock() + BACKGROUND_TTL_S))}
+        if collapse_id and COLLAPSE_ID.fullmatch(collapse_id):
+            headers["apns-collapse-id"] = collapse_id
+        failures: list[str] = []
+        delivered = 0
+        transient = False
+        with self._client() as client:
+            for device in devices:
+                token = str(device.alert_token)
+                ok, why, gone, passing = self._post(client, key, device.environment, token,
+                                                    {**headers, "apns-topic": device.bundle_id}, body)
+                if ok:
+                    delivered += 1
+                    continue
+                if gone:
+                    logger.info("hermes_voice: forgetting an alert token APNs no longer knows (%s)", why)
+                    self.store.forget_alert_token(token)
+                transient = transient or passing
+                failures.append(why)
+        if delivered:
+            return PushResult(True, "", delivered)
+        return PushResult(False, "; ".join(dict.fromkeys(failures)) or "APNs refused the push", retry=transient)
 
     def ready(self) -> tuple[bool, str]:
         """Whether a push can go out from here (the key is set and readable, HTTP/2 is there), else why not."""

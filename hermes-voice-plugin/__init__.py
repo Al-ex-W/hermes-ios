@@ -4,9 +4,10 @@
 the hooks: ``pre_llm_call`` / ``on_session_end`` tell which conversations are busy and keep a call with its
 conversation through compression (in the dashboard process for its hub; anywhere else for the calls ``remote.py``
 places through the hub's socket), and ``post_llm_call`` / ``on_session_end`` tell the alert pushes (``notify.py``)
-when a turn ended. The phone's socket and the device, Scribe-token and status routes live in
+when a turn ended. It also adds ``get_location`` (``location.py``: where the phone is, when the user shares
+that). The phone's socket and the device, location, Scribe-token and status routes live in
 ``dashboard/plugin_api.py``. Both halves share one call hub per process through ``loader.py``, which both load by
-path.
+path. A third call tool, ``scheduled_calls``, lists and cancels the calls ``start_call`` scheduled for later.
 """
 
 from __future__ import annotations
@@ -45,7 +46,8 @@ def register(ctx: Any) -> None:
     tools = _core("tools")
     # start_call's description carries the user's call style as it is now (tools.start_call_schema).
     for schema, handler, emoji in ((tools.start_call_schema(), tools.start_call, "📞"),
-                                   (tools.END_CALL, tools.end_call, "📵")):
+                                   (tools.END_CALL, tools.end_call, "📵"),
+                                   (tools.SCHEDULED_CALLS, tools.scheduled_calls, "⏰")):
         spec = {"name": schema["name"], "toolset": tools.TOOLSET, "schema": schema, "handler": handler,
                 "check_fn": tools.available}
         try:
@@ -67,6 +69,22 @@ def register(ctx: Any) -> None:
             logger.warning("hermes_voice: could not register the %s hook", name, exc_info=True)
     _register_alerts(ctx)
     _bind_remote_calls(ctx)
+    _register_location(ctx)
+
+
+def _register_location(ctx: Any) -> None:
+    """The ``get_location`` tool (``location.py``): where the user's phone is, when it shares its location."""
+    try:
+        location, tools = _core("location"), _core("tools")
+        schema = location.GET_LOCATION
+        spec = {"name": schema["name"], "toolset": tools.TOOLSET, "schema": schema,
+                "handler": location.get_location, "check_fn": tools.available}
+        try:
+            ctx.register_tool(**spec, description=schema["description"], emoji="📍")
+        except TypeError:  # a Hermes without the display fields
+            ctx.register_tool(**spec)
+    except Exception:  # noqa: BLE001 - the call tools still work
+        logger.warning("hermes_voice: could not register get_location", exc_info=True)
 
 
 def _pre_llm_call(session_id: Any = None, parent_session_id: Any = None, user_message: Any = None,

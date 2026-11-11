@@ -15,6 +15,8 @@ platforms:
 provides_tools:
   - start_call
   - end_call
+  - scheduled_calls
+  - get_location
 provides_hooks:
   - pre_llm_call
   - post_llm_call
@@ -83,3 +85,11 @@ config_schema:
     description: >-
       Alert pushes to the phone (an approval or a question waiting, a turn done) for dashboard conversations no
       client has open: enabled (true), approval / clarify / turn_done (true), grace_s (5), previews (true)
+  location:
+    type: dict
+    description: >-
+      The get_location tool (where the phone is, when the user turned "Share location with Hermes" on in the
+      app): enabled (true; false refuses every request on this host), allow_cron (true: scheduled jobs may ask),
+      timeout_s (20: how long the tool waits for the phone), fresh_s (60: a fix younger than this is given without
+      asking the phone again), keep_s (1800: how long the last fix stays in memory; it is never written to disk),
+      requests_per_session (6) per session_window_s (600), requests_global (30) per global_window_s (3600)

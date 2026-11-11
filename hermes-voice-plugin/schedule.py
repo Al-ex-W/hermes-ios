@@ -11,7 +11,7 @@ session), and a Hermes cron job is a scheduled origin the policy refuses. So the
   dashboard per folder rings (``scheduled.runner``, a ``flock`` held while it runs; a second one waits and takes
   over). It looks at the file every ``TICK_S``, so a call rings within about a second of its time, with no chat,
   client or agent turn open. Conversations in other processes schedule through the hub socket (``hubsock.py``:
-  ``schedule`` / ``cancel_scheduled``).
+  ``schedule`` / ``scheduled_calls``).
 - **Policy.** Who may schedule is checked when scheduling (``Policy.check_schedule``: cron, subagent, group and
   source rules), so a call that could never ring is refused at once. At its time the ring is the call the user
   asked for: quiet hours and the ring rate limits are not asked again (the ring log names the ``scheduled`` id; the
@@ -418,7 +418,8 @@ def started_notice(ring: Ring, call_id: str, style: str = "") -> str:
         f"(scheduled_id {ring.id}, call {call_id}) and is hearing the line you gave then: "
         f"{guidance.quote_lines([ring.text])}.{late}{earlier} Don't speak yet: wait for their reply, which arrives "
         "as a message starting with \"[Voice]\", and answer that with start_call (your text replies are not "
-        f"spoken). Hang up with end_call.{' ' + style if style else ''}"
+        "spoken). The line is as old as its scheduling: check anything that may have changed since before you say "
+        f"more. Hang up with end_call.{' ' + style if style else ''}"
     )
 
 
@@ -529,7 +530,7 @@ class Scheduler:
             limit = (f"this conversation already has {PER_CONVERSATION} calls scheduled" if full == "conversation"
                      else f"{OVERALL} calls are already scheduled on this host")
             return {"status": "not_allowed", "scheduled_id": None, "pending": self.pending(origin),
-                    "note": f"Not scheduled: {limit}. Cancel one first with end_call and its scheduled_id."}
+                    "note": f"Not scheduled: {limit}. Cancel one first with scheduled_calls."}
         self.hub.policy.log({"event": "scheduled", "scheduled": entry.id, "session_id": origin.session_id,
                              "source": surface, "rings_at": _iso(rings_at)})
         logger.info("hermes_voice: call %s scheduled for %s by %s", entry.id, local_text(rings_at, zone),
@@ -541,10 +542,10 @@ class Scheduler:
                  if cfg.retries else "If they don't answer you get a notice.")
         note = (
             f"Scheduled: the phone rings at {entry.brief()['rings_at']} ({zone or 'host time'}), in "
-            f"about {span_text(rings_at - now)}, by itself: tell the user the time, and don't wait for it. Your line "
-            "is spoken once they answer. mode is ignored for a scheduled call: what they say then arrives as "
-            f"[Voice] messages; answer them with start_call. {retry} Cancel with end_call and scheduled_id "
-            f"\"{entry.id}\"."
+            f"about {span_text(rings_at - now)}, by itself: tell the user the time the way people say it (\"tomorrow "
+            "at seven\"), and don't wait for it. Your line is spoken once they answer. mode is ignored for a "
+            f"scheduled call: what they say then arrives as [Voice] messages; answer them with start_call. {retry} "
+            f"List or cancel with scheduled_calls (cancel: \"{entry.id}\")."
             f"{self._warnings(rings_at, surface)}{clip_note}{guidance.long_line_note(text)}"
         )
         return {"status": "scheduled", "scheduled_id": entry.id, "rings_at": entry.brief()["rings_at"],
@@ -571,14 +572,15 @@ class Scheduler:
                       "be put into it; put everything they need into the line.")
         return notes
 
-    def cancel(self, origin: hermes.Origin, which: Any) -> dict[str, Any]:
-        """``end_call`` with ``scheduled_id``: cancel one of the conversation's scheduled calls, ``"all"`` of them,
-        or only ``"list"`` them. Returns ``{cancelled, pending, note}``; never hangs anything up."""
-        wanted = str(which or "").strip()
+    def calls(self, origin: hermes.Origin, cancel: Any = None) -> dict[str, Any]:
+        """The ``scheduled_calls`` tool: the conversation's scheduled calls, after cancelling the one `cancel`
+        names (a ``scheduled_id``) or ``"all"`` of them. Returns ``{pending, cancelled, note}``; never rings or
+        hangs anything up."""
+        wanted = str(cancel).strip() if given(cancel) else ""
         key = wanted.lower()
-        if key == "list":
+        if key in ("", "list"):
             pending = self.pending(origin)
-            return {"cancelled": [], "pending": pending,
+            return {"pending": pending, "cancelled": [],
                     "note": f"{_count(len(pending))} scheduled in this conversation. Nothing was changed."}
 
         def remove(entries: list[Entry]) -> list[Entry]:
@@ -600,7 +602,7 @@ class Scheduler:
         if removed:
             ringing = any(entry.call_id for entry in removed)
             note = (f"Cancelled {_count(len(removed))}; nothing was hung up."
-                    f"{' One of them is ringing right now: end_call without scheduled_id hangs up.' if ringing else ''}"
+                    f"{' One of them is ringing right now: end_call hangs up.' if ringing else ''}"
                     + (f" {_count(len(pending))} still scheduled in this conversation." if pending
                        else " Nothing else is scheduled in this conversation."))
         elif key == "all":
@@ -608,7 +610,7 @@ class Scheduler:
         else:
             note = (f"This conversation has no scheduled call {wanted[:40]!r}; nothing was cancelled. "
                     f"{_count(len(pending))} scheduled here (see pending).")
-        return {"cancelled": [entry.id for entry in removed], "pending": pending, "note": note}
+        return {"pending": pending, "cancelled": [entry.id for entry in removed], "note": note}
 
     def pending(self, origin: hermes.Origin) -> list[dict[str, Any]]:
         """The conversation's scheduled calls, soonest first, as tool results list them."""

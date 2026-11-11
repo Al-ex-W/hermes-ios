@@ -44,6 +44,13 @@ enum VoicePluginAPI {
         _ = try await call(client, "POST", "/devices", body: body)
     }
 
+    /// `POST /location`: this iPhone's answer to a location request that came by background push: a fix, or why it
+    /// has none (`LocationSharing.handle`). The plugin's refusals (not registered, not sharing, nobody asked) come as
+    /// `refused`, in its words.
+    static func postLocation(_ client: DashboardClient, body: JSON) async throws {
+        _ = try await call(client, "POST", "/location", body: body, refusals: true)
+    }
+
     /// `POST /scribe-token`: a single-use ElevenLabs Scribe token, minted by the plugin with its API key.
     static func scribeToken(_ client: DashboardClient) async throws -> String {
         let result = try await call(client, "POST", "/scribe-token", body: [:])

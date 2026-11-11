@@ -371,6 +371,7 @@ struct SettingsContentView: View {
         case .profiles: ProfilesPage()
         case .connection: ConnectionSettingsView()
         case .calls: CallsSettingsView()
+        case .location: LocationSettingsView(anchor: anchor)
         case .apiKeys: KeysSettingsView(view: subpage ?? "tools", anchor: anchor)
         case .sessions: SessionsSettingsView(subpage: subpage, anchor: anchor)
         case .about: AboutSettingsView()

@@ -16,6 +16,8 @@ Phone protocol on ``/api/plugins/hermes_voice/phone`` (JSON text frames plus bin
   (``guidance.Playback``: seconds received and played, stalls, audio restarts, route, volume)
 - phone ``replayed {id}``: the user had the phone play the last line again, from the audio it kept
 - phone ``user_turn {call_id, text, ending {kind, ...}, provider, language?, started_at, ended_at}``
+- plugin ``location_request {id}`` -> phone ``location {id, latitude, longitude, accuracy_m, fixed_at, ...}`` or
+  ``location {id, error}`` (``location.py``: the ``get_location`` tool, when the phone shares its location)
 - phone ``ping`` -> ``pong``; phone ``bye {reason?}`` hangs up (``hang_up``, ``declined``, ``no_answer`` when its own
   ring timeout ran out, ``error``); plugin ``ended {outcome}`` when it ends the call
 - close codes: 4401 auth, 4400 bad hello, 4409 replaced by a newer link for the call, 4429 another conversation
@@ -962,8 +964,8 @@ class CallHub:
                 live = call.state == "live"
         if not mine:
             pending = self.schedule.pending(origin)
-            later = (f" It has {len(pending)} scheduled for later (see pending); end_call with scheduled_id "
-                     "cancels one." if pending else "")
+            later = (f" It has {len(pending)} scheduled for later (see pending); scheduled_calls cancels them."
+                     if pending else "")
             return {"call_id": None, "outcome": None, "note": f"This conversation has no voice call running.{later}",
                     **({"pending": pending} if pending else {})}
         note = ""
@@ -1403,6 +1405,9 @@ class CallHub:
                         self.on_turn(call, turn)
                 elif kind == "replayed":
                     self.note_replayed(call, str(message.get("id")))
+                elif kind == "location":
+                    from . import location  # the phone's answer to a location_request (location.py)
+                    location.locations().phone_frame(message)
                 elif kind == "bye":
                     hung_up = True
                     bye_reason = str(message.get("reason") or "")
@@ -1696,7 +1701,8 @@ def _outcome_note(outcome: str, detail: str, unheard: Any = (), heard: Any = ())
     }.get(outcome)
     if what is None:
         return detail
-    return f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard, heard)} {inject.after_call(outcome)}"
+    return (f"{what} {inject.RESULT_SCOPE}{guidance.unheard_note(unheard, heard)} "
+            f"{inject.after_call(outcome, unheard)}")
 
 
 def _style_for(call: Call) -> str:

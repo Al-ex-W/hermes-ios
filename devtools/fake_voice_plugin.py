@@ -13,6 +13,24 @@ call mode can be tested in the iOS Simulator without Hermes, APNs or ElevenLabs:
   GET  /api/plugins/hermes_voice/debug/pushes     every push the fake would have sent
   GET  /api/plugins/hermes_voice/debug/playback   what phones reported about how lines played (the last 200):
                                                   {reports: [{call_id, type, id, reason?, playback?, problems?}]}
+  POST /api/plugins/hermes_voice/location         the phone's answer to a location request it got by background push:
+                                                  {voip_token?, alert_token?, request_id, latitude, longitude,
+                                                  accuracy_m, fixed_at, speed_mps?, course_deg?} or {…, error}
+  POST /api/plugins/hermes_voice/debug/location-request   asks the phone where it is, as get_location does, and
+                                                  answers at once with {request_id, via: "call"|"push", payload,
+                                                  sent_to} (or {status, note} when no phone shares its location)
+  GET  /api/plugins/hermes_voice/debug/location   {sharing, fix, requests}: the last fix and every request, with the
+                                                  background push payload of those that went by push
+
+Location (hermes-voice-plugin/location.py): a device registers ``location: {"enabled": bool, "background"?: bool}``
+with POST /devices (kept when a later registration doesn't name it). ``get_location`` asks on the call's link when
+one is up (``location_request {id}`` -> phone ``location {id, latitude, …}`` or ``location {id, error}``), else by
+a background push, which the fake only records (``payload``, ``sent_to``). In the Simulator, hand the request to a
+debug build of the app with ``xcrun simctl openurl booted "hermesvoice://location-request?request_id=<id>"`` and it
+posts its fix to POST /location (``xcrun simctl push`` doesn't reach the app's handler with a content-available
+payload: the Simulator turns it into a background fetch). The fix is
+kept in memory, dropped when the phone turns sharing off, and shown only by debug/location. Not modelled: who may
+ask, the rate limits, and the stored fix's age limit.
 
 The alert half lives in fake_hermes.py's ``AlertVoicePlugin``, which the dashboard mounts: ``alerts`` on
 POST /devices, GET debug/alerts, and the plugin's test alert routes (POST /devices/test, GET /devices/test/{test_id},
@@ -55,6 +73,7 @@ The fake agent (fake_hermes.py run_turn hands these to ``FakeVoicePlugin.handle`
   "[Voice call started] …"   start_call("Hi, I am fake Hermes. I can hear you.") on that call
   "[Voice] <said>"           start_call("You said: <said>") while the call is live, and the same as text
   "hang up" / "end the call" end_call("Goodbye from fake Hermes.") on this session's call
+  "where am i"               get_location(): waits for the phone's fix (--location-timeout), then says it as text
   the plugin's notices       a short text reply
 
 Simulator: the Simulator can't receive VoIP pushes, so nothing is pushed. Each push is logged (``FAKE … voice push``)
@@ -68,7 +87,8 @@ with initiated_by "push" (the fake then answers ready {state: "ringing"}). To ri
        http://127.0.0.1:9311/api/plugins/hermes_voice/debug/ring
 
 Options (fake_hermes.py flags): --call-ring-timeout (default 45 s, then no_answer/unreachable), --call-drop-retention
-(default 60 s a live call waits for a dropped link before it is lost).
+(default 60 s a live call waits for a dropped link before it is lost), --location-timeout (default 20 s the fake
+agent's get_location waits for the phone).
 """
 
 from __future__ import annotations
@@ -128,9 +148,11 @@ NOTICE_MARKER = "Automated notice from HermesVoice, not something the user said.
 NOTICE_HEAD = f"{NOTICE_MARKER} It applies to this call only and is not a preference, so don't store it."
 RESULT_SCOPE = "This is about this call only and is not a preference, so don't store it."
 AWAY = (
-    "The user can't hear you now and is probably not reading this chat. Finish the task you were given, then reply "
-    "once in text with a short recap; if you were waiting for an answer, say what you still need."
+    "The user can't hear you now and is probably not reading this chat. Finish the task you were given. Don't take "
+    "actions that needed their answer. Then reply once in text with a short recap, for when they look; if you were "
+    "waiting for an answer, say what you still need."
 )
+DELIBERATE = "The hang-up may have been deliberate: don't ring to ask why."
 NEXT_CALL = "When they next call or ask for a call, speak as usual"
 AFTER_CALL = {
     "no_answer": f"{AWAY} Don't ring again unless it is urgent or the user asks. {NEXT_CALL}.",
@@ -139,8 +161,8 @@ AFTER_CALL = {
     "unreachable": f"{AWAY} Tell them the ring didn't get through, and don't ring again unless the user asks.",
     "lost": (f"{AWAY} Ring again with start_call only if it's worth it. {NEXT_CALL} and first offer anything they "
              "missed."),
-    "ended_by_user": (f"{AWAY} Don't ring back unless the user asked in this conversation to be called when you're "
-                      f"done. {NEXT_CALL} and first offer anything they missed."),
+    "ended_by_user": (f"{AWAY} {DELIBERATE} Don't ring back unless the user asked in this conversation to be called "
+                      f"when you're done. {NEXT_CALL} and first offer anything they missed."),
 }
 # The notes on start_call results (hermes-voice-plugin/hub.py: start_call, _outcome_note).
 ASYNC_NOTES = {
@@ -179,6 +201,27 @@ VOICE_TURN = re.compile(r"\[Voice(?:, ([^\]]+))?\] ?(.*)", re.DOTALL)
 # A merged queue slot is prompts joined by blank lines; the plugin's own texts start a new block with "[Voice".
 BLOCKS = re.compile(r"\n\n(?=\[Voice)")
 VOIP_TOKEN = re.compile(r"[0-9a-fA-F]{16,256}")
+
+# Location (hermes-voice-plugin/location.py): the tool's wait, its notes and the phone's error codes.
+LOCATION_TIMEOUT = 20.0
+LOCATION_FRESH_S = 60.0
+LOCATION_ERRORS = ("off", "denied", "unavailable", "timeout")
+WHERE_AM_I = re.compile(r"\bwhere am i\b", re.IGNORECASE)
+LOCATION_SHARING_OFF = (
+    "Location sharing is off on the user's iPhone, so nothing was asked and nothing was sent. If you need their "
+    "location, ask them to turn on \"Share location with Hermes\" (Settings → Location in the HermesVoice app), or "
+    "ask them where they are."
+)
+LOCATION_NO_PHONE = (
+    "No iPhone is registered with this Hermes host, so there is nobody to ask. The user has to open the HermesVoice "
+    "app while signed in to this host."
+)
+LOCATION_PHONE_ERRORS = {
+    "off": ("sharing_off", LOCATION_SHARING_OFF),
+    "denied": ("unavailable", "The phone answered that iOS doesn't let the app use its location right now."),
+    "unavailable": ("unavailable", "The phone answered that it can't get a position fix right now."),
+    "timeout": ("unavailable", "The phone answered that it could not get a position fix in time."),
+}
 
 # What a send on (or a read from) a socket that is gone raises.
 _SOCKET_GONE = (WebSocketDisconnect, RuntimeError, OSError)
@@ -417,10 +460,16 @@ class FakeVoicePlugin:
         self.playback: list[dict[str, Any]] = []
         self.ring_watchers: dict[str, list[asyncio.Future]] = {}
         self.tasks: set[asyncio.Task] = set()
+        # Location (location.py): the last fix (memory only) and every request, by id.
+        self.location_timeout = float(getattr(args, "location_timeout", LOCATION_TIMEOUT))
+        self.location_fix: dict[str, Any] | None = None
+        self.location_requests: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     @staticmethod
     def add_arguments(parser: argparse.ArgumentParser) -> None:
         group = parser.add_argument_group("fake hermes_voice plugin")
+        group.add_argument("--location-timeout", type=float, default=LOCATION_TIMEOUT,
+                           help="seconds the fake agent's get_location waits for the phone's fix")
         group.add_argument("--call-ring-timeout", type=float, default=RING_TIMEOUT,
                            help="seconds an agent call rings before it ends as no_answer")
         group.add_argument("--call-drop-retention", type=float, default=DROP_RETENTION,
@@ -435,6 +484,9 @@ class FakeVoicePlugin:
             Route(f"{PREFIX}/debug/ring", self.debug_ring, methods=["POST"]),
             Route(f"{PREFIX}/debug/pushes", self.debug_pushes, methods=["GET"]),
             Route(f"{PREFIX}/debug/playback", self.debug_playback, methods=["GET"]),
+            Route(f"{PREFIX}/location", self.post_location, methods=["POST"]),
+            Route(f"{PREFIX}/debug/location-request", self.debug_location_request, methods=["POST"]),
+            Route(f"{PREFIX}/debug/location", self.debug_location, methods=["GET"]),
         ]
 
     # ── helpers ───────────────────────────────────────────────────────────────────────────────────
@@ -529,7 +581,8 @@ class FakeVoicePlugin:
         active = None if call is None else {"call_id": call.call_id, "session_id": call.owner, "title": call.title,
                                             "state": call.state, "initiated_by": call.initiated_by}
         return JSONResponse({"calls": 0 if call is None else 1, "tts": "fake", "h2": False,
-                             "apns_configured": False, "scribe_configured": False, "active_call": active})
+                             "apns_configured": False, "scribe_configured": False, "active_call": active,
+                             "location": self.location_status()})
 
     async def debug_pushes(self, request: Request) -> Response:
         if (denied := self.gate(request, post=False)) is not None:
@@ -562,6 +615,191 @@ class FakeVoicePlugin:
                  + (f" ({report['reason']})" if "reason" in report else "")
                  + (f" {self.host.short(facts, 160)}" if facts is not None else "")
                  + (f" MALFORMED: {', '.join(problems)}" if problems else ""))
+
+    # ── location (hermes-voice-plugin/location.py) ────────────────────────────────────────────────
+
+    def sharing_devices(self) -> list[dict[str, Any]]:
+        return [device for device in self.devices.values() if (device.get("location") or {}).get("enabled")]
+
+    def location_status(self) -> dict[str, Any]:
+        """``location`` in GET /status: whether a phone shares, never where it is."""
+        sharing = self.sharing_devices()
+        fix = self.location_fix
+        return {"enabled": True, "sharing": bool(sharing), "phones": len(sharing),
+                "background": sum(1 for device in sharing if device["location"].get("background")),
+                "last_fix_age_s": None if fix is None else round(max(0.0, time.time() - fix["fixed"]))}
+
+    def location_changed(self, device: dict[str, Any]) -> None:
+        """A phone registered (again): once none shares, the fix goes and whoever waits hears that sharing is off."""
+        if (device.get("location") or {}).get("enabled") or self.sharing_devices():
+            return
+        if self.location_fix is not None:
+            self.log("location sharing is off on every phone: the last fix is dropped")
+        self.location_fix = None
+        for entry in self.location_requests.values():
+            self.location_settle(entry, error="off")
+
+    @staticmethod
+    def location_settle(entry: dict[str, Any], fix: dict[str, Any] | None = None, error: str = "") -> None:
+        if entry["status"] != "pending":
+            return
+        entry["status"], entry["error"] = ("answered", None) if fix is not None else ("failed", error)
+        future = entry["future"]
+        if not future.done():
+            future.set_result(fix)
+
+    def location_ask(self) -> dict[str, Any]:
+        """One request to the phone: on the call's link when one is up, else by a background push (only recorded)."""
+        request_id = uuid.uuid4().hex[:16]
+        link = self.call.link if self.call is not None else None
+        entry: dict[str, Any] = {"request_id": request_id, "via": "push", "status": "pending", "error": None,
+                                 "payload": None, "sent_to": [], "asked_at": iso(time.time()),
+                                 "future": asyncio.get_running_loop().create_future()}
+        if link is not None and not link.closed:
+            entry["via"] = "call"
+            self.spawn(link.send({"type": "location_request", "id": request_id}))
+            self.log(f"location request {request_id} -> the call's link ({self.call.call_id[:8]})")
+        else:
+            entry["payload"] = {"aps": {"content-available": 1},
+                                "hermes": {"kind": "location_request", "request_id": request_id,
+                                           "profile": "default"}}
+            entry["sent_to"] = [device["alert_token"] for device in self.sharing_devices()
+                                if device.get("alert_token")]
+            self.log(f"location request {request_id} -> a background push to {len(entry['sent_to'])} device(s) "
+                     f"(nothing is pushed: GET {PREFIX}/debug/location has the payload)")
+        self.location_requests[request_id] = entry
+        while len(self.location_requests) > 50:
+            del self.location_requests[next(iter(self.location_requests))]
+        return entry
+
+    def location_answer(self, body: dict[str, Any], via: str) -> tuple[int, str]:
+        """The phone's answer to a request: (HTTP status, what is wrong) as the plugin's POST /location says it."""
+        entry = self.location_requests.get(str(body.get("request_id") or body.get("id") or ""))
+        if entry is None:
+            return 409, "Nobody asked for this location (request_id is unknown or too old)"
+        error = body.get("error")
+        if error is not None:
+            code = error if error in LOCATION_ERRORS else "unavailable"
+            self.log(f"location request {entry['request_id']}: the phone answered {code!r} ({via})")
+            self.location_settle(entry, error=code)
+            return 200, ""
+        fix: dict[str, Any] = {"source": via}
+        for name, low, high, required in (("latitude", -90.0, 90.0, True), ("longitude", -180.0, 180.0, True),
+                                          ("accuracy_m", 0.0, 1e7, True), ("speed_mps", 0.0, 1e4, False),
+                                          ("course_deg", 0.0, 360.0, False)):
+            value = body.get(name)
+            if value is None and not required:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return 400, f"{name} must be a number"
+            if not low <= value <= high:
+                return 400, f"{name} must be between {low:g} and {high:g}"
+            fix[name] = float(value)
+        fixed = parse_time(body.get("fixed_at"))
+        if fixed is None:
+            return 400, "fixed_at must be the fix's time (ISO 8601)"
+        if fixed > time.time() + 300:
+            return 400, "fixed_at is in the future"
+        fix["fixed"] = fixed
+        self.location_fix = fix
+        self.log(f"location request {entry['request_id']}: a fix arrived ({via}, within {fix['accuracy_m']:g} m)")
+        self.location_settle(entry, fix=fix)
+        return 200, ""
+
+    @staticmethod
+    def location_view(fix: dict[str, Any], source: str = "") -> dict[str, Any]:
+        """A fix as get_location gives it."""
+        view = {"latitude": round(fix["latitude"], 6), "longitude": round(fix["longitude"], 6),
+                "accuracy_m": round(fix["accuracy_m"], 1), "age_s": round(max(0.0, time.time() - fix["fixed"]), 1),
+                "fixed_at": iso(fix["fixed"]), "source": source or fix["source"]}
+        view.update({name: round(fix[name], 1) for name in ("speed_mps", "course_deg") if name in fix})
+        return view
+
+    async def get_location(self, max_age_s: float | None = None) -> dict[str, Any]:
+        """The plugin's ``get_location``: the fix, or ``{status, note}`` (with ``last_known`` when there is one)."""
+        if not self.devices:
+            return {"status": "no_phone", "note": LOCATION_NO_PHONE}
+        if not self.sharing_devices():
+            return {"status": "sharing_off", "note": LOCATION_SHARING_OFF}
+        fresh = LOCATION_FRESH_S if max_age_s is None else max(0.0, max_age_s)
+        last = self.location_fix
+        if fresh > 0 and last is not None and time.time() - last["fixed"] <= fresh:
+            return {"status": "ok", **self.location_view(last, "cached"),
+                    "note": "The phone sent this fix a moment ago; it was not asked again (max_age_s)."}
+        entry = self.location_ask()
+        try:
+            fix = await asyncio.wait_for(asyncio.shield(entry["future"]), self.location_timeout)
+        except TimeoutError:
+            fix = None
+        if fix is not None:
+            return {"status": "ok", **self.location_view(fix), "note": "A fresh fix from the phone."}
+        if entry["error"]:
+            status, note = LOCATION_PHONE_ERRORS[entry["error"]]
+        else:
+            status = "no_answer"
+            note = (f"The phone was asked {'over the voice call' if entry['via'] == 'call' else 'with a background push'}"
+                    f" and did not answer within {self.location_timeout:g} s.")
+        result: dict[str, Any] = {"status": status, "note": note}
+        if self.location_fix is not None:
+            result["last_known"] = {**self.location_view(self.location_fix), "stale": True}
+        return result
+
+    async def post_location(self, request: Request) -> Response:
+        if (denied := self.gate(request, post=True)) is not None:
+            return denied
+
+        def refuse(status: int, detail: str) -> Response:
+            self.log(f"http POST {PREFIX}/location -> {status} ({detail})")
+            return JSONResponse({"detail": detail}, status_code=status)
+
+        body = await self.json_body(request)
+        if body is None:
+            return refuse(400, "Body must be a JSON object")
+        tokens = []
+        for name in ("voip_token", "alert_token"):
+            token = body.get(name) or ""
+            if token and not (isinstance(token, str) and re.fullmatch(r"[0-9a-fA-F]{64,200}", token.strip())):
+                return refuse(400, f"{name} must be the hex APNs token")
+            tokens.append(token.strip().lower())
+        if not any(tokens):
+            return refuse(400, "voip_token or alert_token must name the phone that answers")
+        device = self.devices.get(tokens[0]) if tokens[0] else None
+        if device is None and tokens[1]:
+            device = next((d for d in self.devices.values() if d.get("alert_token") == tokens[1]), None)
+        if device is None:
+            return refuse(404, "This iPhone isn't registered with the Hermes host")
+        if not (device.get("location") or {}).get("enabled"):
+            return refuse(403, "This iPhone doesn't share its location with the Hermes host")
+        status, problem = self.location_answer(body, "push")
+        if status != 200:
+            return refuse(status, problem)
+        self.log(f"http POST {PREFIX}/location -> 200")
+        return JSONResponse({"ok": True})
+
+    @staticmethod
+    def location_request_view(entry: dict[str, Any]) -> dict[str, Any]:
+        return {name: value for name, value in entry.items() if name != "future"}
+
+    async def debug_location_request(self, request: Request) -> Response:
+        """Ask the phone as ``get_location`` would, without waiting for its answer."""
+        if (denied := self.gate(request, post=True)) is not None:
+            return denied
+        if not self.devices:
+            return JSONResponse({"status": "no_phone", "note": LOCATION_NO_PHONE})
+        if not self.sharing_devices():
+            return JSONResponse({"status": "sharing_off", "note": LOCATION_SHARING_OFF})
+        return JSONResponse(self.location_request_view(self.location_ask()))
+
+    async def debug_location(self, request: Request) -> Response:
+        """What the fake knows: who shares, the last fix (a test tool: the real plugin never shows it) and every
+        request, oldest first."""
+        if (denied := self.gate(request, post=False)) is not None:
+            return denied
+        fix = self.location_fix
+        return JSONResponse({"sharing": bool(self.sharing_devices()),
+                             "fix": None if fix is None else self.location_view(fix),
+                             "requests": [self.location_request_view(entry)
+                                          for entry in self.location_requests.values()]})
 
     async def debug_ring(self, request: Request) -> Response:
         """Have the session's fake agent call start_call, as the prompt "call me <mode>: <text>" does."""
@@ -731,6 +969,12 @@ class FakeVoicePlugin:
             return True
         elif kind == "user_turn":
             self.on_turn(call, message)
+        elif kind == "location":
+            # The phone's answer to a location_request; like the plugin, a fix is taken only while a phone shares.
+            status, problem = (self.location_answer(message, "call") if self.sharing_devices()
+                               else (403, "no phone shares its location"))
+            if status != 200:
+                self.log(f"call {call.call_id[:8]} ignored a location answer ({problem})")
         elif kind == "bye":
             reason = message.get("reason")
             self.log(f"call {call.call_id[:8]} bye" + (f" ({self.host.short(reason, 80)})" if reason else ""))
@@ -1094,7 +1338,7 @@ class FakeVoicePlugin:
             return (self.call is not None and self.call.call_id == call_id) or call_id in self.ended
         if VOICE_TURN.match(block):
             return stored.key in self.calls_by_key
-        if CALL_ME.search(block):
+        if CALL_ME.search(block) or WHERE_AM_I.search(block):
             return True
         return bool(HANG_UP.search(block)) and self.call is not None and self.call.owner == stored.key
 
@@ -1128,6 +1372,8 @@ class FakeVoicePlugin:
                 return f"{spoken}{note} (the call is over, so text only)"
             await self.tool(rt, stored, "start_call", {"text": spoken, "mode": "async"})
             return f"You said{note}: {said}" if said else f"Nothing came through{note}."
+        if WHERE_AM_I.search(block) and not CALL_ME.search(block):
+            return self.describe_location(await self.tool(rt, stored, "get_location", {}))
         if (match := CALL_ME.search(block)) is not None:
             mode = match.group(1).lower()
             text = match.group(2).strip() or (SYNC_LINE if mode == "sync" else ASYNC_LINE)
@@ -1148,12 +1394,26 @@ class FakeVoicePlugin:
             return f"You said: {result['said']}" + ("" if kind == "end_of_speech" else f" ({kind})")
         return f"The call ended without a reply ({result.get('outcome')})."
 
+    @staticmethod
+    def describe_location(result: dict[str, Any]) -> str:
+        if result.get("status") != "ok":
+            last = result.get("last_known")
+            old = f" Last known, {last['age_s']:.0f} s ago: {last['latitude']}, {last['longitude']}." if last else ""
+            return f"No location ({result.get('status')}): {result.get('note')}{old}"
+        return (f"You are at {result['latitude']}, {result['longitude']} (within {result['accuracy_m']:g} m, "
+                f"{result['age_s']:.0f} s ago, via {result['source']}).")
+
     async def tool(self, rt: Any, stored: Any, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """One tool call in the turn (tool.start, the work, tool.complete, stored rows) with a JSON result."""
         out: dict[str, Any] = {}
 
         async def work() -> tuple[str, bool]:
             nonlocal out
+            if name == "get_location":
+                out = await self.get_location(args.get("max_age_s"))
+                # As the plugin logs it: that it was asked and how it ended, not where the phone is.
+                self.log(f"{name} from {stored.key} -> {out.get('status')} ({out.get('source') or 'no fix'})")
+                return json.dumps(out, ensure_ascii=False), out.get("status") == "ok"
             if name == "start_call":
                 out = await self.start_call(stored, args["text"], args["mode"])
             else:

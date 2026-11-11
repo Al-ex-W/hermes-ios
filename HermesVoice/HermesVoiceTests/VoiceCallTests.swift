@@ -264,6 +264,35 @@ final class VoiceCallTests: XCTestCase {
         return (call, speech[speech.count - 1])
     }
 
+    // MARK: Location
+
+    func testHermesAsksWhereThePhoneIsOnTheCall() async {
+        let fix = LocationFix(latitude: 59.0, longitude: 18.0, accuracy: 10, fixedAt: Date(timeIntervalSince1970: 1_790_000_000))
+        var asked = 0
+        let (call, _) = await liveCall { environment in
+            environment.locate = {
+                asked += 1
+                return .fix(fix)
+            }
+        }
+        link.deliver(.locationRequest("req-1"))
+        await waitUntil { self.link.sent.contains(.location(id: "req-1", .fix(fix))) }
+        XCTAssertEqual(asked, 1)
+        XCTAssertEqual(call.state, .live, "the call goes on")
+        // A request that is still being answered when the call ends gets no answer on a dead link.
+        link.deliver(.locationRequest("req-2"))
+        call.hangUp()
+        await settle()
+        XCTAssertFalse(link.sent.contains(.location(id: "req-2", .fix(fix))))
+    }
+
+    func testACallWithoutLocationSharingSaysItIsOff() async {
+        let (call, _) = await liveCall()
+        link.deliver(.locationRequest("req-1"))
+        await waitUntil { self.link.sent.contains(.location(id: "req-1", .failure(.off))) }
+        XCTAssertEqual(call.state, .live)
+    }
+
     // MARK: Ringing
 
     func testPushCallRingsThenAnswers() async {

@@ -151,6 +151,25 @@ lists every test with the `payload` the phone would have got. To see it in the S
 `payload.json` and run `xcrun simctl push booted <bundle id> payload.json`; the notification's actions then work as
 on a phone.
 
+Location works as in the plugin (`hermes-voice-plugin/location.py`): a registration's `location: {enabled,
+background}` is kept per device (`GET /status` lists it, and says under `location` whether a phone shares), typing
+`where am I` in a chat makes the fake agent call `get_location` (it waits `--location-timeout`, 20 s, for the
+phone), and `POST …/location` takes the phone's fix or its `error` with the plugin's refusals (`404` unknown phone,
+`403` not sharing, `409` nobody asked, `400` a bad fix). With a call up the fake asks on the call's link
+(`location_request {id}`); otherwise it records the background push instead of sending it.
+`POST …/debug/location-request` asks without waiting and returns `{request_id, via, payload, sent_to}`, and
+`GET …/debug/location` shows `{sharing, fix, requests}` (the fix only here: a test tool). To see the push path in
+the Simulator: `xcrun simctl location booted set 59.0,18.0`, turn **Settings → Location → Share location with
+Hermes** on in the app and allow location, then hand the request to a debug build with
+`xcrun simctl openurl booted "hermesvoice://location-request?request_id=<request_id>"` (the Simulator asks “Open
+in Hermes Voice?” first: tap Open): the app handles it exactly like the background push, and the fix shows in
+`GET …/debug/location`. `xcrun simctl push` can't stand in here:
+the Simulator (iOS 26.4) turns a `content-available` payload into a background fetch
+(`performFetchWithCompletionHandler`, and only for an app with the `fetch` background mode) and never calls the
+app's remote-notification handler, which is what a real background push from APNs reaches. (The Simulator
+hands the app real VoIP and alert tokens, so it registers with the fake by itself once signed in.)
+Not modelled: who may ask, the rate limits and the stored fix's age limit.
+
 ### Settings screens (M3)
 
 The Settings, Profiles and Providers screens have their routes here too, each honouring `?profile=`: the config
