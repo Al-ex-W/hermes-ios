@@ -599,7 +599,8 @@ def test_register_adds_tools_skill_and_hooks(core, fake, make_hub):
     assert "[Voice]" in ctx.tools["start_call"]["description"]
     assert set(ctx.skills) == {"voice-calls"}
     assert ctx.skills["voice-calls"].read_text().startswith("---\nname: voice-calls\n")
-    assert set(ctx.hooks) == {"pre_llm_call", "post_llm_call", "on_session_end"}  # post_llm_call: alert pushes
+    # post_llm_call and on_session_finalize: alert pushes
+    assert set(ctx.hooks) == {"pre_llm_call", "post_llm_call", "on_session_end", "on_session_finalize"}
 
     hub = make_hub()
     origin = core.hermes.Origin(session_id="a")

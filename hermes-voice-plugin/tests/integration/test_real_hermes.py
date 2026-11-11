@@ -94,11 +94,16 @@ def test_dashboard_auth_guards_the_plugin(hermes):
             second = await dashboard.socket(f"{PREFIX}/phone", ticket=reused)
             await second.wait_closed()
             codes["reused ticket"] = second.close_code
-            # A Host the dashboard doesn't serve (DNS rebinding): refused like a bad credential.
+            # A Host the dashboard doesn't serve (DNS rebinding) is refused: by the dashboard's own gate in front of
+            # every plugin socket, before the upgrade (HTTP 403; Hermes 0.22.7 and later), else by the plugin's
+            # check, like a bad credential (4401). The app takes both as "unauthorized" (VoiceLink.closed).
             uri = f"ws://evil.example:{sandbox.port}{PREFIX}/phone?ticket={await dashboard.ticket()}"
-            async with websockets.connect(uri, host="127.0.0.1", port=sandbox.port, proxy=None) as foreign:
-                await foreign.wait_closed()
-                codes["foreign host"] = foreign.close_code
+            try:
+                async with websockets.connect(uri, host="127.0.0.1", port=sandbox.port, proxy=None) as foreign:
+                    await foreign.wait_closed()
+                    codes["foreign host"] = foreign.close_code
+            except websockets.exceptions.InvalidStatus as refused:
+                codes["foreign host"] = f"http {refused.response.status_code}"
             return status_without_cookie, status, codes
 
     without, status, codes = asyncio.run(scenario())
@@ -106,8 +111,9 @@ def test_dashboard_auth_guards_the_plugin(hermes):
     assert status["tts"] == "fake" and status["calls"] == 0 and status["active_call"] is None
     assert set(status) >= {"calls", "tts", "h2", "apns_configured", "scribe_configured"}
     assert codes["unknown call"] == {"type": "cancel", "reason": "unknown_call"}
+    assert codes.pop("foreign host") in (4401, "http 403")
     assert codes == {"unknown call": codes["unknown call"], "forged ticket": 4401, "ticket": 1000,
-                     "reused ticket": 4401, "foreign host": 4401}
+                     "reused ticket": 4401}
 
 
 def test_sync_start_call_returns_what_the_user_said(hermes):
