@@ -14,13 +14,15 @@ from support import PLUGIN_DIR, FakeHermes, FakePusher, PacedSpeech, RecordingIn
 
 # The dashboard's hub opens its socket for other processes once it serves; the tests open their own (test_remote).
 os.environ["HERMES_VOICE_HUB_SOCKET"] = "0"
+# Nor does the process's hub ring scheduled calls by itself: test_schedule drives its schedulers' ticks.
+os.environ["HERMES_VOICE_SCHEDULE"] = "0"
 
 
 @pytest.fixture(scope="session")
 def core() -> types.SimpleNamespace:
     """The plugin's core modules (one shared copy, as in Hermes) and the dashboard API module."""
     loader = _load("hermes_voice_loader", PLUGIN_DIR / "loader.py")
-    names = ("hub", "tools", "inject", "policy", "push", "tts", "config", "hermes", "notify", "guidance")
+    names = ("hub", "tools", "inject", "policy", "push", "tts", "config", "hermes", "notify", "guidance", "schedule")
     mods = types.SimpleNamespace(loader=loader, **{n: loader.module(n, PLUGIN_DIR) for n in names})
     mods.api = _load("hermes_dashboard_plugin_hermes_voice", PLUGIN_DIR / "dashboard" / "plugin_api.py")
     # The routes start the process's alert watcher; tests drive their own watchers' ticks instead.

@@ -6,6 +6,9 @@ author: Al-ex-W
 license: MIT
 homepage: https://github.com/Al-ex-W/hermes-ios
 kind: standalone
+# The oldest Hermes the plugin was ever run against (the canary of 2026-10-25); tested against 0.23.0. The plugin
+# reaches into Hermes internals (hermes.py), so a newer Hermes needs the integration suite run again (README).
+requires_hermes: ">=0.22.5"
 platforms:
   - linux
   - macos
@@ -17,6 +20,7 @@ provides_hooks:
   - pre_llm_call
   - post_llm_call
   - on_session_end
+  - on_session_finalize
 # APNs needs HTTP/2, which httpx only speaks with h2 installed (Hermes' own venv lacks it).
 python_dependencies:
   - "h2>=4,<5"
@@ -69,6 +73,12 @@ config_schema:
       dashboard; empty), allow_cron / allow_subagents / allow_groups (false), rings_per_session (3) per
       session_window_s (600), rings_global (10) per global_window_s (3600), quiet_hours {start: "22:00", end:
       "07:00", action: refuse|confirm, timezone} (alert pushes go silently then)
+  scheduled:
+    type: dict
+    description: >-
+      Calls that ring later (start_call with in_minutes / at; kept in <HERMES_HOME>/hermes-voice/scheduled.json
+      and rung by `hermes serve`): retries (1; more rings when nobody answers, 0 = ring once), retry_after_s (300),
+      late_limit_s (900; a call the host missed still rings when at most this late, else its conversation is told)
   alerts:
     type: dict
     description: >-

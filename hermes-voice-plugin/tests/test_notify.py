@@ -412,6 +412,32 @@ def test_a_failed_turn_alerts_without_on_session_end(core, env, monkeypatch):
     assert at(env, 820.0) == 0 and len(env.mock.requests) == 2
 
 
+@pytest.mark.parametrize("told_by", ["session id", "the record", "nothing"])
+def test_a_conversation_reaped_right_after_its_turn_alerts_with_what_the_turn_said(core, env, monkeypatch, told_by):
+    """The dashboard closes a conversation nobody has open once its turn is over (the reap timer armed when the
+    client left), and frees its event ring with it: when that happens before the watcher's next look, the watcher
+    finds neither the conversation nor the turn's message.complete. Hermes fires on_session_finalize before it
+    frees the ring, and the turn's end is read then. (Without that hook nothing can be said: the last case.)"""
+    replay = Replay(monkeypatch)
+    sid = env.host.add("s1", running=True, _compute_host_turn_id="turn-x")
+    at(env, 100.0)
+    replay.complete(sid, "Your request was not processed.", "error")
+    record = env.host.record(sid)
+    record.pop("_compute_host_turn_id")
+    record["running"] = False
+    del env.fake.host.sessions[sid]  # the reaper pops it, finalizes it, then forgets its events
+    if told_by == "the record":
+        record["_closing"] = True
+        env.alerts.session_closing()
+    elif told_by == "session id":
+        env.alerts.session_closing("s1")
+    del replay.events[sid]
+    sent = [at(env, 100.5), at(env, 106.0)]
+    assert sent == ([0, 0] if told_by == "nothing" else [0, 1])
+    if sent[1]:
+        assert env.mock.payloads()[0]["aps"]["alert"]["body"] == "Hermes stopped: the turn failed."
+
+
 def test_a_failed_turn_the_host_kept_alerts_without_events(core, env):
     sid = env.host.add("s1")
     _turn(env, sid, 100.0, 101.0, inflight_turn={"status": "error", "error": "HTTP 400"})
@@ -675,13 +701,17 @@ def test_the_alert_hooks_work_only_where_the_phone_is_served(core, env):
     core.notify.install(env.alerts)
     try:
         plugin._register_alerts(ctx)
-        assert set(hooks) == {"post_llm_call", "on_session_end"} and len(unloads) == 1
+        assert set(hooks) == {"post_llm_call", "on_session_end", "on_session_finalize"} and len(unloads) == 1
         env.host.add("s1")
         env.fake.bound_host = None  # a process that doesn't serve the dashboard (CLI, gateway, compute host)
         hooks["post_llm_call"][0](session_id="s1", assistant_response="Shipped.", turn_id="t")
         hooks["on_session_end"][0](session_id="s1", turn_id="t", completed=True)
         assert env.alerts.replies == {} and env.alerts.turns == []
+        closings: list[str] = []
+        env.alerts.session_closing = closings.append
+        assert hooks["on_session_finalize"][0](session_id="s1", platform="tui") is None and closings == []
         env.fake.bound_host = "127.0.0.1"
+        assert hooks["on_session_finalize"][0](session_id="s1", platform="tui") is None and closings == ["s1"]
         assert hooks["post_llm_call"][0](session_id="s1", assistant_response="Shipped.", turn_id="t") is None
         assert hooks["on_session_end"][0](session_id="s1", turn_id="t", completed=True, model="m") is None
         assert at(env, 105.0) == 1 and env.mock.payloads()[0]["aps"]["alert"]["body"] == "Shipped."

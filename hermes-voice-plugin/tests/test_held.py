@@ -117,9 +117,9 @@ def test_turns_of_a_held_chat_are_kept_announced_once_and_delivered_in_order_whe
             await phone.expect("speech_end")  # the hub's own line: the chat can't be reached
             await phone.say("first thing")
             await phone.say("second thing")
-            await asyncio.sleep(0.4)  # several retries
+            # The first one is tried again (waited for, not slept for: a loaded machine retries late).
+            await until(lambda: fake.host.methods_called().count("prompt.submit") >= 3)
             assert not hub.deliveries  # nothing given up, nothing in: all three wait
-            assert fake.host.methods_called().count("prompt.submit") >= 3  # the first one, tried again
             said_once = spoken(phone)
             release(fake)
             await until(lambda: len(submitted(fake)) >= 3)

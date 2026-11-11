@@ -34,6 +34,10 @@ every ``HELD_RETRY_S`` for ``HELD_RETRY_LIMIT_S`` (later turns wait behind it, s
 twice), the user hears once per call that the chat can't be reached (``inject.CHAT_HELD_SPOKEN``, the hub's own
 line), and the ring log says ``chat_held``, then ``delivered_late`` or ``undelivered``: never silence.
 
+Calls that ring later (``start_call`` with ``in_minutes`` / ``at``) are kept and rung by ``schedule.py``
+(``CallHub.schedule``): at its time a scheduled call claims the slot like any other (``begin_call`` with
+``scheduled``), without asking the policy again.
+
 Threads: tool handlers run on agent threads, the socket on the dashboard's event loop (captured on the first
 request). Call state is guarded by ``lock``; links and speech run on the loop only.
 """
@@ -55,7 +59,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from . import guidance, hermes, inject, push
+from . import guidance, hermes, inject, push, schedule
 from .config import Settings
 from .config import current as current_settings
 from .policy import Policy, is_messaging, users_own_message
@@ -366,6 +370,8 @@ class Call:
         # Another Hermes process holds the call's chat: logged (once), and said into the call (once).
         self.held_logged = False
         self.held_announced = False
+        # The ring of a scheduled call (``schedule.Ring``): the schedule hears how it went.
+        self.scheduled: Optional[schedule.Ring] = None
 
     def info(self) -> dict[str, Any]:
         """The call as ``GET /status`` shows it (``active_call``), so the app's call button can join it.
@@ -540,6 +546,8 @@ class CallHub:
         # Asks the Hermes processes that attend on the hub socket to put a text into a chat one of them holds:
         # (the chat's stored ids, text) -> how it went, or None when none of them has it (``hubsock.HubServer``).
         self.holders: Optional[Callable[[list[str], str], Optional[inject.Delivery]]] = None
+        # Calls that ring later (kept on disk; rung by the dashboard process once ``schedule.start`` runs).
+        self.schedule = schedule.Scheduler(self)
 
     # ── loop plumbing ────────────────────────────────────────────────────────────────────────────────────
 
@@ -687,10 +695,12 @@ class CallHub:
         logger.info("hermes_voice: call %s ended: %s", call.call_id[:8], outcome)
         self.policy.log({"event": "ended", "call_id": call.call_id, "session_id": call.owner.session_id,
                          "outcome": outcome, **({"detail": detail[:200]} if detail else {})})
-        if not waiting and not quiet:
+        # A scheduled ring nobody took rings again later (its conversation hears nothing yet), or is given up.
+        over = self.schedule.ring_over(call, outcome) if call.scheduled is not None else schedule.Over()
+        if not waiting and not quiet and not over.again:
             notice = inject.outcome_notice(outcome, detail, unheard)
             if notice:
-                call.inbox.put(notice)
+                call.inbox.put(f"{notice}{over.note}")
         call.inbox.close()
         self._soon(self._close_out, call, was, outcome)
         return True
@@ -752,10 +762,16 @@ class CallHub:
         return self.begin_call(origin, text, "async", ring=False).result
 
     def begin_call(self, origin: hermes.Origin, text: str, mode: str = "async", ring: bool = True,
-                   route: Optional[Callable[[Call], Any]] = None) -> Begun:
+                   route: Optional[Callable[[Call], Any]] = None,
+                   scheduled: Optional[schedule.Ring] = None) -> Begun:
         """Queue `text` on this conversation's call, claiming the call slot and ringing the phone first when it has
         none (with `ring`). A sync call gets a waiter for the reply (``wait_reply``). `route` makes the route for a
-        call this starts for a conversation in another process (``hubsock.py``)."""
+        call this starts for a conversation in another process (``hubsock.py``).
+
+        `scheduled`: this is a scheduled call's ring (``schedule.py``, at its time). The policy was asked when it
+        was scheduled, so quiet hours and the rate limits don't refuse it now. Its line goes into a call the
+        conversation is live on, or rings a call of its own; while the phone rings for anything else it is
+        ``busy`` (the schedule tries again)."""
         settings = self.settings()
         text, clip_note = clip(text, settings.max_chars)
         # What the result says about the line itself: that it was cut, and that it is long for a phone call.
@@ -766,6 +782,8 @@ class CallHub:
                 return Begun(_refusal(mode, "busy", (
                     f"The user is on a call with {_quote(call.owner.title) or 'another conversation'}. Reply in "
                     "text; you can call once that call is over.")))
+            if call is not None and scheduled is not None and call.state != "live":
+                return Begun(_refusal(mode, "busy", "The phone is ringing for this conversation already."))
             if call is not None:
                 call.owner.rekey(origin.session_id, origin.runtime_sid)
         rang = False
@@ -773,17 +791,20 @@ class CallHub:
             if not ring:
                 return Begun({"call_id": None, "status": "no_call",
                               "note": "This conversation has no voice call; start_call rings the user."})
-            decision = self.policy.check(origin)
-            if not decision.allowed:
-                return Begun(_refusal(mode, "not_allowed", decision.note))
+            if scheduled is None:
+                decision = self.policy.check(origin)
+                if not decision.allowed:
+                    return Begun(_refusal(mode, "not_allowed", decision.note))
             with self.lock:
                 if self.slot is not None:  # another call won the slot meanwhile
-                    if not self.slot.owner.matches(origin):
+                    if not self.slot.owner.matches(origin) or scheduled is not None:
                         return Begun(_refusal(mode, "busy", "The user is on another call. Reply in text."))
                     call = self.slot
                 else:
-                    call = Call(self, new_call_id(), Owner.from_origin(origin, remote=route is not None), "agent",
-                                "ringing")
+                    remote = route is not None or (scheduled is not None and scheduled.remote)
+                    call = Call(self, scheduled.call_id if scheduled is not None else new_call_id(),
+                                Owner.from_origin(origin, remote=remote), "agent", "ringing")
+                    call.scheduled = scheduled
                     if route is not None:
                         call.route = route(call)
                     self.slot = call
@@ -797,8 +818,10 @@ class CallHub:
                     call.offer = self.missed.take(lambda owner: owner.matches(origin))
                     call.offer_pending = bool(call.offer)
             if rang:
-                self.policy.record_ring(origin, call.call_id)
-                logger.info("hermes_voice: ringing for %s (call %s)", origin.session_id, call.call_id[:8])
+                self.policy.record_ring(origin, call.call_id,
+                                        **(self.schedule.ring_log(scheduled) if scheduled is not None else {}))
+                logger.info("hermes_voice: ringing for %s (call %s%s)", origin.session_id, call.call_id[:8],
+                            f", scheduled {scheduled.id}" if scheduled is not None else "")
         _, waiter = self.enqueue_line(call, text, mode, line_note, wait=mode == "sync")
         if rang:
             if mode == "sync":
@@ -827,12 +850,19 @@ class CallHub:
 
     def end_call(self, origin: hermes.Origin, text: str = "", signals: Optional[Signals] = None) -> dict[str, Any]:
         signals = signals or Signals()
+        live = False
         with self.lock:
             call = self.slot
-            if call is None or not call.owner.matches(origin):
-                return {"call_id": None, "outcome": None, "note": "This conversation has no voice call running."}
-            call.owner.rekey(origin.session_id, origin.runtime_sid)
-            live = call.state == "live"
+            mine = call is not None and call.owner.matches(origin)
+            if mine:
+                call.owner.rekey(origin.session_id, origin.runtime_sid)
+                live = call.state == "live"
+        if not mine:
+            pending = self.schedule.pending(origin)
+            later = (f" It has {len(pending)} scheduled for later (see pending); end_call with scheduled_id "
+                     "cancels one." if pending else "")
+            return {"call_id": None, "outcome": None, "note": f"This conversation has no voice call running.{later}",
+                    **({"pending": pending} if pending else {})}
         note = ""
         if text.strip() and live:
             text, clip_note = clip(text.strip(), self.settings().max_chars)
@@ -1246,7 +1276,19 @@ class CallHub:
         if timer is not None:
             timer.cancel()
         logger.info("hermes_voice: call %s answered", call.call_id[:8])
+        if call.scheduled is not None:
+            # No turn of the conversation is waiting for this call: it hears which call this is before the reply.
+            call.inbox.put(self.schedule.answered(call))
         self._kick(call)
+
+    def tell(self, origin: hermes.Origin, text: str, remote: bool = False) -> None:
+        """Put a notice into a conversation that has no call (a scheduled call that was never placed), the way a
+        call's notices get there: reopened if nobody has it open, retried while another process holds it, logged
+        if it never gets in."""
+        carrier = Call(self, new_call_id(), Owner.from_origin(origin, remote=remote), "agent", "ended")
+        carrier.outcome = "not_placed"
+        carrier.inbox.put(text)
+        carrier.inbox.close()
 
     def on_turn(self, call: Call, turn: Turn) -> None:
         """Route a user turn: to the sync start_call waiting for it, else into the conversation."""
@@ -1371,6 +1413,8 @@ class CallHub:
                 self.busy.pop(key, None)
         if users_own_message(user_message):
             self.policy.note_user_turn(session_id)
+        if parent_session_id and parent_session_id != session_id and hermes.subagent_parent() is None:
+            self.schedule.rekey(parent_session_id, session_id)  # compression: its scheduled calls follow
         with self.lock:
             call = self.slot
         if call is None or call.owner.owns(session_id):
@@ -1401,6 +1445,8 @@ class CallHub:
             "scribe_configured": bool(hermes.get_secret("ELEVENLABS_API_KEY")),
             "active_call": active,
             "hub_socket": socket_state(),
+            # How many calls are scheduled to ring later (never what they say).
+            "scheduled": self.schedule.count(),
         }
 
 
@@ -1677,6 +1723,7 @@ def install_hub(hub: Optional[CallHub]) -> None:
 def mark_routes_mounted() -> None:
     sys.__dict__[_ROUTES_KEY] = True
     serve_socket_when_ready()
+    run_schedule_when_ready()
 
 
 _SOCKET_KEY = "_hermes_voice_hub_socket"
@@ -1773,6 +1820,64 @@ def resume_socket() -> None:
             return
         del sys.__dict__[_SOCKET_KEY]
     serve_socket_when_ready()
+
+
+# Scheduled calls ring from the dashboard process. The key's states: absent (not started), "waiting" (a thread
+# waits for the dashboard to serve), "running", or "paused" (the plugin unloaded).
+_SCHEDULE_KEY = "_hermes_voice_schedule"
+_RUNNING = "running"
+
+
+def run_schedule_when_ready() -> None:
+    """Start ringing the scheduled calls (``schedule.py``) once this process serves the dashboard, as with the hub
+    socket: other processes mount the routes too, without serving. Once per process (and again after
+    ``resume_schedule``); ``HERMES_VOICE_SCHEDULE=0`` turns it off (the unit tests drive their own)."""
+    if os.environ.get("HERMES_VOICE_SCHEDULE", "").strip() == "0":
+        return
+    with _HUB_LOCK:
+        if _SCHEDULE_KEY in sys.__dict__:
+            return
+        sys.__dict__[_SCHEDULE_KEY] = _WAITING
+    try:
+        hermes.spawn_thread(_start_schedule, name="hermes-voice-schedule-start")
+    except RuntimeError:
+        sys.__dict__.pop(_SCHEDULE_KEY, None)
+
+
+def _start_schedule() -> None:
+    deadline = time.monotonic() + SOCKET_WAIT_LIMIT
+    while not hermes.dashboard_serving():
+        if time.monotonic() > deadline:
+            with _HUB_LOCK:
+                if sys.__dict__.get(_SCHEDULE_KEY) == _WAITING:
+                    sys.__dict__.pop(_SCHEDULE_KEY, None)
+            return  # imported, never served
+        time.sleep(0.5)
+    with _HUB_LOCK:
+        if sys.__dict__.get(_SCHEDULE_KEY) != _WAITING:
+            return  # the plugin unloaded meanwhile
+        sys.__dict__[_SCHEDULE_KEY] = _RUNNING
+    get_hub().schedule.start()
+
+
+def pause_schedule() -> None:
+    """The plugin unloads: stop ringing scheduled calls (they stay in the file) until it loads again."""
+    with _HUB_LOCK:
+        if _SCHEDULE_KEY not in sys.__dict__:
+            return
+        state, sys.__dict__[_SCHEDULE_KEY] = sys.__dict__[_SCHEDULE_KEY], _PAUSED
+        hub = sys.__dict__.get(_HUB_KEY)
+    if state == _RUNNING and hub is not None:
+        hub.schedule.stop()
+
+
+def resume_schedule() -> None:
+    """The plugin loaded again in a process whose schedule an unload stopped."""
+    with _HUB_LOCK:
+        if sys.__dict__.get(_SCHEDULE_KEY) != _PAUSED:
+            return
+        del sys.__dict__[_SCHEDULE_KEY]
+    run_schedule_when_ready()
 
 
 def routes_mounted() -> bool:

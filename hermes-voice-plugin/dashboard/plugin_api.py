@@ -138,7 +138,11 @@ def _error(status: int, message: str) -> JSONResponse:
 async def authorize(ws: WebSocket) -> Optional[int]:
     """None when the dashboard's WebSocket auth admits the upgrade, else the close code: 4401 for every refusal
     (a bad or reused ticket, or a Host / Origin / peer the dashboard refuses), as the phone protocol has it; the
-    phone mints one more ticket, then gives up. Fails closed when this Hermes has no such check."""
+    phone mints one more ticket, then gives up. Fails closed when this Hermes has no such check.
+
+    Hermes 0.22.7 and later runs the Host / Origin / peer check itself in front of every plugin socket
+    (``PluginApiWebSocketGate``) and closes before the upgrade, so such a request never gets here: the phone sees
+    HTTP 403 on the handshake, which it treats like 4401. The check stays here for a Hermes without that gate."""
     try:
         from hermes_cli.web_server_chat import _ws_auth_ok, _ws_request_is_allowed
     except ImportError:

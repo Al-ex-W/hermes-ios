@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 from typing import Any
@@ -361,6 +362,109 @@ def test_idle_without_allow_gateway_injection_says_how_to_turn_it_on(core, fake)
     # The classic CLI needs no setting: a refusal there is something else.
     delivery = core.inject.inject_idle(_target(core, None, Ctx(accept=False, cli=True)), "[Voice] hi")
     assert "allow_gateway_injection" not in delivery.detail
+
+
+LOCAL_KEY = "agent:main:local:dm:local-1"
+
+
+class RetiringGateway:
+    """The gateway since Hermes 0.22.6: a local conversation whose last viewer closed is dropped from
+    ``authority.sessions`` (``retired_routes`` / ``retired_local`` remember it), and a plugin's keyed injection is
+    refused while it is absent. ``restore_retired`` brings it back, on the gateway's loop."""
+
+    def __init__(self, fake, monkeypatch, retired: bool = True, restorable: bool = True) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+        self.authority = types.SimpleNamespace(
+            sessions={}, retired_routes={"local-1": LOCAL_KEY} if retired else {},
+            retired_local={"local-1"} if retired else set())
+        self.runner = types.SimpleNamespace(_gateway_loop=self.loop)
+        self.restorable = restorable
+        self.restored: list[tuple[str, bool]] = []  # (session, on the gateway's loop thread)
+        self.homes: list[Any] = []
+        for name, attrs in (("gateway.session_authorities", {"authority_for_home": self.authority_for_home}),
+                            ("gateway.session_retirement", {"restore_retired": self.restore_retired})):
+            module = types.ModuleType(name)
+            module.__dict__.update(attrs)
+            monkeypatch.setitem(sys.modules, name, module)
+        fake.config = {"plugins": {"entries": {"hermes_voice": {"allow_gateway_injection": True}}}}
+
+    def authority_for_home(self, runner: Any, home: Any) -> Any:
+        self.homes.append(home)
+        return self.authority if runner is self.runner else None
+
+    def restore_retired(self, authority: Any, session_id: str) -> None:
+        self.restored.append((session_id, threading.current_thread() is self.thread))
+        if not self.restorable:
+            raise KeyError("no receipt")
+        authority.sessions[session_id] = object()
+        authority.retired_local.discard(session_id)
+
+    def ctx(self, home: Any) -> "Ctx":
+        gateway = self
+
+        class GatewayCtx(Ctx):
+            def inject_message(self, content: str, role: str = "user", *, session_key: Any = None,
+                               origin: Any = None) -> bool:
+                self.injected.append((session_key, content))
+                return any(gateway.authority.retired_routes.get(sid) == session_key
+                           for sid in gateway.authority.sessions)
+
+        ctx = GatewayCtx(home=home)
+        ctx._manager._gateway_message_injector = (self.runner, lambda **_: True)
+        return ctx
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(5)
+        self.loop.close()
+
+
+@pytest.fixture
+def retiring(fake, monkeypatch):
+    gateways: list[RetiringGateway] = []
+
+    def build(**kw: Any) -> RetiringGateway:
+        gateways.append(RetiringGateway(fake, monkeypatch, **kw))
+        return gateways[-1]
+
+    yield build
+    for gateway in gateways:
+        gateway.close()
+
+
+def test_idle_a_local_conversation_the_gateway_retired_is_brought_back_for_the_turn(core, fake, retiring):
+    """The CLI or TUI window is closed (or a `chat -q` run is over) and the gateway dropped the conversation from
+    memory: Hermes refuses the injection as "not a live local session" until its own restore has run."""
+    gateway = retiring()
+    ctx = gateway.ctx(fake.home)
+    delivery = core.inject.deliver_here(_target(core, None, ctx, "local-1", LOCAL_KEY), "[Voice] hi",
+                                        core.inject.Turns())
+    assert (delivery.ok, delivery.via) == (True, "inject")
+    assert ctx.injected == [(LOCAL_KEY, "[Voice] hi")] * 2  # refused, then taken
+    assert gateway.restored == [("local-1", True)] and gateway.homes == [fake.home]
+    # Back in memory, the next turn needs no restore.
+    assert core.inject.inject_idle(_target(core, None, ctx, "local-1", LOCAL_KEY), "[Voice] more").ok
+    assert len(gateway.restored) == 1
+    # Two turns refused at once: the one that finds it restored meanwhile tries again too.
+    assert core.hermes.restore_retired_session(ctx, LOCAL_KEY) is True and len(gateway.restored) == 1
+
+
+@pytest.mark.parametrize("case", ["not retired", "receipt refused", "injection off", "another key", "no gateway"])
+def test_idle_a_refusal_that_restoring_cant_help_stands(core, fake, retiring, case):
+    gateway = retiring(retired=case != "not retired", restorable=case != "receipt refused")
+    ctx = gateway.ctx(fake.home)
+    key = "agent:main:local:dm:local-2" if case == "another key" else LOCAL_KEY
+    if case == "injection off":
+        fake.config = {}
+    if case == "no gateway":
+        ctx._manager._gateway_message_injector = None
+    delivery = core.inject.inject_idle(_target(core, None, ctx, "local-1", key), "[Voice] hi")
+    assert not delivery.ok and delivery.fallback
+    assert ("allow_gateway_injection" in delivery.detail) == (case == "injection off")
+    assert gateway.restored == ([("local-1", True)] if case == "receipt refused" else [])
+    assert ctx.injected == [(key, "[Voice] hi")]  # one attempt: nothing came back to try again for
 
 
 def test_the_ink_tui_puts_turns_in_through_its_own_session_host(core, fake):
