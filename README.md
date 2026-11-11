@@ -76,6 +76,14 @@ direct messages to Hermes on a messaging platform), an agent can call `start_cal
   that ring later".
 - Hermes is told to speak as on the phone: the answer first, two sentences at most, no codes, ids, URLs or paths
   read out. A line that takes longer than about 15 seconds to say is flagged in the `start_call` result.
+- **When a line is hard to hear.** The phone tells the plugin how each line really played (how much of it, gaps
+  where the audio ran dry, audio restarts, the output and its volume), and Hermes is told when a line may not have
+  been heard well, and how much of a line you had heard when you hung up in the middle of it. **Repeat** on the
+  call screen plays Hermes' last line again at once, from the copy the phone keeps for the length of the call
+  (Hermes learns that you did). Lines spoken with a quiet audio tag are raised to normal loudness on the phone, and
+  a line that is playing carries on after the Speaker button or AirPods connecting instead of being cut. When
+  Hermes says exactly the same line again, the plugin replays its audio instead of making it anew. Details and
+  thresholds: [plugin README](hermes-voice-plugin/README.md), "Playback feedback".
 - How you want to be spoken to (tone, form of address, humour, ElevenLabs audio tags) lives in
   `<HERMES_HOME>/hermes-voice/call-style.md`. Hermes gets it with every call, and edits it when you state a lasting
   preference (see the [plugin README](hermes-voice-plugin/README.md), "Call style").
@@ -313,6 +321,10 @@ settings any more):
 - The Simulator has no VoIP pushes, CallKit audio or microphone: there calls ring inside the app only, Hermes can
   be heard, and you answer by typing. Debug builds take `hermesvoice://ring?call_id=…&session_id=…` as a push, and
   `hermesvoice://location-request?request_id=…` as the background push that asks where the phone is.
+- Playback feedback is what the phone can tell: "played" follows the clock against what was queued, not what
+  left the loudspeaker, and the volume is the system's, not how loud the room is. Loudness is levelled per line:
+  a whisper that starts half way through a normal line comes up only after about a second. After a reconnect in
+  the middle of a line, Repeat keeps playing the line before it (the broken one did not arrive whole).
 
 ## Settings, profiles and notifications
 
@@ -477,7 +489,10 @@ position first with `xcrun simctl location booted set 59.0,18.0`.
   says `hello {call_id, session_id, title, initiated_by: user|push, app_version}` and gets `ready {call_id,
   state}`; for a push it says `ringing`, then `answered` (once the call's audio runs) or `declined`. Speech comes
   as `speech_start {id, text, sample_rate, format}`, binary 16-bit PCM and `speech_end {id}`; the app answers
-  `played {id}` once all of it was heard (a line whose audio was dropped gets no ack).
+  `played {id, playback}` once all of it was heard, with what happened to the line (`playback {audio_s, played_s,
+  stalls, stall_s, rebuilds, route_changes, route, volume, level_db, gain_db}`), or `unplayed {id, reason,
+  playback}` for a line that was not played to the end (`hang_up` before a `bye`, `cancelled`, `lost` when its
+  audio was dropped, `dropped` with the link); `replayed {id}` says the user tapped Repeat.
   What you say goes as `user_turn {call_id, text, ending {kind, …}, provider, language, started_at, ended_at}`.
   The plugin ends a call with `cancel {reason}` while it rings or `ended {outcome}` once live; the app hangs up
   with `bye {reason}`. Close codes: 4401 auth (the app mints one more ticket, then gives up), 4400 bad hello, 4409

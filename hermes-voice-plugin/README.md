@@ -121,7 +121,8 @@ the text itself: `chat_held` (another Hermes process holds the chat; `holder` is
 `undelivered` (given up, with the `reason`); `what` is `call_started`, `turn` or `notice`. Calls that ring later
 are in it as `scheduled`, `ring` with the `scheduled` id and `attempt` (and `late_s`, `quiet_hours`),
 `scheduled_busy`, `scheduled_spoken`, `scheduled_retry`, `scheduled_done`, `scheduled_cancelled` and
-`scheduled_dropped`, again without the line's text.
+`scheduled_dropped`, again without the line's text. How each spoken line played on the phone is in it as
+`playback` (see "Playback feedback"), and a Repeat on the phone as `replayed`.
 
 **The owner's direct messages.** A DM may ring the phone when it comes from the owner: whoever `owner_ids` names
 (a user id, or `"<platform>:<user id>"`), or, with no `owner_ids`, whoever the gateway was told to serve by name: its
@@ -222,8 +223,10 @@ in the text, and it is stable:
   `Automated notice from HermesVoice, not something the user said.` (`inject.NOTICE_MARKER`) right after its closing
   bracket. Skip the whole message: `message.startswith(("[Voice call ", "[Voice line "))`, or
   `inject.NOTICE_MARKER in message`.
-- In a `[Voice…] <said> (…)` turn only `<said>` is the user's. Drop the bracket prefix and the trailing hint (one of
-  the two strings above) before storing it.
+- In a `[Voice…] <said> (…)` turn only `<said>` is the user's. Drop the bracket prefix and everything from the hint
+  (one of the two strings above) on before storing it: the hint can be followed by a playback note, which starts
+  with `(HermesVoice playback note, not the user's words: ` (`inject.PLAYBACK_NOTE_HEAD`; see "Playback feedback"),
+  and by `(Delayed by N s: …)` for a turn that got in late.
 
 **Long lines.** A `start_call` result flags a line that takes longer than about 15 seconds to say: `Long line:
 about 22 s of speech. Keep lines to a sentence or two and offer details instead.` (async and sync, from any
@@ -236,7 +239,61 @@ queued (no `played` ack from the phone), the ended notice, or the sync result's 
 first 200 characters of at most three). The hub remembers them for the conversation, in memory only (never on
 disk, at most a day, gone with a restart), and reminds the agent once when the conversation's next call starts: in
 the `[Voice call started]` notice, or in the first `start_call` result (kept for the call after that if nobody
-answers).
+answers). After each quoted line the notice says how much of it had played, so the agent can tell "too long, they
+left" from "they heard it and left": `"…" (they heard about 2 of 9 s)`, `(they heard none of it)`, `(they heard
+nearly all of it)`. The played seconds are the phone's (`unplayed {reason: "hang_up"}`, below); without them (an
+older app, a lost link) they are the host's: the time since the line's first audio went out, up to when the link
+went away. The line's length is its audio's, or, while not all of it was made, the estimate from its text. A line
+the link dropped under says the same in its own notice or result (`… may not have heard all of it (they heard
+about 2 of 9 s). The phone reconnects by itself …`).
+
+## Playback feedback
+
+A line can reach the phone and still not be heard well. The app reports what really happened to each line
+(`playback`, in the protocol below), and the hub tells the agent **only when it matters**, in one short note that
+says what to do. The note comes once, with the next thing the call hands the agent: the `note` of the next
+`start_call` result (a sync call: the result that carries the reply to that very line), or the next `[Voice]`
+turn, after its hint, as `(HermesVoice playback note, not the user's words: …)`. In the async result for the next
+line it reads `Your line before this one …`, since "your last line" there would be taken for the line that result
+is about, and `An earlier line of yours …` once the agent has spoken another line since (`guidance.about_line`).
+A newer note about the last line replaces an older one that was not handed over yet. With fine playback, or an app that sends no facts, nothing is
+added anywhere.
+
+| Fact | Threshold (`guidance.py`) | Note |
+|---|---|---|
+| The player ran dry while more of the line was still coming (the phone counts gaps of 0.1 s or more) | gaps of 0.5 s in all (`STALL_NOTE_S`), or 3 gaps (`STALL_NOTE_COUNT`) | `Your last line may not have been heard well: playback stalled twice (1.8 s of gaps). If it mattered, say it again shorter and plainer.` |
+| The audio engine was rebuilt during the line | 1 | `… the phone's audio restarted while it played. …` |
+| The output route changed during the line (and the engine kept running) | 1 | `… the phone's audio output changed while it played. …` |
+| Acknowledged, but less played than arrived | 1.0 s missing (`MISSING_NOTE_S`) | `… part of its audio was not played. …` |
+| The system output volume | at or under 0.13, two of iOS' sixteen steps (`LOW_VOLUME`); once per call | `… the phone's volume is very low. Ask them to turn the volume up.` |
+| The phone could not play the line to the end (`unplayed {reason: "lost"}`), or never confirmed it | always | `Your last line was not played to the end on the phone (they heard about 1 of 4 s). If it mattered, say it again.` / `Your last line may not have been heard: the phone did not confirm it played it. …` |
+| The user pressed Repeat (`replayed`) | always | `The user replayed your last line on their phone: say important things shorter and plainer.` |
+
+Several facts about one line share one sentence (`…: playback stalled twice (1.8 s of gaps); the phone's volume
+is very low. If it mattered, say it again shorter and plainer, and ask them to turn the volume up.`). A line the
+phone reports as `lost` stops waiting for its ack at once (it used to wait 15 s past its length).
+
+**The ring log** gets the facts of every line that came with any, never its text:
+`{"event": "playback", "call_id", "line", "ended": "played" | "hang_up" | "cancelled" | "lost" | "dropped",
+"audio_s", "played_s", "stalls", "stall_s", "rebuilds", "route_changes", "route", "volume", "level_db", "gain_db",
+"problems": ["stalled", "audio_restarted", "route_changed", "low_volume", "audio_missing"]}` (zero counts and an
+empty `problems` are left out), and `{"event": "replayed", "call_id", "line"}`. `level_db` is the line's speech
+level as it arrived and `gain_db` what the phone added: the numbers to tune the loudness target with.
+
+**Repeat on the phone.** The app keeps the audio of the last line that arrived whole (that line only, in memory,
+gone with the call) and plays it again at once when the user taps Repeat, without the host. The microphone is off
+meanwhile, as for any line; the hub only hears `replayed`.
+
+**The same text again.** The hub keeps the audio of the call's last line that was made in full (one line per call,
+in memory only, up to 8 MB, gone when another line is spoken or the call ends; never on disk). `start_call` with
+exactly that text, the same voice and model, and no other line waiting to be said, sends that audio again instead
+of asking ElevenLabs: it starts at once and costs nothing. The result says so (` Same text as your last line, so
+the audio kept from it is replayed (no new speech). …`). To the phone it is a line like any other, so the
+half-duplex rules hold.
+
+**Loudness** is levelled on the phone, not here: the app measures each line's speech level as it turns the PCM
+into samples and raises a line under -24 dBFS to that level, by at most 15 dB, behind a soft limiter; a line at or
+over it is not touched (`SpeechLeveler.swift`). The stream this plugin sends is ElevenLabs' own.
 
 ## Call style
 
@@ -536,7 +593,7 @@ JSON text frames on `/phone` plus binary PCM (16-bit little-endian mono, 24 kHz)
 
 | Direction | Messages |
 |---|---|
-| phone → plugin | `hello {call_id, session_id?, title?, initiated_by: user\|push, app_version}`, `ringing`, `answered`, `declined`, `played {id}`, `user_turn {call_id, text, ending {kind, detector?, detail?, error?}, provider, language?, started_at, ended_at}`, `location {id, latitude, longitude, accuracy_m, fixed_at, speed_mps?, course_deg?}` or `location {id, error}`, `ping`, `bye {reason?}` |
+| phone → plugin | `hello {call_id, session_id?, title?, initiated_by: user\|push, app_version}`, `ringing`, `answered`, `declined`, `played {id, playback?}`, `unplayed {id, reason, playback?}`, `replayed {id}`, `user_turn {call_id, text, ending {kind, detector?, detail?, error?}, provider, language?, started_at, ended_at}`, `location {id, latitude, longitude, accuracy_m, fixed_at, speed_mps?, course_deg?}` or `location {id, error}`, `ping`, `bye {reason?}` |
 | plugin → phone | `ready {call_id, state: ringing\|live}`, `cancel {reason}`, `speech_start {id, text, sample_rate, format}` + PCM + `speech_end {id}` (or with `cancelled: true` / `error`), `location_request {id}`, `pong`, `ended {outcome}` |
 
 Close codes: 4401 auth (a bad or reused ticket, or a Host / Origin the dashboard refuses), 4400 bad hello, 4409
@@ -547,6 +604,19 @@ HTTP 403 on the handshake and no close code, which the app treats like 4401. VoI
 `{call_id, session_id, profile, mode, title}`; the app turns the 32-hex `call_id` into the CallKit UUID.
 
 - A push call is `ready {state: "ringing"}` until the phone says `answered`; nothing is spoken before that.
+- `played {id, playback?}`: the line was heard to the end. `playback` is what happened to it on the phone, every
+  field optional: `{audio_s, played_s, stalls, stall_s, rebuilds, route_changes, route: "receiver" | "speaker" |
+  "bluetooth" | "headphones" | "car" | "other", volume, level_db, gain_db}`: seconds of audio received and played;
+  how often and for how long the player ran dry while more was coming; audio engine rebuilds and route changes
+  during the line; where the audio came out; the system output volume (0 to 1); the line's speech level as it
+  arrived (dBFS) and the gain the phone's leveller ended on (dB). What isn't a finite number in range is left out.
+- `unplayed {id, reason, playback?}`: the line was not played to the end. `reason`: `hang_up` (the user hung up;
+  sent before the `bye`), `cancelled` (after the plugin's `speech_end {cancelled}`), `lost` (its audio never all
+  reached the speaker: the plugin stops waiting for the ack) or `dropped` (the link went away under it; sent on
+  the next link). `replayed {id}`: the user had the phone play that line again.
+- Both ways stay compatible: an app from before this sends `played {id}` and nothing else (no notes, and "heard so
+  far" comes from the host's clock); a plugin from before this reads only `id` from `played` and ignores the two
+  new messages.
 - `bye {reason}`: `hang_up` and `declined` end the call as `ended_by_user` / `declined`; `no_answer` (the phone's
   own ring timeout ran out) as `no_answer`; `error` (the phone gave up on the call) as `lost`.
 - A hello for a call that is over gets `cancel {reason}` (never answered) or `ended {outcome}`, then close 1000; a

@@ -10,6 +10,30 @@ final class FakeAudio: CallAudioPlayback {
     private(set) var running = false
     private(set) var starts = 0
     private var lost = false
+    /// The lines begun, the audio queued and the flushes, in order.
+    private(set) var lines: [String] = []
+    private(set) var enqueued: [Data] = []
+    private(set) var flushes = 0
+    /// What each line reports about its playback (none: the audio keeps no such facts).
+    var facts: [String: PlaybackFacts] = [:]
+    /// Played-back callbacks wait for `finishPlayback` instead of completing at once (a line takes time to play).
+    var holdsPlayback = false
+    private var waiting: [(Bool) -> Void] = []
+
+    func beginLine(_ id: String) {
+        lines.append(id)
+    }
+
+    func takeFacts(for line: String) -> PlaybackFacts? {
+        facts[line]
+    }
+
+    /// Everything queued has played (or, with `heard` false, never reached the speaker).
+    func finishPlayback(heard: Bool = true) {
+        let done = waiting
+        waiting = []
+        done.forEach { $0(heard) }
+    }
 
     func start(onInput: @escaping @Sendable (AVAudioPCMBuffer) -> Void) {
         guard !running else { return }
@@ -30,17 +54,24 @@ final class FakeAudio: CallAudioPlayback {
 
     func enqueue(pcm16 data: Data) -> Bool {
         if !running { lost = true }
+        if running { enqueued.append(data) }
         return running
     }
 
     func whenPlayedBack(_ done: @escaping (Bool) -> Void) {
         let heard = running && !lost
         lost = false
-        done(heard)
+        if holdsPlayback, heard {
+            waiting.append(done)
+        } else {
+            done(heard)
+        }
     }
 
     func flush() {
         lost = false
+        flushes += 1
+        finishPlayback(heard: false)
     }
 }
 
@@ -524,14 +555,15 @@ final class VoiceCallTests: XCTestCase {
         link.deliver(.speechStart(id: "u1", text: "Hello", sampleRate: 24_000))
         link.deliver(.audio(Data(count: 480)))
         link.deliver(.speechEnd(id: "u1", cancelled: false, error: nil))
-        XCTAssertTrue(link.sent.isEmpty, "dropped audio is never confirmed as heard")
+        XCTAssertEqual(link.sent, [.unplayed("u1", reason: "lost")],
+                       "dropped audio is never confirmed as heard: the plugin is told it was lost")
         XCTAssertFalse(call.hermesSpeaking, "the microphone listens again")
         // Once the audio runs, lines are heard and acked.
         call.audioDidActivate()
         link.deliver(.speechStart(id: "u2", text: "Hi again", sampleRate: 24_000))
         link.deliver(.audio(Data(count: 480)))
         link.deliver(.speechEnd(id: "u2", cancelled: false, error: nil))
-        XCTAssertEqual(link.sent, [.played("u2")])
+        XCTAssertEqual(link.sent, [.unplayed("u1", reason: "lost"), .played("u2")])
         // A reconnect repeats only the heard one.
         link.drop()
         await waitUntil { self.links.count == 2 && self.link.connects == 1 }
@@ -749,5 +781,182 @@ final class VoiceCallTests: XCTestCase {
         link.deliver(.ready(callID: callID, ringing: true))
         call.sayTyped("too early")
         XCTAssertTrue(link.turns.isEmpty)
+    }
+
+    // MARK: Playback facts
+
+    /// Delivers one whole line of Hermes: its start, `frames` of audio, its end.
+    private func speak(_ id: String, _ text: String = "Hello", frames: [Data] = [Data(count: 480)]) {
+        link.deliver(.speechStart(id: id, text: text, sampleRate: 24_000))
+        frames.forEach { link.deliver(.audio($0)) }
+        link.deliver(.speechEnd(id: id, cancelled: false, error: nil))
+    }
+
+    func testPlayedCarriesWhatHappenedToTheLine() async {
+        let (call, _) = await liveCall()
+        defer { withExtendedLifetime(call) {} }
+        let facts = PlaybackFacts(audioSeconds: 4, playedSeconds: 4, stalls: 2, stallSeconds: 1.8, route: .speaker, volume: 0.5)
+        audio[0].facts["u1"] = facts
+        speak("u1")
+        XCTAssertEqual(audio[0].lines, ["u1"], "the audio is told which line its frames belong to")
+        XCTAssertEqual(link.sent, [.played("u1", playback: facts)])
+        // The repeat after a reconnect is the bare ack: the facts went with the first one.
+        link.drop()
+        await waitUntil { self.links.count == 2 && self.link.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: false))
+        XCTAssertEqual(link.sent, [.played("u1")])
+    }
+
+    func testHangingUpMidLineSaysHowMuchOfItWasHeard() async {
+        let (call, _) = await liveCall()
+        audio[0].holdsPlayback = true
+        let heard = PlaybackFacts(audioSeconds: 9, playedSeconds: 2.2, route: .receiver)
+        audio[0].facts["u1"] = heard
+        speak("u1")
+        // A second line is still streaming when the user hangs up.
+        link.deliver(.speechStart(id: "u2", text: "And", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        XCTAssertEqual(link.sent, [])
+        call.hangUp()
+        XCTAssertEqual(link.closedAfter, [
+            .unplayed("u1", reason: "hang_up", playback: heard), .unplayed("u2", reason: "hang_up"), .bye("hang_up"),
+        ])
+    }
+
+    func testACancelledLineIsReported() async {
+        let (call, _) = await liveCall()
+        audio[0].holdsPlayback = true
+        let facts = PlaybackFacts(audioSeconds: 1, playedSeconds: 0.4)
+        audio[0].facts["u1"] = facts
+        link.deliver(.speechStart(id: "u1", text: "Hello", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        link.deliver(.speechEnd(id: "u1", cancelled: true, error: nil))
+        XCTAssertEqual(link.sent, [.unplayed("u1", reason: "cancelled", playback: facts)])
+        XCTAssertEqual(audio[0].flushes, 1)
+        XCTAssertFalse(call.hermesSpeaking)
+        XCTAssertFalse(call.canRepeat, "a line that never finished is not kept for Repeat")
+    }
+
+    func testALineTheLinkDroppedUnderIsReportedOnTheNextLink() async {
+        let (call, _) = await liveCall()
+        defer { withExtendedLifetime(call) {} }
+        audio[0].holdsPlayback = true
+        speak("u1")  // all of it arrived; it is still playing
+        link.deliver(.speechStart(id: "u2", text: "And", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        link.drop()
+        await waitUntil { self.links.count == 2 && self.link.connects == 1 }
+        XCTAssertEqual(link.sent, [])
+        link.deliver(.ready(callID: callID, ringing: false))
+        // The queue was dropped with the link: the first line won't come again, the plugin carries on with the second.
+        XCTAssertEqual(link.sent, [.unplayed("u1", reason: "lost"), .unplayed("u2", reason: "dropped")])
+        link.drop()
+        await waitUntil { self.links.count == 3 && self.link.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: false))
+        XCTAssertEqual(link.sent, [], "told once")
+    }
+
+    // MARK: Repeat
+
+    func testRepeatPlaysTheLastLineAgainFromWhatThePhoneKept() async {
+        let (call, speech) = await liveCall()
+        XCTAssertFalse(call.canRepeat, "nothing was said yet")
+        call.repeatLast()
+        XCTAssertEqual(link.sent, [])
+        audio[0].holdsPlayback = true
+        let frames = [Data([1, 0, 2, 0]), Data([3, 0, 4, 0, 5, 0])]
+        speak("u1", "The meeting moved to three.", frames: frames)
+        XCTAssertFalse(call.canRepeat, "not while Hermes is speaking")
+        audio[0].finishPlayback()
+        XCTAssertEqual(link.sent, [.played("u1")])
+        XCTAssertFalse(call.hermesSpeaking)
+        XCTAssertEqual(speech.paused.last, false)
+        XCTAssertTrue(call.canRepeat)
+
+        call.repeatLast()
+        XCTAssertEqual(link.sent, [.played("u1"), .replayed("u1")], "the plugin hears of it; no new speech is asked for")
+        XCTAssertEqual(audio[0].enqueued, frames + [frames[0] + frames[1]], "the same audio, from memory")
+        XCTAssertEqual(audio[0].lines.count, 2)
+        XCTAssertEqual(call.lastSpoken, "The meeting moved to three.")
+        // Half duplex holds for a replay as for any line of Hermes: the microphone is off until it has played.
+        XCTAssertTrue(call.hermesSpeaking)
+        XCTAssertEqual(speech.paused.last, true)
+        XCTAssertFalse(call.canRepeat)
+        call.repeatLast()
+        XCTAssertEqual(audio[0].enqueued.count, 3, "one at a time")
+        audio[0].finishPlayback()
+        XCTAssertFalse(call.hermesSpeaking)
+        XCTAssertEqual(speech.paused.last, false)
+        XCTAssertEqual(link.sent, [.played("u1"), .replayed("u1")], "a replay is not acked as a line")
+        XCTAssertTrue(link.turns.isEmpty, "nobody was cut off")
+        XCTAssertTrue(call.canRepeat, "and it can be played again")
+    }
+
+    func testRepeatMidSentenceSendsWhatWasHeardAsCutOff() async {
+        let (call, speech) = await liveCall()
+        speak("u1")
+        speech.hear("sorry what")
+        await waitUntil { call.hearing == "sorry what" }
+        call.repeatLast()
+        // The plugin learns of the replay before the turn, so that it can tell Hermes with it.
+        XCTAssertEqual(link.types, ["played", "replayed", "user_turn"])
+        XCTAssertEqual(link.turns.map(\.ending), [.cutOff])
+        XCTAssertEqual(link.turns.map(\.text), ["sorry what"])
+    }
+
+    func testALineOfHermesDuringAReplayPlaysAfterItWithTheMicStillOff() async {
+        let (call, speech) = await liveCall()
+        speak("u1", "First.")
+        audio[0].holdsPlayback = true
+        call.repeatLast()
+        speak("u2", "Second.")
+        XCTAssertTrue(call.hermesSpeaking)
+        audio[0].finishPlayback()
+        XCTAssertEqual(link.sent, [.played("u1"), .replayed("u1"), .played("u2")])
+        XCTAssertFalse(call.hermesSpeaking)
+        XCTAssertEqual(speech.paused.last, false)
+        // Repeat is always the newest line.
+        call.repeatLast()
+        XCTAssertEqual(link.sent.last, .replayed("u2"))
+        XCTAssertEqual(call.lastSpoken, "Second.")
+    }
+
+    func testARepeatWhileTheLinkIsDownIsToldOnTheNextOne() async {
+        let (call, _) = await liveCall()
+        speak("u1")
+        link.drop()
+        call.repeatLast()
+        XCTAssertEqual(audio[0].enqueued.count, 2, "it plays at once, without the host")
+        await waitUntil { self.links.count == 2 && self.link.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: false))
+        XCTAssertEqual(link.sent, [.played("u1"), .replayed("u1")])
+    }
+
+    func testTheKeptLineGoesWithTheCall() async {
+        let (call, _) = await liveCall()
+        speak("u1")
+        XCTAssertTrue(call.hasLineToRepeat)
+        call.hangUp()
+        XCTAssertFalse(call.hasLineToRepeat)
+        XCTAssertFalse(call.canRepeat)
+        call.repeatLast()
+        XCTAssertEqual(audio[0].enqueued.count, 1)
+    }
+
+    func testALineTheLinkDroppedUnderIsNotKeptForRepeat() async {
+        let (call, _) = await liveCall()
+        defer { withExtendedLifetime(call) {} }
+        speak("u1", "Whole.")
+        // The plugin carries on with a broken line where it was: what arrives after the drop is not all of it.
+        link.deliver(.speechStart(id: "u2", text: "Broken.", sampleRate: 24_000))
+        link.deliver(.audio(Data(count: 480)))
+        link.drop()
+        await waitUntil { self.links.count == 2 && self.link.connects == 1 }
+        link.deliver(.ready(callID: callID, ringing: false))
+        speak("u2", "Broken.")
+        XCTAssertTrue(link.sent.contains(.played("u2")))
+        call.repeatLast()
+        XCTAssertEqual(call.lastSpoken, "Whole.", "Repeat still plays the last line it has all of")
+        XCTAssertEqual(link.sent.last, .replayed("u1"))
     }
 }

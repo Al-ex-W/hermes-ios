@@ -71,6 +71,9 @@ HUNG_UP_HINT = (
     "the task you were given, then reply once in text with a short recap. Don't ring back unless they asked to be "
     "called when you're done.)"
 )
+# How a note about the playback of the agent's last line starts, when one follows a turn's hint. The app strips
+# from this exact string on (VoiceTranscript.swift).
+PLAYBACK_NOTE_HEAD = "(HermesVoice playback note, not the user's words: "
 # Every notice the plugin injects ("[Voice call …] …", "[Voice line …] …") carries NOTICE_MARKER right after its
 # bracket prefix: the documented way for memory plugins (and people) to tell it from something the user said.
 NOTICE_MARKER = "Automated notice from HermesVoice, not something the user said."
@@ -149,9 +152,10 @@ def after_call(outcome: str, unheard: Iterable[str] = ()) -> str:
     return ""
 
 
-def outcome_notice(outcome: str, detail: str = "", unheard: Iterable[str] = ()) -> Optional[str]:
+def outcome_notice(outcome: str, detail: str = "", unheard: Iterable[str] = (),
+                   heard: Iterable[str] = ()) -> Optional[str]:
     """The notice for a call that ended without anyone waiting on it (async start_call, user-started calls).
-    `unheard`: the lines the user did not hear to the end."""
+    `unheard`: the lines the user did not hear to the end; `heard`: how much of each they did hear."""
     detail = " ".join((detail or "").split())[:200]
     if outcome in ("no_answer", "declined"):
         why = "they declined it" if outcome == "declined" else "they didn't pick up"
@@ -164,12 +168,18 @@ def outcome_notice(outcome: str, detail: str = "", unheard: Iterable[str] = ()) 
                 f"{after_call(outcome)}")
     if outcome == "lost":
         return (f"[Voice call ended: the phone's connection was lost and didn't come back] {NOTICE_HEAD}"
-                f"{guidance.unheard_note(unheard)} {after_call(outcome)}")
+                f"{guidance.unheard_note(unheard, heard)} {after_call(outcome)}")
     if outcome == "ended_by_user":
         unheard = list(unheard)
-        return (f"[Voice call ended by user] {NOTICE_HEAD}{guidance.unheard_note(unheard)} "
+        return (f"[Voice call ended by user] {NOTICE_HEAD}{guidance.unheard_note(unheard, heard)} "
                 f"{after_call(outcome, unheard)}")
     return None
+
+
+def with_playback_note(text: str, note: str) -> str:
+    """A "[Voice] …" turn with what the plugin has to say about how the agent's last line played on the phone
+    (``guidance.playback_note``), after the turn's hint. The app strips it by ``PLAYBACK_NOTE_HEAD``."""
+    return f"{text} {PLAYBACK_NOTE_HEAD}{note})" if note else text
 
 
 def line_notice(message: str) -> str:

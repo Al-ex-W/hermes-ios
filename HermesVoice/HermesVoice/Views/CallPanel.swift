@@ -109,6 +109,13 @@ struct CallPanel: View {
                 Image(systemName: call.speakerOn ? "speaker.wave.2.fill" : "iphone")
             }
             .accessibilityLabel(call.speakerOn ? "Use the earpiece" : "Use the speaker")
+            // Plays Hermes' last line again from the audio kept on the phone, without asking Hermes.
+            Button { call.repeatLast() } label: {
+                Label("Repeat", systemImage: "arrow.counterclockwise")
+                    .font(.subheadline.weight(.medium))
+            }
+            .disabled(!call.canRepeat)
+            .accessibilityHint("Plays the last thing Hermes said again")
             Spacer()
             Button { calls.end() } label: {
                 Label("End", systemImage: "phone.down.fill")

@@ -18,7 +18,7 @@ import httpx
 import pytest
 import websockets
 
-from support import PREFIX, PacedSpeech, Phone, say_line, serving, tool, until
+from support import PREFIX, PacedSpeech, Phone, heard_part, say_line, serving, tool, until
 
 
 def _call_id() -> str:
@@ -114,7 +114,8 @@ def test_hang_up_mid_speech_is_not_reported_as_heard(core, fake, make_hub):
     assert during["outcome"] == "ended_by_user" and during["said"] == "", during
     assert after.status == "not_delivered" and "has ended" in after.message and "text recap" in after.message
     # The result says what the user did not hear, and that hanging up is no preference of theirs.
-    assert 'did not hear all of what you were saying when the call ended: "A long answer".' in during["note"], during
+    assert ('did not hear all of what you were saying when the call ended: "A long answer".'
+            in heard_part(during["note"])[0]), during
     assert "not a preference" in during["note"] and "Reply in text" not in during["note"]
     # The sync start_call returned the hang-up itself: no "[Voice call ended by user]" notice on top.
     texts = hub.injector.texts()
@@ -262,7 +263,7 @@ def test_an_async_line_that_isnt_delivered_is_told_to_the_conversation(core, fak
         assert core.inject.NOTICE_MARKER in texts[1] and len(texts) == 2
     else:
         line = " ".join(["word"] * 40)
-        assert texts[1:] == [
+        assert [heard_part(text)[0] for text in texts[1:]] == [
             "[Voice call ended by user] Automated notice from HermesVoice, not something the user said. It applies "
             "to this call only and is not a preference, so don't store it. The user did not hear all of what you "
             f'were saying when the call ended: "{line}". The user can\'t hear you now and is probably not reading '
