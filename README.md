@@ -350,7 +350,7 @@ In the app, enter the **Hermes dashboard** address (`https://<machine>.<tailnet>
 # The plugin (call hub, streaming, ring protocol, injection, policy, APNs, routes) against stubbed Hermes modules
 cd hermes-voice-plugin && uv run pytest -q
 
-# The plugin inside a real `hermes serve` in a temp home (opt-in, 6 to 9 minutes; needs a Hermes install)
+# The plugin inside a real `hermes serve` in a temp home (opt-in, about five minutes; needs a Hermes install)
 HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
 
 # The legacy MCP server, and the fake dashboard with its fake plugin

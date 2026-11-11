@@ -379,7 +379,8 @@ uv run pytest -q
 The tests stub every Hermes module the plugin imports, run the plugin's router on a real server (an OS-assigned
 port) and drive it with a fake phone over a real WebSocket, plus a mock APNs and a mock ElevenLabs.
 
-`tests/integration/` runs the plugin inside a real `hermes serve --isolated` (opt-in, 6 to 9 minutes):
+`tests/integration/` runs the plugin inside a real `hermes serve --isolated` (opt-in; about five minutes when
+green, and a minute or two more for each test that fails, since a failure waits out its timeouts):
 
 ```bash
 HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
