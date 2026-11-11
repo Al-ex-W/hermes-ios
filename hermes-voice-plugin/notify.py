@@ -15,7 +15,10 @@ its own surface.
   short to be seen running. How it ended comes from the turn's own ``message.complete`` event in the dashboard's
   replay ring (``complete`` / ``error`` / ``interrupted``, and the reply), else from the turn Hermes kept as failed
   (``inflight_turn`` with ``status: "error"``), else from the hook: Hermes skips ``on_session_end`` on its early
-  returns (a provider error, retries used up), so the hook alone would miss most failed turns. It alerts when no
+  returns (a provider error, retries used up), so the hook alone would miss most failed turns. The dashboard
+  closes a conversation nobody has open once its turn is over, and frees its replay ring with it; that can come
+  before the watcher's next look, so the ``on_session_finalize`` hook (fired before the ring goes) reads the turn's
+  end then (``session_closing``). It alerts when no
   client had the conversation open as the turn ended nor ``grace_s`` later (someone who watched the reply arrive
   doesn't need a push; one who left mid-turn does), the conversation hasn't started another turn by then (that
   one's end alerts instead) and it isn't on a call with the phone. An interrupted or muted turn, and an exact
@@ -545,6 +548,22 @@ class Alerts:
             if known is not None and turn and known.turn_id == turn:
                 return  # the same turn told twice
             self.hook_ends[found[0]] = _HookEnd(session_id, found[1], outcome, reply, self.clock(), turn)
+
+    def session_closing(self, session_id: str = "") -> None:
+        """``on_session_finalize``: the dashboard is closing a conversation, and frees its event ring right after
+        (``tui_gateway.event_replay.forget_session``). It closes one nobody has open as soon as its turn is over
+        (the reap timer that started when the last client left), which can be before the watcher's next look: the
+        turn's ``message.complete`` is read here, while it is still there. Without this the watcher found the
+        conversation gone and its events with it, and said nothing about a turn it had seen running."""
+        with self.lock:
+            for sid, run in self.runs.items():
+                record = run.record
+                if (record.get("_finalized") or record.get("_closing")
+                        or (session_id and hermes.record_session_id(record) == session_id)):
+                    complete, run.seq = last_complete(sid, run.seq)
+                    if complete is not None:
+                        logger.info("hermes_voice: read how a turn ended as the dashboard closed its conversation")
+                    run.complete = complete or run.complete
 
     # ── the watcher ──────────────────────────────────────────────────────────────────────────────────────
 

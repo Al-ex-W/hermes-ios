@@ -365,7 +365,7 @@ In the app, enter the **Hermes dashboard** address (`https://<machine>.<tailnet>
 # The plugin (call hub, streaming, ring protocol, injection, policy, APNs, routes) against stubbed Hermes modules
 cd hermes-voice-plugin && uv run pytest -q
 
-# The plugin inside a real `hermes serve` in a temp home (opt-in, about three minutes; needs a Hermes install)
+# The plugin inside a real `hermes serve` in a temp home (opt-in, about five minutes; needs a Hermes install)
 HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
 
 # The legacy MCP server, and the fake dashboard with its fake plugin
@@ -391,6 +391,12 @@ and under `turn_isolation`; through the plugin's real APNs sender and a mock APN
 that takes approval alerts exactly once. APNs itself is replaced by a recorder or that mock. They look for Hermes
 at `~/.hermes/hermes-agent`; set `HERMES_AGENT_DIR` or `HERMES_PYTHON` otherwise, and
 `HERMES_VOICE_IT_PORTS=<low>-<high>` to keep their servers in a port range.
+
+The plugin reaches into Hermes internals, so it is only known to work with the Hermes it was run against: this
+suite is green against Hermes v0.23.0 (commit `2bd378ed1b`), and was green before that against the canary of
+2026-10-25 (`d778246c84`, v0.22.5 plus 315 commits). `plugin.yaml` refuses to load on a Hermes older than 0.22.5
+(`requires_hermes`). Run the suite again after every Hermes update: the
+[plugin README](hermes-voice-plugin/README.md#hermes-versions) lists what changed in Hermes so far.
 
 With [`devtools/fake_hermes.py`](devtools) running (`--port 9311 --reap-grace 1`), prefix the `xcodebuild test`
 command with `TEST_RUNNER_HERMES_FAKE_URL=http://127.0.0.1:9311 TEST_RUNNER_HERMES_FAKE_REAP_GRACE=1` to also run
