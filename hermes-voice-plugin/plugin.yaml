@@ -6,6 +6,9 @@ author: Al-ex-W
 license: MIT
 homepage: https://github.com/Al-ex-W/hermes-ios
 kind: standalone
+# The oldest Hermes the plugin was ever run against (the canary of 2026-10-25); tested against 0.23.0. The plugin
+# reaches into Hermes internals (hermes.py), so a newer Hermes needs the integration suite run again (README).
+requires_hermes: ">=0.22.5"
 platforms:
   - linux
   - macos
@@ -16,6 +19,7 @@ provides_hooks:
   - pre_llm_call
   - post_llm_call
   - on_session_end
+  - on_session_finalize
 # APNs needs HTTP/2, which httpx only speaks with h2 installed (Hermes' own venv lacks it).
 python_dependencies:
   - "h2>=4,<5"

@@ -99,7 +99,8 @@ def _register_alerts(ctx: Any) -> None:
     """Hooks for the alert pushes: the dashboard's watcher (started with its routes) finds waiting approvals and
     questions by itself; these tell it when a turn this process ran ended, and with what reply. They do nothing in
     a process that doesn't serve the phone (CLI, messaging gateway, a compute-host child)."""
-    for name, callback in (("post_llm_call", _alert_reply), ("on_session_end", _alert_turn_end)):
+    for name, callback in (("post_llm_call", _alert_reply), ("on_session_end", _alert_turn_end),
+                           ("on_session_finalize", _alert_session_closing)):
         try:
             ctx.register_hook(name, callback)
         except Exception:  # noqa: BLE001
@@ -138,6 +139,18 @@ def _alert_turn_end(session_id: Any = None, turn_id: Any = None, completed: Any 
                                             interrupted=interrupted, muted=muted)
     except Exception:  # noqa: BLE001
         logger.debug("hermes_voice: on_session_end alert hook failed", exc_info=True)
+    return None
+
+
+def _alert_session_closing(session_id: Any = None, **_: Any) -> None:
+    """``on_session_finalize``: the dashboard closes a conversation and frees its events next; the watcher reads
+    how its last turn ended while it still can (``notify.Alerts.session_closing``)."""
+    if not _core("hub").routes_mounted():
+        return None
+    try:
+        _core("notify").alerts().session_closing(str(session_id or ""))
+    except Exception:  # noqa: BLE001 - a hook must never break a close
+        logger.debug("hermes_voice: on_session_finalize alert hook failed", exc_info=True)
     return None
 
 
