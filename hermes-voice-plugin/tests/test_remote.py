@@ -447,6 +447,8 @@ def test_idle_a_local_conversation_the_gateway_retired_is_brought_back_for_the_t
     # Back in memory, the next turn needs no restore.
     assert core.inject.inject_idle(_target(core, None, ctx, "local-1", LOCAL_KEY), "[Voice] more").ok
     assert len(gateway.restored) == 1
+    # Two turns refused at once: the one that finds it restored meanwhile tries again too.
+    assert core.hermes.restore_retired_session(ctx, LOCAL_KEY) is True and len(gateway.restored) == 1
 
 
 @pytest.mark.parametrize("case", ["not retired", "receipt refused", "injection off", "another key", "no gateway"])

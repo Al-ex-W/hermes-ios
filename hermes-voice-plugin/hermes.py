@@ -635,7 +635,7 @@ RESTORE_TIMEOUT_S = 10.0
 
 def restore_retired_session(ctx: Any, session_key: str, timeout: float = RESTORE_TIMEOUT_S) -> bool:
     """Bring a local conversation the gateway let go of back into its memory, so that ``ctx.inject_message`` can
-    start a turn in it. True when it is back.
+    start a turn in it. True when it is back (or already was), so that injecting again is worth it.
 
     Since Hermes 0.22.6 the gateway drops a local (CLI / TUI) conversation from ``authority.sessions`` once its last
     viewer closed and nothing runs in it (``gateway/session_retirement.py``), and restores it wherever it is needed
@@ -644,8 +644,8 @@ def restore_retired_session(ctx: Any, session_key: str, timeout: float = RESTORE
     so the injection is refused as "not a live local session". This runs Hermes' own restore
     (``restore_retired``) on the gateway's loop, for a conversation of the plugin's own profile that retirement
     let go and for nothing else; it retires again after 30 s with nothing running in it. False on a Hermes
-    without retirement, outside the gateway, or when the conversation was not retired (the refusal then has
-    another reason)."""
+    without retirement, outside the gateway, or when retirement never let the conversation go (the refusal
+    then has another reason)."""
     manager = getattr(ctx, "_manager", None) if ctx is not None else None
     host = getattr(manager, "_gateway_message_injector", None)
     runner = host[0] if isinstance(host, tuple) and host else None
@@ -666,7 +666,11 @@ def restore_retired_session(ctx: Any, session_key: str, timeout: float = RESTORE
         if not isinstance(sessions, dict) or not isinstance(routes, dict):
             return False
         sid = next((sid for sid, route in list(routes.items()) if route == session_key), None)
-        if sid is None or sid in sessions or sid not in getattr(authority, "retired_local", ()):
+        if sid is None:
+            return False
+        if sid in sessions:
+            return True  # back already (another of the call's turns restored it a moment ago)
+        if sid not in getattr(authority, "retired_local", ()):
             return False
         with _owner_scope(authority):
             restore_retired(authority, sid)
