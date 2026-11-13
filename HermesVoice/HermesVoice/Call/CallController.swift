@@ -96,11 +96,11 @@ final class CallController: NSObject, ObservableObject {
         call.onConnected = { [weak self, uuid = call.uuid] in
             self?.provider.reportOutgoingCall(with: uuid, connectedAt: Date())
         }
-        let action = CXStartCallAction(call: call.uuid, handle: Self.handle(title: chat.title))
+        let action = CXStartCallAction(call: call.uuid, handle: Self.handle)
         action.contactIdentifier = "Hermes"
         do {
             try await controller.request(CXTransaction(action: action))
-            provider.reportCall(with: call.uuid, updated: Self.update(title: chat.title))
+            provider.reportCall(with: call.uuid, updated: Self.update())
         } catch {
             fail(call, error)
         }
@@ -122,7 +122,7 @@ final class CallController: NSObject, ObservableObject {
     func reportIncoming(_ push: CallPush, completion: @escaping () -> Void,
                         makeCall: @escaping (CallPush) async throws -> VoiceCall) {
         guard let uuid = CallID.uuid(from: push.callID) else { return reportUnusablePush(completion: completion) }
-        let update = Self.update(title: push.title ?? "Hermes")
+        let update = Self.update()
         if active?.uuid == uuid || ringing?.uuid == uuid {
             // A repeat of the push for the call that rings: CallKit refuses the duplicate, which is fine.
             provider.reportNewIncomingCall(with: uuid, update: update) { _ in completion() }
@@ -194,7 +194,7 @@ final class CallController: NSObject, ObservableObject {
     /// A VoIP push without a usable call: iOS still requires a call to be reported for it, so one is, and ended.
     func reportUnusablePush(completion: @escaping () -> Void) {
         let uuid = UUID()
-        provider.reportNewIncomingCall(with: uuid, update: Self.update(title: "Hermes")) { [weak self] error in
+        provider.reportNewIncomingCall(with: uuid, update: Self.update()) { [weak self] error in
             Task { @MainActor in
                 if error == nil { self?.provider.reportCall(with: uuid, endedAt: Date(), reason: .failed) }
                 completion()
@@ -313,16 +313,17 @@ final class CallController: NSObject, ObservableObject {
     }
     #endif
 
-    private static func handle(title: String) -> CXHandle {
-        CXHandle(type: .generic, value: title)
-    }
+    /// Who is calling, on the call screen and the lock screen: always just Hermes, whichever chat the call belongs to
+    /// (the chat shows in the app). One stable handle, so iOS sees every call as the same caller.
+    static let callerName = "Hermes"
+    private static let handle = CXHandle(type: .generic, value: callerName)
 
     /// No hold, grouping or DTMF: iOS then offers "End & Accept" for an incoming call instead of
     /// holding this one, which would take its audio away with no way back.
-    private static func update(title: String) -> CXCallUpdate {
+    static func update() -> CXCallUpdate {
         let update = CXCallUpdate()
-        update.localizedCallerName = "Hermes · \(title)"
-        update.remoteHandle = handle(title: title)
+        update.localizedCallerName = callerName
+        update.remoteHandle = handle
         update.hasVideo = false
         update.supportsHolding = false
         update.supportsGrouping = false
@@ -346,7 +347,7 @@ extension CallController: CXProviderDelegate {
             guard let call = active, call.uuid == action.callUUID else { return action.fail() }
             do {
                 try CallAudio.configureSession()
-                provider.reportCall(with: action.callUUID, updated: Self.update(title: call.title))
+                provider.reportCall(with: action.callUUID, updated: Self.update())
                 provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
                 action.fulfill()
             } catch {

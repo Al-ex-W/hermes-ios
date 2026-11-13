@@ -87,7 +87,9 @@ final class VoiceCall: ObservableObject, Identifiable {
     @Published private(set) var muted = false
     @Published private(set) var hearing = ""
     @Published private(set) var lastSpoken = ""
-    @Published private(set) var speakerOn = true
+    /// Where the call's sound comes out: the audio route itself, read again on every route change, so the app's
+    /// button and CallKit's Speaker button show the same thing. Before the audio runs it is what the user picked.
+    @Published private(set) var speakerOn = false
     /// The speech recognizer listening now (Scribe falls back to Apple when it can't go on).
     @Published private(set) var speechProvider: SpeechProviderID
     /// A notice shown under the call status (reconnecting, audio interrupted, speech recognition trouble).
@@ -900,7 +902,9 @@ final class VoiceCall: ObservableObject, Identifiable {
             audioStarts += 1
             sendAnswer()
             if !speakerChosen {
-                // Once per call: start on the loudspeaker unless a headset or car already has the call.
+                // Once per call. A call starts where a phone call does (earpiece, headset, Bluetooth, car): CallKit's
+                // Speaker button doesn't learn of a move the app makes on its own, so a call the app put on the
+                // loudspeaker showed that button off. Only a Speaker tap in the app before the audio ran moves it.
                 speakerChosen = true
                 if speakerOn, CallAudio.outputIsReceiver { try? CallAudio.setSpeaker(true) }
             }

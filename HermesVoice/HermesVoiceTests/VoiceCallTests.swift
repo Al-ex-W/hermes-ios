@@ -1,4 +1,5 @@
 import AVFoundation
+import CallKit
 import XCTest
 @testable import HermesVoice
 
@@ -294,6 +295,28 @@ final class VoiceCallTests: XCTestCase {
     }
 
     // MARK: Ringing
+
+    // MARK: Speaker and caller
+
+    /// A call starts on the earpiece, whoever placed it, so the app's button and CallKit's Speaker button agree; a
+    /// Speaker tap before the audio runs is only the user's pick (applied when the audio comes up).
+    func testACallStartsOnTheEarpieceAndASpeakerTapBeforeTheAudioIsOnlyAPick() {
+        XCTAssertFalse(userCall().speakerOn)
+        XCTAssertFalse(pushCall().speakerOn)
+        let call = userCall()
+        call.toggleSpeaker()
+        XCTAssertTrue(call.speakerOn)
+        call.toggleSpeaker()
+        XCTAssertFalse(call.speakerOn)
+    }
+
+    /// The call screen names the caller "Hermes", never the chat, for every call (one handle, one caller to iOS).
+    func testTheCallerIsJustHermes() {
+        let update = CallController.update()
+        XCTAssertEqual(update.localizedCallerName, "Hermes")
+        XCTAssertEqual(update.remoteHandle?.value, "Hermes")
+        XCTAssertEqual(update.remoteHandle?.type, .generic)
+    }
 
     func testPushCallRingsThenAnswers() async {
         let call = pushCall()

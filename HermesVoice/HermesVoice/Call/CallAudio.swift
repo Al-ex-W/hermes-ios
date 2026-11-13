@@ -69,8 +69,8 @@ final class CallAudio: CallAudioPlayback {
 
     static func configureSession() throws {
         let session = AVAudioSession.sharedInstance()
-        // No .defaultToSpeaker: with it, clearing the speaker override goes back to the loudspeaker,
-        // so the call could never move to the earpiece. VoiceCall puts the call on the speaker instead.
+        // No .defaultToSpeaker: a call starts on the earpiece (or a headset) like a phone call, and with it clearing
+        // the speaker override would go back to the loudspeaker, so the call could never move to the earpiece.
         if usesMicrophone {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP])
         } else {
