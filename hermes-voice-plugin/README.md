@@ -691,6 +691,10 @@ HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
   client attached; the phone rings on time, the line is spoken, and the reply becomes a stored turn of the reopened
   conversation, answered into the call. A ring nobody answers is repeated once and the conversation told; and a
   scheduled call rings on time after the dashboard was restarted.
+- `test_session_edits.py` (the app's contract, not the plugin's): a stored conversation is renamed, flagged and
+  deleted the way Hermes 0.22.3+ requires, naming its state from `GET /api/sessions/{id}/mutation-snapshot`;
+  an edit without that is refused with 409 `client_upgrade_required`, a repeated `request_id` gets the same
+  answer, and a revision that is behind gets 409 `revision_conflict`.
 - `test_alerts_real_hermes.py`, with turns in the dashboard and under `turn_isolation`: approval and question
   alerts once the client leaves, answered with `request.answer` from the alert's ids; a turn the provider fails
   alerts that it failed; and through the real APNs

@@ -431,9 +431,9 @@ HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
 # The legacy MCP server, and the fake dashboard with its fake plugin
 cd hermes-voice-mcp && uv run pytest -q && uv run pytest -q ../devtools/tests
 
-# The app's unit tests
+# The app's unit tests (use any simulator that `xcrun simctl list devices available` shows)
 cd HermesVoice && xcodebuild test -project HermesVoice.xcodeproj -scheme HermesVoice \
-  -destination "platform=iOS Simulator,name=iPhone 17 Pro"
+  -destination "platform=iOS Simulator,name=iPhone 18 Pro" -collect-test-diagnostics never
 ```
 
 The integration tests start Hermes with its own interpreter in a temp `HOME` and `HERMES_HOME` (nothing outside
@@ -485,6 +485,12 @@ position first with `xcrun simctl location booted set 59.0,18.0`.
   on screen or in a call (`session.activate`, or `session.resume` when Hermes reaped it meanwhile), and replays
   what it missed (`session.events.since`). Approvals, questions and passwords arrive as server→client requests and
   are answered from the chat.
+- **Edits of a stored conversation** (rename, pin, unread, archive, delete): the app first reads
+  `GET /api/sessions/{id}/mutation-snapshot` and sends its `runtime_revision` and `runtime_generation` back as
+  `expected_revision` / `expected_generation` with a `request_id` (in a `PATCH` body, in a `DELETE` query). Hermes
+  0.22.3 and later refuse an edit without them (409 `client_upgrade_required`). An edit whose answer never arrived
+  keeps its `request_id`, so trying again can't apply it twice; a conversation that changed meanwhile is read and
+  sent once more. A Hermes without the snapshot route gets the plain edit.
 - **Calls**: `wss://…/api/plugins/hermes_voice/phone?ticket=…`, with a fresh ticket for every connect. The app
   says `hello {call_id, session_id, title, initiated_by: user|push, app_version}` and gets `ready {call_id,
   state}`; for a push it says `ringing`, then `answered` (once the call's audio runs) or `declined`. Speech comes

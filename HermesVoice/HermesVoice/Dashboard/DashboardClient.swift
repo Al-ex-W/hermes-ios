@@ -79,6 +79,8 @@ final class DashboardClient {
     private let closedLock = NSLock()
     private var closedFlag = false
     private var closed: Bool { closedLock.withLock { closedFlag } }
+    /// Edits of stored sessions whose answer never arrived (`mutateSession`).
+    let sessionMutations = SessionMutationLedger()
 
     init(settings: ConnectionSettings) throws {
         guard let base = settings.dashboardBase, base.scheme?.hasPrefix("http") == true else { throw DashboardError.badURL }

@@ -44,7 +44,9 @@ Chat screens (M2). More trigger words, combinable in one prompt, each turn endin
 RPCs: commands.catalog, complete.slash/path, slash.exec, command.dispatch, model.options, config.set,
 image.attach_bytes, file.attach, process.list/kill/stop, subagent.list, session.usage, session.context_breakdown,
 session.workspace.move, session.branch, projects.list. REST: GET /api/profiles, /api/profiles/sessions/sidebar,
-/api/sessions/search, /api/media; GET, PATCH and DELETE /api/sessions/{id}. ``--seed demo`` adds chats across two
+/api/sessions/search, /api/media; GET, PATCH and DELETE /api/sessions/{id}. A PATCH or DELETE must name the row's state
+from GET /api/sessions/{id}/mutation-snapshot (request_id, expected_revision, expected_generation), as Hermes 0.22.3+
+requires: without it the answer is 409 client_upgrade_required. ``--seed demo`` adds chats across two
 projects, two profiles and several days (one pinned, one archived, one unread, a cron and a Telegram one);
 ``--seed minimal`` keeps only the welcome chat; ``--seed full`` (the default) is demo plus the M4 chats below.
 
@@ -240,6 +242,10 @@ class StoredSession:
     pinned: bool = False
     hidden: bool = False
     unread: bool = False
+    # What an edit must name (hermes_state runtime_revision / runtime_generation): the revision moves with every
+    # edit of the row.
+    runtime_revision: int = 0
+    runtime_generation: int = 0
     cwd: str = ""
     git_branch: str | None = None
     git_repo_root: str | None = None
@@ -377,6 +383,9 @@ class Conn:
 HOUR, DAY = 3600, 86400
 DEMO_HOME = "/home/demo"
 DEMO_HERMES_HOME = f"{DEMO_HOME}/.hermes"
+# web_server_sessions.py CLIENT_UPGRADE_REQUIRED: the answer to a session edit that names no state (Hermes 0.22.3+).
+CLIENT_UPGRADE_REQUIRED = ("client_upgrade_required: this app is out of sync (different versions) "
+                           "with the Hermes backend; update the app to edit sessions")
 DEMO_IMAGES = f"{DEMO_HERMES_HOME}/images"
 DEMO_ATTACHMENTS = f"{DEMO_HERMES_HOME}/attachments"
 DEMO_IMAGE = f"{DEMO_IMAGES}/fake-hermes-demo.png"
@@ -1738,13 +1747,39 @@ class ChatFeatures:
         stored = self.sessions.get(sid)
         if stored is not None and not stored.persisted:
             stored = None
+        body: Any = None
+        if request.method == "PATCH":
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001 - FastAPI answers a malformed body with 422
+                return JSONResponse({"detail": "invalid JSON body"}, status_code=422)
+            body = body if isinstance(body, dict) else {}
+        identity, refusal = self.mutation_identity(request, body)
+        if refusal is not None:
+            log(f"http {request.method} /api/sessions/{sid} -> 409 ({refusal[:40]})")
+            return JSONResponse({"detail": refusal}, status_code=409)
+        if (receipt := self.mutation_receipts.get(identity["request_id"])) is not None:
+            log(f"http {request.method} /api/sessions/{sid} -> 200 (receipt replayed)")
+            return JSONResponse(receipt)
+        if stored is not None:
+            if identity["expected_revision"] != stored.runtime_revision:
+                log(f"http {request.method} /api/sessions/{sid} -> 409 (revision_conflict)")
+                return JSONResponse({"detail": "revision_conflict"}, status_code=409)
+            if identity["expected_generation"] not in (None, stored.runtime_generation):
+                log(f"http {request.method} /api/sessions/{sid} -> 409 (stale_generation)")
+                return JSONResponse({"detail": "stale_generation"}, status_code=409)
         if request.method == "DELETE":
+            if stored is None and identity["expected_generation"] is None:
+                # What real Hermes answers a delete that names an absent row's state (revision 0, no generation);
+                # the app answers "already gone" from the snapshot instead of sending it.
+                log(f"http DELETE /api/sessions/{sid} -> 400 (invalid_params)")
+                return JSONResponse({"detail": "invalid_params"}, status_code=400)
             if stored is None:
                 log(f"http DELETE /api/sessions/{sid} -> 200 (already absent)")
                 return JSONResponse({"ok": True, "already_absent": True})
             if (rt := self.find_runtime(sid)) is not None and rt.running:
                 log(f"http DELETE /api/sessions/{sid} -> 409 (turn running)")
-                return JSONResponse({"detail": "session has an active turn; stop it first"}, status_code=409)
+                return JSONResponse({"detail": "session_busy"}, status_code=409)
             for proc in [p for p in self.processes.values() if p["session_key"] == sid]:
                 self.kill(proc, "session.delete")
             if rt is None:
@@ -1755,16 +1790,12 @@ class ChatFeatures:
                 stored.messages.clear()
                 stored.persisted = False
             log(f"http DELETE /api/sessions/{sid} -> 200")
+            self.mutation_receipts[identity["request_id"]] = {"ok": True}
             await self.broadcast("sessions.changed", {})
             return JSONResponse({"ok": True})
         if stored is None:
             log(f"http PATCH /api/sessions/{sid} -> 404")
-            return JSONResponse({"detail": "Session not found"}, status_code=404)
-        try:
-            body = await request.json()
-        except Exception:  # noqa: BLE001 - FastAPI answers a malformed body with 422
-            return JSONResponse({"detail": "invalid JSON body"}, status_code=422)
-        body = body if isinstance(body, dict) else {}
+            return JSONResponse({"detail": "not_found"}, status_code=404)
         flags = ("archived", "hidden", "pinned", "unread")
         if body.get("title") is None and all(body.get(f) is None for f in flags):
             return JSONResponse({"detail": "Nothing to update; provide 'title', 'archived', 'hidden', 'pinned', "
@@ -1781,9 +1812,50 @@ class ChatFeatures:
                 setattr(stored, flag, bool(body[flag]))
                 result[flag] = bool(body[flag])
         result["title"] = stored.title or ""
+        stored.runtime_revision += 1
+        self.mutation_receipts[identity["request_id"]] = result
         log(f"http PATCH /api/sessions/{sid} -> 200 {short(result)}")
         await self.broadcast("sessions.changed", {})
         return JSONResponse(result)
+
+    @staticmethod
+    def mutation_identity(request: Request, body: Any) -> tuple[dict[str, Any], str | None]:
+        """web_server_sessions.py _mutate_session_request: an edit names the state it applies to (`request_id`,
+        `expected_revision`, optionally `expected_generation`; in a PATCH body, in a DELETE's query). An edit with
+        none of them is a client from before the fence (409 `client_upgrade_required`)."""
+        source = body if request.method == "PATCH" else request.query_params
+
+        def whole(name: str) -> int | None:
+            value = source.get(name)
+            if isinstance(value, bool) or value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        request_id = source.get("request_id")
+        request_id = request_id if isinstance(request_id, str) and request_id else None
+        identity = {"request_id": request_id, "expected_revision": whole("expected_revision"),
+                    "expected_generation": whole("expected_generation")}
+        if all(value is None for value in identity.values()):
+            return identity, CLIENT_UPGRADE_REQUIRED
+        if request_id is None or identity["expected_revision"] is None:
+            return identity, "mutation_identity_required"
+        return identity, None
+
+    async def session_mutation_snapshot(self, request: Request) -> Response:
+        """sessions.py GET /api/sessions/{id}/mutation-snapshot: what an edit of the row has to name."""
+        sid = request.path_params["session_id"]
+        if not self.authed(request):
+            return self.unauthorized(request)
+        stored = self.sessions.get(sid)
+        if stored is not None and not stored.persisted:
+            stored = None
+        log(f"http GET /api/sessions/{sid}/mutation-snapshot -> 200 (exists={stored is not None})")
+        return JSONResponse({"session_id": sid, "exists": stored is not None,
+                             "runtime_revision": stored.runtime_revision if stored else 0,
+                             "runtime_generation": stored.runtime_generation if stored else None})
 
     async def get_media(self, request: Request) -> Response:
         """files.py /api/media: a gateway-local image as a data URL for clients that can't read its disk."""
@@ -11436,6 +11508,8 @@ class FakeHermes(ChatFeatures, SettingsFeatures, CapabilityFeatures, WorkspaceFe
         self.access_tokens: dict[str, float] = {}
         self.tickets: dict[str, float] = {}
         self.sessions: dict[str, StoredSession] = {}
+        # Answers of session edits by their request_id: the same edit sent again gets the same answer.
+        self.mutation_receipts: dict[str, dict[str, Any]] = {}
         self.runtimes: dict[str, Runtime] = {}
         self.idempotency: dict[str, str] = {}
         self.conns: set[Conn] = set()
@@ -12618,6 +12692,7 @@ def build_app(fake: FakeHermes) -> Starlette:
         Route("/api/profiles", fake.list_profiles, methods=["GET"]),
         Route("/api/profiles/sessions/sidebar", fake.sidebar_sessions, methods=["GET"]),
         Route("/api/sessions/search", fake.search_sessions, methods=["GET"]),
+        Route("/api/sessions/{session_id}/mutation-snapshot", fake.session_mutation_snapshot, methods=["GET"]),
         Route("/api/sessions/{session_id}", fake.manage_session, methods=["PATCH", "DELETE"]),
         Route("/api/sessions/{session_id}", fake.rest(fake.get_session), methods=["GET"]),
         Route("/api/media", fake.get_media, methods=["GET"]),

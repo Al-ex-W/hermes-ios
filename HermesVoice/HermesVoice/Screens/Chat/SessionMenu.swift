@@ -80,14 +80,12 @@ struct SessionActions {
             _ = try? await gateway.sessionInterrupt(.init(sessionId: runtimeID, profile: target.profile))
             _ = try? await gateway.sessionClose(.init(sessionId: runtimeID, profile: target.profile))
         }
-        _ = try await client.request("DELETE", try path(target), query: target.profile.map { ["profile": $0] } ?? [:])
+        try await client.deleteSession(target.storedID, profile: target.profile)
     }
 
-    /// The owning profile rides in the body: the dashboard opens that profile's store from it.
+    /// A fenced edit of the stored row (`DashboardClient.mutateSession`); the owning profile rides along.
     private func patch(_ target: SessionMenuTarget, _ body: JSON) async throws -> Any {
-        var body = body
-        if let profile = target.profile { body["profile"] = profile }
-        return try await client.request("PATCH", try path(target), body: body)
+        try await client.mutateSession("PATCH", id: target.storedID, profile: target.profile, payload: body) as Any
     }
 
     /// The id goes in as is: `DashboardClient.url` percent-encodes the path once.
