@@ -402,6 +402,55 @@ final class FakeHermesTests: XCTestCase {
         XCTAssertEqual(chat.errorCount, 1, "the rewound turn's card went with it")
     }
 
+    /// Hermes 0.22.3+ refuses an edit of a stored session that doesn't name the state it applies to; the app reads
+    /// that state first (`DashboardClient.mutateSession`), and the fake refuses like Hermes.
+    func testAStoredChatIsRenamedFlaggedAndDeletedAgainstItsRevision() async throws {
+        let chat = await newChat()
+        await reply(chat, "hello")
+        let id = try XCTUnwrap(chat.storedID)
+
+        do {
+            _ = try await client.request("PATCH", "/api/sessions/\(id)", body: ["pinned": true])
+            XCTFail("an edit without its identity went through")
+        } catch let DashboardError.http(code, body) {
+            XCTAssertEqual(code, 409)
+            XCTAssertTrue(body.contains("client_upgrade_required"), body)
+        }
+
+        let title = try await client.updateSession(id, profile: nil, title: "Fenced rename")
+        XCTAssertEqual(title, "Fenced rename")
+        try await client.updateSession(id, profile: nil, pinned: true)
+        try await client.updateSession(id, profile: nil, unread: true)
+        var rows = try await storedSessions()
+        XCTAssertEqual(rows.first { $0.id == id }?.title, "Fenced rename")
+
+        // An identity read before the session changed is refused once (revision_conflict), read again and sent.
+        let behind = try XCTUnwrap(SessionMutationSnapshot(row: ["exists": true, "runtime_revision": 0,
+                                                                 "runtime_generation": 0]))
+        let key = SessionMutationLedger.key(profile: nil, id: id, method: "PATCH", payload: ["title": "Second rename"])
+        client.sessionMutations.keep(SessionMutationIdentity(snapshot: behind), for: key)
+        try await client.updateSession(id, profile: nil, title: "Second rename")
+        XCTAssertNil(client.sessionMutations.pending(key))
+        rows = try await storedSessions()
+        XCTAssertEqual(rows.first { $0.id == id }?.title, "Second rename")
+
+        // The menu's edits go the same way; its delete closes the live chat first.
+        let target = SessionMenuTarget(storedID: id, runtimeID: chat.attachedRuntimeID, title: "Second rename")
+        try await chat.sessionActions.setArchived(target, true)
+        try await chat.sessionActions.setArchived(target, false)
+        try await chat.sessionActions.delete(target)
+        chat.sessionGone()
+        let sessions = try await storedSessions()
+        XCTAssertFalse(sessions.contains { $0.id == id })
+        try await client.deleteSession(id, profile: nil)  // already gone counts as done
+        do {
+            try await client.updateSession(id, profile: nil, pinned: false)
+            XCTFail("a deleted session was edited")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("no longer on Hermes"), error.localizedDescription)
+        }
+    }
+
     func testDeletingARunningChatStopsAndClosesItFirst() async throws {
         let chat = await newChat()
         _ = await chat.send("tools approve")

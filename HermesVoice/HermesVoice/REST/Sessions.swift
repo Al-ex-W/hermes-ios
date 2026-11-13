@@ -231,7 +231,8 @@ extension DashboardClient {
     }
 
     /// Renames (an empty title clears it) or flags a session (`PATCH /api/sessions/:id`). `profile` names the
-    /// store that holds it; the handler reads its database from the body. Returns the stored title.
+    /// store that holds it; the handler reads its database from the body. Returns the stored title when the answer
+    /// carries one.
     @discardableResult
     func updateSession(_ id: String, profile: String?, title: String? = nil, pinned: Bool? = nil,
                        archived: Bool? = nil, unread: Bool? = nil) async throws -> String? {
@@ -240,13 +241,182 @@ extension DashboardClient {
         if let pinned { body["pinned"] = pinned }
         if let archived { body["archived"] = archived }
         if let unread { body["unread"] = unread }
-        if let profile { body["profile"] = profile }
-        let result = try await request("PATCH", "/api/sessions/\(id)", body: body) as? JSON
-        return result?["title"] as? String
+        return try await mutateSession("PATCH", id: id, profile: profile, payload: body)?["title"] as? String
     }
 
     /// Deletes a session and its transcript for good. Already gone counts as done.
     func deleteSession(_ id: String, profile: String?) async throws {
-        _ = try await request("DELETE", "/api/sessions/\(id)", query: profile.map { ["profile": $0] } ?? [:])
+        _ = try await mutateSession("DELETE", id: id, profile: profile)
+    }
+
+    /// One edit of a stored session: `PATCH` (title and sidebar flags) or `DELETE`, the way the desktop sends it
+    /// (`apps/shared/src/session-http-mutations.ts`, `apps/desktop/src/api/sessions.ts`). Since Hermes 0.22.3 an
+    /// edit must say which state of the session it applies to, or it is refused with 409
+    /// `client_upgrade_required`: the app reads `GET /api/sessions/:id/mutation-snapshot` and sends its
+    /// `runtime_revision` (and `runtime_generation`) back as `expected_revision` / `expected_generation` with a
+    /// `request_id`, in the body of a `PATCH` and in the query of a `DELETE`.
+    ///
+    /// - An edit whose answer never arrived keeps its `request_id`, so trying the same edit again can't apply twice.
+    /// - A session that changed between the snapshot and the edit (`revision_conflict`, `stale_generation`) is read
+    ///   and sent once more: a rename or a flag the user just chose is meant for the session as it is now.
+    /// - A Hermes without the snapshot route (before 0.22.3) takes the plain edit.
+    @discardableResult
+    func mutateSession(_ method: String, id: String, profile: String?, payload: JSON = [:]) async throws -> JSON? {
+        let path = "/api/sessions/\(try Self.segment(id))"
+        let scope = profile.map { ["profile": $0] } ?? [:]
+        let key = SessionMutationLedger.key(profile: profile, id: id, method: method, payload: payload)
+
+        func send(_ identity: SessionMutationIdentity?) async throws -> JSON? {
+            if method == "DELETE" {
+                return try await request("DELETE", path, query: scope.merging(identity?.query ?? [:]) { $1 }) as? JSON
+            }
+            var body = payload.merging(identity?.fields ?? [:]) { $1 }
+            if let profile { body["profile"] = profile }
+            return try await request(method, path, body: body) as? JSON
+        }
+
+        for attempt in 0..<2 {
+            var identity = sessionMutations.pending(key)
+            if identity == nil {
+                let row: JSON?
+                do {
+                    row = try await request("GET", "\(path)/mutation-snapshot", query: scope) as? JSON
+                } catch let error where SessionMutationLedger.isMissingRoute(error) {
+                    return try await send(nil)
+                }
+                guard let snapshot = row.flatMap(SessionMutationSnapshot.init(row:)) else {
+                    throw DashboardError.rpc("Hermes couldn't say what state this conversation is in. Refresh and try again.")
+                }
+                guard snapshot.exists else {
+                    if method == "DELETE" { return ["ok": true, "already_absent": true] }
+                    throw DashboardError.rpc("This conversation is no longer on Hermes.")
+                }
+                identity = SessionMutationIdentity(snapshot: snapshot)
+                sessionMutations.keep(identity!, for: key)
+            }
+            do {
+                let result = try await send(identity)
+                sessionMutations.settle(key)
+                return result
+            } catch {
+                // Hermes refused it: the identity is spent. A lost answer keeps it for the next try of the same edit.
+                if error.isRefusal { sessionMutations.drop(key) }
+                if attempt == 0, SessionMutationLedger.isConflict(error) { continue }
+                throw SessionMutationLedger.explained(error)
+            }
+        }
+        throw DashboardError.rpc("This conversation keeps changing on Hermes. Try again in a moment.")
+    }
+}
+
+/// What Hermes holds of a stored session before an edit (`GET /api/sessions/:id/mutation-snapshot`).
+struct SessionMutationSnapshot: Equatable {
+    let exists: Bool
+    let revision: Int
+    let generation: Int?
+
+    /// nil when the row isn't a usable snapshot (the desktop refuses those too: `createSessionMutationClient`).
+    init?(row: JSON) {
+        guard let exists = row["exists"] as? Bool, let revision = Self.count(row["runtime_revision"]) else { return nil }
+        let generation = Self.count(row["runtime_generation"])
+        if exists, generation == nil { return nil }
+        self.exists = exists
+        self.revision = revision
+        self.generation = exists ? generation : nil
+    }
+
+    /// A whole number of zero or more; JSON true/false is not one.
+    private static func count(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let double = number.doubleValue
+        guard double >= 0, double == double.rounded(), double < 9_007_199_254_740_992 else { return nil }
+        return number.intValue
+    }
+}
+
+/// What an edit carries so Hermes applies it once, and only to the session the app read.
+struct SessionMutationIdentity: Equatable {
+    let requestID: String
+    let expectedRevision: Int
+    let expectedGeneration: Int?
+
+    init(snapshot: SessionMutationSnapshot, requestID: String = UUID().uuidString.lowercased()) {
+        self.requestID = requestID
+        expectedRevision = snapshot.revision
+        expectedGeneration = snapshot.generation
+    }
+
+    /// The fields of a `PATCH` body.
+    var fields: JSON {
+        var fields: JSON = ["request_id": requestID, "expected_revision": expectedRevision]
+        if let expectedGeneration { fields["expected_generation"] = expectedGeneration }
+        return fields
+    }
+
+    /// The same as query items, for a `DELETE`.
+    var query: [String: String] {
+        var query = ["request_id": requestID, "expected_revision": String(expectedRevision)]
+        if let expectedGeneration { query["expected_generation"] = String(expectedGeneration) }
+        return query
+    }
+}
+
+/// The identities of session edits whose answer never arrived, by what the edit was. Used from any task.
+final class SessionMutationLedger {
+    private let lock = NSLock()
+    private var identities: [String: SessionMutationIdentity] = [:]
+
+    /// One edit: the store, the session, the method and what it changes.
+    static func key(profile: String?, id: String, method: String, payload: JSON) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        return scope(profile: profile, id: id) + "\(method)\u{1F}" + (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+    }
+
+    private static func scope(profile: String?, id: String) -> String { "\(profile ?? "")\u{1F}\(id)\u{1F}" }
+
+    func pending(_ key: String) -> SessionMutationIdentity? { lock.withLock { identities[key] } }
+
+    func keep(_ identity: SessionMutationIdentity, for key: String) { lock.withLock { identities[key] = identity } }
+
+    func drop(_ key: String) { lock.withLock { _ = identities.removeValue(forKey: key) } }
+
+    /// The edit went through: it and every other edit kept for that session are spent (their revision is behind).
+    func settle(_ key: String) {
+        let parts = key.split(separator: "\u{1F}", maxSplits: 2, omittingEmptySubsequences: false)
+        let scope = parts.count == 3 ? "\(parts[0])\u{1F}\(parts[1])\u{1F}" : key
+        lock.withLock { identities = identities.filter { !$0.key.hasPrefix(scope) } }
+    }
+
+    /// The dashboard has no such route (a Hermes before the fenced edits): its own 404 for an unknown API path, or
+    /// headless `hermes serve`'s fixed body. A plain `{"detail": "Not Found"}` is not that verdict.
+    static func isMissingRoute(_ error: Error) -> Bool {
+        guard case let .http(404, body)? = error as? DashboardError else { return false }
+        let text = body.lowercased()
+        return text.contains("no such api endpoint") || text.contains("endpoint is likely missing")
+            || text.contains("headless backend (hermes serve): web ui disabled")
+    }
+
+    /// The session changed between the snapshot and the edit.
+    static func isConflict(_ error: Error) -> Bool {
+        guard case let .http(409, body)? = error as? DashboardError else { return false }
+        return body.contains("revision_conflict") || body.contains("stale_generation")
+    }
+
+    /// Hermes' refusal codes in words the user can act on; anything else as it came.
+    static func explained(_ error: Error) -> Error {
+        guard case let .http(code, body)? = error as? DashboardError, (400..<500).contains(code) else { return error }
+        let reasons: [(String, String)] = [
+            ("client_upgrade_required", "This Hermes needs a newer HermesVoice to edit conversations. Update the app."),
+            ("revision_conflict", "This conversation changed on Hermes meanwhile. Try again."),
+            ("stale_generation", "This conversation changed on Hermes meanwhile. Try again."),
+            ("session_busy", "Hermes is busy with this conversation. Stop its turn, or try again in a moment."),
+            ("admission_conflict", "Hermes is busy with this conversation. Stop its turn, or try again in a moment."),
+            ("runtime_coordination_required",
+             "This conversation is open in another Hermes window or terminal. Close it there, then try again."),
+            ("permission_denied", "This sign-in isn't allowed to edit that conversation."),
+            ("profile_mismatch", "That conversation belongs to another profile."),
+        ]
+        for (reason, message) in reasons where body.contains(reason) { return DashboardError.rpc(message) }
+        return error
     }
 }

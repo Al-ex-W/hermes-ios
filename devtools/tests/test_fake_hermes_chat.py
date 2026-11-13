@@ -4,6 +4,7 @@ Hermes shapes and the pinned gateway contract."""
 from __future__ import annotations
 
 import asyncio
+import uuid
 import base64
 import re
 
@@ -128,42 +129,59 @@ def test_search_finds_ids_and_message_words_in_one_profile():
                              "preview", "is_active", "profile"}
 
 
+async def fence(http: httpx.AsyncClient, key: str) -> dict:
+    """What an edit of a stored session has to carry: a request id and the row's state as the snapshot route gives it
+    (apps/shared/src/session-http-mutations.ts)."""
+    snapshot = (await http.get(f"/api/sessions/{key}/mutation-snapshot")).json()
+    identity = {"request_id": uuid.uuid4().hex, "expected_revision": snapshot["runtime_revision"]}
+    if snapshot["exists"]:
+        identity["expected_generation"] = snapshot["runtime_generation"]
+    return identity
+
+
 def test_sessions_are_renamed_flagged_and_deleted():
     async def scenario():
         async with serving(seed="demo") as (fake, base):
             key = next(s.key for s in fake.sessions.values() if s.title == "Refactor storage layer")
             async with signed_in(base) as http:
+                async def patch(target: str, fields: dict, **kwargs):
+                    return await http.patch(f"/api/sessions/{target}", json={**fields, **await fence(http, target)},
+                                            **kwargs)
+
+                async def delete(target: str):
+                    return await http.delete(f"/api/sessions/{target}", params=await fence(http, target))
+
                 watcher = await Gateway.connect(base, http)
-                renamed = await http.patch(f"/api/sessions/{key}", json={"title": "  Storage   split  ", "pinned": True,
-                                                                         "unread": False})
+                renamed = await patch(key, {"title": "  Storage   split  ", "pinned": True, "unread": False})
                 changed = await watcher.event("sessions.changed")
-                flagged = (await http.patch(f"/api/sessions/{key}", json={"archived": True})).json()
+                flagged = (await patch(key, {"archived": True})).json()
                 listed = (await http.get("/api/profiles/sessions", params={"archived": "only"})).json()["sessions"]
-                taken = await http.patch(f"/api/sessions/{key}", json={"title": "Release notes draft"})
-                long = await http.patch(f"/api/sessions/{key}", json={"title": "x" * 101})
-                nothing = await http.patch(f"/api/sessions/{key}", json={})
-                missing = await http.patch("/api/sessions/nope", json={"title": "x"})
-                cleared = (await http.patch(f"/api/sessions/{key}", json={"title": ""})).json()
-                foreign = await http.patch(f"/api/sessions/{key}", json={"pinned": False},
-                                           headers={"Origin": "http://evil.example"})
+                taken = await patch(key, {"title": "Release notes draft"})
+                long = await patch(key, {"title": "x" * 101})
+                nothing = await patch(key, {})
+                missing = await patch("nope", {"title": "x"})
+                cleared = (await patch(key, {"title": ""})).json()
+                foreign = await patch(key, {"pinned": False}, headers={"Origin": "http://evil.example"})
                 owner = await Gateway.connect(base, http)
                 sid, busy_key = await open_chat(owner)
                 await owner.call("prompt.submit", {"session_id": sid, "text": "delegate"})
                 await owner.event("subagent.start")
-                busy = await http.delete(f"/api/sessions/{busy_key}")
+                busy = await delete(busy_key)
                 await owner.event("message.complete", timeout=10)
-                deleted = (await http.delete(f"/api/sessions/{key}")).json()
-                again = (await http.delete(f"/api/sessions/{key}")).json()
+                seen = await fence(http, key)
+                deleted = (await delete(key)).json()
+                absent = await delete(key)
+                again = (await http.delete(f"/api/sessions/{key}", params={**seen, "request_id": "r-late"})).json()
                 gone = await http.get(f"/api/sessions/{key}/messages")
                 await owner.close()
                 await watcher.close()
             async with httpx.AsyncClient(base_url=f"http://{base}") as anonymous:
                 denied = await anonymous.delete(f"/api/sessions/{busy_key}")
         return (renamed, changed, flagged, listed, taken, long, nothing, missing, cleared, foreign, busy, deleted,
-                again, gone, denied, watcher)
+                again, gone, denied, watcher, absent)
 
     (renamed, changed, flagged, listed, taken, long, nothing, missing, cleared, foreign, busy, deleted, again, gone,
-     denied, watcher) = asyncio.run(scenario())
+     denied, watcher, absent) = asyncio.run(scenario())
     assert renamed.json() == {"ok": True, "pinned": True, "unread": False, "title": "Storage split"}
     assert changed["payload"] == {} and changed["session_id"] == ""
     assert flagged == {"ok": True, "archived": True, "title": "Storage split"}
@@ -174,8 +192,49 @@ def test_sessions_are_renamed_flagged_and_deleted():
     assert cleared == {"ok": True, "title": ""}
     assert foreign.status_code == 403 and busy.status_code == 409
     assert deleted == {"ok": True} and again == {"ok": True, "already_absent": True} and gone.status_code == 404
+    assert (absent.status_code, absent.json()["detail"]) == (400, "invalid_params"), "an absent row's state names nothing"
     assert denied.status_code == 401
     assert contract_problems(watcher) == []
+
+
+def test_a_session_edit_must_name_the_state_it_applies_to():
+    """Hermes 0.22.3+: web_server_sessions.py _mutate_session_request refuses an edit without its identity, replays
+    the answer of a repeated request_id, and refuses a revision that is behind."""
+    async def scenario():
+        async with serving(seed="demo") as (fake, base):
+            key = next(s.key for s in fake.sessions.values() if s.title == "Refactor storage layer")
+            fake.sessions[key].unread = False
+            async with signed_in(base) as http:
+                bare = await http.patch(f"/api/sessions/{key}", json={"pinned": True})
+                bare_delete = await http.delete(f"/api/sessions/{key}")
+                half = await http.patch(f"/api/sessions/{key}", json={"pinned": True, "request_id": "r-half"})
+                before = (await http.get(f"/api/sessions/{key}/mutation-snapshot")).json()
+                identity = await fence(http, key)
+                first = await http.patch(f"/api/sessions/{key}", json={"pinned": True, **identity})
+                replay = await http.patch(f"/api/sessions/{key}", json={"pinned": True, **identity})
+                after = (await http.get(f"/api/sessions/{key}/mutation-snapshot")).json()
+                stale = await http.patch(f"/api/sessions/{key}", json={
+                    "unread": True, "request_id": "r-stale", "expected_revision": before["runtime_revision"]})
+                wrong_generation = await http.delete(f"/api/sessions/{key}", params={
+                    "request_id": "r-gen", "expected_revision": after["runtime_revision"], "expected_generation": 7})
+                absent = (await http.get("/api/sessions/nope/mutation-snapshot")).json()
+            async with httpx.AsyncClient(base_url=f"http://{base}") as anonymous:
+                denied = await anonymous.get(f"/api/sessions/{key}/mutation-snapshot")
+        return bare, bare_delete, half, before, first, replay, after, stale, wrong_generation, absent, denied, fake, key
+
+    (bare, bare_delete, half, before, first, replay, after, stale, wrong_generation, absent, denied, fake,
+     key) = asyncio.run(scenario())
+    assert bare.status_code == 409 and bare.json()["detail"].startswith("client_upgrade_required")
+    assert bare_delete.status_code == 409 and bare_delete.json()["detail"].startswith("client_upgrade_required")
+    assert (half.status_code, half.json()["detail"]) == (409, "mutation_identity_required")
+    assert before == {"session_id": key, "exists": True, "runtime_revision": 0, "runtime_generation": 0}
+    assert first.status_code == 200 and replay.json() == first.json()
+    assert after["runtime_revision"] == 1, "one edit, though it was sent twice"
+    assert (stale.status_code, stale.json()["detail"]) == (409, "revision_conflict")
+    assert (wrong_generation.status_code, wrong_generation.json()["detail"]) == (409, "stale_generation")
+    assert key in fake.sessions and fake.sessions[key].unread is False
+    assert absent == {"session_id": "nope", "exists": False, "runtime_revision": 0, "runtime_generation": None}
+    assert denied.status_code == 401
 
 
 def test_a_thinking_turn_streams_reasoning_then_text_and_reports_usage():
@@ -710,7 +769,7 @@ def test_rewinds_detaches_config_reads_and_closing_before_delete():
                 await until(lambda: not fake.runtimes[sid].running, 10)
                 after = [r["content"] for r in (await http.get(f"/api/sessions/{key}/messages")).json()["messages"]
                          if r["role"] == "user"]
-                deleted = (await http.delete(f"/api/sessions/{key}")).json()
+                deleted = (await http.delete(f"/api/sessions/{key}", params=await fence(http, key))).json()
                 still_live = sid in fake.runtimes
                 closed = await gateway.call("session.close", {"session_id": sid})
                 gone = sid not in fake.runtimes and key not in fake.sessions
