@@ -287,6 +287,9 @@ settings any more):
 
 ### Known limits
 
+- **Speaker.** A call starts on the earpiece (or a connected headset, Bluetooth or car), like a phone call. The
+  app's speaker button and CallKit's Speaker button both act on the same audio route, and the app reads that route
+  after every change. CallKit's own button may not show a move made with the app's button: iOS doesn't tell it.
 - **Tool Search.** Current Hermes defers plugin tools behind its `tool_search` / `tool_describe` / `tool_call`
   bridge (`tools.tool_search.enabled: auto`): the model sees `start_call` in the bridge's catalog listing and calls
   it through `tool_call`, describing it first if it hasn't yet. `tools.tool_search.enabled: off` lists every tool
