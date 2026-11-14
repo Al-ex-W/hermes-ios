@@ -127,6 +127,8 @@ struct NotificationsSettingsView: View {
                     toggle("Approval needed", "A command waits for your approval.", \.approval).id("notifications.approval")
                     toggle("Question asked", "Hermes asks you a question.", \.clarify).id("notifications.clarify")
                     toggle("Turn finished", "A reply finished while you were elsewhere.", \.turnDone).id("notifications.turn-done")
+                    toggle("Messages from Hermes", "Hermes tells you something itself, from any chat or a scheduled job.",
+                           \.message).id("notifications.message")
                 }
                 .disabled(blocked)
             } header: {
@@ -141,7 +143,7 @@ struct NotificationsSettingsView: View {
                         .hermesText(.button)
                     }
                 } else {
-                    FormNote("Approvals and questions can be answered from the notification.")
+                    FormNote("Approvals, questions and messages can be answered from the notification.")
                 }
             }
             .hermesFormRows()

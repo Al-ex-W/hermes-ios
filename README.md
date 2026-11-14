@@ -317,8 +317,12 @@ settings any more):
   (`approvals.timeout` + 60 s); after that your reply arrives as a `[Voice]` message.
 - The VoIP push's `session_id` can name a conversation of another process (a `local-…` CLI session, a messaging
   chat), which the app may not be able to open; the call itself works the same.
-- Alert pushes cover only conversations the dashboard hosts. A suspended app counts as attached until Hermes
-  notices its socket is gone, and an alert APNs refuses isn't retried.
+- Alert pushes cover only conversations the dashboard hosts (the agent's own `notify_user` messages come from
+  any conversation). A suspended app counts as attached until Hermes notices its socket is gone, and an alert APNs
+  refuses for good isn't retried (one it couldn't take for a passing reason is, a few times).
+- A message from a conversation of another process (a CLI `local-…` session, a messaging chat) opens a stored
+  session the app may not be able to show or answer, as for a call's push: Reply then fails with Hermes' reason,
+  shown on a follow-up notification.
 - Half duplex: the mic is off while Hermes speaks. If you're mid-sentence when Hermes starts, it waits for
   your pause setting plus 2 s (at most 10 s), then what it heard so far goes in as `cut_off`.
 - The Simulator has no VoIP pushes, CallKit audio or microphone: there calls ring inside the app only, Hermes can
@@ -343,14 +347,19 @@ this app's **Connection** page, and **Calls** and **Location** are this app's ow
 - **Providers** signs in to provider accounts (device codes) and adds API keys and custom endpoints. A key you type
   is sent only to your own dashboard (`/api/env`); the app neither keeps nor logs it.
 - **Notifications** chooses which alerts Hermes may push to this iPhone: an approval waiting, a question waiting,
-  a turn finished. The app registers its APNs alert token and these choices with the `hermes_voice` plugin
-  (`POST /api/plugins/hermes_voice/devices`). Approvals can be answered from the notification (Run, Allow for
-  session, Reject), a single question with a typed reply, and tapping a notification opens its chat. The plugin
-  must support alert pushes for these to arrive; with an older plugin only the registration happens.
+  a turn finished, and **Messages from Hermes**: what your agent sends you itself with the plugin's `notify_user`
+  tool, from any of your conversations or a scheduled job ("Your train is 10 minutes late"). The app registers its
+  APNs alert token and these choices with the `hermes_voice` plugin (`POST /api/plugins/hermes_voice/devices`).
+  Approvals can be answered from the notification (Run, Allow for session, Reject), a single question with a typed
+  reply, a message with Reply (your answer goes into that conversation as if you typed it in the chat), and
+  tapping a notification opens its chat. A message Hermes marks time-sensitive gets through a Focus that allows
+  time-sensitive notifications; during the host's quiet hours messages arrive silently. A message from the chat
+  you are looking at shows no banner (its tool call is right there). The plugin must support alert pushes for these
+  to arrive; with an older plugin only the registration happens.
 
   Hermes pushes these only for a conversation nobody has open (after about 5 s), so you can't see one by asking
   for an approval in the chat you are looking at. **Send test notification** on the same page checks the whole
-  path instead: pick the kind (approval, question, turn finished) and tap it; the plugin sends a real push through
+  path instead: pick the kind (approval, question, turn finished, message) and tap it; the plugin sends a real push through
   APNs to this iPhone only, 5 s later, so you can lock the phone or leave the app first (in the app it shows as a
   banner). The line under the button says what happened: that APNs accepted it, or why nothing went out (this
   iPhone isn't registered or has no notification token, APNs isn't set up on the host, the kind is turned off on
@@ -418,7 +427,10 @@ Signing is personal, so it isn't in the repo. Copy `HermesVoice/Config/Local.xcc
 the app's bundle id becomes `$(BUNDLE_ID_PREFIX).hermesvoice`. For Hermes to ring the phone, the team must be a
 paid one with the Push Notifications capability (the app also uses the `voip`, `audio` and `remote-notification`
 background modes; the last one is for the background push that asks where the phone is. It has no `location`
-background mode: it gets one fix per request and tracks nothing in between).
+background mode: it gets one fix per request and tracks nothing in between). It also has the Time Sensitive Notifications
+entitlement (`com.apple.developer.usernotifications.time-sensitive`), so a message Hermes marks time-sensitive gets
+through a Focus that allows it; with automatic signing, Xcode adds the capability to the App ID and makes a new
+provisioning profile on the next device build (for `xcodebuild`, pass `-allowProvisioningUpdates`).
 
 In the app, enter the **Hermes dashboard** address (`https://<machine>.<tailnet>.ts.net`), username and password.
 
@@ -473,8 +485,9 @@ makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/rin
 `xcrun simctl openurl booted "hermesvoice://ring?…"` (see `devtools/fake_voice_plugin.py`). It answers the test
 alert routes as the plugin does without pushing anything; `GET /api/plugins/hermes_voice/debug/test-alerts` has
 each test's payload, which `xcrun simctl push booted <bundle id> payload.json` shows in the Simulator with its
-actions (see [`devtools/README.md`](devtools/README.md)). For location, typing `where am I` makes the fake agent
-call `get_location`, and `POST /api/plugins/hermes_voice/debug/location-request` asks the phone without the agent:
+actions (see [`devtools/README.md`](devtools/README.md)). Typing `notify me: …` makes it call `notify_user`, and
+`GET /api/plugins/hermes_voice/debug/alerts?kind=message` has the alert. For location, typing `where am I` makes the
+fake agent call `get_location`, and `POST /api/plugins/hermes_voice/debug/location-request` asks the phone without the agent:
 on the call's link while a call is up, else it returns the background push it would have sent. The Simulator
 doesn't hand a `content-available` push from `xcrun simctl push` to the app's handler, so a debug build takes
 `xcrun simctl openurl booted "hermesvoice://location-request?request_id=<id>"` as that push; give the Simulator a

@@ -259,11 +259,20 @@ first, then call again). For a call at a set time ("in ten minutes", "at seven")
 
 ## Notifications the app sends (not calls)
 
-The app can notify the user with three pushes: an approval waiting, a question waiting, and a turn that finished.
-They are sent only for conversations the dashboard hosts, and only while no client (phone app, Desktop, dashboard
-chat) has that conversation open, after a grace period of about 5 s; so an approval you trigger in the chat the user
-is looking at never arrives as a push. During quiet hours and past the alert budget they arrive silently. To check
+The app can notify the user with four pushes: an approval waiting, a question waiting, a turn that finished, and
+the messages you send with `notify_user` (below). The first three are sent only for conversations the dashboard
+hosts, and only while no client (phone app, Desktop, dashboard chat) has that conversation open, after a grace
+period of about 5 s; so an approval you trigger in the chat the user is looking at never arrives as a push. During
+quiet hours and past the alert budget they arrive silently. The user can turn each kind off in the app. To check
 that pushes reach the phone, tell the user to use Settings → Notifications → Send test notification in the app.
+
+## Telling the user something now (`notify_user`)
+
+`notify_user(title, body, urgency?)` puts a notification on the user's iPhone: when they asked to be told, or for
+news they'd want now. Not for routine progress, not during a call (speak instead), not in the chat they are reading
+(just reply). It is not a call and never rings through Silent mode; `time_sensitive` also gets through a Focus (use
+it only when it can't wait), `quiet` makes no sound. The text stays here as the tool call: don't repeat it unless
+useful. On `not_sent`, tell them in your reply.
 
 ## Where the user is (`get_location`)
 

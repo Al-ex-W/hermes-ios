@@ -103,6 +103,52 @@ final class FakeHermesTests: XCTestCase {
         } catch DashboardError.http(404, _) {}
     }
 
+    /// `notify_user` end to end: the fake agent sends the message the plugin would push for "notify me …", the payload
+    /// decodes as a message alert of that chat (a tap opens it), and Reply on it puts the answer into the chat as a
+    /// prompt over a gateway connection of its own, as the lock screen's action does.
+    func testAMessageFromTheAgentNamesItsChatAndItsReplyGoesIntoIt() async throws {
+        let alertToken = String(repeating: "e1", count: 32)
+        try await VoicePluginAPI.registerDevice(client, body: PushRegistration.deviceBody(
+            voipToken: String(repeating: "f2", count: 32), environment: "sandbox", bundleID: "com.example.hermesvoice",
+            alertToken: alertToken, alerts: .defaults))
+        let chat = await newChat()
+        await reply(chat, "notify me urgently: Your train is 10 minutes late")
+        XCTAssertEqual(chat.lastReply, "I sent you a notification.")
+        let stored = try XCTUnwrap(chat.storedID)
+
+        let listed = try await client.request("GET", "\(VoicePluginAPI.path)/debug/alerts",
+                                              query: ["session_id": stored, "kind": "message"]) as? JSON
+        // To this phone (and to the phones other tests registered with the same fake).
+        XCTAssertTrue((listed?["sent_to"] as? [String] ?? []).contains(alertToken), "\(String(describing: listed?["sent_to"]))")
+        let payload = try XCTUnwrap(listed?["alert"] as? JSON)
+        let aps = JSONValue(any: payload["aps"] as Any)
+        XCTAssertEqual(aps["interruption-level"], "time-sensitive")
+        let push = try XCTUnwrap(AlertPush(userInfo: payload))
+        XCTAssertEqual(push.kind, .message)
+        XCTAssertEqual(push.category, AlertCategory.message)
+        XCTAssertEqual(push.sessionID, stored)
+        XCTAssertEqual(push.body, "Your train is 10 minutes late")
+        XCTAssertEqual(AlertNotifications.presentation(for: push, sessionOnScreen: true), [], "its own chat is on screen")
+
+        // Reply from the lock screen: a connection of its own, the chat resumed, the words queued as a prompt.
+        guard case let .prompt(text) = AlertIntent.of(action: AlertAction.messageReply, text: "Thanks, I'll take the next one",
+                                                      push: push) else { return XCTFail("Reply is no prompt") }
+        let lockScreen = GatewayConnection(client: client)
+        defer { lockScreen.disconnect() }
+        let status = try await MessageReplier(gateway: lockScreen.client).send(push, text)
+        XCTAssertTrue(status == .streaming || status == .queued, "\(String(describing: status))")
+        // The reply's turn runs on in Hermes; wait for its answer to be stored.
+        var rows: [JSONValue] = []
+        let deadline = Date().addingTimeInterval(10)
+        while !rows.contains(where: { $0["content"]?.stringValue == "Echo: Thanks, I'll take the next one" }), Date() < deadline {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            rows = try await client.messageRows(sessionID: stored)
+        }
+        XCTAssertTrue(rows.contains { $0["content"]?.stringValue == "Echo: Thanks, I'll take the next one" }, "\(rows)")
+        XCTAssertTrue(rows.contains { $0["role"] == "user" && $0["content"]?.stringValue == "Thanks, I'll take the next one" },
+                      "\(rows)")
+    }
+
     func testNewChatIsStoredAndTitled() async throws {
         let chat = await newChat()
         var reported: String?

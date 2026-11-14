@@ -16,11 +16,13 @@ targets:
       Release: Config/Base.xcconfig
     sources:
       - path: HermesVoice
-    # Push Notifications, for the VoIP pushes that ring the phone (Background Modes voip + audio are in Info.plist).
+    # Push Notifications, for the VoIP pushes that ring the phone (Background Modes voip + audio are in Info.plist),
+    # and Time Sensitive Notifications, so a message Hermes marks time-sensitive gets through a Focus that allows it.
     entitlements:
       path: HermesVoice/HermesVoice.entitlements
       properties:
         aps-environment: development
+        com.apple.developer.usernotifications.time-sensitive: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).hermesvoice

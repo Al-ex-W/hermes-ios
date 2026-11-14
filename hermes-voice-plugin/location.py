@@ -193,28 +193,21 @@ def current_settings() -> LocationSettings:
 
 def allowed(origin: hermes.Origin, settings: LocationSettings, calls: Any) -> call_policy.Decision:
     """Whether this conversation may ask where the user is. `calls` is the call policy (``config.PolicyConfig``):
-    the same sources and the same owner as for ringing the phone."""
+    the same sources and the same owner as for ringing the phone (``policy.owner_conversation``)."""
     if not settings.enabled:
         return call_policy.Decision(False, "off_on_host", OFF_ON_HOST)
-    if origin.is_subagent:
-        return call_policy.Decision(False, "subagent", (
-            "Only the main conversation can ask where the user is. Report back; it can ask."))
-    if origin.is_cron:
-        if settings.allow_cron:
-            return call_policy.Decision(True)
-        return call_policy.Decision(False, "cron", (
-            "Scheduled jobs can't ask for the user's location on this host (settings.location.allow_cron is off)."))
-    surface = call_policy._surface(origin)
-    if call_policy.is_messaging(surface):
-        if origin.chat_type != "dm":
-            return call_policy.Decision(False, "group", "The user's location is never given out in a group chat.")
-        if not (calls.allow_owner_dms and call_policy.is_owner(origin, calls.owner_ids)):
-            return call_policy.Decision(False, "not_owner", (
-                "Only the owner's own direct messages may ask where they are."))
-    elif surface not in calls.allowed_sources:
-        return call_policy.Decision(False, "source", (
-            f"Conversations from {surface or 'this surface'} can't ask for the user's location."))
-    return call_policy.Decision(True)
+    reason = call_policy.owner_conversation(origin, calls, settings.allow_cron)
+    if not reason:
+        return call_policy.Decision(True)
+    notes = {
+        "subagent": "Only the main conversation can ask where the user is. Report back; it can ask.",
+        "cron": "Scheduled jobs can't ask for the user's location on this host (settings.location.allow_cron is off).",
+        "group": "The user's location is never given out in a group chat.",
+        "not_owner": "Only the owner's own direct messages may ask where they are.",
+        "source": f"Conversations from {call_policy._surface(origin) or 'this surface'} can't ask for the user's "
+                  "location.",
+    }
+    return call_policy.Decision(False, reason, notes[reason])
 
 
 # ── fixes ──────────────────────────────────────────────────────────────────────────────────────────────────

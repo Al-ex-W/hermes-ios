@@ -74,6 +74,9 @@ The fake agent (fake_hermes.py run_turn hands these to ``FakeVoicePlugin.handle`
   "[Voice] <said>"           start_call("You said: <said>") while the call is live, and the same as text
   "hang up" / "end the call" end_call("Goodbye from fake Hermes.") on this session's call
   "where am i"               get_location(): waits for the phone's fix (--location-timeout), then says it as text
+  "notify me[ urgently| quietly]: <text>"
+                             notify_user(title "Fake Hermes", body <text>, urgency time_sensitive | quiet | normal):
+                             the alert lands in GET debug/alerts (kind "message"); then says the result as text
   the plugin's notices       a short text reply
 
 Simulator: the Simulator can't receive VoIP pushes, so nothing is pushed. Each push is logged (``FAKE … voice push``)
@@ -207,6 +210,10 @@ LOCATION_TIMEOUT = 20.0
 LOCATION_FRESH_S = 60.0
 LOCATION_ERRORS = ("off", "denied", "unavailable", "timeout")
 WHERE_AM_I = re.compile(r"\bwhere am i\b", re.IGNORECASE)
+# notify_user (hermes-voice-plugin/message.py): "notify me: <text>", "notify me urgently: …", "notify me quietly: …".
+NOTIFY_ME = re.compile(r"\bnotify me(?: (urgently|quietly))?\b[:,]?\s*(.*)", re.IGNORECASE | re.DOTALL)
+NOTIFY_TITLE = "Fake Hermes"
+NOTIFY_LINE = "Fake Hermes has news for you."
 LOCATION_SHARING_OFF = (
     "Location sharing is off on the user's iPhone, so nothing was asked and nothing was sent. If you need their "
     "location, ask them to turn on \"Share location with Hermes\" (Settings → Location in the HermesVoice app), or "
@@ -1338,7 +1345,7 @@ class FakeVoicePlugin:
             return (self.call is not None and self.call.call_id == call_id) or call_id in self.ended
         if VOICE_TURN.match(block):
             return stored.key in self.calls_by_key
-        if CALL_ME.search(block) or WHERE_AM_I.search(block):
+        if CALL_ME.search(block) or WHERE_AM_I.search(block) or NOTIFY_ME.search(block):
             return True
         return bool(HANG_UP.search(block)) and self.call is not None and self.call.owner == stored.key
 
@@ -1374,6 +1381,14 @@ class FakeVoicePlugin:
             return f"You said{note}: {said}" if said else f"Nothing came through{note}."
         if WHERE_AM_I.search(block) and not CALL_ME.search(block):
             return self.describe_location(await self.tool(rt, stored, "get_location", {}))
+        if (notify := NOTIFY_ME.search(block)) is not None and not CALL_ME.search(block):
+            urgency = {"urgently": "time_sensitive", "quietly": "quiet"}.get((notify.group(1) or "").lower(), "normal")
+            body = notify.group(2).strip() or NOTIFY_LINE
+            result = await self.tool(rt, stored, "notify_user", {"title": NOTIFY_TITLE, "body": body,
+                                                                  "urgency": urgency})
+            if result.get("status") in ("sent", "quiet"):
+                return "I sent you a notification."
+            return f"No notification ({result.get('status')}): {result.get('note')}"
         if (match := CALL_ME.search(block)) is not None:
             mode = match.group(1).lower()
             text = match.group(2).strip() or (SYNC_LINE if mode == "sync" else ASYNC_LINE)
@@ -1381,6 +1396,10 @@ class FakeVoicePlugin:
             return self.describe(mode, result)
         result = await self.tool(rt, stored, "end_call", {"text": GOODBYE})
         return "Hung up." if result.get("outcome") == "ended_by_agent" else "There is no call to hang up."
+
+    async def notify_user(self, stored: Any, args: dict[str, Any]) -> dict[str, Any]:
+        """``notify_user`` without the alert half (fake_hermes.py's AlertVoicePlugin sends it)."""
+        return {"status": "not_available", "note": "This fake plugin has no alert pushes."}
 
     @staticmethod
     def describe(mode: str, result: dict[str, Any]) -> str:
@@ -1414,6 +1433,11 @@ class FakeVoicePlugin:
                 # As the plugin logs it: that it was asked and how it ended, not where the phone is.
                 self.log(f"{name} from {stored.key} -> {out.get('status')} ({out.get('source') or 'no fix'})")
                 return json.dumps(out, ensure_ascii=False), out.get("status") == "ok"
+            if name == "notify_user":
+                out = await self.notify_user(stored, args)
+                # As the plugin logs it: from which conversation and how it ended, never the text.
+                self.log(f"{name} from {stored.key} -> {out.get('status')} ({out.get('reason') or args.get('urgency')})")
+                return json.dumps(out, ensure_ascii=False), out.get("status") != "not_sent"
             if name == "start_call":
                 out = await self.start_call(stored, args["text"], args["mode"])
             else:

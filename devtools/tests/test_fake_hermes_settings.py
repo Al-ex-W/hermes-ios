@@ -593,12 +593,12 @@ def test_alert_registration_and_the_alerts_a_backgrounded_app_would_get():
      everything, unknown, bad_kind, cleared, after_clear, anonymous_alerts) = asyncio.run(scenario())
     assert bad == {"not bool": 422, "not an object": 422}
     assert unknown_kind.json() == {"ok": True}
-    assert fresh == {"approval": True, "clarify": True, "turn_done": True}
+    assert fresh == {"approval": True, "clarify": True, "turn_done": True, "message": True}
     assert no_alert_token.json() == {"ok": True}
     assert registered.json() == {"ok": True}
     [listed] = status["devices"]
     assert listed["voip_token"] == VOIP and listed["alert_token"] == ALERT
-    assert listed["alerts"] == {"approval": True, "clarify": False, "turn_done": True}
+    assert listed["alerts"] == {"approval": True, "clarify": False, "turn_done": True, "message": True}
 
     alert = approval["alert"]
     assert alert["aps"]["category"] == "HERMES_APPROVAL" and alert["aps"]["thread-id"] == key
@@ -617,7 +617,7 @@ def test_alert_registration_and_the_alerts_a_backgrounded_app_would_get():
     assert unknown.status_code == 404 and bad_kind.status_code == 422 and anonymous_alerts == 401
     assert cleared.json() == {"ok": True}
     assert [(d["voip_token"], d["alert_token"]) for d in after_clear] == [(VOIP, None)]
-    assert after_clear[0]["alerts"] == {"approval": False, "clarify": False, "turn_done": False}
+    assert after_clear[0]["alerts"] == {"approval": False, "clarify": False, "turn_done": False, "message": False}
 
 
 def test_shared_metrics_consent_is_kept_per_profile():

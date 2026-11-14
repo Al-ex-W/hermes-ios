@@ -8,8 +8,8 @@ private let notificationLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? 
 
 // MARK: - Payload
 
-/// A background alert from the Hermes Voice plugin: an approval or a question waiting in a session, or a turn that
-/// finished. The push is `{aps: {alert: {title, body}, category, thread-id, sound}, hermes: {kind, session_id, profile,
+/// A background alert from the Hermes Voice plugin: an approval or a question waiting in a session, a turn that
+/// finished, or a message Hermes sent of its own accord (`notify_user`, category `HERMES_MESSAGE`). The push is `{aps: {alert: {title, body}, category, thread-id, sound}, hermes: {kind, session_id, profile,
 /// request_id, choices, questions}}`; the app posts the same shape locally for follow-ups. A test alert (Settings >
 /// Notifications) has `test: true` and `test_id` under `hermes` and belongs to no session: it is answered on this
 /// iPhone alone, never with `request.answer`.
@@ -18,6 +18,9 @@ struct AlertPush: Equatable, Sendable {
         case approval
         case clarify
         case turnDone = "turn_done"
+        /// Hermes notifies the user itself (the plugin's `notify_user` tool): a tap opens the conversation, Reply
+        /// answers into it.
+        case message
     }
 
     let kind: Kind
@@ -80,6 +83,7 @@ struct AlertPush: Equatable, Sendable {
         case .approval: return AlertCategory.approval
         case .clarify: return AlertCategory.clarify
         case .turnDone: return AlertCategory.turnDone
+        case .message: return AlertCategory.message
         }
     }
 
@@ -132,6 +136,7 @@ enum AlertCategory {
     static let approval = "HERMES_APPROVAL"
     static let clarify = "HERMES_CLARIFY"
     static let turnDone = "HERMES_TURN_DONE"
+    static let message = "HERMES_MESSAGE"
 }
 
 /// The actions on the alerts. "Always" is offered only on the approval card inside the app.
@@ -140,6 +145,8 @@ enum AlertAction {
     static let allowSession = "HERMES_APPROVE_SESSION"
     static let reject = "HERMES_REJECT"
     static let reply = "HERMES_CLARIFY_REPLY"
+    /// A reply to a message, sent into its conversation as a prompt.
+    static let messageReply = "HERMES_MESSAGE_REPLY"
     static let open = "HERMES_OPEN"
 
     static func categories() -> Set<UNNotificationCategory> {
@@ -150,6 +157,10 @@ enum AlertAction {
         let reject = UNNotificationAction(identifier: reject, title: "Reject", options: [.destructive])
         let reply = UNTextInputNotificationAction(identifier: reply, title: "Reply", options: [.authenticationRequired],
                                                   textInputButtonTitle: "Send", textInputPlaceholder: "Your answer")
+        // A reply to a message starts a turn in its conversation, so the lock screen asks for Face ID first too.
+        let messageReply = UNTextInputNotificationAction(identifier: messageReply, title: "Reply",
+                                                         options: [.authenticationRequired], textInputButtonTitle: "Send",
+                                                         textInputPlaceholder: "Reply to Hermes")
         let open = UNNotificationAction(identifier: open, title: "Open", options: [.foreground])
         return [
             UNNotificationCategory(identifier: AlertCategory.approval, actions: [run, allowSession, reject],
@@ -157,6 +168,8 @@ enum AlertAction {
             UNNotificationCategory(identifier: AlertCategory.clarify, actions: [reply, open], intentIdentifiers: [],
                                    options: []),
             UNNotificationCategory(identifier: AlertCategory.turnDone, actions: [open], intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: AlertCategory.message, actions: [messageReply, open], intentIdentifiers: [],
+                                   options: []),
         ]
     }
 }
@@ -181,6 +194,8 @@ enum AlertIntent: Equatable {
     /// Open its session (a tap, or the Open action).
     case open
     case answer(AlertReply)
+    /// Send the user's words into the alert's conversation, as the chat would (Reply on a message).
+    case prompt(String)
     /// The action can't answer this alert (why); the alert is posted again with that note, with its actions only
     /// when another try could work (`retry`: another approval choice, a reply that isn't empty). An alert that
     /// names no request, or a clarify that carries no questions (the host keeps previews off, or the questions
@@ -209,6 +224,11 @@ enum AlertIntent: Equatable {
             let answer = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !answer.isEmpty else { return .unanswerable("The reply was empty.", retry: true) }
             return .answer(.clarify(qid: question.qid, text: answer))
+        case AlertAction.messageReply:
+            guard push.kind == .message else { return .ignore }
+            let reply = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !reply.isEmpty else { return .unanswerable("The reply was empty.", retry: true) }
+            return .prompt(reply)
         default:
             return .ignore
         }
@@ -287,6 +307,31 @@ struct AlertResponder {
     }
 }
 
+/// Sends a reply typed on a message notification into its conversation, as the chat sends a prompt: the stored
+/// session is resumed on a gateway connection (`session.resume`, as the chat attaches) and the text goes in with
+/// `prompt.submit`, queued behind a turn that is running (never steered into it). The turn runs on in Hermes after
+/// the connection closes; its end alerts as any turn nobody watched.
+struct MessageReplier {
+    let gateway: GatewayClient
+    /// Per call: a notification action has about half a minute in the background, sign-in and connecting included.
+    var timeout: TimeInterval = 12
+
+    /// Hermes' answer: the turn started (`streaming`), or the prompt waits behind the running one (`queued`).
+    func send(_ push: AlertPush, _ text: String) async throws -> PromptSubmitStatus? {
+        let session = try await LiveSession.attach({
+            try await gateway.sessionResume(.init(sessionId: push.sessionID, profile: push.profile, cols: 96,
+                                                  source: "desktop", omitMessages: true), timeout: timeout)
+        }, LiveSession.init)
+        do {
+            return try await gateway.promptSubmit(.init(sessionId: session.runtimeID, text: .string(text), queued: true),
+                                                  timeout: timeout).status
+        } catch let error as GatewayDecodingError {
+            // Accepted; only the answer is outside the contract.
+            return (try? error.raw.decode(PromptSubmitResult.self))?.status
+        }
+    }
+}
+
 // MARK: - Notifications
 
 /// Background alerts (non-VoIP APNs) from the Hermes Voice plugin: the alert token and opt-ins sent with the device
@@ -338,8 +383,8 @@ final class AlertNotifications: NSObject, ObservableObject {
         }
     }
 
-    /// Foreground presentation: nothing while the alert's session is on screen (its card or reply shows there). A
-    /// test alert always shows: it belongs to no session, and the user asked to see it.
+    /// Foreground presentation: nothing while the alert's session is on screen (its card or reply shows there, and
+    /// a message's tool call). A test alert always shows: it belongs to no session, and the user asked to see it.
     nonisolated static func presentation(for push: AlertPush?, sessionOnScreen: Bool) -> UNNotificationPresentationOptions {
         guard let push, !push.isTest, sessionOnScreen else { return [.banner, .list, .sound] }
         return []
@@ -552,6 +597,32 @@ final class AlertNotifications: NSObject, ObservableObject {
             post(push, note: reason, actions: retry)
         case let .answer(reply):
             await answer(push, reply)
+        case let .prompt(text):
+            await reply(push, text)
+        }
+    }
+
+    /// Reply on a message: the words go into its conversation as a prompt. A failure is posted back on the message
+    /// (with Reply again when it may work then); an answer that was lost isn't sent again (it may have arrived, and
+    /// a second one would be a second prompt).
+    private func reply(_ push: AlertPush, _ text: String) async {
+        let background = BackgroundTask(name: "Hermes message reply")
+        defer { background.end() }
+        var opened: GatewayConnection?
+        defer { opened?.disconnect() }
+        do {
+            let connection = connect(try await signedInClient())
+            opened = connection
+            let status = try await MessageReplier(gateway: connection.client).send(push, text)
+            // The status only: never the reply's text.
+            notificationLog.info("message reply: \(status.map { "\($0)" } ?? "sent", privacy: .public)")
+            removeDelivered { $0.kind == .message && $0.sessionID == push.sessionID }
+        } catch DashboardError.timeout, DashboardError.disconnected {
+            notificationLog.error("message reply unconfirmed")
+            post(push, note: "Hermes didn't confirm your reply. Open Hermes to check.", actions: false)
+        } catch {
+            notificationLog.error("message reply failed: \(error.localizedDescription, privacy: .public)")
+            post(push, note: "Your reply wasn't sent: \(error.localizedDescription)", actions: true)
         }
     }
 

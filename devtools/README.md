@@ -137,9 +137,14 @@ The fake takes the app's playback feedback (`played {id, playback}`, `unplayed {
 `problems` on a malformed one. A line reported as `lost` stops waiting for its ack. It makes no notes for its
 fake agent out of them (the real plugin does), and it does not replay a repeated line's audio.
 
-Devices may also register an APNs `alert_token` with `alerts: {approval, clarify, turn_done}` (bad shapes get
-`422`); `GET /status` lists them, and `GET …/debug/alerts?session_id=…&kind=approval|clarify|turn_done` returns the
-`{aps, hermes}` notification the plugin would push, the alert tokens it would go to, and the history.
+Devices may also register an APNs `alert_token` with `alerts: {approval, clarify, turn_done, message}` (bad
+shapes get `422`); `GET /status` lists them, and `GET …/debug/alerts?session_id=…&kind=approval|clarify|turn_done|message`
+returns the `{aps, hermes}` notification the plugin would push, the alert tokens it would go to, and the history.
+Typing `notify me: <text>` in a chat (`notify me urgently: …` for time-sensitive, `notify me quietly: …` for no
+sound) makes the fake agent call `notify_user` (`hermes-voice-plugin/message.py`): the `HERMES_MESSAGE` alert lands
+in `debug/alerts` (kind `message`) and the tool result is the plugin's `{status, note, reason?}` (`not_sent` for no
+phone, no alert token or messages off on every phone). Who may notify, the rate limits, quiet hours, the budget and
+previews are not modelled.
 `POST …/debug/hold-devices {hold: true}` keeps each later registration waiting (`{hold: false}` lets them go;
 the answer says how many wait), so a test can change the alerts while one is in flight.
 
