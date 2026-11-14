@@ -106,18 +106,19 @@ final class FakeVoicePluginTests: XCTestCase {
         try await register(alertToken: alert, alerts: .defaults)
         var stored = try await device(voip)
         XCTAssertEqual(stored?["alert_token"] as? String, alert)
-        XCTAssertEqual(alerts(stored), ["approval": true, "clarify": true, "turn_done": true])
+        XCTAssertEqual(alerts(stored), ["approval": true, "clarify": true, "turn_done": true, "message": true])
 
         // A launch before iOS hands over the alert token: the opt-ins go through, the stored token stays.
-        try await register(alertToken: nil, alerts: NotificationPreferences(approval: true, clarify: false, turnDone: true))
+        try await register(alertToken: nil, alerts: NotificationPreferences(approval: true, clarify: false, turnDone: true,
+                                                                             message: false))
         stored = try await device(voip)
         XCTAssertEqual(stored?["alert_token"] as? String, alert)
-        XCTAssertEqual(alerts(stored), ["approval": true, "clarify": false, "turn_done": true])
+        XCTAssertEqual(alerts(stored), ["approval": true, "clarify": false, "turn_done": true, "message": false])
 
         // Signing out registers no alerts at all.
         try await register(alertToken: nil, alerts: NotificationPreferences.none)
         stored = try await device(voip)
-        XCTAssertEqual(alerts(stored), ["approval": false, "clarify": false, "turn_done": false])
+        XCTAssertEqual(alerts(stored), ["approval": false, "clarify": false, "turn_done": false, "message": false])
     }
 
     func testPushRegistrationSendsTheLatestStateInOrder() async throws {
@@ -148,7 +149,7 @@ final class FakeVoicePluginTests: XCTestCase {
         guard case .sent = push.upload else { return XCTFail("upload is \(push.upload)") }
         let stored = try await device(voip)
         XCTAssertEqual(stored?["alert_token"] as? String, alert)
-        XCTAssertEqual(alerts(stored), ["approval": false, "clarify": true, "turn_done": false])
+        XCTAssertEqual(alerts(stored), ["approval": false, "clarify": true, "turn_done": false, "message": true])
 
         // An upload that can't reach the dashboard says so.
         let offline = try DashboardClient(settings: ConnectionSettings(dashboardURL: "http://127.0.0.1:9", username: "test",
@@ -222,12 +223,14 @@ final class FakeVoicePluginTests: XCTestCase {
             let push = try XCTUnwrap(AlertPush(userInfo: try XCTUnwrap(sent["payload"] as? JSON)))
             XCTAssertEqual(push.kind, kind)
             XCTAssertTrue(push.isTest)
-            XCTAssertEqual(push.category, [.approval: "HERMES_APPROVAL", .clarify: "HERMES_CLARIFY", .turnDone: "HERMES_TURN_DONE"][kind])
-            let action = [.approval: AlertAction.reject, .clarify: AlertAction.reply, .turnDone: AlertAction.open][kind] ?? ""
-            await notifications.handle(action: action, text: kind == .clarify ? "blue" : nil, push: push)
+            XCTAssertEqual(push.category, [.approval: "HERMES_APPROVAL", .clarify: "HERMES_CLARIFY", .turnDone: "HERMES_TURN_DONE",
+                                           .message: "HERMES_MESSAGE"][kind])
+            let action = [.approval: AlertAction.reject, .clarify: AlertAction.reply, .turnDone: AlertAction.open,
+                          .message: AlertAction.messageReply][kind] ?? ""
+            await notifications.handle(action: action, text: kind == .clarify || kind == .message ? "blue" : nil, push: push)
             XCTAssertEqual(notifications.test?.phase, .answered, "\(kind)")
             let reported = try await VoicePluginAPI.testAlertStatus(client, id: id)
-            XCTAssertEqual(reported.action, [.approval: "deny", .clarify: "reply", .turnDone: "open"][kind], "\(kind)")
+            XCTAssertEqual(reported.action, [.approval: "deny", .clarify: "reply", .turnDone: "open", .message: "reply"][kind], "\(kind)")
             XCTAssertFalse(reported.message.contains("blue"), "the reply's text stays on the phone")
         }
         XCTAssertNil(notifications.openRequest)

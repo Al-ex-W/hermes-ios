@@ -427,7 +427,10 @@ Signing is personal, so it isn't in the repo. Copy `HermesVoice/Config/Local.xcc
 the app's bundle id becomes `$(BUNDLE_ID_PREFIX).hermesvoice`. For Hermes to ring the phone, the team must be a
 paid one with the Push Notifications capability (the app also uses the `voip`, `audio` and `remote-notification`
 background modes; the last one is for the background push that asks where the phone is. It has no `location`
-background mode: it gets one fix per request and tracks nothing in between).
+background mode: it gets one fix per request and tracks nothing in between). It also has the Time Sensitive Notifications
+entitlement (`com.apple.developer.usernotifications.time-sensitive`), so a message Hermes marks time-sensitive gets
+through a Focus that allows it; with automatic signing, Xcode adds the capability to the App ID and makes a new
+provisioning profile on the next device build (for `xcodebuild`, pass `-allowProvisioningUpdates`).
 
 In the app, enter the **Hermes dashboard** address (`https://<machine>.<tailnet>.ts.net`), username and password.
 
@@ -482,8 +485,9 @@ makes its agent call `start_call`, and `POST /api/plugins/hermes_voice/debug/rin
 `xcrun simctl openurl booted "hermesvoice://ring?…"` (see `devtools/fake_voice_plugin.py`). It answers the test
 alert routes as the plugin does without pushing anything; `GET /api/plugins/hermes_voice/debug/test-alerts` has
 each test's payload, which `xcrun simctl push booted <bundle id> payload.json` shows in the Simulator with its
-actions (see [`devtools/README.md`](devtools/README.md)). For location, typing `where am I` makes the fake agent
-call `get_location`, and `POST /api/plugins/hermes_voice/debug/location-request` asks the phone without the agent:
+actions (see [`devtools/README.md`](devtools/README.md)). Typing `notify me: …` makes it call `notify_user`, and
+`GET /api/plugins/hermes_voice/debug/alerts?kind=message` has the alert. For location, typing `where am I` makes the
+fake agent call `get_location`, and `POST /api/plugins/hermes_voice/debug/location-request` asks the phone without the agent:
 on the call's link while a call is up, else it returns the background push it would have sent. The Simulator
 doesn't hand a `content-available` push from `xcrun simctl push` to the app's handler, so a debug build takes
 `xcrun simctl openurl booted "hermesvoice://location-request?request_id=<id>"` as that push; give the Simulator a

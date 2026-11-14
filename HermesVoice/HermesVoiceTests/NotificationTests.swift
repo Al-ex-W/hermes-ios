@@ -117,7 +117,7 @@ final class NotificationTests: XCTestCase {
 
     func testCategoriesOfferTheContractActions() throws {
         let categories = Dictionary(uniqueKeysWithValues: AlertAction.categories().map { ($0.identifier, $0) })
-        XCTAssertEqual(Set(categories.keys), ["HERMES_APPROVAL", "HERMES_CLARIFY", "HERMES_TURN_DONE"])
+        XCTAssertEqual(Set(categories.keys), ["HERMES_APPROVAL", "HERMES_CLARIFY", "HERMES_TURN_DONE", "HERMES_MESSAGE"])
 
         let approval = try XCTUnwrap(categories["HERMES_APPROVAL"])
         XCTAssertEqual(approval.actions.map(\.title), ["Run", "Allow for session", "Reject"], "Always only in the app")
@@ -134,6 +134,144 @@ final class NotificationTests: XCTestCase {
         let done = try XCTUnwrap(categories["HERMES_TURN_DONE"])
         XCTAssertEqual(done.actions.map(\.identifier), [AlertAction.open])
         XCTAssertTrue(done.actions[0].options.contains(.foreground))
+
+        // A message: Reply (typed, into its conversation; Face ID first on the lock screen) and Open.
+        let message = try XCTUnwrap(categories["HERMES_MESSAGE"])
+        XCTAssertEqual(message.actions.map(\.identifier), [AlertAction.messageReply, AlertAction.open])
+        XCTAssertEqual(message.actions.map(\.title), ["Reply", "Open"])
+        let reply = try XCTUnwrap(message.actions[0] as? UNTextInputNotificationAction)
+        XCTAssertTrue(reply.options.contains(.authenticationRequired))
+        XCTAssertEqual(reply.textInputButtonTitle, "Send")
+        XCTAssertTrue(message.actions[1].options.contains(.foreground))
+    }
+
+    // MARK: Messages (notify_user)
+
+    /// The plugin's `notify_user` alert (`message.py`).
+    private let messageJSON = """
+    {"aps": {"alert": {"title": "Trains", "body": "Your train is 10 minutes late"}, "category": "HERMES_MESSAGE",
+             "thread-id": "20261114_cron_ab12", "sound": "default", "interruption-level": "time-sensitive"},
+     "hermes": {"kind": "message", "session_id": "20261114_cron_ab12", "profile": "work"}}
+    """
+
+    private func message(_ sessionID: String = "s1") -> AlertPush {
+        AlertPush(kind: .message, sessionID: sessionID, profile: "work", title: "Trains", body: "Your train is late")
+    }
+
+    func testMessagePayloadDecodes() throws {
+        let push = try XCTUnwrap(AlertPush(userInfo: userInfo(messageJSON)))
+        XCTAssertEqual(push.kind, .message)
+        XCTAssertEqual(push.sessionID, "20261114_cron_ab12")
+        XCTAssertEqual(push.profile, "work")
+        XCTAssertEqual(push.title, "Trains")
+        XCTAssertEqual(push.body, "Your train is 10 minutes late")
+        XCTAssertNil(push.requestID)
+        XCTAssertEqual(push.choices, [])
+        XCTAssertEqual(push.category, "HERMES_MESSAGE")
+        XCTAssertFalse(push.isTest)
+        // Posted again (a reply that failed), it is the same message.
+        let info = Dictionary(uniqueKeysWithValues: push.userInfo.map { ("\($0.key)", $0.value) })
+        XCTAssertNoThrow(try PropertyListSerialization.data(fromPropertyList: info, format: .binary, options: 0))
+        XCTAssertEqual(AlertPush(userInfo: push.userInfo), push)
+        // The generic line of a host with previews off is a message all the same.
+        let generic = try XCTUnwrap(AlertPush(userInfo: userInfo("""
+        {"aps": {"alert": {"title": "Hermes", "body": "Hermes sent you a message."}, "category": "HERMES_MESSAGE",
+                 "thread-id": "s7", "interruption-level": "passive"},
+         "hermes": {"kind": "message", "session_id": "s7", "profile": "default"}}
+        """)))
+        XCTAssertEqual(generic.kind, .message)
+        XCTAssertEqual(generic.sessionID, "s7")
+    }
+
+    func testMessageReplyIsAPromptAndATapOpensTheConversation() {
+        let push = message()
+        XCTAssertEqual(AlertIntent.of(action: AlertAction.messageReply, text: "  Thanks, leave at 8 \n", push: push),
+                       .prompt("Thanks, leave at 8"))
+        XCTAssertEqual(AlertIntent.of(action: UNNotificationDefaultActionIdentifier, text: nil, push: push), .open)
+        XCTAssertEqual(AlertIntent.of(action: AlertAction.open, text: nil, push: push), .open)
+        guard case .unanswerable(_, retry: true) = AlertIntent.of(action: AlertAction.messageReply, text: " ", push: push) else {
+            return XCTFail("an empty reply went out, or can't be typed again")
+        }
+        // Other kinds' actions answer nothing on a message, and its Reply nothing on theirs.
+        XCTAssertEqual(AlertIntent.of(action: AlertAction.reply, text: "yes", push: push), .ignore)
+        XCTAssertEqual(AlertIntent.of(action: AlertAction.run, text: nil, push: push), .ignore)
+        XCTAssertEqual(AlertIntent.of(action: AlertAction.messageReply, text: "yes", push: clarify([q1])), .ignore)
+    }
+
+    func testATappedMessageOpensItsConversation() async {
+        let notifications = AlertNotifications()
+        await notifications.handle(action: UNNotificationDefaultActionIdentifier, text: nil, push: message("cron_42"))
+        XCTAssertEqual(notifications.openRequest, AlertNotifications.SessionTarget(id: "cron_42", profile: "work"))
+    }
+
+    private func reply(_ text: String, _ handlers: [String: (JSONValue) -> ScriptedGateway.Reply]) async throws
+        -> (PromptSubmitStatus?, ScriptedGateway) {
+        let gateway = ScriptedGateway()
+        gateway.handlers = handlers
+        let connection = gateway.connection()
+        defer { connection.disconnect() }
+        let status = try await MessageReplier(gateway: connection.client).send(message("20261114_abc"), text)
+        return (status, gateway)
+    }
+
+    func testMessageReplyResumesTheConversationAndQueuesThePrompt() async throws {
+        let (status, gateway) = try await reply("Thanks, leave at 8", [
+            "session.resume": { _ in .result(["session_id": "rt-9", "message_count": 0, "messages": [],
+                                              "info": [:], "running": true]) },
+            "prompt.submit": { _ in .result(["status": "queued"]) },
+        ])
+        XCTAssertEqual(status, .queued)
+        XCTAssertEqual(gateway.calls("session.resume").map(\.params),
+                       [["session_id": "20261114_abc", "profile": "work", "cols": 96, "source": "desktop",
+                         "omit_messages": true]])
+        // Into the resumed runtime, queued behind a running turn: never steered into it.
+        XCTAssertEqual(gateway.calls("prompt.submit").map(\.params),
+                       [["session_id": "rt-9", "text": "Thanks, leave at 8", "queued": true]])
+    }
+
+    func testMessageReplyToAnIdleConversationStartsItsTurn() async throws {
+        let (status, gateway) = try await reply("ok", [
+            // A resume answer outside the contract is read from its raw form, as the chat reads it.
+            "session.resume": { _ in .result(["session_id": "rt-1"]) },
+            "prompt.submit": { _ in .result(["status": "streaming", "user_row_id": 12]) },
+        ])
+        XCTAssertEqual(status, .streaming)
+        XCTAssertEqual(gateway.calls("prompt.submit").first?.params["session_id"], "rt-1")
+    }
+
+    func testMessageReplyHermesRefusesIsReported() async throws {
+        do {
+            _ = try await reply("ok", [
+                "session.resume": { _ in .result(["session_id": "rt-1"]) },
+                "prompt.submit": { _ in .error(4012, "This chat is open in another Hermes window") },
+            ])
+            XCTFail("the refusal was swallowed")
+        } catch let error as GatewayRPCError {
+            XCTAssertEqual(error.code, 4012)
+        }
+        do {
+            _ = try await reply("ok", ["session.resume": { _ in .error(4007, "session not found") }])
+            XCTFail("a conversation Hermes can't open got a prompt")
+        } catch let error as GatewayRPCError {
+            XCTAssertEqual(error.code, 4007)
+        }
+    }
+
+    func testAReplyWithoutASignInOpensNoConnection() async {
+        let notifications = AlertNotifications()
+        var connected = 0
+        notifications.connect = { client in
+            connected += 1
+            return GatewayConnection(client: client)
+        }
+        await notifications.handle(action: AlertAction.messageReply, text: "hello", push: message())
+        XCTAssertEqual(connected, 0, "no dashboard client: nothing to send it through")
+        XCTAssertNil(notifications.openRequest)
+    }
+
+    func testForegroundMessageIsQuietOnlyInItsOwnChat() {
+        XCTAssertEqual(AlertNotifications.presentation(for: message(), sessionOnScreen: true), [])
+        XCTAssertEqual(AlertNotifications.presentation(for: message(), sessionOnScreen: false), [.banner, .list, .sound])
     }
 
     func testApprovalActionsMapToChoices() {
@@ -332,7 +470,10 @@ final class NotificationTests: XCTestCase {
         XCTAssertEqual(body(PushRegistration.deviceBody(voipToken: "aa", environment: "sandbox", bundleID: "b",
                                                         alertToken: "bb", alerts: preferences)),
                        ["voip_token": "aa", "environment": "sandbox", "bundle_id": "b", "alert_token": "bb",
-                        "alerts": ["approval": true, "clarify": false, "turn_done": true]])
+                        "alerts": ["approval": true, "clarify": false, "turn_done": true, "message": true]])
+        let noMessages = NotificationPreferences(approval: true, clarify: true, turnDone: true, message: false)
+        XCTAssertEqual(body(PushRegistration.deviceBody(voipToken: "aa", environment: "sandbox", bundleID: "b",
+                                                        alertToken: "bb", alerts: noMessages))["alerts"]?["message"], false)
     }
 
     func testRegistrationLeavesOutWhatIsNotKnownYet() {
@@ -343,7 +484,7 @@ final class NotificationTests: XCTestCase {
         XCTAssertEqual(body(PushRegistration.deviceBody(voipToken: "aa", environment: "sandbox", bundleID: "b",
                                                         alertToken: nil, alerts: NotificationPreferences.none)),
                        ["voip_token": "aa", "environment": "sandbox", "bundle_id": "b",
-                        "alerts": ["approval": false, "clarify": false, "turn_done": false]])
+                        "alerts": ["approval": false, "clarify": false, "turn_done": false, "message": false]])
     }
 
     func testOptInsRegisterOnlyWhileIOSLetsTheAppNotify() {
@@ -369,16 +510,32 @@ final class NotificationTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         XCTAssertEqual(NotificationPreferences.load(from: defaults), NotificationPreferences.defaults)
         XCTAssertTrue(NotificationPreferences.defaults.approval && NotificationPreferences.defaults.clarify
-                      && NotificationPreferences.defaults.turnDone)
+                      && NotificationPreferences.defaults.turnDone && NotificationPreferences.defaults.message)
 
         let changed = expectation(forNotification: NotificationPreferences.didChange, object: nil)
         let preferences = NotificationPreferences(approval: false, clarify: true, turnDone: false)
         NotificationPreferences.save(preferences, to: defaults)
         wait(for: [changed], timeout: 1)
         XCTAssertEqual(NotificationPreferences.load(from: defaults), preferences)
-        XCTAssertEqual(preferences.alerts, ["approval": false, "clarify": true, "turn_done": false])
+        XCTAssertEqual(preferences.alerts, ["approval": false, "clarify": true, "turn_done": false, "message": true])
         XCTAssertTrue(preferences.anyEnabled)
         XCTAssertFalse(NotificationPreferences.none.anyEnabled)
+        XCTAssertTrue(NotificationPreferences(approval: false, clarify: false, turnDone: false, message: true).anyEnabled)
+
+        // The Messages switch is saved and read back like the others.
+        let quiet = NotificationPreferences(approval: true, clarify: true, turnDone: true, message: false)
+        NotificationPreferences.save(quiet, to: defaults)
+        XCTAssertEqual(NotificationPreferences.load(from: defaults), quiet)
+        XCTAssertEqual(NotificationPreferences.load(from: defaults).alerts["message"], false)
+    }
+
+    func testPreferencesSavedBeforeMessagesKeepTheirChoicesAndTakeMessages() throws {
+        let suite = "NotificationTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(Data(#"{"approval": false, "clarify": true, "turnDone": false}"#.utf8), forKey: "notifications.preferences")
+        XCTAssertEqual(NotificationPreferences.load(from: defaults),
+                       NotificationPreferences(approval: false, clarify: true, turnDone: false, message: true))
     }
 
     // MARK: Foreground
@@ -468,6 +625,10 @@ final class NotificationTests: XCTestCase {
         XCTAssertEqual(answer(AlertAction.open, testPush(.clarify))?.action, "open")
         // An empty reply answers nothing (the alert is posted again), nor does another kind's action.
         XCTAssertNil(answer(AlertAction.reply, text: "  ", testPush(.clarify)))
+        XCTAssertEqual(answer(AlertAction.messageReply, text: " ok ", testPush(.message)),
+                       TestAlertAnswer(action: "reply", summary: "Test message replied to: “ok”. It went to no conversation."))
+        XCTAssertNil(answer(AlertAction.messageReply, text: " ", testPush(.message)))
+        XCTAssertEqual(TestAlertRow.title(.message), "Message")
         XCTAssertNil(answer(AlertAction.run, testPush(.clarify)))
     }
 
@@ -528,7 +689,7 @@ final class NotificationTests: XCTestCase {
         XCTAssertTrue(failed.isError)
         XCTAssertFalse(failed.busy)
         XCTAssertEqual(failed.message, "APNs is not configured.")
-        XCTAssertEqual(AlertPush.Kind.allCases.map(TestAlertRow.title), ["Approval", "Question", "Turn finished"])
+        XCTAssertEqual(AlertPush.Kind.allCases.map(TestAlertRow.title), ["Approval", "Question", "Turn finished", "Message"])
     }
 
     func testTestStateFollowsThePluginAndKeepsWhatThisPhoneSaw() {

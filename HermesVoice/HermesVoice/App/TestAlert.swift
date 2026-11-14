@@ -92,6 +92,7 @@ struct TestAlertRow: Equatable {
         case .approval: return "Approval"
         case .clarify: return "Question"
         case .turnDone: return "Turn finished"
+        case .message: return "Message"
         }
     }
 }
@@ -113,6 +114,9 @@ struct TestAlertAnswer: Equatable {
         case let .answer(.clarify(_, text)):
             let shown = text.count > 80 ? text.prefix(79) + "…" : Substring(text)
             return TestAlertAnswer(action: "reply", summary: "Test question answered: “\(shown)”.")
+        case let .prompt(text):
+            let shown = text.count > 80 ? text.prefix(79) + "…" : Substring(text)
+            return TestAlertAnswer(action: "reply", summary: "Test message replied to: “\(shown)”. It went to no conversation.")
         case .unanswerable, .ignore:
             return nil
         }
