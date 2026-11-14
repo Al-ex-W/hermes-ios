@@ -3,11 +3,11 @@
 - ``WS /phone?ticket=<single-use ws-ticket>``: the phone's call link (protocol in ``hub.py``).
 - ``POST /devices {voip_token, alert_token?, environment, bundle_id, alerts?}``: where to send VoIP pushes, and
   alert pushes (``notify.py``) to the alert token. ``alerts`` turns kinds off or back on for this phone
-  (``{"approval": bool, "clarify": bool, "turn_done": bool}``; a kind it never names stays on). A registration
-  without ``alert_token`` keeps the one stored for the phone; ``"alert_token": null`` clears it.
+  (``{"approval": bool, "clarify": bool, "turn_done": bool, "message": bool}``; a kind it never names stays on). A
+  registration without ``alert_token`` keeps the one stored for the phone; ``"alert_token": null`` clears it.
 - ``POST /devices/test {voip_token?, alert_token?, kind?, delay_s?}``: a test alert push (``notify.TestAlerts``) to
-  the phone with these tokens and no other: ``kind`` is ``approval`` (the default), ``clarify`` or ``turn_done``,
-  ``delay_s`` (0-30) lets the user lock the phone first. It answers ``{ok, test_id, kind, status: "sent" |
+  the phone with these tokens and no other: ``kind`` is ``approval`` (the default), ``clarify``, ``turn_done`` or
+  ``message``, ``delay_s`` (0-30) lets the user lock the phone first. It answers ``{ok, test_id, kind, status: "sent" |
   "scheduled" | "failed" | "answered", code, message, delay_s, action}``: ``code`` says what APNs answered or why
   nothing went out, ``message`` says it in words the app shows. ``GET /devices/test/{test_id}`` answers the same
   later (a delayed test's outcome), and ``POST /devices/test/{test_id}/answer {action}`` is the phone saying what
@@ -22,8 +22,9 @@
   answer to a location request it got by background push (``location.py``). Only from a registered phone that
   shares its location, and only for a request this host made: ``404`` for an unknown phone, ``403`` for one that
   doesn't share, ``409`` for a request nobody made (or one that is too old). The fix is kept in memory only.
-- ``GET /status``: what works here (TTS, h2, APNs, Scribe), the call in progress, the alert watcher and
-  ``location`` (whether a phone shares its location; never where it is).
+- ``GET /status``: what works here (TTS, h2, APNs, Scribe), the call in progress, the alert watcher,
+  ``location`` (whether a phone shares its location; never where it is) and ``messages`` (whether ``notify_user``
+  can reach a phone now: ``{available, phones, sent, allow_cron, note?}``).
 
 HTTP routes sit behind the dashboard's own auth middleware. WebSocket upgrades skip that middleware, so the socket
 checks the dashboard's WebSocket auth itself (the check ``/api/audio/speak-stream`` uses), failing closed.
@@ -91,6 +92,7 @@ hermes = _core("hermes")
 push = _core("push")
 notify = _core("notify")
 location = _core("location")
+message = _core("message")
 hub_module.mark_routes_mounted()
 # Alert pushes: the watcher acts once this process serves the dashboard (hub.routes_mounted()).
 notify.start()
@@ -343,6 +345,10 @@ async def status() -> Any:
             report["location"] = location.locations().status()
         except Exception:  # noqa: BLE001
             logger.debug("hermes_voice: location status unavailable", exc_info=True)
+        try:
+            report["messages"] = message.messages().status()
+        except Exception:  # noqa: BLE001
+            logger.debug("hermes_voice: message status unavailable", exc_info=True)
         return report
 
     return await run_in_threadpool(collect)

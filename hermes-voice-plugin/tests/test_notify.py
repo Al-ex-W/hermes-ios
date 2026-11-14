@@ -233,7 +233,7 @@ def test_the_host_can_turn_alerts_off(core, env):
 
     parsed = core.notify.AlertSettings.from_plugin_settings(
         {"alerts": {"turn_done": False, "grace_s": "12", "previews": "off"}})
-    assert parsed == core.notify.AlertSettings(kinds=frozenset({"approval", "clarify"}), grace_s=12.0,
+    assert parsed == core.notify.AlertSettings(kinds=frozenset({"approval", "clarify", "message"}), grace_s=12.0,
                                                previews=False)
     assert core.notify.AlertSettings.from_plugin_settings({"alerts": {"grace_s": 9999}}).grace_s == 120.0
     assert core.notify.AlertSettings.from_plugin_settings({}) == core.notify.AlertSettings()
@@ -760,7 +760,7 @@ def test_devices_register_alert_tokens_and_choices(core, fake, make_hub, tmp_pat
     assert steps[2][1]["alerts"] == {"turn_done": True, "clarify": False}
     assert steps[3][1]["alert_token"] is None and steps[3][1]["voip_token"] == VOIP
     assert bad.status_code == 400 and "alerts" in bad.json()["detail"]
-    assert status["alerts"]["enabled"] is True and status["alerts"]["kinds"] == ["approval", "clarify", "turn_done"]
+    assert status["alerts"]["enabled"] is True and status["alerts"]["kinds"] == ["approval", "clarify", "message", "turn_done"]
     assert ALERT not in json.dumps(status) and VOIP not in json.dumps(status)
 
 
@@ -802,7 +802,7 @@ def test_a_failing_sender_logs_no_more_than_what_failed(core, env, caplog):
 
 def test_status_counts_phones_that_take_alerts(core, env):
     env.store.register(core.push.Device("12" * 32, "sandbox", BUNDLE))
-    assert env.alerts.status() == {"enabled": True, "kinds": ["approval", "clarify", "turn_done"],
+    assert env.alerts.status() == {"enabled": True, "kinds": ["approval", "clarify", "message", "turn_done"],
                                    "watching": False, "devices": 1, "sent": 0}
     sid = env.host.add("s1")
     env.host.approval(sid)

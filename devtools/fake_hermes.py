@@ -102,9 +102,10 @@ agent/learning_graph.py, tui_gateway/methods_{subagents,session_foreign}.py and 
   PUT, DELETE), /api/dashboard/plugins, the kanban plugin under /api/plugins/kanban/ with its /events socket
   (``--no-kanban`` turns it off), and the RPCs session.foreign.{list,preview,import} and
   subagent.{interrupt,tail,steer} (the chat trigger ``fleet`` runs a subagent tree for them).
-The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done}
-(listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert pushes
-the plugin would send ({aps, hermes}: approval or clarify waiting, turn done) and the alert tokens they go to.
+The fake hermes_voice plugin's POST /devices also takes ``alert_token`` + ``alerts`` {approval, clarify, turn_done,
+message} (listed by GET /status), and GET /api/plugins/hermes_voice/debug/alerts?session_id=… returns the alert
+pushes the plugin would send ({aps, hermes}: approval or clarify waiting, turn done, and the agent's notify_user
+messages: type "notify me: <text>" in a chat) and the alert tokens they go to.
 POST /api/plugins/hermes_voice/devices/test {voip_token?, alert_token?, kind?, delay_s?} answers like the plugin's
 test alert route (with GET /devices/test/{test_id} and POST /devices/test/{test_id}/answer {action}); nothing is
 pushed, and GET /api/plugins/hermes_voice/debug/test-alerts lists each test with its payload.
@@ -1942,10 +1943,17 @@ VAULT_REQUIRED = {"payment": ("card_number", "exp_month", "exp_year", "cvc"),
 PASSWORD_MANAGERS = (("onepassword", "1Password", True), ("bitwarden", "Bitwarden", False))
 BILLING_SCOPE_MESSAGE = "This action needs the billing:manage scope."
 # The alert pushes the hermes_voice plugin sends beside the VoIP ones (the app's App/Notifications.swift).
-ALERT_KINDS = ("approval", "clarify", "turn_done")
+# "message": what the agent sends with notify_user (hermes-voice-plugin/message.py).
+ALERT_KINDS = ("approval", "clarify", "turn_done", "message")
 # A kind a device never named is on (the plugin's ``Device.wants``: ``alerts.get(kind, True)``).
-ALERT_DEFAULTS = {"approval": True, "clarify": True, "turn_done": True}
-ALERT_CATEGORIES = {"approval": "HERMES_APPROVAL", "clarify": "HERMES_CLARIFY", "turn_done": "HERMES_TURN_DONE"}
+ALERT_DEFAULTS = {"approval": True, "clarify": True, "turn_done": True, "message": True}
+ALERT_CATEGORIES = {"approval": "HERMES_APPROVAL", "clarify": "HERMES_CLARIFY", "turn_done": "HERMES_TURN_DONE",
+                    "message": "HERMES_MESSAGE"}
+# notify_user (message.py): its caps, urgencies and the note every sent result carries.
+MESSAGE_TITLE_CHARS, MESSAGE_BODY_CHARS = 80, 500
+MESSAGE_URGENCIES = ("normal", "time_sensitive", "quiet")
+MESSAGE_IN_CONVERSATION = ("The text is also in this conversation (this tool call), so don't repeat it in your "
+                           "reply unless that helps.")
 ALERT_MEMORY = 200
 # Test alerts (``POST /devices/test``): the texts and names of hermes-voice-plugin/notify.py.
 TEST_ALERT_SESSION = "hermes-voice-test"
@@ -1953,8 +1961,10 @@ TEST_ALERT_BODIES = {
     "approval": "Test approval: nothing will run, whatever you choose.",
     "clarify": "Test question: reply with anything.",
     "turn_done": "Test: this is how a finished turn looks.",
+    "message": "Test message: this is how a message from Hermes looks. A reply goes nowhere.",
 }
-TEST_ALERT_KIND_NAMES = {"approval": "approval", "clarify": "question", "turn_done": "turn-finished"}
+TEST_ALERT_KIND_NAMES = {"approval": "approval", "clarify": "question", "turn_done": "turn-finished",
+                         "message": "message"}
 TEST_ALERT_ACTIONS = ("once", "session", "always", "deny", "reply", "open")
 TEST_ALERT_SENT = ("APNs accepted the test notification. If it doesn't show within a few seconds, check Focus and "
                    "the app's notification settings on the iPhone.")
@@ -2520,7 +2530,14 @@ def alert_preferences(value: Any) -> tuple[dict[str, bool], str | None]:
 class AlertVoicePlugin(FakeVoicePlugin):
     """The fake hermes_voice plugin plus the alert half of ``POST /devices``: ``alert_token`` with the ``alerts``
     the user opted into (kept per device, listed by ``GET /status``), and ``GET /debug/alerts``: the alert pushes
-    the plugin would have sent (approval / clarify waiting, turn done) and to which alert tokens.
+    the plugin would have sent (approval / clarify waiting, turn done, notify_user messages) and to which alert
+    tokens.
+
+    ``notify_user`` (message.py), which the fake agent calls for "notify me: <text>": the alert is recorded like
+    the others (kind ``message``, category ``HERMES_MESSAGE``, thread = the stored session id) for every phone that
+    takes messages, and the result is the plugin's ``{status, note, reason?}``: ``not_sent`` for no phone, no alert
+    token or messages turned off on every phone, else ``sent`` (``quiet`` for urgency quiet is still ``sent``).
+    Not modelled: who may notify, the rate limits, quiet hours, the alert budget, previews and redaction.
 
     Registering again works as the plugin's ``DeviceStore.register`` with ``kept_fields``: a body that doesn't
     name ``alert_token`` keeps the stored one (an explicit null clears it), and the alert choices merge kind by
@@ -2768,6 +2785,36 @@ class AlertVoicePlugin(FakeVoicePlugin):
 
     def alert_targets(self, kind: str) -> list[str]:
         return [device["alert_token"] for device in self.devices.values() if self.alerts_of(device).get(kind)]
+
+    async def notify_user(self, stored: Any, args: dict[str, Any]) -> dict[str, Any]:
+        """The plugin's ``notify_user`` (message.py) for ``stored``'s agent: records the alert, answers its result."""
+        title = " ".join(str(args.get("title") or "").split())
+        body = " ".join(str(args.get("body") or "").split())
+        if not body:
+            title, body = "", title
+        if not body:
+            return {"status": "not_sent", "reason": "empty", "note": "Nothing was sent: body is empty."}
+        urgency = str(args.get("urgency") or "normal").strip().lower().replace("-", "_")
+        urgency = urgency if urgency in MESSAGE_URGENCIES else "normal"
+        if not self.devices:
+            return {"status": "not_sent", "reason": "no_phone", "note": (
+                "No iPhone is registered with this Hermes host, so nothing was sent. Tell them in your reply instead.")}
+        if not any(device.get("alert_token") for device in self.devices.values()):
+            return {"status": "not_sent", "reason": "no_alert_token", "note": (
+                "The user's iPhone has no notification token on this host, so nothing was sent.")}
+        if not self.alert_targets("message"):
+            return {"status": "not_sent", "reason": "off_on_phone", "note": (
+                "The user turned off \"Messages from Hermes\" (Settings → Notifications in the HermesVoice app), so "
+                "nothing was sent. Put it in your reply instead.")}
+        cut = len(title) > MESSAGE_TITLE_CHARS or len(body) > MESSAGE_BODY_CHARS
+        clip = lambda text, limit: text if len(text) <= limit else text[: limit - 1].rstrip() + "…"  # noqa: E731
+        self.fake.note_message_alert(stored, clip(title, MESSAGE_TITLE_CHARS) or "Hermes",
+                                     clip(body, MESSAGE_BODY_CHARS), urgency)
+        how = {"normal": "Sent to the user's iPhone, with sound.",
+               "time_sensitive": "Sent to the user's iPhone with sound, as time-sensitive.",
+               "quiet": "Sent to the user's iPhone silently, as asked (no sound)."}[urgency]
+        note = " ".join(part for part in (how, "The text was cut." if cut else "", MESSAGE_IN_CONVERSATION) if part)
+        return {"status": "sent", "note": note}
 
     async def debug_alerts(self, request: Request) -> Response:
         """``?session_id=`` (stored or runtime id; omitted: every session) and ``?kind=``: the latest alert as
@@ -4069,6 +4116,23 @@ class SettingsFeatures:
                             "sent_to": sent_to})
         log(f"alert {kind} for {stored.key} "
             + (f"-> {len(sent_to)} device(s)" if sent_to else "(no device opted in)"))
+
+    def note_message_alert(self, stored: StoredSession, title: str, body: str, urgency: str) -> None:
+        """Record the ``notify_user`` alert the plugin would send (message.py): its own title, the thread of the
+        stored session, and the interruption level its urgency asks for."""
+        aps: dict[str, Any] = {"alert": {"title": title, "body": body}, "category": ALERT_CATEGORIES["message"],
+                               "thread-id": stored.key}
+        if urgency == "quiet":
+            aps["interruption-level"] = "passive"
+        else:
+            aps["sound"] = "default"
+            if urgency == "time_sensitive":
+                aps["interruption-level"] = "time-sensitive"
+        payload = {"aps": aps, "hermes": {"kind": "message", "session_id": stored.key, "profile": stored.profile}}
+        sent_to = self.voice_plugin.alert_targets("message")
+        self.alerts.append({"at": time.time(), "session_id": stored.key, "kind": "message", "payload": payload,
+                            "sent_to": sent_to})
+        log(f"alert message ({urgency}) for {stored.key} -> {len(sent_to)} device(s)")
 
     def note_request_alert(self, rt: Runtime, req: ServerRequest) -> None:
         stored = self.sessions.get(rt.key)

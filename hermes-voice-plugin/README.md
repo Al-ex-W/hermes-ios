@@ -9,7 +9,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
   reply arrives in the conversation as a `[Voice] …` message. `end_call(text?)` hangs up. With `in_minutes` or `at`,
   `start_call` schedules the call instead and the plugin rings at that time by itself (see "Calls that ring
   later"); `scheduled_calls(cancel?)` lists or cancels those. `get_location(max_age_s?)` asks the phone where it
-  is, when the user shares that (see "Location").
+  is, when the user shares that (see "Location"). `notify_user(title, body, urgency?)` sends the phone a
+  notification of the agent's own (see "Messages from Hermes").
 - **Skill** `voice-calls`: the longer rules (`skill_view("hermes_voice:voice-calls")`).
 - **Call style** `<HERMES_HOME>/hermes-voice/call-style.md`: the user's own preferences for how Hermes speaks on
   calls, which the agent reads at every call and edits itself (see "Call style").
@@ -18,7 +19,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
   pushes when a turn ended, and with what reply, and `on_session_finalize` lets them read how a turn ended
   before the dashboard drops a conversation nobody has open.
 - **Alert pushes** (ordinary APNs notifications, not VoIP): an approval or a question waiting, or a turn done, in a
-  dashboard conversation no client has open (see "Alert pushes").
+  dashboard conversation no client has open (see "Alert pushes"), and the messages the agent sends with
+  `notify_user`.
 - **Hub socket** `<HERMES_HOME>/hermes-voice/hub.sock`: how conversations in other Hermes processes (CLI, Ink TUI,
   the messaging gateway, cron, compute-host children, backends the Hermes Desktop app spawns) place and hear
   calls (see "Calls from any session").
@@ -28,8 +30,8 @@ A Hermes plugin that lets Hermes **call you** on the HermesVoice iPhone app and 
 
 `POST /devices {voip_token, alert_token?, environment: "sandbox" | "production", bundle_id, alerts?}` registers a
 phone: VoIP pushes go to `voip_token` (topic `<bundle_id>.voip`), alert pushes to `alert_token` (topic
-`<bundle_id>`). `alerts: {"approval": bool, "clarify": bool, "turn_done": bool}` turns kinds off or back on for
-that phone (a kind it never names stays on); a registration without `alert_token` keeps the stored one, and
+`<bundle_id>`). `alerts: {"approval": bool, "clarify": bool, "turn_done": bool, "message": bool}` turns kinds off
+or back on for that phone (a kind it never names stays on); a registration without `alert_token` keeps the stored one, and
 `"alert_token": null` clears it. The answer is `{"ok": true}`.
 
 One call at a time per host (the dashboard holds it for every process). A call belongs to one conversation; another
@@ -100,6 +102,7 @@ plugins:
           approval: true                   # each kind can be turned off for every phone here
           clarify: true
           turn_done: true
+          message: true                    # notify_user's messages (see "Messages from Hermes")
           grace_s: 5                       # how long nothing has the conversation open before an alert
           previews: true                   # false: no conversation text or title goes through APNs (alerts
                                            # and the call push alike)
@@ -111,6 +114,10 @@ plugins:
           keep_s: 1800                     # how long the last fix stays in memory; never on disk
           requests_per_session: 6          # per session_window_s (600)
           requests_global: 30              # per global_window_s (3600)
+        notify_user:                       # the agent's own notifications (the kind's switch: alerts.message)
+          allow_cron: true                 # scheduled jobs (and kanban tasks) may notify
+          per_session: 5                   # per session_window_s (600)
+          per_host: 30                     # per host_window_s (3600)
       allow_gateway_injection: true        # not under settings: Hermes' own switch (see "Calls from any session")
 ```
 
@@ -418,7 +425,8 @@ nothing has that conversation open (no app, Desktop window or dashboard chat att
   covered: under `turn_isolation`, a turn that starts and ends between two looks is never seen (no hook of the
   dashboard's fires for a turn that ran in a child).
 
-Messaging and CLI conversations don't alert: they ask on their own surface, and the phone answers through the
+Messaging and CLI conversations don't alert (only the agent's own `notify_user` messages come from them; see
+"Messages from Hermes"): they ask on their own surface, and the phone answers through the
 dashboard. Each alert goes to every registered phone with an alert token that didn't turn the kind off; the host
 turns kinds off for all phones under `settings.alerts`. Pushes are `apns-push-type: alert` to the app's own topic
 (the bundle id), priority 10, kept by APNs for 15 minutes (an approval or question) or an hour (a turn done), with
@@ -587,6 +595,66 @@ sharing, phones, background, last_fix_age_s}`: whether a phone shares, not where
 of the conversation that asked (a tool result), like anything else the agent reads, and so reaches the model
 provider of that conversation.
 
+## Messages from Hermes
+
+`notify_user(title, body, urgency?)` lets the agent notify the user whenever it has something for them ("Your train
+is 10 minutes late"), from any of the owner's conversations and from scheduled jobs. Code: `message.py`.
+
+It is an ordinary alert push, the fourth kind `message`, sent like the others (`push.Apns.push_alert`, kept by APNs
+for an hour, its own collapse id so messages don't replace each other) to every phone of the profile that takes
+`message` alerts:
+
+```json
+{"aps": {"alert": {"title": "Trains", "body": "Your train is 10 minutes late"}, "category": "HERMES_MESSAGE",
+         "thread-id": "<stored session id>", "sound": "default"},
+ "hermes": {"kind": "message", "session_id": "<stored session id>", "profile": "default"}}
+```
+
+- `urgency`: `normal` (the default: sound), `time_sensitive` (sound and `"interruption-level": "time-sensitive"`:
+  it gets through a Focus the user allows time-sensitive notifications in; the app has that entitlement) or `quiet`
+  (`"interruption-level": "passive"`, no sound). None of them rings through Silent mode: it is a notification, not
+  a call.
+- **Text.** At most 80 characters of title and 500 of body (whitespace collapsed), through Hermes' secret
+  redaction first; the result says when it was cut. With `alerts.previews: false` (or where redaction can't run)
+  the phone shows "Hermes" / "Hermes sent you a message." and the user reads the text in the conversation: the tool
+  call is stored there with its arguments, and the result tells the agent so ("don't repeat it in your reply").
+- **Tap and Reply.** A tap opens the conversation (the thread is its stored id). The app's Reply action sends the
+  answer into that conversation as the chat would (`session.resume`, then `prompt.submit`, queued behind a running
+  turn).
+- **Quiet.** During `policy.quiet_hours` every message goes passive, `time_sensitive` included: the user's own
+  setting wins over the agent's idea of urgent. Past the alert budget (20 sounding alerts an hour, all kinds
+  together) a `normal` message goes passive too; a `time_sensitive` one still sounds, since the tool's own rate
+  limits bound it.
+- **Retries.** APNs unreachable, `429` or `5xx`: tried again after 1, 2, 4 and 8 s while the tool waits.
+
+The result is `{status, note}` (and `reason` unless it was sent as asked); the note says what happened in words:
+
+| `status` | `reason` | |
+|---|---|---|
+| `sent` | | APNs took it for at least one phone |
+| `quiet` | `quiet_hours`, `budget` | sent, but silently |
+| `not_sent` | `not_allowed` | this conversation may not notify (see below) |
+| | `rate_limited` | `per_session` / `per_host` reached |
+| | `off_on_host` | `alerts.enabled` or `alerts.message` is false |
+| | `no_phone`, `no_alert_token`, `off_on_phone` | no phone registered, none has a notification token, or every phone turned "Messages from Hermes" off |
+| | `apns_not_configured` | the host can't send pushes (key, h2) |
+| | `apns_refused`, `apns_unreachable` | APNs refused it (the note says why in words, with APNs' reason), or stayed unreachable through the retries |
+| | `empty`, `interrupted`, `error` | no text; the user pressed Stop during a retry; the plugin failed |
+| `not_available` | | from another Hermes process: no dashboard with this plugin (or an older one) |
+
+**Who may.** As for `get_location` (`policy.owner_conversation`): the sources in `policy.allowed_sources`, the
+owner's own direct messages, and scheduled jobs and kanban tasks unless `notify_user.allow_cron` is false (for
+calls they are off by default; here a job that checks something and tells the user is the point). Never a delegated
+subagent, a group chat, somebody else's chat, a one-shot or `--source tool` run unless `allowed_sources` lists it,
+or another profile's process unless `policy.allowed_profiles` lists the profile. `per_session` (5 per 10 minutes)
+and `per_host` (30 an hour) bound how often. From other Hermes processes the tool goes through the hub socket (op
+`notify`), and the checks run in the dashboard.
+
+`rings.jsonl` gets `{"event": "notify", "session_id", "source", "result", "reason"?, "urgency", "level": "sound" |
+"time-sensitive" | "passive", "policy"?, "phones"?, "attempts"?, "cut"?, "previews"?, "detail"?}` for every call,
+never the text. `GET /status` has `messages: {available, phones, sent, allow_cron, note?}`: whether a message can
+reach a phone now, and why not. The test alerts (`POST /devices/test`) take `kind: "message"` too.
+
 ## Phone protocol
 
 JSON text frames on `/phone` plus binary PCM (16-bit little-endian mono, 24 kHz):
@@ -622,10 +690,11 @@ HTTP 403 on the handshake and no close code, which the app treats like 4401. VoI
 - A hello for a call that is over gets `cancel {reason}` (never answered) or `ended {outcome}`, then close 1000; a
   push hello for a call the plugin doesn't know gets `cancel {reason: "unknown_call"}`.
 - `GET /status` → `{calls, tts: "elevenlabs" | "fake", h2, apns_configured, scribe_configured, active_call,
-  hub_socket: "open" | "waiting" | "taken" | "paused" | "failed" | "off", scheduled, alerts, location}`,
+  hub_socket: "open" | "waiting" | "taken" | "paused" | "failed" | "off", scheduled, alerts, location, messages}`,
   where `active_call` is `{call_id, session_id, title, state, initiated_by: "push" | "user"}` or null (the app's
   call button joins a call Hermes holds for the same chat), `alerts` is `{enabled, kinds, watching, devices,
-  sent}` and `location` is `{enabled, sharing, phones, background, last_fix_age_s}`. HTTP errors are `{detail}`.
+  sent}`, `location` is `{enabled, sharing, phones, background, last_fix_age_s}` and `messages` is `{available,
+  phones, sent, allow_cron, note?}`. HTTP errors are `{detail}`.
 - The VoIP push's `session_id` can be a conversation of another process (`local-…` for a CLI one the gateway runs,
   a messaging chat's), which the dashboard may not be able to open: the call works the same.
 
@@ -699,7 +768,9 @@ HERMES_VOICE_INTEGRATION=1 uv run pytest -q tests/integration
   alerts once the client leaves, answered with `request.answer` from the alert's ids; a turn the provider fails
   alerts that it failed; and through the real APNs
   sender against a mock APNs, one approval alert per phone that takes them (ES256 provider token, headers, topic,
-  payload), none for a phone that turned approvals off.
+  payload), none for a phone that turned approvals off; and a conversation's `notify_user` (through the hub socket
+  under `turn_isolation`) as one time-sensitive `HERMES_MESSAGE` alert per phone that takes messages, a second one
+  refused by the rate limit.
 
 It starts Hermes with its own interpreter (`HERMES_PYTHON`, else the environment Hermes' package manager committed
 for the checkout at `HERMES_AGENT_DIR`, default `~/.hermes/hermes-agent`) in a temp `HOME` and `HERMES_HOME`, with

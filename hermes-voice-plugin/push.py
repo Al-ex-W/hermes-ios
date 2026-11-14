@@ -10,7 +10,8 @@ that one token and the same request path; only the headers differ:
 - VoIP: ``apns-push-type: voip``, topic ``<bundle id>.voip``, priority 10, expiration 0 (now or never), to the
   device's VoIP token.
 - Alert: ``apns-push-type: alert``, topic ``<bundle id>``, priority 10, an expiration a while ahead (APNs keeps it
-  for a phone that is offline just now) and a collapse id, to the device's alert token; at most 4 KB.
+  for a phone that is offline just now) and a collapse id, to the device's alert token; at most 4 KB. The same goes
+  for a message the agent sends with ``notify_user`` (``message.py``).
 - Background: ``apns-push-type: background``, topic ``<bundle id>``, priority 5 (APNs refuses 10 for these),
   ``{"aps": {"content-available": 1}, ...}`` with no alert, sound or badge, to the alert token of the phones that
   share their location (``location.py``: "where are you?"). iOS hands these to the app when it sees fit: it
@@ -49,11 +50,12 @@ KEY_ID = re.compile(r"[A-Z0-9]{10}")
 TEAM_ID = re.compile(r"[A-Z0-9]{10}")
 GONE_REASONS = frozenset({"Unregistered", "BadDeviceToken", "DeviceTokenNotForTopic"})
 
-# Alert kinds a phone can turn off one by one (POST /devices {"alerts": {kind: bool}}).
-ALERT_KINDS = ("approval", "clarify", "turn_done")
+# Alert kinds a phone can turn off one by one (POST /devices {"alerts": {kind: bool}}). "message": what the agent
+# sends with notify_user (message.py).
+ALERT_KINDS = ("approval", "clarify", "turn_done", "message")
 # How long APNs keeps an alert for a phone that is offline just now: a waiting approval or question rarely
-# outlives that (approvals.timeout is 300 s by default); a finished turn stays news for longer.
-ALERT_TTL_S = {"approval": 900, "clarify": 900, "turn_done": 3600}
+# outlives that (approvals.timeout is 300 s by default); a finished turn or a message stays news for longer.
+ALERT_TTL_S = {"approval": 900, "clarify": 900, "turn_done": 3600, "message": 3600}
 # APNs refuses a larger alert payload (VoIP allows 5 KB).
 MAX_ALERT_BYTES = 4096
 # How long APNs keeps a background push for a phone it can't reach just now: the request it carries isn't worth

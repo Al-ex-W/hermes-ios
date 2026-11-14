@@ -1,7 +1,8 @@
 """Alert pushes inside a real ``hermes serve`` (opt-in; see conftest.py): a real approval and a real clarify question
 waiting on a conversation no client has open reach the phone with the gateway's own request id, the phone answers
 them with ``request.answer`` from a socket that isn't attached, and the finished turn alerts too. Through the
-plugin's real APNs sender and a mock APNs, an approval alerts each phone that takes approval alerts exactly once.
+plugin's real APNs sender and a mock APNs, an approval alerts each phone that takes approval alerts exactly once, and
+a conversation's ``notify_user`` reaches each phone that takes messages (a second one is rate limited).
 
 This module runs its own sandboxes, one with turns in the dashboard process and one with ``dashboard.turn_isolation``
 (turns in a compute-host child, whose requests the dashboard mirrors): manual approvals (the default guardian would
@@ -27,6 +28,7 @@ import pytest
 import websockets
 
 import hermes_sandbox as hs
+from scenario import tool_results
 
 pytestmark = pytest.mark.integration
 
@@ -67,6 +69,8 @@ class AlertSandbox(hs.Sandbox):
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["approvals"] = {"mode": "manual", "timeout": 120}
         config["plugins"]["entries"]["hermes_voice"]["settings"]["alerts"] = {"grace_s": 1}
+        # One notify_user per conversation per 10 minutes: the second one shows a refusal.
+        config["plugins"]["entries"]["hermes_voice"]["settings"]["notify_user"] = {"per_session": 1}
         config["dashboard"]["turn_isolation"] = self.isolated
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         helper = self.hermes_home / "plugins" / "hermes_voice_it" / "dashboard" / "plugin_api.py"
@@ -108,8 +112,8 @@ def _alive(pid: int) -> bool:
 
 class Model:
     """``do the dangerous thing`` -> ``terminal rm -rf <a folder in the sandbox>`` (an approval); ``ask me`` ->
-    ``clarify`` with one question; ``fail now`` -> the provider refuses the request; after a tool result -> a short
-    reply."""
+    ``clarify`` with one question; ``notify me: <text>`` -> ``notify_user`` (time-sensitive) with that text; ``fail
+    now`` -> the provider refuses the request; after a tool result -> a short reply."""
 
     def __init__(self) -> None:
         self.target = ""
@@ -130,6 +134,9 @@ class Model:
                 return hs.Fail(delay=1.0)  # a provider 400: the turn ends on an early return
             if "dangerous" in text:
                 return call("terminal", {"command": f"rm -rf {self.target}"})
+            if "notify me: " in text:
+                said = text.split("notify me: ", 1)[1].splitlines()[0].strip()
+                return call("notify_user", {"title": "Trains", "body": said, "urgency": "time_sensitive"})
             if "ask me" in text:
                 return call("clarify", {"questions": [{"question": "Which environment?",
                                                        "choices": ["staging", "production"]}]})
@@ -464,3 +471,73 @@ def test_a_test_alert_goes_through_apns_to_the_phone_that_asks_and_takes_its_ans
 
 def _of(pushes: list[dict], category: str) -> list[dict]:
     return [push for push in pushes if ((push.get("payload") or {}).get("aps") or {}).get("category") == category]
+
+
+PHONE_C = {"voip_token": "c3" * 32, "alert_token": "c4" * 32, "environment": "sandbox",
+           "bundle_id": "com.example.hermesvoice", "alerts": {"message": False}}
+
+
+def test_a_conversation_notifies_each_phone_that_takes_messages_and_a_second_one_is_rate_limited(hermes):
+    """``notify_user`` from a dashboard conversation's stub model (under ``turn_isolation`` the tool runs in the
+    compute-host child and goes through the hub socket): the real sender sends one time-sensitive ``HERMES_MESSAGE``
+    alert to each phone that takes messages, its thread is the conversation's stored id, and the model is told it
+    went out. A second one in the same conversation is past ``notify_user.per_session`` (1 here) and is refused.
+    (Last in the module: it registers a third phone.)"""
+    sandbox, model = hermes
+    apns = sandbox.apns
+    text = "Your train is 10 minutes late"
+
+    async def scenario():
+        dashboard = hs.Dashboard(sandbox)
+        try:
+            assert (await dashboard.sign_in()).status_code == 200
+            for phone in (PHONE_A, PHONE_B, PHONE_C):
+                assert (await dashboard.post(f"{hs.PREFIX}/devices", phone)).json() == {"ok": True}
+            assert (await dashboard.post(f"{hs.HELPER}/arm-apns", {"url": apns.url})).status_code == 200
+            status = (await dashboard.get(f"{hs.PREFIX}/status")).json()
+            before = len(apns.received())
+            gateway = await Gateway.answering(dashboard)
+            try:
+                created = await gateway.call("session.create", {"source": "desktop", "title": "Notify"})
+                sid, stored = created["session_id"], created["stored_session_id"]
+                seen = len(gateway.events)
+                await gateway.call("prompt.submit", {"session_id": sid, "text": f"notify me: {text}"})
+                await gateway.event("message.complete", after=seen, timeout=90)
+                seen = len(gateway.events)
+                await gateway.call("prompt.submit", {"session_id": sid, "text": "notify me: and again"})
+                await gateway.event("message.complete", after=seen, timeout=90)
+            finally:
+                await gateway.close()
+            messages = await dashboard.messages(stored)
+            return status, stored, apns.received()[before:], messages
+        finally:
+            await dashboard.close()
+
+    status, stored, pushes, messages = asyncio.run(scenario())
+    assert status["messages"]["available"] is True and status["messages"]["phones"] >= 2
+    sent = _of(pushes, "HERMES_MESSAGE")
+    # A and B take messages (B only turned approvals off); C turned messages off. One push each, and only one
+    # message: the second was refused before anything went to APNs.
+    assert sorted(push["token"] for push in sent) == sorted([PHONE_A["alert_token"], PHONE_B["alert_token"]])
+    for push in sent:
+        assert push["token_ok"] is True and push["headers"]["apns-push-type"] == "alert"
+        assert push["headers"]["apns-topic"] == "com.example.hermesvoice"
+        assert push["headers"]["apns-collapse-id"].startswith("msg-")
+        assert push["payload"] == {
+            "aps": {"alert": {"title": "Trains", "body": text}, "category": "HERMES_MESSAGE", "thread-id": stored,
+                    "sound": "default", "interruption-level": "time-sensitive"},
+            "hermes": {"kind": "message", "session_id": stored, "profile": "default"}}
+    results = [r for r in tool_results(model.requests) if r.get("status") in ("sent", "quiet", "not_sent")]
+    first = next(r for r in results if r["status"] == "sent")
+    assert "also in this conversation" in first["note"]
+    refused = next(r for r in results if r["status"] == "not_sent")
+    assert refused["reason"] == "rate_limited" and "already sent 1 notification in" in refused["note"]
+    # The text is in the conversation: the stored tool call carries it.
+    assert text in json.dumps(messages)
+    log = (sandbox.hermes_home / "hermes-voice" / "rings.jsonl").read_text(encoding="utf-8")
+    entries = [json.loads(line) for line in log.splitlines() if '"notify"' in line]
+    assert [(entry["session_id"], entry["result"], entry.get("reason")) for entry in entries][-2:] == [
+        (stored, "sent", None), (stored, "not_sent", "rate_limited")]
+    assert entries[-2]["level"] == "time-sensitive" and entries[-2]["phones"] == 2
+    assert entries[-2]["source"] in ("desktop", "dashboard")
+    assert text not in log

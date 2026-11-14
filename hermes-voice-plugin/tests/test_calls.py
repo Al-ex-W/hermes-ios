@@ -592,12 +592,13 @@ def test_register_adds_tools_skill_and_hooks(core, fake, make_hub):
 
     ctx = Ctx()
     plugin.register(ctx)
-    assert set(ctx.tools) == {"start_call", "end_call", "scheduled_calls", "get_location"}
+    assert set(ctx.tools) == {"start_call", "end_call", "scheduled_calls", "get_location", "notify_user"}
     for name, entry in ctx.tools.items():
         assert entry["toolset"] == "voice" and entry["schema"]["name"] == name
         assert entry["check_fn"] is core.tools.available and entry["description"] == entry["schema"]["description"]
         # the one shared copy
-        assert entry["handler"].__module__ == f"hermes_voice_core.{'location' if name == 'get_location' else 'tools'}"
+        home = {"get_location": "location", "notify_user": "message"}.get(name, "tools")
+        assert entry["handler"].__module__ == f"hermes_voice_core.{home}"
     assert ctx.tools["start_call"]["schema"]["parameters"]["required"] == ["text"]
     assert "[Voice]" in ctx.tools["start_call"]["description"]
     assert set(ctx.skills) == {"voice-calls"}

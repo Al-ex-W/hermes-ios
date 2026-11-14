@@ -244,6 +244,26 @@ def gateway_owner(platform: str, user_id: str) -> bool:
     return hermes.gateway_paired(platform, user_id)
 
 
+def owner_conversation(origin: hermes.Origin, calls: Any, allow_cron: bool) -> str:
+    """Whether a conversation may act on the owner's phone outside a call (``get_location``, ``notify_user``): ""
+    when it may, else why not (``subagent``, ``cron``, ``group``, ``not_owner``, ``source``). `calls` is the call
+    policy (``config.PolicyConfig``): the same sources and owner as for ringing the phone; scheduled jobs (and kanban
+    tasks) when `allow_cron` says so; never a subagent or a group chat."""
+    if origin.is_subagent:
+        return "subagent"
+    if origin.is_cron:
+        return "" if allow_cron else "cron"
+    surface = _surface(origin)
+    if is_messaging(surface):
+        if origin.chat_type != "dm":
+            return "group"
+        if not (calls.allow_owner_dms and is_owner(origin, calls.owner_ids)):
+            return "not_owner"
+    elif surface not in calls.allowed_sources:
+        return "source"
+    return ""
+
+
 def is_messaging(surface: str) -> bool:
     """A messaging platform rather than one of the owner's own clients (``_surface`` values)."""
     return (surface or "").strip().lower() not in NON_MESSAGING

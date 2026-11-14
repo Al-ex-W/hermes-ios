@@ -35,6 +35,8 @@ Protocol: one JSON object per line (UTF-8, at most 64 KiB). The client starts wi
   held?}``).
 - ``location {origin, max_age_s?}``: ``get_location`` for that conversation (``location.py``): the phone's fix, or
   ``{status, note}``. It answers within the hub's ``location.timeout_s``.
+- ``notify {origin, title, body, urgency?}``: ``notify_user`` for that conversation (``message.py``): ``{status,
+  note, reason?}``. It answers once APNs did (passing failures are tried again for up to 15 s).
 
 And five one-way messages: ``{"op": "signal", ref: <request id>, interrupt?: true, yield?: true}`` (the tool
 thread waiting on ``await_turn`` / ``end`` was stopped, or Hermes asked it to yield), ``delivered`` and ``attended``
@@ -656,6 +658,9 @@ class HubServer:
         if op == "location":
             from . import location  # get_location for a conversation in another process (location.py)
             return location.from_socket(self, message, signals)
+        if op == "notify":
+            from . import message as notify_message  # notify_user for a conversation in another process
+            return notify_message.from_socket(self, message, signals)
         raise ProtocolError("unknown_op", f"unknown op {op!r}")
 
     def _foreign(self, origin: hermes.Origin, mode: str) -> Optional[dict[str, Any]]:

@@ -5,7 +5,7 @@ the hooks: ``pre_llm_call`` / ``on_session_end`` tell which conversations are bu
 conversation through compression (in the dashboard process for its hub; anywhere else for the calls ``remote.py``
 places through the hub's socket), and ``post_llm_call`` / ``on_session_end`` tell the alert pushes (``notify.py``)
 when a turn ended. It also adds ``get_location`` (``location.py``: where the phone is, when the user shares
-that). The phone's socket and the device, location, Scribe-token and status routes live in
+that) and ``notify_user`` (``message.py``: a notification the agent sends the phone of its own). The phone's socket and the device, location, Scribe-token and status routes live in
 ``dashboard/plugin_api.py``. Both halves share one call hub per process through ``loader.py``, which both load by
 path. A third call tool, ``scheduled_calls``, lists and cancels the calls ``start_call`` scheduled for later.
 """
@@ -70,6 +70,22 @@ def register(ctx: Any) -> None:
     _register_alerts(ctx)
     _bind_remote_calls(ctx)
     _register_location(ctx)
+    _register_message(ctx)
+
+
+def _register_message(ctx: Any) -> None:
+    """The ``notify_user`` tool (``message.py``): a notification of the agent's own on the user's phone."""
+    try:
+        message, tools = _core("message"), _core("tools")
+        schema = message.NOTIFY_USER
+        spec = {"name": schema["name"], "toolset": tools.TOOLSET, "schema": schema,
+                "handler": message.notify_user, "check_fn": tools.available}
+        try:
+            ctx.register_tool(**spec, description=schema["description"], emoji="🔔")
+        except TypeError:  # a Hermes without the display fields
+            ctx.register_tool(**spec)
+    except Exception:  # noqa: BLE001 - the other tools still work
+        logger.warning("hermes_voice: could not register notify_user", exc_info=True)
 
 
 def _register_location(ctx: Any) -> None:

@@ -1,5 +1,7 @@
 """Alert pushes: the phone hears about an approval or a question waiting in a conversation, and about a turn that
-finished, while no client has that conversation open.
+finished, while no client has that conversation open. The fourth kind, ``message``, is what the agent sends itself
+with the ``notify_user`` tool (``message.py``): it goes through the same payload builder, sender, switches, quiet
+hours and budget, but not through the watcher below.
 
 Only conversations the dashboard hosts count (the phone app, Hermes Desktop and the dashboard's chat attach to
 those), since the phone answers through the dashboard's gateway: ``request.answer {id, result}`` with the request id
@@ -27,7 +29,7 @@ its own surface.
 "A client attached" is a live client transport on the conversation (``_session_live_transports``): the app or a
 Desktop window that has it open. Each phone can turn kinds off (``POST /devices {"alerts": {...}}``), and the host
 can too (``plugins.entries.hermes_voice.settings.alerts``: ``enabled``, ``approval``, ``clarify``, ``turn_done``,
-``grace_s``, ``previews``). With ``previews: false`` no conversation text (the reply, the question, what needs
+``message``, ``grace_s``, ``previews``). With ``previews: false`` no conversation text (the reply, the question, what needs
 approving, the conversation's title) goes through APNs: the phone shows a generic line and opens the conversation
 to answer. With previews on, every text is passed through Hermes' secret redaction first (where that can't run, the
 generic line goes instead), and a question whose choices redaction would change goes without its questions.
@@ -38,10 +40,10 @@ passive``. A push APNs couldn't take for a passing reason (unreachable, 429, 5xx
 (1, 2, 4, 8 s) while its request is still open.
 
 Payload (``push.Apns.push_alert`` sends it as ``apns-push-type: alert`` to the app's own topic):
-``{"aps": {"alert": {title, body}, "category": "HERMES_APPROVAL" | "HERMES_CLARIFY" | "HERMES_TURN_DONE",
-"thread-id": <stored session id>, "sound": "default"}, "hermes": {"kind", "session_id", "profile", "request_id",
-"choices" (approval), "questions" (clarify)}}``; a silent one has ``"interruption-level": "passive"`` instead of
-``sound``.
+``{"aps": {"alert": {title, body}, "category": "HERMES_APPROVAL" | "HERMES_CLARIFY" | "HERMES_TURN_DONE" |
+"HERMES_MESSAGE", "thread-id": <stored session id>, "sound": "default"}, "hermes": {"kind", "session_id", "profile",
+"request_id", "choices" (approval), "questions" (clarify)}}``; a silent one has ``"interruption-level": "passive"``
+instead of ``sound``, and a time-sensitive message ``"interruption-level": "time-sensitive"`` beside ``sound``.
 
 **Test alerts** (``TestAlerts``, ``POST /devices/test``): the phone asks for a sample alert of one kind, to check
 that pushes reach it and can be answered. It goes through the same sender to that phone alone, at once or a few
@@ -71,7 +73,8 @@ from .policy import in_quiet_hours
 logger = logging.getLogger("hermes_voice")
 
 KINDS = push.ALERT_KINDS
-CATEGORIES = {"approval": "HERMES_APPROVAL", "clarify": "HERMES_CLARIFY", "turn_done": "HERMES_TURN_DONE"}
+CATEGORIES = {"approval": "HERMES_APPROVAL", "clarify": "HERMES_CLARIFY", "turn_done": "HERMES_TURN_DONE",
+              "message": "HERMES_MESSAGE"}
 # Server request methods that alert, and as which kind.
 REQUEST_KINDS = {"approval": "approval", "clarify": "clarify"}
 APPROVAL_CHOICES = ("once", "session", "always", "deny")
@@ -81,6 +84,7 @@ GENERIC = {
     "clarify": "Hermes has a question for you.",
     "turn_done": "Hermes finished.",
     "failed": "Hermes stopped: the turn failed.",
+    "message": "Hermes sent you a message.",
 }
 TITLE_CHARS = 80
 BODY_CHARS = 240
@@ -190,9 +194,10 @@ def safe(text: Any) -> Optional[str]:
 
 def build(kind: str, *, title: str, body: str, session_id: str, profile: str, request_id: str = "",
           choices: Optional[list[str]] = None, questions: Optional[list[dict]] = None,
-          quiet: bool = False) -> dict[str, Any]:
+          quiet: bool = False, time_sensitive: bool = False, body_chars: int = BODY_CHARS) -> dict[str, Any]:
     """An alert payload as the app expects it (see the module doc), at most APNs' 4 KB. A `quiet` one makes no
-    sound and doesn't light the screen (quiet hours, or over the budget)."""
+    sound and doesn't light the screen (quiet hours, or over the budget); a `time_sensitive` one (a message the
+    agent marked so) gets through a Focus the user allows time-sensitive notifications in."""
     data: dict[str, Any] = {"kind": kind, "session_id": session_id, "profile": profile or "default"}
     if kind in ("approval", "clarify"):
         data["request_id"] = request_id
@@ -201,7 +206,7 @@ def build(kind: str, *, title: str, body: str, session_id: str, profile: str, re
     if kind == "clarify":
         data["questions"] = list(questions or [])
     aps: dict[str, Any] = {
-        "alert": {"title": clip(title, TITLE_CHARS) or DEFAULT_TITLE, "body": clip(body, BODY_CHARS)},
+        "alert": {"title": clip(title, TITLE_CHARS) or DEFAULT_TITLE, "body": clip(body, body_chars)},
         "category": CATEGORIES[kind],
         "thread-id": session_id,
     }
@@ -209,6 +214,8 @@ def build(kind: str, *, title: str, body: str, session_id: str, profile: str, re
         aps["interruption-level"] = "passive"
     else:
         aps["sound"] = "default"
+        if time_sensitive:
+            aps["interruption-level"] = "time-sensitive"
     return fit({"aps": aps, "hermes": data})
 
 
@@ -735,8 +742,12 @@ class Alerts:
 
     def _quiet(self, kind: str, session_id: str, now: float, quiet_hours: bool) -> bool:
         """Whether this alert goes silently: quiet hours, or over the budget."""
-        if quiet_hours:
-            return True
+        return quiet_hours or self.over_budget(kind, session_id, now)
+
+    def over_budget(self, kind: str, session_id: str, now: Optional[float] = None) -> bool:
+        """Past the sounding budget: 20 sounding alerts an hour in all, one sounding turn_done per conversation
+        every 5 minutes."""
+        now = self.clock() if now is None else now
         with self.lock:
             recent = [(at, k, sid) for at, k, sid in self.sounded if now - at < 3600.0]
         if len(recent) >= SOUNDED_PER_HOUR:
@@ -744,10 +755,10 @@ class Alerts:
         return kind == "turn_done" and any(k == "turn_done" and sid == session_id and now - at < TURN_DONE_EVERY_S
                                            for at, k, sid in recent)
 
-    def _sounded(self, kind: str, session_id: str, now: float, quiet: bool) -> None:
+    def _sounded(self, kind: str, session_id: str, now: Optional[float] = None, quiet: bool = False) -> None:
         if not quiet:
             with self.lock:
-                self.sounded.append((now, kind, session_id))
+                self.sounded.append((self.clock() if now is None else now, kind, session_id))
 
     def _title(self, sid: str, record: dict) -> str:
         try:
@@ -848,11 +859,12 @@ TEST_BODIES = {
     "approval": "Test approval: nothing will run, whatever you choose.",
     "clarify": "Test question: reply with anything.",
     "turn_done": "Test: this is how a finished turn looks.",
+    "message": "Test message: this is how a message from Hermes looks. A reply goes nowhere.",
 }
 TEST_QUESTION = {"qid": "test", "question": TEST_BODIES["clarify"], "choices": None, "multi_select": False}
 # What the phone may report it did with a test alert: an approval choice, a typed reply (never its text), a tap.
 TEST_ACTIONS = (*APPROVAL_CHOICES, "reply", "open")
-KIND_NAMES = {"approval": "approval", "clarify": "question", "turn_done": "turn-finished"}
+KIND_NAMES = {"approval": "approval", "clarify": "question", "turn_done": "turn-finished", "message": "message"}
 NO_ALERT_TOKEN = ("This iPhone has no notification token on the Hermes host: allow notifications for the app in "
                   "iOS Settings, then open the app again.")
 # APNs' reasons, by what the user can do about them.
